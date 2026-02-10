@@ -17,7 +17,7 @@ FROM python:3.11-slim
 WORKDIR /app
 
 # Install gRPC dependencies
-RUN pip install --no-cache-dir \
+RUN pip install --no-cache-dir --break-system-packages \
     grpcio \
     grpcio-tools
 
