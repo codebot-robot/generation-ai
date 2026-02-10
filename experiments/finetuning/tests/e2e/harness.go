@@ -110,6 +110,18 @@ func (h *Harness) WaitForDeployment(name string, timeout time.Duration) {
 	h.RunCommand("kubectl", "rollout", "status", "deployment/"+name, "--timeout="+timeout.String())
 }
 
+func (h *Harness) DeleteDeployment(name string) {
+	h.t.Helper()
+	// Ignore errors if deployment doesn't exist
+	exec.Command("kubectl", "delete", "deployment", name, "--ignore-not-found").Run()
+}
+
+func (h *Harness) DeleteService(name string) {
+	h.t.Helper()
+	// Ignore errors if service doesn't exist
+	exec.Command("kubectl", "delete", "service", name, "--ignore-not-found").Run()
+}
+
 func (h *Harness) DeletePod(name string) {
 	h.t.Helper()
 	// Ignore errors if pod doesn't exist

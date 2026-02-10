@@ -63,6 +63,8 @@ func TestE2E(t *testing.T) {
 
 	// Apply manifest
 	h.DeleteJob("finetuning-client")
+	h.DeleteDeployment("finetuning-server")
+	h.DeleteService("finetuning-server")
 	h.KubectlApplyContent(manifest)
 
 	// Wait for server
