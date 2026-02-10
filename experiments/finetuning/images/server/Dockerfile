@@ -17,13 +17,13 @@ FROM pytorch/pytorch:2.10.0-cuda13.0-cudnn9-runtime
 WORKDIR /app
 
 # Install dependencies
-RUN pip install --no-cache-dir --break-system-packages 
-    transformers 
-    accelerate 
-    trl 
-    peft 
-    datasets 
-    grpcio 
+RUN pip install --no-cache-dir --break-system-packages \
+    transformers \
+    accelerate \
+    trl \
+    peft \
+    datasets \
+    grpcio \
     grpcio-tools
 
 # Copy source code
