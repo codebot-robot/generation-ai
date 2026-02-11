@@ -16,20 +16,48 @@ import grpc
 import finetuning_pb2
 import finetuning_pb2_grpc
 import argparse
+import time
+import sys
 
 def run(host, model_id, dataset_id, dataset_text_field, max_steps):
-    with grpc.insecure_channel(host) as channel:
-        stub = finetuning_pb2_grpc.FinetuningServiceStub(channel)
-        request = finetuning_pb2.SFTRequest(
-            model_id=model_id,
-            dataset_id=dataset_id,
-            dataset_text_field=dataset_text_field,
-            max_steps=max_steps
-        )
-        
-        print(f"Requesting SFT for {model_id}...")
-        for response in stub.StartSFT(request):
-            print(f"SERVER: {response.log_entry}")
+    print(f"Connecting to {host}...")
+    
+    # We use a longer timeout for the initial connection
+    channel = grpc.insecure_channel(host)
+    stub = finetuning_pb2_grpc.FinetuningServiceStub(channel)
+    
+    request = finetuning_pb2.SFTRequest(
+        model_id=model_id,
+        dataset_id=dataset_id,
+        dataset_text_field=dataset_text_field,
+        max_steps=max_steps
+    )
+    
+    max_retries = 10
+    retry_delay = 5
+    
+    for attempt in range(max_retries):
+        try:
+            print(f"Requesting SFT for {model_id} (attempt {attempt + 1}/{max_retries})...")
+            responses = stub.StartSFT(request)
+            for response in responses:
+                print(f"SERVER: {response.log_entry}")
+            
+            # If we reach here, the stream finished successfully
+            print("Client finished successfully.")
+            return
+            
+        except grpc.RpcError as e:
+            print(f"gRPC error on attempt {attempt + 1}: {e.code()} - {e.details()}")
+            if attempt < max_retries - 1:
+                print(f"Retrying in {retry_delay} seconds...")
+                time.sleep(retry_delay)
+            else:
+                print("Max retries reached. Exiting.")
+                sys.exit(1)
+        except Exception as e:
+            print(f"Unexpected error: {e}")
+            sys.exit(1)
 
 if __name__ == '__main__':
     parser = argparse.ArgumentParser()
