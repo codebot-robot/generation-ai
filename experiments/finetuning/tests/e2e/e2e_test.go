@@ -72,7 +72,7 @@ func TestE2E(t *testing.T) {
 
 	// Wait for client job
 	err = h.WaitForJobSuccess("finetuning-client", 10*time.Minute)
-	
+
 	// Check logs (always, even on failure)
 	logs := h.GetPodLogs("app=finetuning-server")
 	t.Logf("Server logs:\n%s", logs)
