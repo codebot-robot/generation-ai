@@ -18,8 +18,8 @@ import threading
 import queue
 import torch
 import os
-from trl import SFTTrainer
-from transformers import AutoModelForCausalLM, AutoTokenizer, TrainingArguments, TrainerCallback
+from trl import SFTTrainer, SFTConfig
+from transformers import AutoModelForCausalLM, AutoTokenizer, TrainerCallback
 from datasets import load_dataset
 
 import finetuning_pb2
@@ -64,7 +64,7 @@ class FinetuningService(finetuning_pb2_grpc.FinetuningServiceServicer):
                 model = AutoModelForCausalLM.from_pretrained(
                     request.model_id,
                     device_map="auto",
-                    torch_dtype=torch.float32 if not torch.cuda.is_available() else "auto"
+                    dtype=torch.float32 if not torch.cuda.is_available() else "auto"
                 )
                 
                 # Load dataset
@@ -72,23 +72,23 @@ class FinetuningService(finetuning_pb2_grpc.FinetuningServiceServicer):
                 dataset = load_dataset(request.dataset_id, split="train")
                 
                 # Training arguments
-                training_args = TrainingArguments(
+                sft_config = SFTConfig(
                     output_dir="/tmp/output",
                     max_steps=request.max_steps if request.max_steps > 0 else 5,
                     per_device_train_batch_size=1,
                     logging_steps=1,
                     save_strategy="no",
                     report_to="none",
-                    use_cpu=not torch.cuda.is_available()
+                    use_cpu=not torch.cuda.is_available(),
+                    dataset_text_field=request.dataset_text_field,
+                    max_seq_length=512,
                 )
                 
                 log_queue.put("Initializing SFTTrainer...")
                 trainer = SFTTrainer(
                     model=model,
                     train_dataset=dataset,
-                    dataset_text_field=request.dataset_text_field,
-                    max_seq_length=512,
-                    args=training_args,
+                    args=sft_config,
                     callbacks=[QueueCallback(log_queue)]
                 )
                 

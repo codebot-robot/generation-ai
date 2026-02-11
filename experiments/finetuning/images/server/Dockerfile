@@ -16,6 +16,11 @@ FROM pytorch/pytorch:2.10.0-cuda13.0-cudnn9-runtime
 
 WORKDIR /app
 
+# Install system dependencies
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    build-essential \
+    && rm -rf /var/lib/apt/lists/*
+
 # Install dependencies
 RUN pip install --no-cache-dir --break-system-packages --upgrade pip && \
     pip install --no-cache-dir --break-system-packages \
