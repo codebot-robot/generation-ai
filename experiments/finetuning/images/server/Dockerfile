@@ -12,7 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-FROM pytorch/pytorch:2.10.0-cuda13.0-cudnn9-runtime
+FROM pytorch/pytorch:2.5.1-cuda12.4-cudnn9-runtime
 
 WORKDIR /app
 
@@ -22,14 +22,14 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     && rm -rf /var/lib/apt/lists/*
 
 # Install dependencies
-RUN pip install --no-cache-dir --break-system-packages --upgrade pip && \
-    pip install --no-cache-dir --break-system-packages \
+# Pinning versions to ensure compatibility and avoid 'no_cuda' / 'max_seq_length' errors.
+RUN pip install --no-cache-dir --break-system-packages \
     setuptools \
-    transformers \
-    accelerate \
-    datasets \
-    trl \
-    peft \
+    transformers==4.46.3 \
+    accelerate==1.1.1 \
+    datasets==3.1.0 \
+    trl==0.12.1 \
+    peft==0.13.2 \
     grpcio \
     grpcio-tools
 

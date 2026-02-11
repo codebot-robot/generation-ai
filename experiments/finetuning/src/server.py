@@ -26,8 +26,12 @@ import finetuning_pb2
 import finetuning_pb2_grpc
 
 def get_diagnostics():
+    import transformers
+    import trl
     diag = []
     diag.append(f"PyTorch version: {torch.__version__}")
+    diag.append(f"Transformers version: {transformers.__version__}")
+    diag.append(f"TRL version: {trl.__version__}")
     diag.append(f"CUDA available: {torch.cuda.is_available()}")
     if torch.cuda.is_available():
         diag.append(f"Device count: {torch.cuda.device_count()}")
@@ -72,6 +76,8 @@ class FinetuningService(finetuning_pb2_grpc.FinetuningServiceServicer):
                 dataset = load_dataset(request.dataset_id, split="train")
                 
                 # Training arguments
+                # SFTConfig was introduced in trl 0.8.0.
+                # In 0.8.0+, dataset_text_field and max_seq_length should be in SFTConfig.
                 sft_config = SFTConfig(
                     output_dir="/tmp/output",
                     max_steps=request.max_steps if request.max_steps > 0 else 5,
