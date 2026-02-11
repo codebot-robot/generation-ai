@@ -28,9 +28,11 @@ The script will:
 
 ## Local Testing
 
-To test locally, you'll need to generate gRPC code and install dependencies:
+To test locally, it is recommended to use a virtual environment:
 
 ```bash
+python3 -m venv venv
+source venv/bin/activate
 pip install trl transformers datasets grpcio grpcio-tools
 ./generate_proto.sh
 python3 src/server.py &

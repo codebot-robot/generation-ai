@@ -68,7 +68,7 @@ class FinetuningService(finetuning_pb2_grpc.FinetuningServiceServicer):
                 model = AutoModelForCausalLM.from_pretrained(
                     request.model_id,
                     device_map="auto",
-                    dtype=torch.float32 if not torch.cuda.is_available() else "auto"
+                    torch_dtype=torch.float32 if not torch.cuda.is_available() else "auto"
                 )
                 
                 # Load dataset
