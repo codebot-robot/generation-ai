@@ -146,20 +146,16 @@ func (h *Harness) GetPodLogs(labelSelector string) string {
 
 func (h *Harness) WaitForJobSuccess(name string, timeout time.Duration) error {
 	h.t.Helper()
-	h.t.Logf("Waiting for job %s to succeed", name)
+	h.t.Logf("Waiting for job %s to succeed (timeout: %s)", name, timeout)
 	start := time.Now()
 	for {
 		if time.Since(start) > timeout {
-			return fmt.Errorf("timed out waiting for job %s to succeed", name)
+			return fmt.Errorf("timed out waiting for job %s to succeed after %s", name, timeout)
 		}
 		cmd := exec.Command("kubectl", "get", "job", name, "-o", "jsonpath={.status.succeeded}")
 		out, err := cmd.Output()
-		if err != nil {
-			// Might not be created yet, ignore error
-			time.Sleep(2 * time.Second)
-			continue
-		}
-		if string(out) == "1" {
+		if err == nil && string(out) == "1" {
+			h.t.Logf("Job %s succeeded", name)
 			return nil
 		}
 
@@ -167,6 +163,11 @@ func (h *Harness) WaitForJobSuccess(name string, timeout time.Duration) error {
 		out, err = cmd.Output()
 		if err == nil && string(out) == "1" {
 			return fmt.Errorf("job %s failed", name)
+		}
+
+		// Optional: Log status every 30 seconds
+		if int(time.Since(start).Seconds())%30 < 2 {
+			h.t.Logf("Still waiting for job %s...", name)
 		}
 
 		time.Sleep(2 * time.Second)
