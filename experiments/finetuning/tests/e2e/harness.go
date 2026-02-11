@@ -16,6 +16,7 @@ package e2e
 
 import (
 	"bytes"
+	"fmt"
 	"os/exec"
 	"strings"
 	"testing"
@@ -143,13 +144,13 @@ func (h *Harness) GetPodLogs(labelSelector string) string {
 	return string(out)
 }
 
-func (h *Harness) WaitForJobSuccess(name string, timeout time.Duration) {
+func (h *Harness) WaitForJobSuccess(name string, timeout time.Duration) error {
 	h.t.Helper()
 	h.t.Logf("Waiting for job %s to succeed", name)
 	start := time.Now()
 	for {
 		if time.Since(start) > timeout {
-			h.t.Fatalf("Timed out waiting for job %s to succeed", name)
+			return fmt.Errorf("timed out waiting for job %s to succeed", name)
 		}
 		cmd := exec.Command("kubectl", "get", "job", name, "-o", "jsonpath={.status.succeeded}")
 		out, err := cmd.Output()
@@ -159,13 +160,13 @@ func (h *Harness) WaitForJobSuccess(name string, timeout time.Duration) {
 			continue
 		}
 		if string(out) == "1" {
-			return
+			return nil
 		}
 
 		cmd = exec.Command("kubectl", "get", "job", name, "-o", "jsonpath={.status.failed}")
 		out, err = cmd.Output()
 		if err == nil && string(out) == "1" {
-			h.t.Fatalf("Job %s failed", name)
+			return fmt.Errorf("job %s failed", name)
 		}
 
 		time.Sleep(2 * time.Second)

@@ -57,9 +57,9 @@ func TestE2E(t *testing.T) {
 
 	// Reduce resource requirements for E2E
 	manifest = strings.ReplaceAll(manifest, "cpu: \"2\"", "cpu: \"500m\"")
-	manifest = strings.ReplaceAll(manifest, "memory: \"8Gi\"", "memory: \"1Gi\"")
+	manifest = strings.ReplaceAll(manifest, "memory: \"8Gi\"", "memory: \"2Gi\"")
 	manifest = strings.ReplaceAll(manifest, "cpu: \"4\"", "cpu: \"1\"")
-	manifest = strings.ReplaceAll(manifest, "memory: \"16Gi\"", "memory: \"2Gi\"")
+	manifest = strings.ReplaceAll(manifest, "memory: \"16Gi\"", "memory: \"4Gi\"")
 
 	// Apply manifest
 	h.DeleteJob("finetuning-client")
@@ -71,14 +71,18 @@ func TestE2E(t *testing.T) {
 	h.WaitForDeployment("finetuning-server", 5*time.Minute)
 
 	// Wait for client job
-	h.WaitForJobSuccess("finetuning-client", 10*time.Minute)
-
-	// Check logs
+	err = h.WaitForJobSuccess("finetuning-client", 10*time.Minute)
+	
+	// Check logs (always, even on failure)
 	logs := h.GetPodLogs("app=finetuning-server")
 	t.Logf("Server logs:\n%s", logs)
 
 	clientLogs := h.GetPodLogs("batch.kubernetes.io/job-name=finetuning-client")
 	t.Logf("Client logs:\n%s", clientLogs)
+
+	if err != nil {
+		t.Fatalf("Job failed: %v", err)
+	}
 
 	if !strings.Contains(clientLogs, "Fine-tuning completed successfully") {
 		t.Error("Client logs do not indicate successful completion")
