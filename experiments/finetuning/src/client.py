@@ -40,12 +40,21 @@ def run(host, model_id, dataset_id, dataset_text_field, max_steps):
         try:
             print(f"Requesting SFT for {model_id} (attempt {attempt + 1}/{max_retries})...")
             responses = stub.StartSFT(request)
+            success = False
             for response in responses:
                 print(f"SERVER: {response.log_entry}")
+                if "Fine-tuning completed successfully" in response.log_entry:
+                    success = True
+                if "Error during fine-tuning:" in response.log_entry:
+                    print("Exiting due to server error.")
+                    sys.exit(1)
             
-            # If we reach here, the stream finished successfully
-            print("Client finished successfully.")
-            return
+            if success:
+                print("Client finished successfully.")
+                return
+            else:
+                print("Client finished without success message.")
+                sys.exit(1)
             
         except grpc.RpcError as e:
             print(f"gRPC error on attempt {attempt + 1}: {e.code()} - {e.details()}")

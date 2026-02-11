@@ -79,7 +79,7 @@ class FinetuningService(finetuning_pb2_grpc.FinetuningServiceServicer):
                     logging_steps=1,
                     save_strategy="no",
                     report_to="none",
-                    no_cuda=not torch.cuda.is_available()
+                    use_cpu=not torch.cuda.is_available()
                 )
                 
                 log_queue.put("Initializing SFTTrainer...")

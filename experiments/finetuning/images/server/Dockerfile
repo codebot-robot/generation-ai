@@ -17,7 +17,8 @@ FROM pytorch/pytorch:2.10.0-cuda13.0-cudnn9-runtime
 WORKDIR /app
 
 # Install dependencies
-RUN pip install --no-cache-dir --break-system-packages \
+RUN pip install --no-cache-dir --break-system-packages --upgrade pip && \
+    pip install --no-cache-dir --break-system-packages \
     setuptools \
     transformers \
     accelerate \
