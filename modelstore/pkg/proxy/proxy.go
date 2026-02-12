@@ -101,7 +101,7 @@ func (p *Proxy) proxyOnly(w http.ResponseWriter, r *http.Request) {
 	if err != nil {
 		log.Error(err, "failed to copy response body", "url", target.String())
 	} else {
-		log.V(2).Info("proxied request", "url", target.String(), "status", resp.StatusCode, "bytes", n)
+		log.Info("proxied request", "url", target.String(), "status", resp.StatusCode, "bytes", n)
 	}
 }
 
@@ -113,7 +113,7 @@ func (p *Proxy) fetchAndStore(w http.ResponseWriter, r *http.Request, cachePath 
 	target.Path = r.URL.Path
 	target.RawQuery = r.URL.RawQuery
 
-	log.V(2).Info("fetching from upstream", "url", target.String())
+	log.Info("fetching from upstream", "url", target.String())
 
 	req, err := http.NewRequestWithContext(ctx, http.MethodGet, target.String(), nil)
 	if err != nil {
@@ -131,7 +131,7 @@ func (p *Proxy) fetchAndStore(w http.ResponseWriter, r *http.Request, cachePath 
 	defer resp.Body.Close()
 
 	if resp.StatusCode != http.StatusOK {
-		log.V(2).Info("upstream returned non-OK status, proxying without caching", "status", resp.StatusCode, "url", target.String())
+		log.Info("upstream returned non-OK status, proxying without caching", "status", resp.StatusCode, "url", target.String())
 		// Just proxy non-OK responses without caching
 		for k, v := range resp.Header {
 			w.Header()[k] = v
@@ -186,6 +186,6 @@ func (p *Proxy) fetchAndStore(w http.ResponseWriter, r *http.Request, cachePath 
 		return fmt.Errorf("error renaming tmp file to %q: %w", cachePath, err)
 	}
 	moved = true
-	log.V(2).Info("cached file", "url", target.String(), "path", cachePath, "bytes", n)
+	log.Info("cached file", "url", target.String(), "path", cachePath, "bytes", n)
 	return nil
 }

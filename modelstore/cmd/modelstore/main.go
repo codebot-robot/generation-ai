@@ -15,7 +15,9 @@
 package main
 
 import (
+	"context"
 	"flag"
+	"fmt"
 	"net/http"
 	"os"
 
@@ -25,21 +27,35 @@ import (
 
 func main() {
 	klog.InitFlags(nil)
+	defer klog.Flush()
+
+	if err := run(context.Background()); err != nil {
+		klog.ErrorS(err, "terminated with error")
+		os.Exit(1)
+	}
+}
+
+func run(ctx context.Context) error {
 	port := flag.String("port", "8080", "Port to listen on")
 	cacheDir := flag.String("cache-dir", "/cache", "Directory to store cached models")
 	upstream := flag.String("upstream", "https://huggingface.co", "Upstream URL to proxy")
 	flag.Parse()
 
 	if err := os.MkdirAll(*cacheDir, 0755); err != nil {
-		klog.Fatalf("Failed to create cache directory: %v", err)
+		return fmt.Errorf("failed to create cache directory: %w", err)
 	}
 
 	p, err := proxy.NewProxy(*upstream, *cacheDir)
 	if err != nil {
-		klog.Fatalf("Failed to create proxy: %v", err)
+		return fmt.Errorf("failed to create proxy: %w", err)
 	}
 
-	klog.Infof("Starting modelstore on port %s, caching to %s", *port, *cacheDir)
-	klog.Infof("Proxying to %s", *upstream)
-	klog.Fatal(http.ListenAndServe(":"+*port, p))
+	klog.InfoS("Starting modelstore", "port", *port, "cacheDir", *cacheDir, "upstream", *upstream)
+
+	server := &http.Server{
+		Addr:    ":" + *port,
+		Handler: p,
+	}
+
+	return server.ListenAndServe()
 }

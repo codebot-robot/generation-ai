@@ -53,7 +53,7 @@ func TestE2E(t *testing.T) {
 	msManifest := string(msb)
 	msManifest = strings.ReplaceAll(msManifest, "MODELSTORE_IMAGE_PLACEHOLDER", "modelstore:e2e")
 	msManifest = strings.ReplaceAll(msManifest, "imagePullPolicy: IfNotPresent", "imagePullPolicy: Never")
-	msManifest = strings.ReplaceAll(msManifest, "image: modelstore:e2e", "image: modelstore:e2e\n        imagePullPolicy: Never")
+	msManifest = strings.ReplaceAll(msManifest, "image: modelstore:e2e", "image: modelstore:e2e\n          imagePullPolicy: Never")
 
 	// Read manifest and replace placeholders
 	manifestPath := filepath.Join(experimentRoot, "k8s/manifest.yaml")
@@ -66,8 +66,8 @@ func TestE2E(t *testing.T) {
 	manifest = strings.ReplaceAll(manifest, "CLIENT_IMAGE_PLACEHOLDER", "finetuning-client:e2e")
 	manifest = strings.ReplaceAll(manifest, "imagePullPolicy: IfNotPresent", "imagePullPolicy: Never")
 	// Add imagePullPolicy: Never if not present
-	manifest = strings.ReplaceAll(manifest, "image: finetuning-server:e2e", "image: finetuning-server:e2e\n        imagePullPolicy: Never")
-	manifest = strings.ReplaceAll(manifest, "image: finetuning-client:e2e", "image: finetuning-client:e2e\n        imagePullPolicy: Never")
+	manifest = strings.ReplaceAll(manifest, "image: finetuning-server:e2e", "image: finetuning-server:e2e\n          imagePullPolicy: Never")
+	manifest = strings.ReplaceAll(manifest, "image: finetuning-client:e2e", "image: finetuning-client:e2e\n          imagePullPolicy: Never")
 
 	// Add HF_ENDPOINT to server
 	envVar := `        - name: HF_ENDPOINT
