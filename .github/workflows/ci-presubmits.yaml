@@ -22,6 +22,15 @@ on:
   merge_group:
 
 jobs:
+  ap-e2e:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Run ap-e2e
+        run: ./dev/ci/presubmits/ap-e2e
+
   ap-lint:
     runs-on: ubuntu-latest
     steps:
