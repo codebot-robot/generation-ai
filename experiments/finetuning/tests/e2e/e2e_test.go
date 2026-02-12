@@ -32,14 +32,28 @@ func TestE2E(t *testing.T) {
 
 	gitRoot := h.GetGitRoot()
 	experimentRoot := filepath.Join(gitRoot, "experiments/finetuning")
+	modelstoreRoot := filepath.Join(gitRoot, "modelstore")
 
 	// Build images
 	h.DockerBuild("finetuning-server:e2e", filepath.Join(experimentRoot, "images/server/Dockerfile"), experimentRoot)
 	h.DockerBuild("finetuning-client:e2e", filepath.Join(experimentRoot, "images/client/Dockerfile"), experimentRoot)
+	h.DockerBuild("modelstore:e2e", filepath.Join(modelstoreRoot, "images/modelstore/Dockerfile"), modelstoreRoot)
 
 	// Load images into Kind
 	h.KindLoad("finetuning-server:e2e")
 	h.KindLoad("finetuning-client:e2e")
+	h.KindLoad("modelstore:e2e")
+
+	// Read modelstore manifest
+	msManifestPath := filepath.Join(modelstoreRoot, "k8s/manifest.yaml")
+	msb, err := os.ReadFile(msManifestPath)
+	if err != nil {
+		t.Fatalf("Failed to read modelstore manifest: %v", err)
+	}
+	msManifest := string(msb)
+	msManifest = strings.ReplaceAll(msManifest, "MODELSTORE_IMAGE_PLACEHOLDER", "modelstore:e2e")
+	msManifest = strings.ReplaceAll(msManifest, "imagePullPolicy: IfNotPresent", "imagePullPolicy: Never")
+	msManifest = strings.ReplaceAll(msManifest, "image: modelstore:e2e", "image: modelstore:e2e\n        imagePullPolicy: Never")
 
 	// Read manifest and replace placeholders
 	manifestPath := filepath.Join(experimentRoot, "k8s/manifest.yaml")
@@ -55,17 +69,28 @@ func TestE2E(t *testing.T) {
 	manifest = strings.ReplaceAll(manifest, "image: finetuning-server:e2e", "image: finetuning-server:e2e\n        imagePullPolicy: Never")
 	manifest = strings.ReplaceAll(manifest, "image: finetuning-client:e2e", "image: finetuning-client:e2e\n        imagePullPolicy: Never")
 
+	// Add HF_ENDPOINT to server
+	envVar := `        - name: HF_ENDPOINT
+          value: http://modelstore`
+	manifest = strings.ReplaceAll(manifest, "name: finetuning-server", "name: finetuning-server\n        env:\n"+envVar)
+
 	// Reduce resource requirements for E2E
 	manifest = strings.ReplaceAll(manifest, "cpu: \"2\"", "cpu: \"500m\"")
 	manifest = strings.ReplaceAll(manifest, "memory: \"8Gi\"", "memory: \"2Gi\"")
 	manifest = strings.ReplaceAll(manifest, "cpu: \"4\"", "cpu: \"1\"")
 	manifest = strings.ReplaceAll(manifest, "memory: \"16Gi\"", "memory: \"4Gi\"")
 
-	// Apply manifest
+	// Apply manifests
 	h.DeleteJob("finetuning-client")
 	h.DeleteDeployment("finetuning-server")
 	h.DeleteService("finetuning-server")
+	h.DeleteDeployment("modelstore")
+	h.DeleteService("modelstore")
+	h.KubectlApplyContent(msManifest)
 	h.KubectlApplyContent(manifest)
+
+	// Wait for modelstore
+	h.WaitForDeployment("modelstore", 2*time.Minute)
 
 	// Wait for server
 	h.WaitForDeployment("finetuning-server", 5*time.Minute)
