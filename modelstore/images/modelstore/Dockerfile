@@ -12,7 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-FROM golang:1.23-alpine AS builder
+FROM golang:1.26 AS builder
 
 WORKDIR /app
 COPY go.mod ./
@@ -20,13 +20,10 @@ COPY go.mod ./
 RUN go mod download
 
 COPY . .
-RUN go build -o modelstore ./cmd/modelstore
+RUN CGO_ENABLED=0 go build -o modelstore ./cmd/modelstore
 
-FROM alpine:latest
-RUN apk --no-cache add ca-certificates
-WORKDIR /root/
-COPY --from=builder /app/modelstore .
-RUN mkdir /cache
+FROM gcr.io/distroless/static-debian13:latest
+COPY --from=builder /app/modelstore /modelstore
 EXPOSE 8080
-ENTRYPOINT ["./modelstore"]
+ENTRYPOINT ["/modelstore"]
 CMD ["--port=8080", "--cache-dir=/cache"]

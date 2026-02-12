@@ -16,26 +16,30 @@ package main
 
 import (
 	"flag"
-	"log"
 	"net/http"
 	"os"
 
 	"github.com/gke-labs/generation-ai/modelstore/pkg/proxy"
+	"k8s.io/klog/v2"
 )
 
 func main() {
+	klog.InitFlags(nil)
 	port := flag.String("port", "8080", "Port to listen on")
 	cacheDir := flag.String("cache-dir", "/cache", "Directory to store cached models")
 	upstream := flag.String("upstream", "https://huggingface.co", "Upstream URL to proxy")
 	flag.Parse()
 
 	if err := os.MkdirAll(*cacheDir, 0755); err != nil {
-		log.Fatalf("Failed to create cache directory: %v", err)
+		klog.Fatalf("Failed to create cache directory: %v", err)
 	}
 
-	p := proxy.NewProxy(*upstream, *cacheDir)
+	p, err := proxy.NewProxy(*upstream, *cacheDir)
+	if err != nil {
+		klog.Fatalf("Failed to create proxy: %v", err)
+	}
 
-	log.Printf("Starting modelstore on port %s, caching to %s", *port, *cacheDir)
-	log.Printf("Proxying to %s", *upstream)
-	log.Fatal(http.ListenAndServe(":"+*port, p))
+	klog.Infof("Starting modelstore on port %s, caching to %s", *port, *cacheDir)
+	klog.Infof("Proxying to %s", *upstream)
+	klog.Fatal(http.ListenAndServe(":"+*port, p))
 }

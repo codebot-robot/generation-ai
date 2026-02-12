@@ -42,7 +42,10 @@ func TestProxy(t *testing.T) {
 	}))
 	defer upstream.Close()
 
-	p := NewProxy(upstream.URL, cacheDir)
+	p, err := NewProxy(upstream.URL, cacheDir)
+	if err != nil {
+		t.Fatalf("Failed to create proxy: %v", err)
+	}
 
 	// First request - should fetch from upstream and cache
 	req := httptest.NewRequest(http.MethodGet, "/test-file", nil)

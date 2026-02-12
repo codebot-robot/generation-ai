@@ -25,10 +25,11 @@ spec:
       targetPort: 8080
 ---
 apiVersion: apps/v1
-kind: Deployment
+kind: StatefulSet
 metadata:
   name: modelstore
 spec:
+  serviceName: "modelstore"
   replicas: 1
   selector:
     matchLabels:
@@ -46,6 +47,11 @@ spec:
           volumeMounts:
             - name: cache
               mountPath: /cache
-      volumes:
-        - name: cache
-          emptyDir: {}
+  volumeClaimTemplates:
+    - metadata:
+        name: cache
+      spec:
+        accessModes: [ "ReadWriteOnce" ]
+        resources:
+          requests:
+            storage: 10Gi
