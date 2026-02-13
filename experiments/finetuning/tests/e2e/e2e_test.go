@@ -66,13 +66,13 @@ func TestE2E(t *testing.T) {
 	manifest = strings.ReplaceAll(manifest, "CLIENT_IMAGE_PLACEHOLDER", "finetuning-client:e2e")
 	manifest = strings.ReplaceAll(manifest, "imagePullPolicy: IfNotPresent", "imagePullPolicy: Never")
 	// Add imagePullPolicy: Never if not present
-	manifest = strings.ReplaceAll(manifest, "image: finetuning-server:e2e", "image: finetuning-server:e2e\n          imagePullPolicy: Never")
-	manifest = strings.ReplaceAll(manifest, "image: finetuning-client:e2e", "image: finetuning-client:e2e\n          imagePullPolicy: Never")
+	manifest = strings.ReplaceAll(manifest, "image: finetuning-server:e2e", "image: finetuning-server:e2e\n        imagePullPolicy: Never")
+	manifest = strings.ReplaceAll(manifest, "image: finetuning-client:e2e", "image: finetuning-client:e2e\n        imagePullPolicy: Never")
 
 	// Add HF_ENDPOINT to server
-	envVar := `        - name: HF_ENDPOINT
-          value: http://modelstore`
-	manifest = strings.ReplaceAll(manifest, "name: finetuning-server", "name: finetuning-server\n        env:\n"+envVar)
+	envVar := `          - name: HF_ENDPOINT
+            value: http://modelstore`
+	manifest = strings.ReplaceAll(manifest, "name: server", "name: server\n        env:\n"+envVar)
 
 	// Reduce resource requirements for E2E
 	manifest = strings.ReplaceAll(manifest, "cpu: \"2\"", "cpu: \"500m\"")
@@ -84,13 +84,16 @@ func TestE2E(t *testing.T) {
 	h.DeleteJob("finetuning-client")
 	h.DeleteDeployment("finetuning-server")
 	h.DeleteService("finetuning-server")
-	h.DeleteDeployment("modelstore")
+	h.DeleteStatefulSet("modelstore")
 	h.DeleteService("modelstore")
+
+	t.Log("Applying modelstore manifest")
 	h.KubectlApplyContent(msManifest)
+	t.Log("Applying finetuning manifest")
 	h.KubectlApplyContent(manifest)
 
 	// Wait for modelstore
-	h.WaitForDeployment("modelstore", 2*time.Minute)
+	h.WaitForStatefulSet("modelstore", 2*time.Minute)
 
 	// Wait for server
 	h.WaitForDeployment("finetuning-server", 5*time.Minute)
@@ -99,6 +102,9 @@ func TestE2E(t *testing.T) {
 	err = h.WaitForJobSuccess("finetuning-client", 10*time.Minute)
 
 	// Check logs (always, even on failure)
+	msLogs := h.GetPodLogs("app=modelstore")
+	t.Logf("Modelstore logs:\n%s", msLogs)
+
 	logs := h.GetPodLogs("app=finetuning-server")
 	t.Logf("Server logs:\n%s", logs)
 

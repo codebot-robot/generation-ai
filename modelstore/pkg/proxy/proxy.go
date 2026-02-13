@@ -69,6 +69,12 @@ func (p *Proxy) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	}
 }
 
+var noRedirectClient = &http.Client{
+	CheckRedirect: func(req *http.Request, via []*http.Request) error {
+		return http.ErrUseLastResponse
+	},
+}
+
 func (p *Proxy) proxyOnly(w http.ResponseWriter, r *http.Request) {
 	ctx := r.Context()
 	log := klog.FromContext(ctx)
@@ -83,9 +89,10 @@ func (p *Proxy) proxyOnly(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, err.Error(), http.StatusInternalServerError)
 		return
 	}
-	req.Header = r.Header
+	req.Header = r.Header.Clone()
+	req.Header.Del("Host")
 
-	resp, err := http.DefaultClient.Do(req)
+	resp, err := noRedirectClient.Do(req)
 	if err != nil {
 		log.Error(err, "failed to proxy request", "url", target.String())
 		http.Error(w, err.Error(), http.StatusBadGateway)
@@ -119,7 +126,8 @@ func (p *Proxy) fetchAndStore(w http.ResponseWriter, r *http.Request, cachePath 
 	if err != nil {
 		return fmt.Errorf("failed to create request for %q: %w", target.String(), err)
 	}
-	req.Header = r.Header
+	req.Header = r.Header.Clone()
+	req.Header.Del("Host")
 	// Don't pass through some headers that might interfere with caching or range requests if we don't support them fully
 	req.Header.Del("If-None-Match")
 	req.Header.Del("If-Modified-Since")
