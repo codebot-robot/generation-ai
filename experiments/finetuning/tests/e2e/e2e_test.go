@@ -32,14 +32,26 @@ func TestE2E(t *testing.T) {
 
 	gitRoot := h.GetGitRoot()
 	experimentRoot := filepath.Join(gitRoot, "experiments/finetuning")
+	modelstoreRoot := filepath.Join(gitRoot, "modelstore")
 
 	// Build images
 	h.DockerBuild("finetuning-server:e2e", filepath.Join(experimentRoot, "images/server/Dockerfile"), experimentRoot)
 	h.DockerBuild("finetuning-client:e2e", filepath.Join(experimentRoot, "images/client/Dockerfile"), experimentRoot)
+	h.DockerBuild("modelstore:e2e", filepath.Join(modelstoreRoot, "images/modelstore/Dockerfile"), modelstoreRoot)
 
 	// Load images into Kind
 	h.KindLoad("finetuning-server:e2e")
 	h.KindLoad("finetuning-client:e2e")
+	h.KindLoad("modelstore:e2e")
+
+	// Read modelstore manifest
+	msManifestPath := filepath.Join(modelstoreRoot, "k8s/manifest.yaml")
+	msb, err := os.ReadFile(msManifestPath)
+	if err != nil {
+		t.Fatalf("Failed to read modelstore manifest: %v", err)
+	}
+	msManifest := string(msb)
+	msManifest = strings.ReplaceAll(msManifest, "image: MODELSTORE_IMAGE_PLACEHOLDER", "image: modelstore:e2e\n          imagePullPolicy: Never")
 
 	// Read manifest and replace placeholders
 	manifestPath := filepath.Join(experimentRoot, "k8s/manifest.yaml")
@@ -48,12 +60,14 @@ func TestE2E(t *testing.T) {
 		t.Fatalf("Failed to read manifest: %v", err)
 	}
 	manifest := string(b)
-	manifest = strings.ReplaceAll(manifest, "SERVER_IMAGE_PLACEHOLDER", "finetuning-server:e2e")
-	manifest = strings.ReplaceAll(manifest, "CLIENT_IMAGE_PLACEHOLDER", "finetuning-client:e2e")
-	manifest = strings.ReplaceAll(manifest, "imagePullPolicy: IfNotPresent", "imagePullPolicy: Never")
-	// Add imagePullPolicy: Never if not present
-	manifest = strings.ReplaceAll(manifest, "image: finetuning-server:e2e", "image: finetuning-server:e2e\n        imagePullPolicy: Never")
-	manifest = strings.ReplaceAll(manifest, "image: finetuning-client:e2e", "image: finetuning-client:e2e\n        imagePullPolicy: Never")
+	manifest = strings.ReplaceAll(manifest, "image: SERVER_IMAGE_PLACEHOLDER", "image: finetuning-server:e2e\n        imagePullPolicy: Never")
+	manifest = strings.ReplaceAll(manifest, "image: CLIENT_IMAGE_PLACEHOLDER", "image: finetuning-client:e2e\n        imagePullPolicy: Never")
+
+	// Add HF_ENDPOINT to server
+	envVar := `        env:
+        - name: HF_ENDPOINT
+          value: http://modelstore`
+	manifest = strings.ReplaceAll(manifest, "- name: server", "- name: server\n"+envVar)
 
 	// Reduce resource requirements for E2E
 	manifest = strings.ReplaceAll(manifest, "cpu: \"2\"", "cpu: \"500m\"")
@@ -61,11 +75,18 @@ func TestE2E(t *testing.T) {
 	manifest = strings.ReplaceAll(manifest, "cpu: \"4\"", "cpu: \"1\"")
 	manifest = strings.ReplaceAll(manifest, "memory: \"16Gi\"", "memory: \"4Gi\"")
 
-	// Apply manifest
+	// Apply manifests
 	h.DeleteJob("finetuning-client")
 	h.DeleteDeployment("finetuning-server")
 	h.DeleteService("finetuning-server")
-	h.KubectlApplyContent(manifest)
+	h.DeleteStatefulSet("modelstore")
+	h.DeleteService("modelstore")
+
+	h.KubectlApplyContent("modelstore", msManifest)
+	h.KubectlApplyContent("finetuning", manifest)
+
+	// Wait for modelstore
+	h.WaitForStatefulSet("modelstore", 2*time.Minute)
 
 	// Wait for server
 	h.WaitForDeployment("finetuning-server", 5*time.Minute)
@@ -74,6 +95,9 @@ func TestE2E(t *testing.T) {
 	err = h.WaitForJobSuccess("finetuning-client", 10*time.Minute)
 
 	// Check logs (always, even on failure)
+	msLogs := h.GetPodLogs("app=modelstore")
+	t.Logf("Modelstore logs:\n%s", msLogs)
+
 	logs := h.GetPodLogs("app=finetuning-server")
 	t.Logf("Server logs:\n%s", logs)
 

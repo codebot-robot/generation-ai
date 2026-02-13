@@ -42,14 +42,17 @@ func (h *Harness) Setup() {
 	out, err := cmd.Output()
 	if err == nil && strings.Contains(string(out), h.ClusterName) {
 		h.t.Logf("Cluster %s already exists", h.ClusterName)
-		return
+		h.RunCommand("kind", "export", "kubeconfig", "--name", h.ClusterName)
+	} else {
+		h.t.Logf("Creating cluster %s", h.ClusterName)
+		cmd = exec.Command("kind", "create", "cluster", "--name", h.ClusterName)
+		if out, err := cmd.CombinedOutput(); err != nil {
+			h.t.Fatalf("Failed to create cluster: %v\nOutput: %s", err, out)
+		}
 	}
 
-	h.t.Logf("Creating cluster %s", h.ClusterName)
-	cmd = exec.Command("kind", "create", "cluster", "--name", h.ClusterName)
-	if out, err := cmd.CombinedOutput(); err != nil {
-		h.t.Fatalf("Failed to create cluster: %v\nOutput: %s", err, out)
-	}
+	// Ensure default namespace is used, avoiding issues with environment-specific defaults
+	h.RunCommand("kubectl", "config", "set-context", "--current", "--namespace=default")
 
 	h.t.Cleanup(func() {
 		h.Teardown()
@@ -95,13 +98,17 @@ func (h *Harness) KindLoad(tag string) {
 	h.RunCommand("kind", "load", "docker-image", tag, "--name", h.ClusterName)
 }
 
-func (h *Harness) KubectlApplyContent(content string) {
+func (h *Harness) KubectlApplyContent(name, content string) {
 	h.t.Helper()
-	h.t.Logf("Applying manifest content")
+	snippet := content
+	if len(snippet) > 100 {
+		snippet = snippet[:100] + "..."
+	}
+	h.t.Logf("Applying manifest content for %s:\n%s", name, snippet)
 	cmd := exec.Command("kubectl", "apply", "-f", "-")
 	cmd.Stdin = bytes.NewBufferString(content)
 	if out, err := cmd.CombinedOutput(); err != nil {
-		h.t.Fatalf("Failed to apply content: %v\nOutput: %s", err, out)
+		h.t.Fatalf("Failed to apply content for %s: %v\nOutput: %s\nFull manifest:\n%s", name, err, out, content)
 	}
 }
 
@@ -111,10 +118,22 @@ func (h *Harness) WaitForDeployment(name string, timeout time.Duration) {
 	h.RunCommand("kubectl", "rollout", "status", "deployment/"+name, "--timeout="+timeout.String())
 }
 
+func (h *Harness) WaitForStatefulSet(name string, timeout time.Duration) {
+	h.t.Helper()
+	h.t.Logf("Waiting for statefulset %s", name)
+	h.RunCommand("kubectl", "rollout", "status", "statefulset/"+name, "--timeout="+timeout.String())
+}
+
 func (h *Harness) DeleteDeployment(name string) {
 	h.t.Helper()
 	// Ignore errors if deployment doesn't exist
 	exec.Command("kubectl", "delete", "deployment", name, "--ignore-not-found").Run()
+}
+
+func (h *Harness) DeleteStatefulSet(name string) {
+	h.t.Helper()
+	// Ignore errors if statefulset doesn't exist
+	exec.Command("kubectl", "delete", "statefulset", name, "--ignore-not-found").Run()
 }
 
 func (h *Harness) DeleteService(name string) {
