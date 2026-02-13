@@ -12,7 +12,7 @@ This file provides context and instructions for LLM coding agents working on the
 - **Modern AI Practices**: Employ best practices for fine-tuning, serving, and evaluating AI models.
 - **GKE Integration**: Solutions should be designed to run effectively on Google Kubernetes Engine (GKE).
 - **Clarity and Documentation**: Code should be well-documented and easy to follow, serving as a reference for users.
-- **Structured Logging**: Use `klog.FromContext(ctx)` for structured logging to ensure operational visibility.
+- **Structured Logging**: Use `log := klog.FromContext(ctx)` for structured logging to ensure operational visibility. Always pass context down and use structured fields (e.g., `log.Info("message", "key", value)`) instead of formatted strings.
 - **Testability**: Ensure that implementations are well-tested, including end-to-end tests where appropriate.
 
 ## Development Workflow
