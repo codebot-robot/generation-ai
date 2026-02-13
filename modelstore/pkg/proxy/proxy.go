@@ -60,7 +60,7 @@ func (p *Proxy) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 func (p *Proxy) isResponseStarted(w http.ResponseWriter) bool {
 	// This is a bit tricky with standard http.ResponseWriter.
 	// For now we'll assume we can send the error if it's early enough.
-	return false 
+	return false
 }
 
 func (p *Proxy) serve(w http.ResponseWriter, r *http.Request) error {
@@ -101,6 +101,7 @@ func (p *Proxy) proxyOnly(w http.ResponseWriter, r *http.Request) error {
 
 	req, err := http.NewRequestWithContext(ctx, r.Method, target.String(), r.Body)
 	if err != nil {
+		log.Error(err, "failed to create proxy request", "url", target.String())
 		return fmt.Errorf("failed to create request for %q: %w", target.String(), err)
 	}
 	req.Header = r.Header.Clone()
@@ -108,6 +109,7 @@ func (p *Proxy) proxyOnly(w http.ResponseWriter, r *http.Request) error {
 
 	resp, err := noRedirectClient.Do(req)
 	if err != nil {
+		log.Error(err, "failed to execute proxy request", "url", target.String())
 		return fmt.Errorf("failed to proxy request to %q: %w", target.String(), err)
 	}
 	defer resp.Body.Close()
@@ -138,6 +140,7 @@ func (p *Proxy) fetchAndStore(w http.ResponseWriter, r *http.Request, cachePath 
 
 	req, err := http.NewRequestWithContext(ctx, http.MethodGet, target.String(), nil)
 	if err != nil {
+		log.Error(err, "failed to create fetch request", "url", target.String())
 		return fmt.Errorf("failed to create request for %q: %w", target.String(), err)
 	}
 	req.Header = r.Header.Clone()
@@ -148,6 +151,7 @@ func (p *Proxy) fetchAndStore(w http.ResponseWriter, r *http.Request, cachePath 
 
 	resp, err := http.DefaultClient.Do(req)
 	if err != nil {
+		log.Error(err, "failed to execute fetch request", "url", target.String())
 		return fmt.Errorf("failed to fetch %q: %w", target.String(), err)
 	}
 	defer resp.Body.Close()

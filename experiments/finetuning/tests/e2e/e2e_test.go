@@ -82,9 +82,7 @@ func TestE2E(t *testing.T) {
 	h.DeleteStatefulSet("modelstore")
 	h.DeleteService("modelstore")
 
-	t.Log("Applying modelstore manifest")
 	h.KubectlApplyContent("modelstore", msManifest)
-	t.Log("Applying finetuning manifest")
 	h.KubectlApplyContent("finetuning", manifest)
 
 	// Wait for modelstore
