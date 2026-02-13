@@ -70,9 +70,10 @@ func TestE2E(t *testing.T) {
 	manifest = strings.ReplaceAll(manifest, "image: finetuning-client:e2e", "image: finetuning-client:e2e\n        imagePullPolicy: Never")
 
 	// Add HF_ENDPOINT to server
-	envVar := `          - name: HF_ENDPOINT
-            value: http://modelstore`
-	manifest = strings.ReplaceAll(manifest, "name: server", "name: server\n        env:\n"+envVar)
+	envVar := `        env:
+        - name: HF_ENDPOINT
+          value: http://modelstore`
+	manifest = strings.ReplaceAll(manifest, "- name: server", "- name: server\n"+envVar)
 
 	// Reduce resource requirements for E2E
 	manifest = strings.ReplaceAll(manifest, "cpu: \"2\"", "cpu: \"500m\"")
@@ -88,9 +89,9 @@ func TestE2E(t *testing.T) {
 	h.DeleteService("modelstore")
 
 	t.Log("Applying modelstore manifest")
-	h.KubectlApplyContent(msManifest)
+	h.KubectlApplyContent("modelstore", msManifest)
 	t.Log("Applying finetuning manifest")
-	h.KubectlApplyContent(manifest)
+	h.KubectlApplyContent("finetuning", manifest)
 
 	// Wait for modelstore
 	h.WaitForStatefulSet("modelstore", 2*time.Minute)

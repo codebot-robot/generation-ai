@@ -42,6 +42,7 @@ func (h *Harness) Setup() {
 	out, err := cmd.Output()
 	if err == nil && strings.Contains(string(out), h.ClusterName) {
 		h.t.Logf("Cluster %s already exists", h.ClusterName)
+		h.RunCommand("kind", "export", "kubeconfig", "--name", h.ClusterName)
 	} else {
 		h.t.Logf("Creating cluster %s", h.ClusterName)
 		cmd = exec.Command("kind", "create", "cluster", "--name", h.ClusterName)
@@ -97,17 +98,17 @@ func (h *Harness) KindLoad(tag string) {
 	h.RunCommand("kind", "load", "docker-image", tag, "--name", h.ClusterName)
 }
 
-func (h *Harness) KubectlApplyContent(content string) {
+func (h *Harness) KubectlApplyContent(name, content string) {
 	h.t.Helper()
 	snippet := content
 	if len(snippet) > 100 {
 		snippet = snippet[:100] + "..."
 	}
-	h.t.Logf("Applying manifest content:\n%s", snippet)
+	h.t.Logf("Applying manifest content for %s:\n%s", name, snippet)
 	cmd := exec.Command("kubectl", "apply", "-f", "-")
 	cmd.Stdin = bytes.NewBufferString(content)
 	if out, err := cmd.CombinedOutput(); err != nil {
-		h.t.Fatalf("Failed to apply content: %v\nOutput: %s\nFull manifest:\n%s", err, out, content)
+		h.t.Fatalf("Failed to apply content for %s: %v\nOutput: %s\nFull manifest:\n%s", name, err, out, content)
 	}
 }
 

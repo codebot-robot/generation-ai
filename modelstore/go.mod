@@ -1,6 +1,6 @@
 module github.com/gke-labs/generation-ai/modelstore
 
-go 1.26.0
+go 1.25.0
 
 require k8s.io/klog/v2 v2.130.1
 
