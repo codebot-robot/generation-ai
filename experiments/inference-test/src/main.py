@@ -61,13 +61,14 @@ def main():
 
     # Initialize distributed environment if applicable
     if "RANK" in os.environ and "WORLD_SIZE" in os.environ:
-        dist.init_process_group(backend="nccl")
+        backend = "nccl" if torch.cuda.is_available() else "gloo"
+        dist.init_process_group(backend=backend)
         rank = dist.get_rank()
         world_size = dist.get_world_size()
         local_rank = int(os.environ.get("LOCAL_RANK", 0))
-        print(f"[Rank {rank}] Initialized process group. World size: {world_size}")
+        print(f"[Rank {rank}] Initialized process group with {backend} backend. World size: {world_size}")
         
-        if args.enable_fsdp:
+        if args.enable_fsdp and torch.cuda.is_available():
              torch.cuda.set_device(local_rank)
     else:
         rank = 0
@@ -84,6 +85,12 @@ def main():
     if torch.cuda.is_available():
         torch.cuda.manual_seed_all(42)
 
+    if args.enable_fsdp and dist.is_initialized():
+        if not torch.cuda.is_available():
+            if rank == 0:
+                print("[Rank 0] Warning: FSDP requested but CUDA not available. Falling back to non-sharded model.")
+            args.enable_fsdp = False
+            
     if args.enable_fsdp and dist.is_initialized():
         print(f"[Rank {rank}] FSDP Enabled. Loading model on CPU first...")
         # For FSDP, we load on CPU (low_cpu_mem_usage=True is default in recent transformers)
@@ -107,11 +114,13 @@ def main():
             print(f"[Rank {rank}] Warning: Could not identify transformer layer class. FSDP efficiency might be reduced.")
 
         print(f"[Rank {rank}] Wrapping model with FSDP...")
+        device_id = torch.cuda.current_device() if torch.cuda.is_available() else None
         model = FSDP(
             model,
             auto_wrap_policy=auto_wrap_policy,
-            device_id=torch.cuda.current_device(),
+            device_id=device_id,
             use_orig_params=True, # Required for HF models
+            sync_module_states=True, # Recommended for multi-node
         )
         
         # Monkey-patch generate method
@@ -119,6 +128,8 @@ def main():
         # model.module is the original model instance (but stripped of FSDP wrapper).
         # We use type(model.module) to get the class, which has the generate method mixed in.
         model.generate = types.MethodType(type(model.module).generate, model)
+        # Add device attribute to FSDP wrapper for compatibility with HF generate
+        model.device = torch.device(f"cuda:{device_id}") if device_id is not None else torch.device("cpu")
         
     else:
         # Legacy/Single-node behavior
@@ -126,7 +137,7 @@ def main():
         model = AutoModelForCausalLM.from_pretrained(
             model_id,
             torch_dtype="auto",
-            device_map="auto"
+            device_map="auto" if torch.cuda.is_available() else None
         )
 
     tokenizer = AutoTokenizer.from_pretrained(model_id)
@@ -143,15 +154,13 @@ def main():
         add_generation_prompt=True
     )
     
-    if isinstance(model, FSDP):
-        device = torch.cuda.current_device()
-    else:
-        device = model.device
-        
+    device = model.device
     model_inputs = tokenizer([text], return_tensors="pt").to(device)
 
-    print(f"Prompt: {prompt}")
-    print("Starting generation...")
+    if rank == 0:
+        print(f"Prompt: {prompt}")
+        print("Starting generation...")
+    
     start_time = time.time()
     
     generated_ids = model.generate(
@@ -161,24 +170,25 @@ def main():
     
     end_time = time.time()
     
-    generated_ids = [
-        output_ids[len(input_ids):] for input_ids, output_ids in zip(model_inputs.input_ids, generated_ids)
-    ]
+    if rank == 0:
+        generated_ids_trimmed = [
+            output_ids[len(input_ids):] for input_ids, output_ids in zip(model_inputs.input_ids, generated_ids)
+        ]
 
-    response = tokenizer.batch_decode(generated_ids, skip_special_tokens=True)[0]
-    
-    print("\nResponse:")
-    print(response)
-    
-    # Calculate metrics
-    num_tokens = sum(len(ids) for ids in generated_ids)
-    duration = end_time - start_time
-    tokens_per_second = num_tokens / duration if duration > 0 else 0
-    
-    print("\nMetrics:")
-    print(f"Tokens generated: {num_tokens}")
-    print(f"Duration: {duration:.4f} seconds")
-    print(f"Tokens per second: {tokens_per_second:.2f} tokens/s")
+        response = tokenizer.batch_decode(generated_ids_trimmed, skip_special_tokens=True)[0]
+        
+        print("\nResponse:")
+        print(response)
+        
+        # Calculate metrics
+        num_tokens = sum(len(ids) for ids in generated_ids_trimmed)
+        duration = end_time - start_time
+        tokens_per_second = num_tokens / duration if duration > 0 else 0
+        
+        print("\nMetrics:")
+        print(f"Tokens generated: {num_tokens}")
+        print(f"Duration: {duration:.4f} seconds")
+        print(f"Tokens per second: {tokens_per_second:.2f} tokens/s")
 
     if dist.is_initialized():
         dist.destroy_process_group()
