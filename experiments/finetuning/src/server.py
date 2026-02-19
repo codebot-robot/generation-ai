@@ -24,6 +24,30 @@ from datasets import load_dataset
 
 import finetuning_pb2
 import finetuning_pb2_grpc
+import http.client
+from urllib.parse import urlparse
+
+def push_to_modelstore(model_dir, model_id, log_queue, modelstore_url=os.getenv("MODELSTORE_URL", "http://modelstore")):
+    log_queue.put(f"Pushing fine-tuned model to modelstore at {modelstore_url}...")
+    parsed_url = urlparse(modelstore_url)
+    
+    for root, dirs, files in os.walk(model_dir):
+        for file in files:
+            file_path = os.path.join(root, file)
+            rel_path = os.path.relpath(file_path, model_dir)
+            target_path = f"{parsed_url.path}/{model_id}/{rel_path}".replace("//", "/")
+            log_queue.put(f"Pushing {rel_path}...")
+            try:
+                conn = http.client.HTTPConnection(parsed_url.netloc)
+                with open(file_path, 'rb') as f:
+                    conn.request("PUT", target_path, body=f)
+                    resp = conn.getresponse()
+                    if resp.status not in (200, 201):
+                        log_queue.put(f"Failed to push {rel_path}: {resp.status} {resp.reason}")
+                    resp.read()
+                conn.close()
+            except Exception as e:
+                log_queue.put(f"Error pushing {rel_path}: {str(e)}")
 
 def get_diagnostics():
     import transformers
@@ -100,6 +124,14 @@ class FinetuningService(finetuning_pb2_grpc.FinetuningServiceServicer):
                 
                 log_queue.put("Starting training...")
                 trainer.train()
+                
+                log_queue.put("Saving model...")
+                output_dir = "/tmp/output"
+                trainer.save_model(output_dir)
+                
+                output_model_id = f"{request.model_id}-finetuned"
+                push_to_modelstore(output_dir, output_model_id, log_queue)
+                
                 log_queue.put("Fine-tuning completed successfully")
             except Exception as e:
                 log_queue.put(f"Error during fine-tuning: {str(e)}")
