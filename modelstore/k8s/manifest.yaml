@@ -13,6 +13,33 @@
 # limitations under the License.
 
 apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: modelstore
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRole
+metadata:
+  name: modelstore-manager
+rules:
+  - apiGroups: ["generationai.labs.gke.io"]
+    resources: ["models"]
+    verbs: ["get", "list", "watch", "create", "update", "patch", "delete"]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRoleBinding
+metadata:
+  name: modelstore-manager-rolebinding
+subjects:
+  - kind: ServiceAccount
+    name: modelstore
+    namespace: default
+roleRef:
+  kind: ClusterRole
+  name: modelstore-manager
+  apiGroup: rbac.authorization.k8s.io
+---
+apiVersion: v1
 kind: Service
 metadata:
   name: modelstore
@@ -39,6 +66,7 @@ spec:
       labels:
         app: modelstore
     spec:
+      serviceAccountName: modelstore
       containers:
         - name: modelstore
           image: MODELSTORE_IMAGE_PLACEHOLDER
