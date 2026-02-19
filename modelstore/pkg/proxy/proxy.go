@@ -15,24 +15,32 @@
 package proxy
 
 import (
+	"crypto/sha256"
+	"encoding/hex"
+	"encoding/json"
 	"fmt"
 	"io"
 	"net/http"
 	"net/url"
 	"os"
 	"path/filepath"
+	"strings"
 	"sync"
 
+	"github.com/gke-labs/generation-ai/modelstore/apis/v1alpha1"
+	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/klog/v2"
+	"sigs.k8s.io/controller-runtime/pkg/client"
 )
 
 type Proxy struct {
 	upstream *url.URL
 	cacheDir string
 	mu       sync.Mutex
+	kube     client.Client
 }
 
-func NewProxy(upstreamURL, cacheDir string) (*Proxy, error) {
+func NewProxy(upstreamURL, cacheDir string, kube client.Client) (*Proxy, error) {
 	u, err := url.Parse(upstreamURL)
 	if err != nil {
 		return nil, fmt.Errorf("invalid upstream URL %q: %w", upstreamURL, err)
@@ -40,6 +48,7 @@ func NewProxy(upstreamURL, cacheDir string) (*Proxy, error) {
 	return &Proxy{
 		upstream: u,
 		cacheDir: cacheDir,
+		kube:     kube,
 	}, nil
 }
 
@@ -66,6 +75,24 @@ func (p *Proxy) isResponseStarted(w http.ResponseWriter) bool {
 func (p *Proxy) serve(w http.ResponseWriter, r *http.Request) error {
 	ctx := r.Context()
 	log := klog.FromContext(ctx)
+
+	if strings.HasPrefix(r.URL.Path, "/blobs/") {
+		if r.Method == http.MethodPut {
+			return p.handleBlobPut(w, r)
+		}
+		if r.Method == http.MethodGet {
+			return p.handleBlobGet(w, r)
+		}
+	}
+
+	if r.URL.Path == "/models" || strings.HasPrefix(r.URL.Path, "/models/") {
+		if r.Method == http.MethodPost {
+			return p.handleModelCreate(w, r)
+		}
+		if r.Method == http.MethodGet {
+			return p.handleModelList(w, r)
+		}
+	}
 
 	if r.Method == http.MethodPut {
 		return p.handlePut(w, r)
@@ -155,6 +182,133 @@ func (p *Proxy) handlePut(w http.ResponseWriter, r *http.Request) error {
 	log.Info("stored file", "path", r.URL.Path, "bytes", n)
 	w.WriteHeader(http.StatusCreated)
 	return nil
+}
+
+func (p *Proxy) handleBlobPut(w http.ResponseWriter, r *http.Request) error {
+	ctx := r.Context()
+	log := klog.FromContext(ctx)
+
+	sha := strings.TrimPrefix(r.URL.Path, "/blobs/")
+	if sha == "" {
+		return fmt.Errorf("missing sha in blob put")
+	}
+
+	// Create blobs directory if it doesn't exist
+	blobsDir := filepath.Join(p.cacheDir, "blobs")
+	if err := os.MkdirAll(blobsDir, 0755); err != nil {
+		return fmt.Errorf("failed to create blobs directory: %w", err)
+	}
+
+	blobPath := filepath.Join(blobsDir, sha)
+
+	// Create temporary file in the same directory to handle concurrent uploads and partial writes
+	tmpFile, err := os.CreateTemp(blobsDir, "upload-*")
+	if err != nil {
+		return fmt.Errorf("failed to create temp file: %w", err)
+	}
+	tmpPath := tmpFile.Name()
+	moved := false
+	defer func() {
+		tmpFile.Close()
+		if !moved {
+			if err := os.Remove(tmpPath); err != nil && !os.IsNotExist(err) {
+				log.Error(err, "failed to remove temp file", "path", tmpPath)
+			}
+		}
+	}()
+
+	hasher := sha256.New()
+	mw := io.MultiWriter(tmpFile, hasher)
+
+	n, err := io.Copy(mw, r.Body)
+	if err != nil {
+		return fmt.Errorf("failed to save blob: %w", err)
+	}
+
+	if err := tmpFile.Close(); err != nil {
+		return fmt.Errorf("failed to close temp file: %w", err)
+	}
+
+	actualSha := hex.EncodeToString(hasher.Sum(nil))
+	if actualSha != sha {
+		return fmt.Errorf("sha256 mismatch: expected %s, got %s", sha, actualSha)
+	}
+
+	// Move to final location
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	if err := os.Rename(tmpPath, blobPath); err != nil {
+		return fmt.Errorf("failed to rename blob: %w", err)
+	}
+	moved = true
+
+	log.Info("stored blob", "sha", sha, "bytes", n)
+	w.WriteHeader(http.StatusCreated)
+	return nil
+}
+
+func (p *Proxy) handleBlobGet(w http.ResponseWriter, r *http.Request) error {
+	sha := strings.TrimPrefix(r.URL.Path, "/blobs/")
+	if sha == "" {
+		return fmt.Errorf("missing sha in blob get")
+	}
+
+	blobPath := filepath.Join(p.cacheDir, "blobs", sha)
+	if _, err := os.Stat(blobPath); err != nil {
+		if os.IsNotExist(err) {
+			http.NotFound(w, r)
+			return nil
+		}
+		return fmt.Errorf("failed to check blob: %w", err)
+	}
+
+	http.ServeFile(w, r, blobPath)
+	return nil
+}
+
+func (p *Proxy) handleModelCreate(w http.ResponseWriter, r *http.Request) error {
+	ctx := r.Context()
+	log := klog.FromContext(ctx)
+
+	var model v1alpha1.Model
+	if err := json.NewDecoder(r.Body).Decode(&model); err != nil {
+		return fmt.Errorf("failed to decode model: %w", err)
+	}
+
+	if model.Name == "" {
+		return fmt.Errorf("model name is required")
+	}
+
+	// Verify all blobs exist
+	for _, file := range model.Spec.Files {
+		blobPath := filepath.Join(p.cacheDir, "blobs", file.SHA256)
+		if _, err := os.Stat(blobPath); err != nil {
+			return fmt.Errorf("blob %s (path %s) not found: %w", file.SHA256, file.Path, err)
+		}
+	}
+
+	model.ResourceVersion = ""
+	model.UID = ""
+	model.CreationTimestamp = metav1.Time{}
+
+	if err := p.kube.Create(ctx, &model); err != nil {
+		return fmt.Errorf("failed to create model CRD: %w", err)
+	}
+
+	log.Info("created model", "name", model.Name)
+	w.WriteHeader(http.StatusCreated)
+	return json.NewEncoder(w).Encode(model)
+}
+
+func (p *Proxy) handleModelList(w http.ResponseWriter, r *http.Request) error {
+	ctx := r.Context()
+	var list v1alpha1.ModelList
+	if err := p.kube.List(ctx, &list); err != nil {
+		return fmt.Errorf("failed to list models: %w", err)
+	}
+
+	w.Header().Set("Content-Type", "application/json")
+	return json.NewEncoder(w).Encode(list)
 }
 
 func (p *Proxy) fetchAndStore(w http.ResponseWriter, r *http.Request, cachePath string) error {

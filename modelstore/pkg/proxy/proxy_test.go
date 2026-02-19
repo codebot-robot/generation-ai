@@ -15,6 +15,8 @@
 package proxy
 
 import (
+	"bytes"
+	"encoding/json"
 	"fmt"
 	"io"
 	"net/http"
@@ -23,6 +25,11 @@ import (
 	"path/filepath"
 	"strings"
 	"testing"
+
+	"github.com/gke-labs/generation-ai/modelstore/apis/v1alpha1"
+	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/apimachinery/pkg/runtime"
+	"sigs.k8s.io/controller-runtime/pkg/client/fake"
 )
 
 func TestProxy(t *testing.T) {
@@ -43,7 +50,7 @@ func TestProxy(t *testing.T) {
 	}))
 	defer upstream.Close()
 
-	p, err := NewProxy(upstream.URL, cacheDir)
+	p, err := NewProxy(upstream.URL, cacheDir, nil)
 	if err != nil {
 		t.Fatalf("Failed to create proxy: %v", err)
 	}
@@ -88,7 +95,7 @@ func TestProxyPut(t *testing.T) {
 	}
 	defer os.RemoveAll(cacheDir)
 
-	p, err := NewProxy("http://localhost:1234", cacheDir) // Upstream doesn't matter for PUT
+	p, err := NewProxy("http://localhost:1234", cacheDir, nil) // Upstream doesn't matter for PUT
 	if err != nil {
 		t.Fatalf("Failed to create proxy: %v", err)
 	}
@@ -111,5 +118,74 @@ func TestProxyPut(t *testing.T) {
 	}
 	if string(gotContent) != content {
 		t.Errorf("Expected '%s', got '%s'", content, string(gotContent))
+	}
+}
+
+func TestBlobAndModelAPI(t *testing.T) {
+	cacheDir, err := os.MkdirTemp("", "modelstore-blob-test-*")
+	if err != nil {
+		t.Fatalf("Failed to create temp dir: %v", err)
+	}
+	defer os.RemoveAll(cacheDir)
+
+	scheme := runtime.NewScheme()
+	_ = v1alpha1.AddToScheme(scheme)
+	kube := fake.NewClientBuilder().WithScheme(scheme).Build()
+
+	p, err := NewProxy("http://localhost:1234", cacheDir, kube)
+	if err != nil {
+		t.Fatalf("Failed to create proxy: %v", err)
+	}
+
+	// 1. Upload a blob
+	content := "blob content"
+	sha := "7b24cf3d897fd680e0258c1c7c23db50a5428581ed1785c08de505c381b4c4b5"
+	req := httptest.NewRequest(http.MethodPut, "/blobs/"+sha, strings.NewReader(content))
+	w := httptest.NewRecorder()
+	p.ServeHTTP(w, req)
+
+	if w.Code != http.StatusCreated {
+		t.Errorf("Expected blob PUT status 201, got %d", w.Code)
+	}
+
+	// 2. Create a model
+	model := v1alpha1.Model{
+		ObjectMeta: metav1.ObjectMeta{
+			Name: "test-model",
+		},
+		Spec: v1alpha1.ModelSpec{
+			Files: []v1alpha1.File{
+				{Path: "weights.bin", SHA256: sha},
+			},
+		},
+	}
+	modelJSON, _ := json.Marshal(model)
+	req = httptest.NewRequest(http.MethodPost, "/models", bytes.NewReader(modelJSON))
+	w = httptest.NewRecorder()
+	p.ServeHTTP(w, req)
+
+	if w.Code != http.StatusCreated {
+		t.Errorf("Expected model POST status 201, got %d: %s", w.Code, w.Body.String())
+	}
+
+	// 3. List models
+	req = httptest.NewRequest(http.MethodGet, "/models", nil)
+	w = httptest.NewRecorder()
+	p.ServeHTTP(w, req)
+
+	if w.Code != http.StatusOK {
+		t.Errorf("Expected model GET status 200, got %d", w.Code)
+	}
+
+	var list v1alpha1.ModelList
+	if err := json.NewDecoder(w.Body).Decode(&list); err != nil {
+		t.Fatalf("Failed to decode model list: %v", err)
+	}
+
+	if len(list.Items) != 1 {
+		t.Errorf("Expected 1 model, got %d", len(list.Items))
+	}
+	if list.Items[0].Name != "test-model" {
+		t.Errorf("Expected model name 'test-model', got '%s'", list.Items[0].Name)
 	}
 }

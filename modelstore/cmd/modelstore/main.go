@@ -21,8 +21,12 @@ import (
 	"net/http"
 	"os"
 
+	"github.com/gke-labs/generation-ai/modelstore/apis/v1alpha1"
 	"github.com/gke-labs/generation-ai/modelstore/pkg/proxy"
+	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/klog/v2"
+	"sigs.k8s.io/controller-runtime/pkg/client"
+	"sigs.k8s.io/controller-runtime/pkg/client/config"
 )
 
 func main() {
@@ -45,7 +49,22 @@ func run(ctx context.Context) error {
 		return fmt.Errorf("failed to create cache directory: %w", err)
 	}
 
-	p, err := proxy.NewProxy(*upstream, *cacheDir)
+	scheme := runtime.NewScheme()
+	if err := v1alpha1.AddToScheme(scheme); err != nil {
+		return fmt.Errorf("failed to add v1alpha1 to scheme: %w", err)
+	}
+
+	cfg, err := config.GetConfig()
+	if err != nil {
+		return fmt.Errorf("failed to get kubernetes config: %w", err)
+	}
+
+	kube, err := client.New(cfg, client.Options{Scheme: scheme})
+	if err != nil {
+		return fmt.Errorf("failed to create kubernetes client: %w", err)
+	}
+
+	p, err := proxy.NewProxy(*upstream, *cacheDir, kube)
 	if err != nil {
 		return fmt.Errorf("failed to create proxy: %w", err)
 	}

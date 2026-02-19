@@ -25,29 +25,71 @@ from datasets import load_dataset
 import finetuning_pb2
 import finetuning_pb2_grpc
 import http.client
+import json
+import hashlib
 from urllib.parse import urlparse
+
+def calculate_sha256(file_path):
+    sha256_hash = hashlib.sha256()
+    with open(file_path, "rb") as f:
+        for byte_block in iter(lambda: f.read(4096), b""):
+            sha256_hash.update(byte_block)
+    return sha256_hash.hexdigest()
 
 def push_to_modelstore(model_dir, model_id, log_queue, modelstore_url=os.getenv("MODELSTORE_URL", "http://modelstore")):
     log_queue.put(f"Pushing fine-tuned model to modelstore at {modelstore_url}...")
     parsed_url = urlparse(modelstore_url)
     
+    files_to_register = []
+    
     for root, dirs, files in os.walk(model_dir):
         for file in files:
             file_path = os.path.join(root, file)
             rel_path = os.path.relpath(file_path, model_dir)
-            target_path = f"{parsed_url.path}/{model_id}/{rel_path}".replace("//", "/")
-            log_queue.put(f"Pushing {rel_path}...")
+            sha256 = calculate_sha256(file_path)
+            
+            log_queue.put(f"Pushing blob {rel_path} (sha256: {sha256})...")
             try:
                 conn = http.client.HTTPConnection(parsed_url.netloc)
                 with open(file_path, 'rb') as f:
-                    conn.request("PUT", target_path, body=f)
+                    blob_path = f"/blobs/{sha256}"
+                    conn.request("PUT", blob_path, body=f)
                     resp = conn.getresponse()
                     if resp.status not in (200, 201):
-                        log_queue.put(f"Failed to push {rel_path}: {resp.status} {resp.reason}")
+                        log_queue.put(f"Failed to push blob {rel_path}: {resp.status} {resp.reason}")
                     resp.read()
                 conn.close()
+                files_to_register.append({
+                    "path": rel_path,
+                    "sha256": sha256
+                })
             except Exception as e:
-                log_queue.put(f"Error pushing {rel_path}: {str(e)}")
+                log_queue.put(f"Error pushing blob {rel_path}: {str(e)}")
+
+    # Register the model
+    log_queue.put(f"Registering model {model_id}...")
+    try:
+        model_spec = {
+            "apiVersion": "generationai.labs.gke.io/v1alpha1",
+            "kind": "Model",
+            "metadata": {
+                "name": model_id
+            },
+            "spec": {
+                "files": files_to_register
+            }
+        }
+        conn = http.client.HTTPConnection(parsed_url.netloc)
+        conn.request("POST", "/models", body=json.dumps(model_spec), headers={"Content-Type": "application/json"})
+        resp = conn.getresponse()
+        if resp.status not in (200, 201):
+            log_queue.put(f"Failed to register model {model_id}: {resp.status} {resp.reason}")
+        else:
+            log_queue.put(f"Model {model_id} registered successfully.")
+        resp.read()
+        conn.close()
+    except Exception as e:
+        log_queue.put(f"Error registering model {model_id}: {str(e)}")
 
 def get_diagnostics():
     import transformers
