@@ -120,7 +120,7 @@ def main():
             auto_wrap_policy=auto_wrap_policy,
             device_id=device_id,
             use_orig_params=True, # Required for HF models
-            sync_module_states=True, # Recommended for multi-node
+            sync_module_states=True if torch.cuda.is_available() else False, # Only sync if on GPU
         )
         
         # Monkey-patch generate method
@@ -128,7 +128,12 @@ def main():
         # model.module is the original model instance (but stripped of FSDP wrapper).
         # We use type(model.module) to get the class, which has the generate method mixed in.
         model.generate = types.MethodType(type(model.module).generate, model)
-        # Add device attribute to FSDP wrapper for compatibility with HF generate
+        
+        # Add attributes to FSDP wrapper for compatibility with HF generate
+        for attr in ["config", "generation_config", "can_generate", "main_input_name", "base_model_prefix"]:
+            if hasattr(model.module, attr) and not hasattr(model, attr):
+                setattr(model, attr, getattr(model.module, attr))
+        
         model.device = torch.device(f"cuda:{device_id}") if device_id is not None else torch.device("cpu")
         
     else:
@@ -140,6 +145,7 @@ def main():
             device_map="auto" if torch.cuda.is_available() else None
         )
 
+    model.eval()
     tokenizer = AutoTokenizer.from_pretrained(model_id)
 
     prompt = "What is Raleigh Scattering?"
@@ -163,10 +169,16 @@ def main():
     
     start_time = time.time()
     
-    generated_ids = model.generate(
-        **model_inputs,
-        max_new_tokens=512
-    )
+    # Use synced_gpus=True for distributed generation to avoid hangs
+    # and only if we are using distributed mode
+    is_distributed = dist.is_initialized() and dist.get_world_size() > 1
+    
+    with torch.no_grad():
+        generated_ids = model.generate(
+            **model_inputs,
+            max_new_tokens=512,
+            synced_gpus=is_distributed and torch.cuda.is_available()
+        )
     
     end_time = time.time()
     
