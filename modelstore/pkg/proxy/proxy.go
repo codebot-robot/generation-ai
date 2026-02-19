@@ -67,6 +67,10 @@ func (p *Proxy) serve(w http.ResponseWriter, r *http.Request) error {
 	ctx := r.Context()
 	log := klog.FromContext(ctx)
 
+	if r.Method == http.MethodPut {
+		return p.handlePut(w, r)
+	}
+
 	// Only cache GET requests
 	if r.Method != http.MethodGet {
 		return p.proxyOnly(w, r)
@@ -125,6 +129,31 @@ func (p *Proxy) proxyOnly(w http.ResponseWriter, r *http.Request) error {
 	}
 
 	log.Info("proxied request", "url", target.String(), "status", resp.StatusCode, "bytes", n)
+	return nil
+}
+
+func (p *Proxy) handlePut(w http.ResponseWriter, r *http.Request) error {
+	ctx := r.Context()
+	log := klog.FromContext(ctx)
+
+	cachePath := filepath.Join(p.cacheDir, r.URL.Path)
+	if err := os.MkdirAll(filepath.Dir(cachePath), 0755); err != nil {
+		return fmt.Errorf("failed to create directory: %w", err)
+	}
+
+	f, err := os.Create(cachePath)
+	if err != nil {
+		return fmt.Errorf("failed to create file: %w", err)
+	}
+	defer f.Close()
+
+	n, err := io.Copy(f, r.Body)
+	if err != nil {
+		return fmt.Errorf("failed to save file: %w", err)
+	}
+
+	log.Info("stored file", "path", r.URL.Path, "bytes", n)
+	w.WriteHeader(http.StatusCreated)
 	return nil
 }
 

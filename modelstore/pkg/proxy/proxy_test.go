@@ -21,6 +21,7 @@ import (
 	"net/http/httptest"
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 )
 
@@ -76,5 +77,39 @@ func TestProxy(t *testing.T) {
 	body2, _ := io.ReadAll(resp2.Body)
 	if string(body2) != "upstream content" {
 		t.Errorf("Expected 'upstream content' from cache, got '%s'", string(body2))
+	}
+}
+
+func TestProxyPut(t *testing.T) {
+	// Create a temporary cache directory
+	cacheDir, err := os.MkdirTemp("", "modelstore-test-*")
+	if err != nil {
+		t.Fatalf("Failed to create temp dir: %v", err)
+	}
+	defer os.RemoveAll(cacheDir)
+
+	p, err := NewProxy("http://localhost:1234", cacheDir) // Upstream doesn't matter for PUT
+	if err != nil {
+		t.Fatalf("Failed to create proxy: %v", err)
+	}
+
+	content := "finetuned model content"
+	req := httptest.NewRequest(http.MethodPut, "/finetuned/model.bin", strings.NewReader(content))
+	w := httptest.NewRecorder()
+	p.ServeHTTP(w, req)
+
+	resp := w.Result()
+	if resp.StatusCode != http.StatusCreated {
+		t.Errorf("Expected status 201 Created, got %d", resp.StatusCode)
+	}
+
+	// Verify it's in cache
+	cachePath := filepath.Join(cacheDir, "finetuned/model.bin")
+	gotContent, err := os.ReadFile(cachePath)
+	if err != nil {
+		t.Fatalf("Failed to read cached file: %v", err)
+	}
+	if string(gotContent) != content {
+		t.Errorf("Expected '%s', got '%s'", content, string(gotContent))
 	}
 }
