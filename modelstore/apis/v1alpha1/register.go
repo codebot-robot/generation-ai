@@ -18,7 +18,12 @@ import (
 	"k8s.io/apimachinery/pkg/runtime/schema"
 )
 
-// Resource takes an unqualified resource and returns a Group qualified GroupResource
-func Resource(resource string) schema.GroupResource {
+var (
+	ModelGVK = GroupVersion.WithKind("Model")
+	ModelGVR = GroupVersion.WithResource("models")
+)
+
+// resource takes an unqualified resource and returns a Group qualified GroupResource
+func resource(resource string) schema.GroupResource {
 	return GroupVersion.WithResource(resource).GroupResource()
 }

@@ -24,7 +24,6 @@ import (
 	"github.com/gke-labs/generation-ai/modelstore/apis/v1alpha1"
 	"github.com/gke-labs/generation-ai/modelstore/pkg/proxy"
 	"k8s.io/apimachinery/pkg/runtime"
-	clientgoscheme "k8s.io/client-go/kubernetes/scheme"
 	"k8s.io/klog/v2"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/client/config"
@@ -51,9 +50,6 @@ func run(ctx context.Context) error {
 	}
 
 	scheme := runtime.NewScheme()
-	if err := clientgoscheme.AddToScheme(scheme); err != nil {
-		return fmt.Errorf("failed to add client-go to scheme: %w", err)
-	}
 	if err := v1alpha1.AddToScheme(scheme); err != nil {
 		return fmt.Errorf("failed to add v1alpha1 to scheme: %w", err)
 	}

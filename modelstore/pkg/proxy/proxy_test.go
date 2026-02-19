@@ -138,8 +138,8 @@ func TestBlobAndModelAPI(t *testing.T) {
 	}
 
 	// 1. Upload a blob
-	sha := "abc123"
 	content := "blob content"
+	sha := "7b24cf3d897fd680e0258c1c7c23db50a5428581ed1785c08de505c381b4c4b5"
 	req := httptest.NewRequest(http.MethodPut, "/blobs/"+sha, strings.NewReader(content))
 	w := httptest.NewRecorder()
 	p.ServeHTTP(w, req)

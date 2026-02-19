@@ -15,6 +15,8 @@
 package proxy
 
 import (
+	"crypto/sha256"
+	"encoding/hex"
 	"encoding/json"
 	"fmt"
 	"io"
@@ -191,21 +193,54 @@ func (p *Proxy) handleBlobPut(w http.ResponseWriter, r *http.Request) error {
 		return fmt.Errorf("missing sha in blob put")
 	}
 
-	blobPath := filepath.Join(p.cacheDir, "blobs", sha)
-	if err := os.MkdirAll(filepath.Dir(blobPath), 0755); err != nil {
+	// Create blobs directory if it doesn't exist
+	blobsDir := filepath.Join(p.cacheDir, "blobs")
+	if err := os.MkdirAll(blobsDir, 0755); err != nil {
 		return fmt.Errorf("failed to create blobs directory: %w", err)
 	}
 
-	f, err := os.Create(blobPath)
-	if err != nil {
-		return fmt.Errorf("failed to create blob file: %w", err)
-	}
-	defer f.Close()
+	blobPath := filepath.Join(blobsDir, sha)
 
-	n, err := io.Copy(f, r.Body)
+	// Create temporary file in the same directory to handle concurrent uploads and partial writes
+	tmpFile, err := os.CreateTemp(blobsDir, "upload-*")
+	if err != nil {
+		return fmt.Errorf("failed to create temp file: %w", err)
+	}
+	tmpPath := tmpFile.Name()
+	moved := false
+	defer func() {
+		tmpFile.Close()
+		if !moved {
+			if err := os.Remove(tmpPath); err != nil && !os.IsNotExist(err) {
+				log.Error(err, "failed to remove temp file", "path", tmpPath)
+			}
+		}
+	}()
+
+	hasher := sha256.New()
+	mw := io.MultiWriter(tmpFile, hasher)
+
+	n, err := io.Copy(mw, r.Body)
 	if err != nil {
 		return fmt.Errorf("failed to save blob: %w", err)
 	}
+
+	if err := tmpFile.Close(); err != nil {
+		return fmt.Errorf("failed to close temp file: %w", err)
+	}
+
+	actualSha := hex.EncodeToString(hasher.Sum(nil))
+	if actualSha != sha {
+		return fmt.Errorf("sha256 mismatch: expected %s, got %s", sha, actualSha)
+	}
+
+	// Move to final location
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	if err := os.Rename(tmpPath, blobPath); err != nil {
+		return fmt.Errorf("failed to rename blob: %w", err)
+	}
+	moved = true
 
 	log.Info("stored blob", "sha", sha, "bytes", n)
 	w.WriteHeader(http.StatusCreated)
