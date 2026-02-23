@@ -35,5 +35,21 @@ go test ./...
 ### Local Run
 
 ```bash
+# Start the server
 go run cmd/bema/main.go --storage-dir=/tmp/bema
+
+# In another terminal, run the CLI client
+go run cmd/bema-cli/main.go
 ```
+
+## CLI Client
+
+The `bema-cli` supports the following options:
+
+- `--addr`: Server address (default "localhost:50051").
+- `--list`: List all available sessions.
+- `--session <id>`: Resume a specific session.
+
+Inside the CLI, you can use:
+- `/session <id>`: Switch to a different session.
+- `/quit` or `/exit`: Exit the CLI.
