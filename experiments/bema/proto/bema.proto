@@ -1,0 +1,97 @@
+// Copyright 2026 Google LLC
+//
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+//     http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
+
+syntax = "proto3";
+
+package bema.v1alpha1;
+
+option go_package = "github.com/gke-labs/generation-ai/experiments/bema/pkg/api/v1alpha1;v1alpha1";
+
+import "google/protobuf/timestamp.proto";
+import "google/protobuf/struct.proto";
+
+service BemaService {
+  // Create a new session
+  rpc CreateSession(CreateSessionRequest) returns (Session) {}
+
+  // Get a session
+  rpc GetSession(GetSessionRequest) returns (Session) {}
+
+  // List sessions
+  rpc ListSessions(ListSessionsRequest) returns (ListSessionsResponse) {}
+
+  // Watch a session for changes
+  rpc WatchSession(WatchSessionRequest) returns (stream SessionEvent) {}
+
+  // Append a message to a session
+  rpc AppendMessage(AppendMessageRequest) returns (Session) {}
+}
+
+message Session {
+  string id = 1;
+  google.protobuf.Timestamp created_at = 2;
+  google.protobuf.Timestamp updated_at = 3;
+  
+  // Model parameters, tools, etc.
+  google.protobuf.Struct config = 4;
+
+  repeated Message messages = 5;
+  
+  // Status of the session (e.g. idle, processing)
+  string status = 6;
+}
+
+message Message {
+  string role = 1; // user, assistant, system, tool
+  string content = 2;
+  
+  // For tool calls and responses
+  google.protobuf.Struct tool_calls = 3;
+  google.protobuf.Struct tool_outputs = 4;
+  
+  google.protobuf.Timestamp timestamp = 5;
+}
+
+message CreateSessionRequest {
+  google.protobuf.Struct config = 1;
+}
+
+message GetSessionRequest {
+  string id = 1;
+}
+
+message ListSessionsRequest {}
+
+message ListSessionsResponse {
+  repeated Session sessions = 1;
+}
+
+message WatchSessionRequest {
+  string id = 1;
+}
+
+message SessionEvent {
+  enum Type {
+    TYPE_UNSPECIFIED = 0;
+    UPDATED = 1;
+    MESSAGE_APPENDED = 2;
+  }
+  Type type = 1;
+  Session session = 2;
+}
+
+message AppendMessageRequest {
+  string id = 1;
+  Message message = 2;
+}

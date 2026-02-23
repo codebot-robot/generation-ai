@@ -1,0 +1,57 @@
+# Copyright 2026 Google LLC
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
+apiVersion: v1
+kind: Service
+metadata:
+  name: bema
+spec:
+  selector:
+    app: bema
+  ports:
+    - protocol: TCP
+      port: 50051
+      targetPort: 50051
+---
+apiVersion: apps/v1
+kind: StatefulSet
+metadata:
+  name: bema
+spec:
+  serviceName: "bema"
+  replicas: 1
+  selector:
+    matchLabels:
+      app: bema
+  template:
+    metadata:
+      labels:
+        app: bema
+    spec:
+      containers:
+        - name: bema
+          image: BEMA_IMAGE_PLACEHOLDER
+          ports:
+            - containerPort: 50051
+          volumeMounts:
+            - name: data
+              mountPath: /data
+  volumeClaimTemplates:
+    - metadata:
+        name: data
+      spec:
+        accessModes: [ "ReadWriteOnce" ]
+        resources:
+          requests:
+            storage: 1Gi
