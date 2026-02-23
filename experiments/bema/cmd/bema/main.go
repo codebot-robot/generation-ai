@@ -15,10 +15,12 @@
 package main
 
 import (
+	"context"
 	"flag"
 	"net"
 
 	v1alpha1 "github.com/gke-labs/generation-ai/experiments/bema/pkg/api/v1alpha1"
+	"github.com/gke-labs/generation-ai/experiments/bema/pkg/backend/gemini"
 	"github.com/gke-labs/generation-ai/experiments/bema/pkg/server"
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/reflection"
@@ -29,7 +31,21 @@ func main() {
 	klog.InitFlags(nil)
 	port := flag.String("port", "50051", "The server port")
 	storageDir := flag.String("storage-dir", "/tmp/bema", "Directory to store sessions")
+	backendType := flag.String("backend", "", "The LLM backend to use (e.g. gemini)")
+	modelName := flag.String("model", "gemini-1.5-flash", "The model name for the backend")
 	flag.Parse()
+
+	ctx := context.Background()
+
+	var backend server.Backend
+	if *backendType == "gemini" {
+		var err error
+		backend, err = gemini.New(ctx, *modelName)
+		if err != nil {
+			klog.Fatalf("failed to create gemini backend: %v", err)
+		}
+		klog.Infof("using gemini backend with model %s", *modelName)
+	}
 
 	lis, err := net.Listen("tcp", ":"+*port)
 	if err != nil {
@@ -37,7 +53,7 @@ func main() {
 	}
 
 	s := grpc.NewServer()
-	bemaServer, err := server.NewBemaServer(*storageDir)
+	bemaServer, err := server.NewBemaServer(*storageDir, backend)
 	if err != nil {
 		klog.Fatalf("failed to create bema server: %v", err)
 	}

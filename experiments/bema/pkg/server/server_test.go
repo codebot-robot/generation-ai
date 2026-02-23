@@ -30,7 +30,7 @@ func TestBemaServer(t *testing.T) {
 	}
 	defer os.RemoveAll(tmpDir)
 
-	s, err := NewBemaServer(tmpDir)
+	s, err := NewBemaServer(tmpDir, nil)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -71,7 +71,7 @@ func TestBemaServer(t *testing.T) {
 	}
 
 	// 4. Persistence test
-	s2, err := NewBemaServer(tmpDir)
+	s2, err := NewBemaServer(tmpDir, nil)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -106,7 +106,7 @@ func TestWatchSession(t *testing.T) {
 	}
 	defer os.RemoveAll(tmpDir)
 
-	s, err := NewBemaServer(tmpDir)
+	s, err := NewBemaServer(tmpDir, nil)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -154,5 +154,65 @@ func TestWatchSession(t *testing.T) {
 		}
 	case <-time.After(1 * time.Second):
 		t.Fatal("Timeout waiting for message event")
+	}
+}
+
+type mockBackend struct {
+	triggered chan bool
+	response  *pb.Message
+}
+
+func (m *mockBackend) GenerateResponse(ctx context.Context, session *pb.Session) (*pb.Message, error) {
+	m.triggered <- true
+	return m.response, nil
+}
+
+func TestBackendTriggered(t *testing.T) {
+	tmpDir, err := os.MkdirTemp("", "bema-backend-test")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer os.RemoveAll(tmpDir)
+
+	triggered := make(chan bool, 1)
+	mock := &mockBackend{
+		triggered: triggered,
+		response: &pb.Message{
+			Role:    "assistant",
+			Content: "I am a robot",
+		},
+	}
+
+	s, err := NewBemaServer(tmpDir, mock)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	ctx := context.Background()
+	sess, _ := s.CreateSession(ctx, &pb.CreateSessionRequest{})
+
+	s.AppendMessage(ctx, &pb.AppendMessageRequest{
+		Id: sess.Id,
+		Message: &pb.Message{
+			Role:    "user",
+			Content: "Hello",
+		},
+	})
+
+	select {
+	case <-triggered:
+		// success
+	case <-time.After(2 * time.Second):
+		t.Fatal("Backend was not triggered")
+	}
+
+	// Verify the assistant message was appended
+	time.Sleep(100 * time.Millisecond) // Give it a moment to append
+	sess2, _ := s.GetSession(ctx, &pb.GetSessionRequest{Id: sess.Id})
+	if len(sess2.Messages) != 2 {
+		t.Errorf("Expected 2 messages, got %d", len(sess2.Messages))
+	}
+	if sess2.Messages[1].Role != "assistant" {
+		t.Errorf("Expected second message role 'assistant', got '%s'", sess2.Messages[1].Role)
 	}
 }

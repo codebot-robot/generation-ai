@@ -33,19 +33,21 @@ type BemaServer struct {
 	pb.UnimplementedBemaServiceServer
 
 	storageDir string
+	backend    Backend
 
 	mu       sync.RWMutex
 	sessions map[string]*pb.Session
 	watchers map[string][]chan *pb.SessionEvent
 }
 
-func NewBemaServer(storageDir string) (*BemaServer, error) {
+func NewBemaServer(storageDir string, backend Backend) (*BemaServer, error) {
 	if err := os.MkdirAll(storageDir, 0755); err != nil {
 		return nil, err
 	}
 
 	s := &BemaServer{
 		storageDir: storageDir,
+		backend:    backend,
 		sessions:   make(map[string]*pb.Session),
 		watchers:   make(map[string][]chan *pb.SessionEvent),
 	}
@@ -167,7 +169,36 @@ func (s *BemaServer) AppendMessage(ctx context.Context, req *pb.AppendMessageReq
 
 	s.notifyWatchers(session, pb.SessionEvent_MESSAGE_APPENDED)
 
+	if s.backend != nil && msg.Role == "user" {
+		go s.generateBackendResponse(context.Background(), session.Id)
+	}
+
 	return session, nil
+}
+
+func (s *BemaServer) generateBackendResponse(ctx context.Context, sessionID string) {
+	s.mu.RLock()
+	session, ok := s.sessions[sessionID]
+	if !ok {
+		s.mu.RUnlock()
+		return
+	}
+	s.mu.RUnlock()
+
+	resp, err := s.backend.GenerateResponse(ctx, session)
+	if err != nil {
+		klog.ErrorS(err, "failed to generate backend response", "sessionID", sessionID)
+		return
+	}
+
+	// Append the response
+	_, err = s.AppendMessage(ctx, &pb.AppendMessageRequest{
+		Id:      sessionID,
+		Message: resp,
+	})
+	if err != nil {
+		klog.ErrorS(err, "failed to append backend response", "sessionID", sessionID)
+	}
 }
 
 func (s *BemaServer) WatchSession(req *pb.WatchSessionRequest, stream pb.BemaService_WatchSessionServer) error {
