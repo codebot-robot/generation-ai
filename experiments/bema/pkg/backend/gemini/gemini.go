@@ -31,7 +31,7 @@ type GeminiBackend struct {
 }
 
 func New(ctx context.Context, model string) (*GeminiBackend, error) {
-	apiKey := os.Getenv("GOOGLE_API_KEY")
+	apiKey := os.Getenv("GEMINI_API_KEY")
 	var opts []option.ClientOption
 	if apiKey != "" {
 		opts = append(opts, option.WithAPIKey(apiKey))
