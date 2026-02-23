@@ -1,0 +1,39 @@
+# Bema - Session-based Chat Server
+
+Bema is a platform for session-based chat, designed to support agentic lifecycles and multi-turn scenarios.
+
+## Key Features
+
+- **Session-based API**: Manage chat sessions as persistent resources.
+- **Watch Support**: Get notified of all changes to a session in real-time.
+- **Persistence**: Sessions are stored persistently, allowing clients to disconnect and reconnect without losing state.
+
+## Directory Structure
+
+- `proto/`: gRPC service definition.
+- `pkg/api/v1alpha1/`: Generated Go code from proto.
+- `pkg/server/`: Core server implementation.
+- `cmd/bema/`: Server entry point.
+- `k8s/`: Kubernetes manifests for deployment.
+
+## Development
+
+### Generate Proto
+
+To regenerate the gRPC code, run:
+
+```bash
+./generate_proto.sh
+```
+
+### Run Tests
+
+```bash
+go test ./...
+```
+
+### Local Run
+
+```bash
+go run cmd/bema/main.go --storage-dir=/tmp/bema
+```
