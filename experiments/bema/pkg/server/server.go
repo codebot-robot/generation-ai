@@ -205,7 +205,15 @@ func (s *BemaServer) generateBackendResponse(ctx context.Context, sessionID stri
 		}
 
 		// If it's a tool call, execute it and loop
-		if resp.ToolCalls != nil && s.executor != nil {
+		hasFunctionCalls := false
+		for _, p := range resp.Parts {
+			if _, ok := p.Data.(*pb.Part_FunctionCall); ok {
+				hasFunctionCalls = true
+				break
+			}
+		}
+
+		if hasFunctionCalls && s.executor != nil {
 			toolResp, err := s.executor.Execute(ctx, sessionID, resp)
 			if err != nil {
 				klog.ErrorS(err, "failed to execute tools", "sessionID", sessionID)

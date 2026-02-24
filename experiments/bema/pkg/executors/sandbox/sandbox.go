@@ -66,53 +66,66 @@ func New(ctx context.Context) (*SandboxExecutor, error) {
 }
 
 func (e *SandboxExecutor) Execute(ctx context.Context, sessionID string, message *pb.Message) (*pb.Message, error) {
-	if message.ToolCalls == nil {
-		return nil, nil
-	}
+	var pbParts []*pb.Part
 
-	functionCalls, ok := message.ToolCalls.Fields["functionCalls"]
-	if !ok {
-		return nil, nil
-	}
-
-	var toolOutputs []any
-
-	for _, fcValue := range functionCalls.GetListValue().Values {
-		fc := fcValue.GetStructValue()
-		name := fc.Fields["name"].GetStringValue()
-		args := fc.Fields["args"].GetStructValue()
+	for _, p := range message.Parts {
+		fcPart, ok := p.Data.(*pb.Part_FunctionCall)
+		if !ok {
+			continue
+		}
+		fc := fcPart.FunctionCall
+		name := fc.Name
+		args := fc.Args
 
 		if name == "exec" {
 			command := args.Fields["command"].GetStringValue()
 			output, err := e.executeInSandbox(ctx, sessionID, command)
 
 			result := map[string]any{
-				"name":   name,
 				"output": output,
 			}
 			if err != nil {
 				result["error"] = err.Error()
 			}
-			toolOutputs = append(toolOutputs, result)
+			responseStruct, err := structpb.NewStruct(result)
+			if err != nil {
+				return nil, err
+			}
+
+			pbParts = append(pbParts, &pb.Part{
+				Data: &pb.Part_FunctionResponse{
+					FunctionResponse: &pb.FunctionResponse{
+						Name:     name,
+						Response: responseStruct,
+					},
+				},
+			})
 		} else {
-			toolOutputs = append(toolOutputs, map[string]any{
-				"name":  name,
+			responseStruct, err := structpb.NewStruct(map[string]any{
 				"error": "unknown tool",
+			})
+			if err != nil {
+				return nil, err
+			}
+			pbParts = append(pbParts, &pb.Part{
+				Data: &pb.Part_FunctionResponse{
+					FunctionResponse: &pb.FunctionResponse{
+						Name:     name,
+						Response: responseStruct,
+					},
+				},
 			})
 		}
 	}
 
-	outputsStruct, err := structpb.NewStruct(map[string]any{
-		"functionResponses": toolOutputs,
-	})
-	if err != nil {
-		return nil, err
+	if len(pbParts) == 0 {
+		return nil, nil
 	}
 
 	return &pb.Message{
-		Role:        "tool",
-		ToolOutputs: outputsStruct,
-		Timestamp:   timestamppb.Now(),
+		Role:      "function",
+		Parts:     pbParts,
+		Timestamp: timestamppb.Now(),
 	}, nil
 }
 

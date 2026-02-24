@@ -87,7 +87,18 @@ func listSessions(client pb.BemaServiceClient) {
 
 func printMessage(msg *pb.Message) {
 	role := strings.ToUpper(msg.Role)
-	fmt.Printf("[%s]: %s\n", role, msg.Content)
+	var sb strings.Builder
+	for _, p := range msg.Parts {
+		switch part := p.Data.(type) {
+		case *pb.Part_Text:
+			sb.WriteString(part.Text)
+		case *pb.Part_FunctionCall:
+			sb.WriteString(fmt.Sprintf("[TOOL CALL: %s args: %v]", part.FunctionCall.Name, part.FunctionCall.Args.AsMap()))
+		case *pb.Part_FunctionResponse:
+			sb.WriteString(fmt.Sprintf("[TOOL RESPONSE: %s response: %v]", part.FunctionResponse.Name, part.FunctionResponse.Response.AsMap()))
+		}
+	}
+	fmt.Printf("[%s]: %s\n", role, sb.String())
 }
 
 func runChat(client pb.BemaServiceClient, sessionID string) {
@@ -161,8 +172,14 @@ func runChat(client pb.BemaServiceClient, sessionID string) {
 		_, err := client.AppendMessage(ctx, &pb.AppendMessageRequest{
 			Id: sessionID,
 			Message: &pb.Message{
-				Role:    "user",
-				Content: text,
+				Role: "user",
+				Parts: []*pb.Part{
+					{
+						Data: &pb.Part_Text{
+							Text: text,
+						},
+					},
+				},
 			},
 		})
 		if err != nil {
