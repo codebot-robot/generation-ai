@@ -120,27 +120,31 @@ func (e *SandboxExecutor) ensureSandbox(ctx context.Context, sessionID string) e
 	name := "bema-" + sessionID
 
 	_, err := e.client.Resource(agentSandboxGVR).Namespace(e.namespace).Get(ctx, name, v1.GetOptions{})
-	if err == nil {
-		return nil
-	}
-
-	// Create it
-	sandbox := &unstructured.Unstructured{
-		Object: map[string]interface{}{
-			"apiVersion": "agentsandbox.sigs.k8s.io/v1alpha1",
-			"kind":       "AgentSandbox",
-			"metadata": map[string]interface{}{
-				"name": name,
-			},
-			"spec": map[string]interface{}{
-				// Default spec
-			},
-		},
-	}
-
-	_, err = e.client.Resource(agentSandboxGVR).Namespace(e.namespace).Create(ctx, sandbox, v1.CreateOptions{})
 	if err != nil {
-		return fmt.Errorf("failed to create AgentSandbox: %v", err)
+		// Create it
+		sandbox := &unstructured.Unstructured{
+			Object: map[string]interface{}{
+				"apiVersion": "agentsandbox.sigs.k8s.io/v1alpha1",
+				"kind":       "AgentSandbox",
+				"metadata": map[string]interface{}{
+					"name": name,
+				},
+				"spec": map[string]interface{}{
+					// Default spec
+				},
+			},
+		}
+
+		_, err = e.client.Resource(agentSandboxGVR).Namespace(e.namespace).Create(ctx, sandbox, v1.CreateOptions{})
+		if err != nil {
+			return fmt.Errorf("failed to create AgentSandbox: %v", err)
+		}
+	}
+
+	// Wait for it to be ready
+	cmd := exec.CommandContext(ctx, "kubectl", "wait", "--for=condition=Ready", "sandbox", "-n", e.namespace, name, "--timeout=60s")
+	if output, err := cmd.CombinedOutput(); err != nil {
+		return fmt.Errorf("failed to wait for AgentSandbox readiness: %v: %s", err, string(output))
 	}
 
 	return nil
