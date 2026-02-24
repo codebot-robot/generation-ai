@@ -19,8 +19,9 @@ import (
 	"flag"
 	"net"
 
-	v1alpha1 "github.com/gke-labs/generation-ai/experiments/bema/pkg/api/v1alpha1"
+	"github.com/gke-labs/generation-ai/experiments/bema/pkg/api/v1alpha1"
 	"github.com/gke-labs/generation-ai/experiments/bema/pkg/backend/gemini"
+	"github.com/gke-labs/generation-ai/experiments/bema/pkg/executors/sandbox"
 	"github.com/gke-labs/generation-ai/experiments/bema/pkg/server"
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/reflection"
@@ -47,13 +48,18 @@ func main() {
 		klog.Infof("using gemini backend with model %s", *modelName)
 	}
 
+	executor, err := sandbox.New(ctx)
+	if err != nil {
+		klog.Warningf("failed to create sandbox executor: %v", err)
+	}
+
 	lis, err := net.Listen("tcp", ":"+*port)
 	if err != nil {
 		klog.Fatalf("failed to listen: %v", err)
 	}
 
 	s := grpc.NewServer()
-	bemaServer, err := server.NewBemaServer(*storageDir, backend)
+	bemaServer, err := server.NewBemaServer(*storageDir, backend, executor)
 	if err != nil {
 		klog.Fatalf("failed to create bema server: %v", err)
 	}
