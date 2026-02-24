@@ -44,19 +44,19 @@ type SandboxExecutor struct {
 }
 
 func New(ctx context.Context) (*SandboxExecutor, error) {
-	config, err := rest.InClusterConfig()
+	restConfig, err := rest.InClusterConfig()
 	if err != nil {
 		return nil, fmt.Errorf("failed to get kubernetes config: %v", err)
 	}
 
-	client, err := dynamic.NewForConfig(config)
+	client, err := dynamic.NewForConfig(restConfig)
 	if err != nil {
 		return nil, fmt.Errorf("failed to create dynamic client: %v", err)
 	}
 
 	ns := os.Getenv("NAMESPACE")
 	if ns == "" {
-		ns = "workspace-github-gke-labs-generation-ai-38"
+		ns = "bema-sandboxes"
 	}
 
 	return &SandboxExecutor{
