@@ -133,7 +133,7 @@ func (b *GeminiBackend) GenerateResponse(ctx context.Context, session *pb.Sessio
 					Text: part.Text,
 				},
 				Thought:          part.Thought,
-				ThoughtSignature: string(part.ThoughtSignature),
+				ThoughtSignature: part.ThoughtSignature,
 			})
 		} else if fc := part.FunctionCall; fc != nil {
 			args, err := structpb.NewStruct(fc.Args)
@@ -148,12 +148,12 @@ func (b *GeminiBackend) GenerateResponse(ctx context.Context, session *pb.Sessio
 					},
 				},
 				Thought:          part.Thought,
-				ThoughtSignature: string(part.ThoughtSignature),
+				ThoughtSignature: part.ThoughtSignature,
 			})
 		} else if part.Thought {
 			pbParts = append(pbParts, &pb.Part{
 				Thought:          true,
-				ThoughtSignature: string(part.ThoughtSignature),
+				ThoughtSignature: part.ThoughtSignature,
 			})
 		} else {
 			log.Info("unknown genai part", "part", part)
@@ -173,7 +173,7 @@ func toGenaiParts(ctx context.Context, pbParts []*pb.Part) []*genai.Part {
 	for _, p := range pbParts {
 		part := &genai.Part{
 			Thought:          p.Thought,
-			ThoughtSignature: []byte(p.ThoughtSignature),
+			ThoughtSignature: p.ThoughtSignature,
 		}
 		switch data := p.Data.(type) {
 		case *pb.Part_Text:

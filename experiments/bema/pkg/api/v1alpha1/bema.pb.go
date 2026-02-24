@@ -241,7 +241,7 @@ type Part struct {
 	//	*Part_FunctionResponse
 	Data             isPart_Data `protobuf_oneof:"data"`
 	Thought          bool        `protobuf:"varint,4,opt,name=thought,proto3" json:"thought,omitempty"`
-	ThoughtSignature string      `protobuf:"bytes,5,opt,name=thought_signature,json=thoughtSignature,proto3" json:"thought_signature,omitempty"`
+	ThoughtSignature []byte      `protobuf:"bytes,5,opt,name=thought_signature,json=thoughtSignature,proto3" json:"thought_signature,omitempty"`
 	unknownFields    protoimpl.UnknownFields
 	sizeCache        protoimpl.SizeCache
 }
@@ -317,11 +317,11 @@ func (x *Part) GetThought() bool {
 	return false
 }
 
-func (x *Part) GetThoughtSignature() string {
+func (x *Part) GetThoughtSignature() []byte {
 	if x != nil {
 		return x.ThoughtSignature
 	}
-	return ""
+	return nil
 }
 
 type isPart_Data interface {
@@ -790,7 +790,7 @@ const file_bema_proto_rawDesc = "" +
 	"\rfunction_call\x18\x02 \x01(\v2\x1b.bema.v1alpha1.FunctionCallH\x00R\ffunctionCall\x12N\n" +
 	"\x11function_response\x18\x03 \x01(\v2\x1f.bema.v1alpha1.FunctionResponseH\x00R\x10functionResponse\x12\x18\n" +
 	"\athought\x18\x04 \x01(\bR\athought\x12+\n" +
-	"\x11thought_signature\x18\x05 \x01(\tR\x10thoughtSignatureB\x06\n" +
+	"\x11thought_signature\x18\x05 \x01(\fR\x10thoughtSignatureB\x06\n" +
 	"\x04data\"O\n" +
 	"\fFunctionCall\x12\x12\n" +
 	"\x04name\x18\x01 \x01(\tR\x04name\x12+\n" +
