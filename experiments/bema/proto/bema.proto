@@ -66,6 +66,8 @@ message Part {
     FunctionCall function_call = 2;
     FunctionResponse function_response = 3;
   }
+  bool thought = 4;
+  string thought_signature = 5;
 }
 
 message FunctionCall {
