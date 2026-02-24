@@ -24,6 +24,7 @@ import (
 	"google.golang.org/api/option"
 	"google.golang.org/protobuf/types/known/structpb"
 	"google.golang.org/protobuf/types/known/timestamppb"
+	"k8s.io/klog/v2"
 )
 
 type GeminiBackend struct {
@@ -50,6 +51,7 @@ func New(ctx context.Context, model string) (*GeminiBackend, error) {
 }
 
 func (b *GeminiBackend) GenerateResponse(ctx context.Context, session *pb.Session) (*pb.Message, error) {
+	log := klog.FromContext(ctx)
 	if len(session.Messages) == 0 {
 		return nil, fmt.Errorf("no messages in session")
 	}
@@ -81,7 +83,13 @@ func (b *GeminiBackend) GenerateResponse(ctx context.Context, session *pb.Sessio
 	var systemInstruction []genai.Part
 	for _, msg := range session.Messages {
 		if msg.Role == "system" {
-			systemInstruction = append(systemInstruction, genai.Text(msg.Content))
+			for _, part := range msg.Parts {
+				if text, ok := part.Data.(*pb.Part_Text); ok {
+					systemInstruction = append(systemInstruction, genai.Text(text.Text))
+				} else {
+					log.Info("ignoring non-text part in system instruction", "type", fmt.Sprintf("%T", part.Data))
+				}
+			}
 		}
 	}
 	if len(systemInstruction) > 0 {
@@ -106,49 +114,15 @@ func (b *GeminiBackend) GenerateResponse(ctx context.Context, session *pb.Sessio
 			role = "function"
 		}
 
-		parts := []genai.Part{}
-		if msg.Content != "" {
-			parts = append(parts, genai.Text(msg.Content))
-		}
-
-		if msg.ToolCalls != nil {
-			if fcs, ok := msg.ToolCalls.Fields["functionCalls"]; ok {
-				for _, fcValue := range fcs.GetListValue().Values {
-					fc := fcValue.GetStructValue()
-					name := fc.Fields["name"].GetStringValue()
-					args := fc.Fields["args"].GetStructValue().AsMap()
-					parts = append(parts, genai.FunctionCall{
-						Name: name,
-						Args: args,
-					})
-				}
-			}
-		}
-
-		if msg.ToolOutputs != nil {
-			if frs, ok := msg.ToolOutputs.Fields["functionResponses"]; ok {
-				for _, frValue := range frs.GetListValue().Values {
-					fr := frValue.GetStructValue()
-					name := fr.Fields["name"].GetStringValue()
-					// Genai expects response to be a map
-					response := fr.AsMap()
-					parts = append(parts, genai.FunctionResponse{
-						Name:     name,
-						Response: response,
-					})
-				}
-			}
-		}
-
 		history = append(history, &genai.Content{
 			Role:  role,
-			Parts: parts,
+			Parts: toGenaiParts(ctx, msg.Parts),
 		})
 	}
 	cs.History = history
 
 	lastMsg := session.Messages[len(session.Messages)-1]
-	resp, err := cs.SendMessage(ctx, genai.Text(lastMsg.Content))
+	resp, err := cs.SendMessage(ctx, toGenaiParts(ctx, lastMsg.Parts)...)
 	if err != nil {
 		return nil, err
 	}
@@ -157,38 +131,61 @@ func (b *GeminiBackend) GenerateResponse(ctx context.Context, session *pb.Sessio
 		return nil, fmt.Errorf("no candidates in response")
 	}
 
-	content := ""
-	var toolCalls *structpb.Struct
-	var functionCalls []any
-
+	var pbParts []*pb.Part
 	for _, part := range resp.Candidates[0].Content.Parts {
 		if text, ok := part.(genai.Text); ok {
-			content += string(text)
-		}
-		if fc, ok := part.(genai.FunctionCall); ok {
-			functionCalls = append(functionCalls, map[string]any{
-				"name": fc.Name,
-				"args": fc.Args,
+			pbParts = append(pbParts, &pb.Part{
+				Data: &pb.Part_Text{
+					Text: string(text),
+				},
 			})
-		}
-	}
-
-	if len(functionCalls) > 0 {
-		var err error
-		toolCalls, err = structpb.NewStruct(map[string]any{
-			"functionCalls": functionCalls,
-		})
-		if err != nil {
-			return nil, err
+		} else if fc, ok := part.(genai.FunctionCall); ok {
+			args, err := structpb.NewStruct(fc.Args)
+			if err != nil {
+				return nil, err
+			}
+			pbParts = append(pbParts, &pb.Part{
+				Data: &pb.Part_FunctionCall{
+					FunctionCall: &pb.FunctionCall{
+						Name: fc.Name,
+						Args: args,
+					},
+				},
+			})
+		} else {
+			log.Info("unknown genai part type", "type", fmt.Sprintf("%T", part))
 		}
 	}
 
 	return &pb.Message{
-		Role:      "assistant",
-		Content:   content,
-		ToolCalls: toolCalls,
+		Role:      "model",
+		Parts:     pbParts,
 		Timestamp: timestamppb.Now(),
 	}, nil
+}
+
+func toGenaiParts(ctx context.Context, pbParts []*pb.Part) []genai.Part {
+	log := klog.FromContext(ctx)
+	var parts []genai.Part
+	for _, p := range pbParts {
+		switch part := p.Data.(type) {
+		case *pb.Part_Text:
+			parts = append(parts, genai.Text(part.Text))
+		case *pb.Part_FunctionCall:
+			parts = append(parts, genai.FunctionCall{
+				Name: part.FunctionCall.Name,
+				Args: part.FunctionCall.Args.AsMap(),
+			})
+		case *pb.Part_FunctionResponse:
+			parts = append(parts, genai.FunctionResponse{
+				Name:     part.FunctionResponse.Name,
+				Response: part.FunctionResponse.Response.AsMap(),
+			})
+		default:
+			log.Info("unknown bema part type", "type", fmt.Sprintf("%T", p.Data))
+		}
+	}
+	return parts
 }
 
 func (b *GeminiBackend) Close() error {

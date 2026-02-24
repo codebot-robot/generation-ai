@@ -51,8 +51,14 @@ func TestBemaServer(t *testing.T) {
 	_, err = s.AppendMessage(ctx, &pb.AppendMessageRequest{
 		Id: sess.Id,
 		Message: &pb.Message{
-			Role:    "user",
-			Content: "Hello",
+			Role: "user",
+			Parts: []*pb.Part{
+				{
+					Data: &pb.Part_Text{
+						Text: "Hello",
+					},
+				},
+			},
 		},
 	})
 	if err != nil {
@@ -67,8 +73,8 @@ func TestBemaServer(t *testing.T) {
 	if len(sess2.Messages) != 1 {
 		t.Errorf("Expected 1 message, got %d", len(sess2.Messages))
 	}
-	if sess2.Messages[0].Content != "Hello" {
-		t.Errorf("Expected message content 'Hello', got '%s'", sess2.Messages[0].Content)
+	if sess2.Messages[0].Parts[0].GetText() != "Hello" {
+		t.Errorf("Expected message content 'Hello', got '%s'", sess2.Messages[0].Parts[0].GetText())
 	}
 
 	// 4. Persistence test
@@ -140,8 +146,14 @@ func TestWatchSession(t *testing.T) {
 	s.AppendMessage(ctx, &pb.AppendMessageRequest{
 		Id: sess.Id,
 		Message: &pb.Message{
-			Role:    "user",
-			Content: "Watch me",
+			Role: "user",
+			Parts: []*pb.Part{
+				{
+					Data: &pb.Part_Text{
+						Text: "Watch me",
+					},
+				},
+			},
 		},
 	})
 
@@ -179,8 +191,14 @@ func TestBackendTriggered(t *testing.T) {
 	mock := &mockBackend{
 		triggered: triggered,
 		response: &pb.Message{
-			Role:    "assistant",
-			Content: "I am a robot",
+			Role: "model",
+			Parts: []*pb.Part{
+				{
+					Data: &pb.Part_Text{
+						Text: "I am a robot",
+					},
+				},
+			},
 		},
 	}
 
@@ -195,8 +213,14 @@ func TestBackendTriggered(t *testing.T) {
 	s.AppendMessage(ctx, &pb.AppendMessageRequest{
 		Id: sess.Id,
 		Message: &pb.Message{
-			Role:    "user",
-			Content: "Hello",
+			Role: "user",
+			Parts: []*pb.Part{
+				{
+					Data: &pb.Part_Text{
+						Text: "Hello",
+					},
+				},
+			},
 		},
 	})
 
@@ -213,8 +237,8 @@ func TestBackendTriggered(t *testing.T) {
 	if len(sess2.Messages) != 2 {
 		t.Errorf("Expected 2 messages, got %d", len(sess2.Messages))
 	}
-	if sess2.Messages[1].Role != "assistant" {
-		t.Errorf("Expected second message role 'assistant', got '%s'", sess2.Messages[1].Role)
+	if sess2.Messages[1].Role != "model" {
+		t.Errorf("Expected second message role 'model', got '%s'", sess2.Messages[1].Role)
 	}
 }
 
@@ -238,39 +262,43 @@ func TestToolCalling(t *testing.T) {
 	backendTriggered := make(chan bool, 2)
 	executorTriggered := make(chan bool, 1)
 
-	toolCalls, _ := structpb.NewStruct(map[string]any{
-		"functionCalls": []any{
-			map[string]any{
-				"name": "exec",
-				"args": map[string]any{
-					"command": "ls",
-				},
-			},
-		},
+	args, _ := structpb.NewStruct(map[string]any{
+		"command": "ls",
 	})
-
 	backend := &mockBackend{
 		triggered: backendTriggered,
 		response: &pb.Message{
-			Role:      "assistant",
-			ToolCalls: toolCalls,
+			Role: "model",
+			Parts: []*pb.Part{
+				{
+					Data: &pb.Part_FunctionCall{
+						FunctionCall: &pb.FunctionCall{
+							Name: "exec",
+							Args: args,
+						},
+					},
+				},
+			},
 		},
 	}
 
-	toolOutputs, _ := structpb.NewStruct(map[string]any{
-		"functionResponses": []any{
-			map[string]any{
-				"name":   "exec",
-				"output": "file1.txt",
-			},
-		},
+	response, _ := structpb.NewStruct(map[string]any{
+		"output": "file1.txt",
 	})
-
 	executor := &mockExecutor{
 		triggered: executorTriggered,
 		response: &pb.Message{
-			Role:        "tool",
-			ToolOutputs: toolOutputs,
+			Role: "function",
+			Parts: []*pb.Part{
+				{
+					Data: &pb.Part_FunctionResponse{
+						FunctionResponse: &pb.FunctionResponse{
+							Name:     "exec",
+							Response: response,
+						},
+					},
+				},
+			},
 		},
 	}
 
@@ -286,16 +314,28 @@ func TestToolCalling(t *testing.T) {
 	go func() {
 		<-backendTriggered
 		backend.response = &pb.Message{
-			Role:    "assistant",
-			Content: "Done",
+			Role: "model",
+			Parts: []*pb.Part{
+				{
+					Data: &pb.Part_Text{
+						Text: "Done",
+					},
+				},
+			},
 		}
 	}()
 
 	s.AppendMessage(ctx, &pb.AppendMessageRequest{
 		Id: sess.Id,
 		Message: &pb.Message{
-			Role:    "user",
-			Content: "Run ls",
+			Role: "user",
+			Parts: []*pb.Part{
+				{
+					Data: &pb.Part_Text{
+						Text: "Run ls",
+					},
+				},
+			},
 		},
 	})
 

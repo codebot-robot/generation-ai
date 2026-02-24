@@ -17,7 +17,7 @@ set -e
 
 mkdir -p pkg/api/v1alpha1
 
-protoc --proto_path=proto 
-    --go_out=pkg/api/v1alpha1 --go_opt=paths=source_relative 
-    --go-grpc_out=pkg/api/v1alpha1 --go-grpc_opt=paths=source_relative 
+protoc --proto_path=proto \
+    --go_out=pkg/api/v1alpha1 --go_opt=paths=source_relative \
+    --go-grpc_out=pkg/api/v1alpha1 --go-grpc_opt=paths=source_relative \
     proto/bema.proto

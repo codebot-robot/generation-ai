@@ -83,7 +83,7 @@ func (x SessionEvent_Type) Number() protoreflect.EnumNumber {
 
 // Deprecated: Use SessionEvent_Type.Descriptor instead.
 func (SessionEvent_Type) EnumDescriptor() ([]byte, []int) {
-	return file_bema_proto_rawDescGZIP(), []int{7, 0}
+	return file_bema_proto_rawDescGZIP(), []int{10, 0}
 }
 
 type Session struct {
@@ -173,13 +173,10 @@ func (x *Session) GetStatus() string {
 }
 
 type Message struct {
-	state   protoimpl.MessageState `protogen:"open.v1"`
-	Role    string                 `protobuf:"bytes,1,opt,name=role,proto3" json:"role,omitempty"` // user, assistant, system, tool
-	Content string                 `protobuf:"bytes,2,opt,name=content,proto3" json:"content,omitempty"`
-	// For tool calls and responses
-	ToolCalls     *structpb.Struct       `protobuf:"bytes,3,opt,name=tool_calls,json=toolCalls,proto3" json:"tool_calls,omitempty"`
-	ToolOutputs   *structpb.Struct       `protobuf:"bytes,4,opt,name=tool_outputs,json=toolOutputs,proto3" json:"tool_outputs,omitempty"`
-	Timestamp     *timestamppb.Timestamp `protobuf:"bytes,5,opt,name=timestamp,proto3" json:"timestamp,omitempty"`
+	state         protoimpl.MessageState `protogen:"open.v1"`
+	Role          string                 `protobuf:"bytes,1,opt,name=role,proto3" json:"role,omitempty"` // user, model, system, function
+	Parts         []*Part                `protobuf:"bytes,2,rep,name=parts,proto3" json:"parts,omitempty"`
+	Timestamp     *timestamppb.Timestamp `protobuf:"bytes,3,opt,name=timestamp,proto3" json:"timestamp,omitempty"`
 	unknownFields protoimpl.UnknownFields
 	sizeCache     protoimpl.SizeCache
 }
@@ -221,23 +218,9 @@ func (x *Message) GetRole() string {
 	return ""
 }
 
-func (x *Message) GetContent() string {
+func (x *Message) GetParts() []*Part {
 	if x != nil {
-		return x.Content
-	}
-	return ""
-}
-
-func (x *Message) GetToolCalls() *structpb.Struct {
-	if x != nil {
-		return x.ToolCalls
-	}
-	return nil
-}
-
-func (x *Message) GetToolOutputs() *structpb.Struct {
-	if x != nil {
-		return x.ToolOutputs
+		return x.Parts
 	}
 	return nil
 }
@@ -245,6 +228,208 @@ func (x *Message) GetToolOutputs() *structpb.Struct {
 func (x *Message) GetTimestamp() *timestamppb.Timestamp {
 	if x != nil {
 		return x.Timestamp
+	}
+	return nil
+}
+
+type Part struct {
+	state protoimpl.MessageState `protogen:"open.v1"`
+	// Types that are valid to be assigned to Data:
+	//
+	//	*Part_Text
+	//	*Part_FunctionCall
+	//	*Part_FunctionResponse
+	Data          isPart_Data `protobuf_oneof:"data"`
+	unknownFields protoimpl.UnknownFields
+	sizeCache     protoimpl.SizeCache
+}
+
+func (x *Part) Reset() {
+	*x = Part{}
+	mi := &file_bema_proto_msgTypes[2]
+	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+	ms.StoreMessageInfo(mi)
+}
+
+func (x *Part) String() string {
+	return protoimpl.X.MessageStringOf(x)
+}
+
+func (*Part) ProtoMessage() {}
+
+func (x *Part) ProtoReflect() protoreflect.Message {
+	mi := &file_bema_proto_msgTypes[2]
+	if x != nil {
+		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+		if ms.LoadMessageInfo() == nil {
+			ms.StoreMessageInfo(mi)
+		}
+		return ms
+	}
+	return mi.MessageOf(x)
+}
+
+// Deprecated: Use Part.ProtoReflect.Descriptor instead.
+func (*Part) Descriptor() ([]byte, []int) {
+	return file_bema_proto_rawDescGZIP(), []int{2}
+}
+
+func (x *Part) GetData() isPart_Data {
+	if x != nil {
+		return x.Data
+	}
+	return nil
+}
+
+func (x *Part) GetText() string {
+	if x != nil {
+		if x, ok := x.Data.(*Part_Text); ok {
+			return x.Text
+		}
+	}
+	return ""
+}
+
+func (x *Part) GetFunctionCall() *FunctionCall {
+	if x != nil {
+		if x, ok := x.Data.(*Part_FunctionCall); ok {
+			return x.FunctionCall
+		}
+	}
+	return nil
+}
+
+func (x *Part) GetFunctionResponse() *FunctionResponse {
+	if x != nil {
+		if x, ok := x.Data.(*Part_FunctionResponse); ok {
+			return x.FunctionResponse
+		}
+	}
+	return nil
+}
+
+type isPart_Data interface {
+	isPart_Data()
+}
+
+type Part_Text struct {
+	Text string `protobuf:"bytes,1,opt,name=text,proto3,oneof"`
+}
+
+type Part_FunctionCall struct {
+	FunctionCall *FunctionCall `protobuf:"bytes,2,opt,name=function_call,json=functionCall,proto3,oneof"`
+}
+
+type Part_FunctionResponse struct {
+	FunctionResponse *FunctionResponse `protobuf:"bytes,3,opt,name=function_response,json=functionResponse,proto3,oneof"`
+}
+
+func (*Part_Text) isPart_Data() {}
+
+func (*Part_FunctionCall) isPart_Data() {}
+
+func (*Part_FunctionResponse) isPart_Data() {}
+
+type FunctionCall struct {
+	state         protoimpl.MessageState `protogen:"open.v1"`
+	Name          string                 `protobuf:"bytes,1,opt,name=name,proto3" json:"name,omitempty"`
+	Args          *structpb.Struct       `protobuf:"bytes,2,opt,name=args,proto3" json:"args,omitempty"`
+	unknownFields protoimpl.UnknownFields
+	sizeCache     protoimpl.SizeCache
+}
+
+func (x *FunctionCall) Reset() {
+	*x = FunctionCall{}
+	mi := &file_bema_proto_msgTypes[3]
+	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+	ms.StoreMessageInfo(mi)
+}
+
+func (x *FunctionCall) String() string {
+	return protoimpl.X.MessageStringOf(x)
+}
+
+func (*FunctionCall) ProtoMessage() {}
+
+func (x *FunctionCall) ProtoReflect() protoreflect.Message {
+	mi := &file_bema_proto_msgTypes[3]
+	if x != nil {
+		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+		if ms.LoadMessageInfo() == nil {
+			ms.StoreMessageInfo(mi)
+		}
+		return ms
+	}
+	return mi.MessageOf(x)
+}
+
+// Deprecated: Use FunctionCall.ProtoReflect.Descriptor instead.
+func (*FunctionCall) Descriptor() ([]byte, []int) {
+	return file_bema_proto_rawDescGZIP(), []int{3}
+}
+
+func (x *FunctionCall) GetName() string {
+	if x != nil {
+		return x.Name
+	}
+	return ""
+}
+
+func (x *FunctionCall) GetArgs() *structpb.Struct {
+	if x != nil {
+		return x.Args
+	}
+	return nil
+}
+
+type FunctionResponse struct {
+	state         protoimpl.MessageState `protogen:"open.v1"`
+	Name          string                 `protobuf:"bytes,1,opt,name=name,proto3" json:"name,omitempty"`
+	Response      *structpb.Struct       `protobuf:"bytes,2,opt,name=response,proto3" json:"response,omitempty"`
+	unknownFields protoimpl.UnknownFields
+	sizeCache     protoimpl.SizeCache
+}
+
+func (x *FunctionResponse) Reset() {
+	*x = FunctionResponse{}
+	mi := &file_bema_proto_msgTypes[4]
+	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+	ms.StoreMessageInfo(mi)
+}
+
+func (x *FunctionResponse) String() string {
+	return protoimpl.X.MessageStringOf(x)
+}
+
+func (*FunctionResponse) ProtoMessage() {}
+
+func (x *FunctionResponse) ProtoReflect() protoreflect.Message {
+	mi := &file_bema_proto_msgTypes[4]
+	if x != nil {
+		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+		if ms.LoadMessageInfo() == nil {
+			ms.StoreMessageInfo(mi)
+		}
+		return ms
+	}
+	return mi.MessageOf(x)
+}
+
+// Deprecated: Use FunctionResponse.ProtoReflect.Descriptor instead.
+func (*FunctionResponse) Descriptor() ([]byte, []int) {
+	return file_bema_proto_rawDescGZIP(), []int{4}
+}
+
+func (x *FunctionResponse) GetName() string {
+	if x != nil {
+		return x.Name
+	}
+	return ""
+}
+
+func (x *FunctionResponse) GetResponse() *structpb.Struct {
+	if x != nil {
+		return x.Response
 	}
 	return nil
 }
@@ -258,7 +443,7 @@ type CreateSessionRequest struct {
 
 func (x *CreateSessionRequest) Reset() {
 	*x = CreateSessionRequest{}
-	mi := &file_bema_proto_msgTypes[2]
+	mi := &file_bema_proto_msgTypes[5]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -270,7 +455,7 @@ func (x *CreateSessionRequest) String() string {
 func (*CreateSessionRequest) ProtoMessage() {}
 
 func (x *CreateSessionRequest) ProtoReflect() protoreflect.Message {
-	mi := &file_bema_proto_msgTypes[2]
+	mi := &file_bema_proto_msgTypes[5]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -283,7 +468,7 @@ func (x *CreateSessionRequest) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use CreateSessionRequest.ProtoReflect.Descriptor instead.
 func (*CreateSessionRequest) Descriptor() ([]byte, []int) {
-	return file_bema_proto_rawDescGZIP(), []int{2}
+	return file_bema_proto_rawDescGZIP(), []int{5}
 }
 
 func (x *CreateSessionRequest) GetConfig() *structpb.Struct {
@@ -302,7 +487,7 @@ type GetSessionRequest struct {
 
 func (x *GetSessionRequest) Reset() {
 	*x = GetSessionRequest{}
-	mi := &file_bema_proto_msgTypes[3]
+	mi := &file_bema_proto_msgTypes[6]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -314,7 +499,7 @@ func (x *GetSessionRequest) String() string {
 func (*GetSessionRequest) ProtoMessage() {}
 
 func (x *GetSessionRequest) ProtoReflect() protoreflect.Message {
-	mi := &file_bema_proto_msgTypes[3]
+	mi := &file_bema_proto_msgTypes[6]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -327,7 +512,7 @@ func (x *GetSessionRequest) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use GetSessionRequest.ProtoReflect.Descriptor instead.
 func (*GetSessionRequest) Descriptor() ([]byte, []int) {
-	return file_bema_proto_rawDescGZIP(), []int{3}
+	return file_bema_proto_rawDescGZIP(), []int{6}
 }
 
 func (x *GetSessionRequest) GetId() string {
@@ -345,7 +530,7 @@ type ListSessionsRequest struct {
 
 func (x *ListSessionsRequest) Reset() {
 	*x = ListSessionsRequest{}
-	mi := &file_bema_proto_msgTypes[4]
+	mi := &file_bema_proto_msgTypes[7]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -357,7 +542,7 @@ func (x *ListSessionsRequest) String() string {
 func (*ListSessionsRequest) ProtoMessage() {}
 
 func (x *ListSessionsRequest) ProtoReflect() protoreflect.Message {
-	mi := &file_bema_proto_msgTypes[4]
+	mi := &file_bema_proto_msgTypes[7]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -370,7 +555,7 @@ func (x *ListSessionsRequest) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use ListSessionsRequest.ProtoReflect.Descriptor instead.
 func (*ListSessionsRequest) Descriptor() ([]byte, []int) {
-	return file_bema_proto_rawDescGZIP(), []int{4}
+	return file_bema_proto_rawDescGZIP(), []int{7}
 }
 
 type ListSessionsResponse struct {
@@ -382,7 +567,7 @@ type ListSessionsResponse struct {
 
 func (x *ListSessionsResponse) Reset() {
 	*x = ListSessionsResponse{}
-	mi := &file_bema_proto_msgTypes[5]
+	mi := &file_bema_proto_msgTypes[8]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -394,7 +579,7 @@ func (x *ListSessionsResponse) String() string {
 func (*ListSessionsResponse) ProtoMessage() {}
 
 func (x *ListSessionsResponse) ProtoReflect() protoreflect.Message {
-	mi := &file_bema_proto_msgTypes[5]
+	mi := &file_bema_proto_msgTypes[8]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -407,7 +592,7 @@ func (x *ListSessionsResponse) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use ListSessionsResponse.ProtoReflect.Descriptor instead.
 func (*ListSessionsResponse) Descriptor() ([]byte, []int) {
-	return file_bema_proto_rawDescGZIP(), []int{5}
+	return file_bema_proto_rawDescGZIP(), []int{8}
 }
 
 func (x *ListSessionsResponse) GetSessions() []*Session {
@@ -426,7 +611,7 @@ type WatchSessionRequest struct {
 
 func (x *WatchSessionRequest) Reset() {
 	*x = WatchSessionRequest{}
-	mi := &file_bema_proto_msgTypes[6]
+	mi := &file_bema_proto_msgTypes[9]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -438,7 +623,7 @@ func (x *WatchSessionRequest) String() string {
 func (*WatchSessionRequest) ProtoMessage() {}
 
 func (x *WatchSessionRequest) ProtoReflect() protoreflect.Message {
-	mi := &file_bema_proto_msgTypes[6]
+	mi := &file_bema_proto_msgTypes[9]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -451,7 +636,7 @@ func (x *WatchSessionRequest) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use WatchSessionRequest.ProtoReflect.Descriptor instead.
 func (*WatchSessionRequest) Descriptor() ([]byte, []int) {
-	return file_bema_proto_rawDescGZIP(), []int{6}
+	return file_bema_proto_rawDescGZIP(), []int{9}
 }
 
 func (x *WatchSessionRequest) GetId() string {
@@ -471,7 +656,7 @@ type SessionEvent struct {
 
 func (x *SessionEvent) Reset() {
 	*x = SessionEvent{}
-	mi := &file_bema_proto_msgTypes[7]
+	mi := &file_bema_proto_msgTypes[10]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -483,7 +668,7 @@ func (x *SessionEvent) String() string {
 func (*SessionEvent) ProtoMessage() {}
 
 func (x *SessionEvent) ProtoReflect() protoreflect.Message {
-	mi := &file_bema_proto_msgTypes[7]
+	mi := &file_bema_proto_msgTypes[10]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -496,7 +681,7 @@ func (x *SessionEvent) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use SessionEvent.ProtoReflect.Descriptor instead.
 func (*SessionEvent) Descriptor() ([]byte, []int) {
-	return file_bema_proto_rawDescGZIP(), []int{7}
+	return file_bema_proto_rawDescGZIP(), []int{10}
 }
 
 func (x *SessionEvent) GetType() SessionEvent_Type {
@@ -523,7 +708,7 @@ type AppendMessageRequest struct {
 
 func (x *AppendMessageRequest) Reset() {
 	*x = AppendMessageRequest{}
-	mi := &file_bema_proto_msgTypes[8]
+	mi := &file_bema_proto_msgTypes[11]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -535,7 +720,7 @@ func (x *AppendMessageRequest) String() string {
 func (*AppendMessageRequest) ProtoMessage() {}
 
 func (x *AppendMessageRequest) ProtoReflect() protoreflect.Message {
-	mi := &file_bema_proto_msgTypes[8]
+	mi := &file_bema_proto_msgTypes[11]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -548,7 +733,7 @@ func (x *AppendMessageRequest) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use AppendMessageRequest.ProtoReflect.Descriptor instead.
 func (*AppendMessageRequest) Descriptor() ([]byte, []int) {
-	return file_bema_proto_rawDescGZIP(), []int{8}
+	return file_bema_proto_rawDescGZIP(), []int{11}
 }
 
 func (x *AppendMessageRequest) GetId() string {
@@ -579,14 +764,22 @@ const file_bema_proto_rawDesc = "" +
 	"updated_at\x18\x03 \x01(\v2\x1a.google.protobuf.TimestampR\tupdatedAt\x12/\n" +
 	"\x06config\x18\x04 \x01(\v2\x17.google.protobuf.StructR\x06config\x122\n" +
 	"\bmessages\x18\x05 \x03(\v2\x16.bema.v1alpha1.MessageR\bmessages\x12\x16\n" +
-	"\x06status\x18\x06 \x01(\tR\x06status\"\xe5\x01\n" +
+	"\x06status\x18\x06 \x01(\tR\x06status\"\x82\x01\n" +
 	"\aMessage\x12\x12\n" +
-	"\x04role\x18\x01 \x01(\tR\x04role\x12\x18\n" +
-	"\acontent\x18\x02 \x01(\tR\acontent\x126\n" +
-	"\n" +
-	"tool_calls\x18\x03 \x01(\v2\x17.google.protobuf.StructR\ttoolCalls\x12:\n" +
-	"\ftool_outputs\x18\x04 \x01(\v2\x17.google.protobuf.StructR\vtoolOutputs\x128\n" +
-	"\ttimestamp\x18\x05 \x01(\v2\x1a.google.protobuf.TimestampR\ttimestamp\"G\n" +
+	"\x04role\x18\x01 \x01(\tR\x04role\x12)\n" +
+	"\x05parts\x18\x02 \x03(\v2\x13.bema.v1alpha1.PartR\x05parts\x128\n" +
+	"\ttimestamp\x18\x03 \x01(\v2\x1a.google.protobuf.TimestampR\ttimestamp\"\xb8\x01\n" +
+	"\x04Part\x12\x14\n" +
+	"\x04text\x18\x01 \x01(\tH\x00R\x04text\x12B\n" +
+	"\rfunction_call\x18\x02 \x01(\v2\x1b.bema.v1alpha1.FunctionCallH\x00R\ffunctionCall\x12N\n" +
+	"\x11function_response\x18\x03 \x01(\v2\x1f.bema.v1alpha1.FunctionResponseH\x00R\x10functionResponseB\x06\n" +
+	"\x04data\"O\n" +
+	"\fFunctionCall\x12\x12\n" +
+	"\x04name\x18\x01 \x01(\tR\x04name\x12+\n" +
+	"\x04args\x18\x02 \x01(\v2\x17.google.protobuf.StructR\x04args\"[\n" +
+	"\x10FunctionResponse\x12\x12\n" +
+	"\x04name\x18\x01 \x01(\tR\x04name\x123\n" +
+	"\bresponse\x18\x02 \x01(\v2\x17.google.protobuf.StructR\bresponse\"G\n" +
 	"\x14CreateSessionRequest\x12/\n" +
 	"\x06config\x18\x01 \x01(\v2\x17.google.protobuf.StructR\x06config\"#\n" +
 	"\x11GetSessionRequest\x12\x0e\n" +
@@ -627,49 +820,55 @@ func file_bema_proto_rawDescGZIP() []byte {
 }
 
 var file_bema_proto_enumTypes = make([]protoimpl.EnumInfo, 1)
-var file_bema_proto_msgTypes = make([]protoimpl.MessageInfo, 9)
+var file_bema_proto_msgTypes = make([]protoimpl.MessageInfo, 12)
 var file_bema_proto_goTypes = []any{
 	(SessionEvent_Type)(0),        // 0: bema.v1alpha1.SessionEvent.Type
 	(*Session)(nil),               // 1: bema.v1alpha1.Session
 	(*Message)(nil),               // 2: bema.v1alpha1.Message
-	(*CreateSessionRequest)(nil),  // 3: bema.v1alpha1.CreateSessionRequest
-	(*GetSessionRequest)(nil),     // 4: bema.v1alpha1.GetSessionRequest
-	(*ListSessionsRequest)(nil),   // 5: bema.v1alpha1.ListSessionsRequest
-	(*ListSessionsResponse)(nil),  // 6: bema.v1alpha1.ListSessionsResponse
-	(*WatchSessionRequest)(nil),   // 7: bema.v1alpha1.WatchSessionRequest
-	(*SessionEvent)(nil),          // 8: bema.v1alpha1.SessionEvent
-	(*AppendMessageRequest)(nil),  // 9: bema.v1alpha1.AppendMessageRequest
-	(*timestamppb.Timestamp)(nil), // 10: google.protobuf.Timestamp
-	(*structpb.Struct)(nil),       // 11: google.protobuf.Struct
+	(*Part)(nil),                  // 3: bema.v1alpha1.Part
+	(*FunctionCall)(nil),          // 4: bema.v1alpha1.FunctionCall
+	(*FunctionResponse)(nil),      // 5: bema.v1alpha1.FunctionResponse
+	(*CreateSessionRequest)(nil),  // 6: bema.v1alpha1.CreateSessionRequest
+	(*GetSessionRequest)(nil),     // 7: bema.v1alpha1.GetSessionRequest
+	(*ListSessionsRequest)(nil),   // 8: bema.v1alpha1.ListSessionsRequest
+	(*ListSessionsResponse)(nil),  // 9: bema.v1alpha1.ListSessionsResponse
+	(*WatchSessionRequest)(nil),   // 10: bema.v1alpha1.WatchSessionRequest
+	(*SessionEvent)(nil),          // 11: bema.v1alpha1.SessionEvent
+	(*AppendMessageRequest)(nil),  // 12: bema.v1alpha1.AppendMessageRequest
+	(*timestamppb.Timestamp)(nil), // 13: google.protobuf.Timestamp
+	(*structpb.Struct)(nil),       // 14: google.protobuf.Struct
 }
 var file_bema_proto_depIdxs = []int32{
-	10, // 0: bema.v1alpha1.Session.created_at:type_name -> google.protobuf.Timestamp
-	10, // 1: bema.v1alpha1.Session.updated_at:type_name -> google.protobuf.Timestamp
-	11, // 2: bema.v1alpha1.Session.config:type_name -> google.protobuf.Struct
+	13, // 0: bema.v1alpha1.Session.created_at:type_name -> google.protobuf.Timestamp
+	13, // 1: bema.v1alpha1.Session.updated_at:type_name -> google.protobuf.Timestamp
+	14, // 2: bema.v1alpha1.Session.config:type_name -> google.protobuf.Struct
 	2,  // 3: bema.v1alpha1.Session.messages:type_name -> bema.v1alpha1.Message
-	11, // 4: bema.v1alpha1.Message.tool_calls:type_name -> google.protobuf.Struct
-	11, // 5: bema.v1alpha1.Message.tool_outputs:type_name -> google.protobuf.Struct
-	10, // 6: bema.v1alpha1.Message.timestamp:type_name -> google.protobuf.Timestamp
-	11, // 7: bema.v1alpha1.CreateSessionRequest.config:type_name -> google.protobuf.Struct
-	1,  // 8: bema.v1alpha1.ListSessionsResponse.sessions:type_name -> bema.v1alpha1.Session
-	0,  // 9: bema.v1alpha1.SessionEvent.type:type_name -> bema.v1alpha1.SessionEvent.Type
-	1,  // 10: bema.v1alpha1.SessionEvent.session:type_name -> bema.v1alpha1.Session
-	2,  // 11: bema.v1alpha1.AppendMessageRequest.message:type_name -> bema.v1alpha1.Message
-	3,  // 12: bema.v1alpha1.BemaService.CreateSession:input_type -> bema.v1alpha1.CreateSessionRequest
-	4,  // 13: bema.v1alpha1.BemaService.GetSession:input_type -> bema.v1alpha1.GetSessionRequest
-	5,  // 14: bema.v1alpha1.BemaService.ListSessions:input_type -> bema.v1alpha1.ListSessionsRequest
-	7,  // 15: bema.v1alpha1.BemaService.WatchSession:input_type -> bema.v1alpha1.WatchSessionRequest
-	9,  // 16: bema.v1alpha1.BemaService.AppendMessage:input_type -> bema.v1alpha1.AppendMessageRequest
-	1,  // 17: bema.v1alpha1.BemaService.CreateSession:output_type -> bema.v1alpha1.Session
-	1,  // 18: bema.v1alpha1.BemaService.GetSession:output_type -> bema.v1alpha1.Session
-	6,  // 19: bema.v1alpha1.BemaService.ListSessions:output_type -> bema.v1alpha1.ListSessionsResponse
-	8,  // 20: bema.v1alpha1.BemaService.WatchSession:output_type -> bema.v1alpha1.SessionEvent
-	1,  // 21: bema.v1alpha1.BemaService.AppendMessage:output_type -> bema.v1alpha1.Session
-	17, // [17:22] is the sub-list for method output_type
-	12, // [12:17] is the sub-list for method input_type
-	12, // [12:12] is the sub-list for extension type_name
-	12, // [12:12] is the sub-list for extension extendee
-	0,  // [0:12] is the sub-list for field type_name
+	3,  // 4: bema.v1alpha1.Message.parts:type_name -> bema.v1alpha1.Part
+	13, // 5: bema.v1alpha1.Message.timestamp:type_name -> google.protobuf.Timestamp
+	4,  // 6: bema.v1alpha1.Part.function_call:type_name -> bema.v1alpha1.FunctionCall
+	5,  // 7: bema.v1alpha1.Part.function_response:type_name -> bema.v1alpha1.FunctionResponse
+	14, // 8: bema.v1alpha1.FunctionCall.args:type_name -> google.protobuf.Struct
+	14, // 9: bema.v1alpha1.FunctionResponse.response:type_name -> google.protobuf.Struct
+	14, // 10: bema.v1alpha1.CreateSessionRequest.config:type_name -> google.protobuf.Struct
+	1,  // 11: bema.v1alpha1.ListSessionsResponse.sessions:type_name -> bema.v1alpha1.Session
+	0,  // 12: bema.v1alpha1.SessionEvent.type:type_name -> bema.v1alpha1.SessionEvent.Type
+	1,  // 13: bema.v1alpha1.SessionEvent.session:type_name -> bema.v1alpha1.Session
+	2,  // 14: bema.v1alpha1.AppendMessageRequest.message:type_name -> bema.v1alpha1.Message
+	6,  // 15: bema.v1alpha1.BemaService.CreateSession:input_type -> bema.v1alpha1.CreateSessionRequest
+	7,  // 16: bema.v1alpha1.BemaService.GetSession:input_type -> bema.v1alpha1.GetSessionRequest
+	8,  // 17: bema.v1alpha1.BemaService.ListSessions:input_type -> bema.v1alpha1.ListSessionsRequest
+	10, // 18: bema.v1alpha1.BemaService.WatchSession:input_type -> bema.v1alpha1.WatchSessionRequest
+	12, // 19: bema.v1alpha1.BemaService.AppendMessage:input_type -> bema.v1alpha1.AppendMessageRequest
+	1,  // 20: bema.v1alpha1.BemaService.CreateSession:output_type -> bema.v1alpha1.Session
+	1,  // 21: bema.v1alpha1.BemaService.GetSession:output_type -> bema.v1alpha1.Session
+	9,  // 22: bema.v1alpha1.BemaService.ListSessions:output_type -> bema.v1alpha1.ListSessionsResponse
+	11, // 23: bema.v1alpha1.BemaService.WatchSession:output_type -> bema.v1alpha1.SessionEvent
+	1,  // 24: bema.v1alpha1.BemaService.AppendMessage:output_type -> bema.v1alpha1.Session
+	20, // [20:25] is the sub-list for method output_type
+	15, // [15:20] is the sub-list for method input_type
+	15, // [15:15] is the sub-list for extension type_name
+	15, // [15:15] is the sub-list for extension extendee
+	0,  // [0:15] is the sub-list for field type_name
 }
 
 func init() { file_bema_proto_init() }
@@ -677,13 +876,18 @@ func file_bema_proto_init() {
 	if File_bema_proto != nil {
 		return
 	}
+	file_bema_proto_msgTypes[2].OneofWrappers = []any{
+		(*Part_Text)(nil),
+		(*Part_FunctionCall)(nil),
+		(*Part_FunctionResponse)(nil),
+	}
 	type x struct{}
 	out := protoimpl.TypeBuilder{
 		File: protoimpl.DescBuilder{
 			GoPackagePath: reflect.TypeOf(x{}).PkgPath(),
 			RawDescriptor: unsafe.Slice(unsafe.StringData(file_bema_proto_rawDesc), len(file_bema_proto_rawDesc)),
 			NumEnums:      1,
-			NumMessages:   9,
+			NumMessages:   12,
 			NumExtensions: 0,
 			NumServices:   1,
 		},
