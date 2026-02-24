@@ -21,6 +21,7 @@ import (
 	"time"
 
 	pb "github.com/gke-labs/generation-ai/experiments/bema/pkg/api/v1alpha1"
+	"google.golang.org/protobuf/types/known/structpb"
 )
 
 func TestBemaServer(t *testing.T) {
@@ -30,7 +31,7 @@ func TestBemaServer(t *testing.T) {
 	}
 	defer os.RemoveAll(tmpDir)
 
-	s, err := NewBemaServer(tmpDir, nil)
+	s, err := NewBemaServer(tmpDir, nil, nil)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -71,7 +72,7 @@ func TestBemaServer(t *testing.T) {
 	}
 
 	// 4. Persistence test
-	s2, err := NewBemaServer(tmpDir, nil)
+	s2, err := NewBemaServer(tmpDir, nil, nil)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -106,7 +107,7 @@ func TestWatchSession(t *testing.T) {
 	}
 	defer os.RemoveAll(tmpDir)
 
-	s, err := NewBemaServer(tmpDir, nil)
+	s, err := NewBemaServer(tmpDir, nil, nil)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -183,7 +184,7 @@ func TestBackendTriggered(t *testing.T) {
 		},
 	}
 
-	s, err := NewBemaServer(tmpDir, mock)
+	s, err := NewBemaServer(tmpDir, mock, nil)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -214,5 +215,109 @@ func TestBackendTriggered(t *testing.T) {
 	}
 	if sess2.Messages[1].Role != "assistant" {
 		t.Errorf("Expected second message role 'assistant', got '%s'", sess2.Messages[1].Role)
+	}
+}
+
+type mockExecutor struct {
+	triggered chan bool
+	response  *pb.Message
+}
+
+func (m *mockExecutor) Execute(ctx context.Context, sessionID string, message *pb.Message) (*pb.Message, error) {
+	m.triggered <- true
+	return m.response, nil
+}
+
+func TestToolCalling(t *testing.T) {
+	tmpDir, err := os.MkdirTemp("", "bema-tool-test")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer os.RemoveAll(tmpDir)
+
+	backendTriggered := make(chan bool, 2)
+	executorTriggered := make(chan bool, 1)
+
+	toolCalls, _ := structpb.NewStruct(map[string]interface{}{
+		"functionCalls": []interface{}{
+			map[string]interface{}{
+				"name": "exec",
+				"args": map[string]interface{}{
+					"command": "ls",
+				},
+			},
+		},
+	})
+
+	backend := &mockBackend{
+		triggered: backendTriggered,
+		response: &pb.Message{
+			Role:      "assistant",
+			ToolCalls: toolCalls,
+		},
+	}
+
+	toolOutputs, _ := structpb.NewStruct(map[string]interface{}{
+		"functionResponses": []interface{}{
+			map[string]interface{}{
+				"name":   "exec",
+				"output": "file1.txt",
+			},
+		},
+	})
+
+	executor := &mockExecutor{
+		triggered: executorTriggered,
+		response: &pb.Message{
+			Role:        "tool",
+			ToolOutputs: toolOutputs,
+		},
+	}
+
+	s, err := NewBemaServer(tmpDir, backend, executor)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	ctx := context.Background()
+	sess, _ := s.CreateSession(ctx, &pb.CreateSessionRequest{})
+
+	// Change backend response for the second call
+	go func() {
+		<-backendTriggered
+		backend.response = &pb.Message{
+			Role:    "assistant",
+			Content: "Done",
+		}
+	}()
+
+	s.AppendMessage(ctx, &pb.AppendMessageRequest{
+		Id: sess.Id,
+		Message: &pb.Message{
+			Role:    "user",
+			Content: "Run ls",
+		},
+	})
+
+	select {
+	case <-executorTriggered:
+		// success
+	case <-time.After(2 * time.Second):
+		t.Fatal("Executor was not triggered")
+	}
+
+	select {
+	case <-backendTriggered:
+		// second call success
+	case <-time.After(2 * time.Second):
+		t.Fatal("Backend was not triggered second time")
+	}
+
+	// Verify messages
+	time.Sleep(100 * time.Millisecond)
+	sess2, _ := s.GetSession(ctx, &pb.GetSessionRequest{Id: sess.Id})
+	// 1: user, 2: assistant (tool call), 3: tool (output), 4: assistant (final)
+	if len(sess2.Messages) != 4 {
+		t.Errorf("Expected 4 messages, got %d", len(sess2.Messages))
 	}
 }

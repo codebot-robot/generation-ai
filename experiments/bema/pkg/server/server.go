@@ -34,13 +34,14 @@ type BemaServer struct {
 
 	storageDir string
 	backend    Backend
+	executor   Executor
 
 	mu       sync.RWMutex
 	sessions map[string]*pb.Session
 	watchers map[string][]chan *pb.SessionEvent
 }
 
-func NewBemaServer(storageDir string, backend Backend) (*BemaServer, error) {
+func NewBemaServer(storageDir string, backend Backend, executor Executor) (*BemaServer, error) {
 	if err := os.MkdirAll(storageDir, 0755); err != nil {
 		return nil, err
 	}
@@ -48,6 +49,7 @@ func NewBemaServer(storageDir string, backend Backend) (*BemaServer, error) {
 	s := &BemaServer{
 		storageDir: storageDir,
 		backend:    backend,
+		executor:   executor,
 		sessions:   make(map[string]*pb.Session),
 		watchers:   make(map[string][]chan *pb.SessionEvent),
 	}
@@ -177,27 +179,55 @@ func (s *BemaServer) AppendMessage(ctx context.Context, req *pb.AppendMessageReq
 }
 
 func (s *BemaServer) generateBackendResponse(ctx context.Context, sessionID string) {
-	s.mu.RLock()
-	session, ok := s.sessions[sessionID]
-	if !ok {
+	for {
+		s.mu.RLock()
+		session, ok := s.sessions[sessionID]
+		if !ok {
+			s.mu.RUnlock()
+			return
+		}
 		s.mu.RUnlock()
-		return
-	}
-	s.mu.RUnlock()
 
-	resp, err := s.backend.GenerateResponse(ctx, session)
-	if err != nil {
-		klog.ErrorS(err, "failed to generate backend response", "sessionID", sessionID)
-		return
-	}
+		resp, err := s.backend.GenerateResponse(ctx, session)
+		if err != nil {
+			klog.ErrorS(err, "failed to generate backend response", "sessionID", sessionID)
+			return
+		}
 
-	// Append the response
-	_, err = s.AppendMessage(ctx, &pb.AppendMessageRequest{
-		Id:      sessionID,
-		Message: resp,
-	})
-	if err != nil {
-		klog.ErrorS(err, "failed to append backend response", "sessionID", sessionID)
+		// Append the response
+		_, err = s.AppendMessage(ctx, &pb.AppendMessageRequest{
+			Id:      sessionID,
+			Message: resp,
+		})
+		if err != nil {
+			klog.ErrorS(err, "failed to append backend response", "sessionID", sessionID)
+			return
+		}
+
+		// If it's a tool call, execute it and loop
+		if resp.ToolCalls != nil && s.executor != nil {
+			toolResp, err := s.executor.Execute(ctx, sessionID, resp)
+			if err != nil {
+				klog.ErrorS(err, "failed to execute tools", "sessionID", sessionID)
+				return
+			}
+
+			if toolResp != nil {
+				_, err = s.AppendMessage(ctx, &pb.AppendMessageRequest{
+					Id:      sessionID,
+					Message: toolResp,
+				})
+				if err != nil {
+					klog.ErrorS(err, "failed to append tool response", "sessionID", sessionID)
+					return
+				}
+				// Continue loop to let LLM process tool results
+				continue
+			}
+		}
+
+		// If no more tool calls, we are done
+		break
 	}
 }
 
