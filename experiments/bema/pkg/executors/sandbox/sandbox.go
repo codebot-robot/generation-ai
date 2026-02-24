@@ -27,7 +27,7 @@ import (
 	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
 	"k8s.io/apimachinery/pkg/runtime/schema"
 	"k8s.io/client-go/dynamic"
-	"k8s.io/client-go/rest"
+	"sigs.k8s.io/controller-runtime/pkg/client/config"
 )
 
 var (
@@ -44,7 +44,7 @@ type SandboxExecutor struct {
 }
 
 func New(ctx context.Context) (*SandboxExecutor, error) {
-	restConfig, err := rest.InClusterConfig()
+	restConfig, err := config.GetConfig()
 	if err != nil {
 		return nil, fmt.Errorf("failed to get kubernetes config: %v", err)
 	}
