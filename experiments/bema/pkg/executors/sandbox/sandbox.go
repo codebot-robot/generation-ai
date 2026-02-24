@@ -75,7 +75,7 @@ func (e *SandboxExecutor) Execute(ctx context.Context, sessionID string, message
 		return nil, nil
 	}
 
-	var toolOutputs []interface{}
+	var toolOutputs []any
 
 	for _, fcValue := range functionCalls.GetListValue().Values {
 		fc := fcValue.GetStructValue()
@@ -86,7 +86,7 @@ func (e *SandboxExecutor) Execute(ctx context.Context, sessionID string, message
 			command := args.Fields["command"].GetStringValue()
 			output, err := e.executeInSandbox(ctx, sessionID, command)
 
-			result := map[string]interface{}{
+			result := map[string]any{
 				"name":   name,
 				"output": output,
 			}
@@ -95,14 +95,14 @@ func (e *SandboxExecutor) Execute(ctx context.Context, sessionID string, message
 			}
 			toolOutputs = append(toolOutputs, result)
 		} else {
-			toolOutputs = append(toolOutputs, map[string]interface{}{
+			toolOutputs = append(toolOutputs, map[string]any{
 				"name":  name,
 				"error": "unknown tool",
 			})
 		}
 	}
 
-	outputsStruct, err := structpb.NewStruct(map[string]interface{}{
+	outputsStruct, err := structpb.NewStruct(map[string]any{
 		"functionResponses": toolOutputs,
 	})
 	if err != nil {
@@ -120,25 +120,36 @@ func (e *SandboxExecutor) ensureSandbox(ctx context.Context, sessionID string) e
 	name := "bema-" + sessionID
 
 	_, err := e.client.Resource(agentSandboxGVR).Namespace(e.namespace).Get(ctx, name, v1.GetOptions{})
-	if err != nil {
-		// Create it
-		sandbox := &unstructured.Unstructured{
-			Object: map[string]interface{}{
-				"apiVersion": "agentsandbox.sigs.k8s.io/v1alpha1",
-				"kind":       "AgentSandbox",
-				"metadata": map[string]interface{}{
-					"name": name,
-				},
-				"spec": map[string]interface{}{
-					// Default spec
+	if err == nil {
+		return nil
+	}
+
+	// Create it
+	sandbox := &unstructured.Unstructured{
+		Object: map[string]any{
+			"apiVersion": "agentsandbox.sigs.k8s.io/v1alpha1",
+			"kind":       "AgentSandbox",
+			"metadata": map[string]any{
+				"name": name,
+			},
+			"spec": map[string]any{
+				"podTemplate": map[string]any{
+					"spec": map[string]any{
+						"containers": []any{
+							map[string]any{
+								"name":  "sandbox",
+								"image": "debian:latest",
+							},
+						},
+					},
 				},
 			},
-		}
+		},
+	}
 
-		_, err = e.client.Resource(agentSandboxGVR).Namespace(e.namespace).Create(ctx, sandbox, v1.CreateOptions{})
-		if err != nil {
-			return fmt.Errorf("failed to create AgentSandbox: %v", err)
-		}
+	_, err = e.client.Resource(agentSandboxGVR).Namespace(e.namespace).Create(ctx, sandbox, v1.CreateOptions{})
+	if err != nil {
+		return fmt.Errorf("failed to create AgentSandbox: %v", err)
 	}
 
 	// Wait for it to be ready

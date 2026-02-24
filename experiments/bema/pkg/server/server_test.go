@@ -238,11 +238,11 @@ func TestToolCalling(t *testing.T) {
 	backendTriggered := make(chan bool, 2)
 	executorTriggered := make(chan bool, 1)
 
-	toolCalls, _ := structpb.NewStruct(map[string]interface{}{
-		"functionCalls": []interface{}{
-			map[string]interface{}{
+	toolCalls, _ := structpb.NewStruct(map[string]any{
+		"functionCalls": []any{
+			map[string]any{
 				"name": "exec",
-				"args": map[string]interface{}{
+				"args": map[string]any{
 					"command": "ls",
 				},
 			},
@@ -257,9 +257,9 @@ func TestToolCalling(t *testing.T) {
 		},
 	}
 
-	toolOutputs, _ := structpb.NewStruct(map[string]interface{}{
-		"functionResponses": []interface{}{
-			map[string]interface{}{
+	toolOutputs, _ := structpb.NewStruct(map[string]any{
+		"functionResponses": []any{
+			map[string]any{
 				"name":   "exec",
 				"output": "file1.txt",
 			},

@@ -159,14 +159,14 @@ func (b *GeminiBackend) GenerateResponse(ctx context.Context, session *pb.Sessio
 
 	content := ""
 	var toolCalls *structpb.Struct
-	var functionCalls []interface{}
+	var functionCalls []any
 
 	for _, part := range resp.Candidates[0].Content.Parts {
 		if text, ok := part.(genai.Text); ok {
 			content += string(text)
 		}
 		if fc, ok := part.(genai.FunctionCall); ok {
-			functionCalls = append(functionCalls, map[string]interface{}{
+			functionCalls = append(functionCalls, map[string]any{
 				"name": fc.Name,
 				"args": fc.Args,
 			})
@@ -175,7 +175,7 @@ func (b *GeminiBackend) GenerateResponse(ctx context.Context, session *pb.Sessio
 
 	if len(functionCalls) > 0 {
 		var err error
-		toolCalls, err = structpb.NewStruct(map[string]interface{}{
+		toolCalls, err = structpb.NewStruct(map[string]any{
 			"functionCalls": functionCalls,
 		})
 		if err != nil {
