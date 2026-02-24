@@ -14,6 +14,7 @@ This file provides context and instructions for LLM coding agents working on the
 - **Clarity and Documentation**: Code should be well-documented and easy to follow, serving as a reference for users.
 - **Structured Logging**: Use `log := klog.FromContext(ctx)` for structured logging to ensure operational visibility. Always pass context down and use structured fields (e.g., `log.Info("message", "key", value)`) instead of formatted strings.
 - **Testability**: Ensure that implementations are well-tested, including end-to-end tests where appropriate.
+- **Modern Go**: Use `any` instead of `interface{}` in Go code.
 
 ## Development Workflow
 
