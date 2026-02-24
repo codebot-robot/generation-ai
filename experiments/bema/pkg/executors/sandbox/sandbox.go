@@ -32,9 +32,9 @@ import (
 
 var (
 	agentSandboxGVR = schema.GroupVersionResource{
-		Group:    "agentsandbox.sigs.k8s.io",
+		Group:    "agents.x-k8s.io",
 		Version:  "v1alpha1",
-		Resource: "agentsandboxes",
+		Resource: "sandboxes",
 	}
 )
 
@@ -140,8 +140,8 @@ func (e *SandboxExecutor) ensureSandbox(ctx context.Context, sessionID string) e
 	// Create it
 	sandbox := &unstructured.Unstructured{
 		Object: map[string]any{
-			"apiVersion": "agentsandbox.sigs.k8s.io/v1alpha1",
-			"kind":       "AgentSandbox",
+			"apiVersion": "agents.x-k8s.io/v1alpha1",
+			"kind":       "Sandbox",
 			"metadata": map[string]any{
 				"name": name,
 			},
@@ -162,13 +162,13 @@ func (e *SandboxExecutor) ensureSandbox(ctx context.Context, sessionID string) e
 
 	_, err = e.client.Resource(agentSandboxGVR).Namespace(e.namespace).Create(ctx, sandbox, v1.CreateOptions{})
 	if err != nil {
-		return fmt.Errorf("failed to create AgentSandbox: %v", err)
+		return fmt.Errorf("failed to create Sandbox: %v", err)
 	}
 
 	// Wait for it to be ready
 	cmd := exec.CommandContext(ctx, "kubectl", "wait", "--for=condition=Ready", "sandbox", "-n", e.namespace, name, "--timeout=60s")
 	if output, err := cmd.CombinedOutput(); err != nil {
-		return fmt.Errorf("failed to wait for AgentSandbox readiness: %v: %s", err, string(output))
+		return fmt.Errorf("failed to wait for Sandbox readiness: %v: %s", err, string(output))
 	}
 
 	return nil
@@ -182,7 +182,7 @@ func (e *SandboxExecutor) executeInSandbox(ctx context.Context, sessionID string
 	name := "bema-" + sessionID
 
 	// We use kubectl exec.
-	// Since we are using AgentSandbox, we should try to exec into the pod created by it.
+	// Since we are using Sandbox, we should try to exec into the pod created by it.
 	// We'll assume for now that the pod has the same name or we can find it by label.
 
 	cmd := exec.CommandContext(ctx, "kubectl", "exec", "-n", e.namespace, name, "--", "sh", "-c", command)
