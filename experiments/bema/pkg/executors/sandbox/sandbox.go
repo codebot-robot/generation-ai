@@ -150,8 +150,9 @@ func (e *SandboxExecutor) ensureSandbox(ctx context.Context, sessionID string) e
 					"spec": map[string]any{
 						"containers": []any{
 							map[string]any{
-								"name":  "sandbox",
-								"image": "debian:latest",
+								"name":    "sandbox",
+								"image":   "debian:latest",
+								"command": []string{"sleep", "infinity"},
 							},
 						},
 					},
