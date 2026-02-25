@@ -53,7 +53,7 @@ func TestE2E(t *testing.T) {
 		t.Fatalf("Failed to read modelstore manifest: %v", err)
 	}
 	msManifest := string(msb)
-	msManifest = strings.ReplaceAll(msManifest, "image: MODELSTORE_IMAGE_PLACEHOLDER", "image: modelstore:e2e\n          imagePullPolicy: Never")
+	msManifest = strings.ReplaceAll(msManifest, "image: modelstore:latest", "image: modelstore:e2e\n          imagePullPolicy: Never")
 
 	// Deploy modelstore
 	h.DeleteStatefulSet("modelstore")
@@ -71,7 +71,7 @@ func TestE2E(t *testing.T) {
 		}
 		manifest := string(b)
 		manifest = strings.ReplaceAll(manifest, "name: inference-test", "name: inference-test-single")
-		manifest = strings.ReplaceAll(manifest, "image: IMAGE_PLACEHOLDER", "image: inference-test:e2e\n        imagePullPolicy: Never")
+		manifest = strings.ReplaceAll(manifest, "image: inference-test:latest", "image: inference-test:e2e\n        imagePullPolicy: Never")
 
 		// Remove GPU requirement for CPU test
 		manifest = strings.ReplaceAll(manifest, "nvidia.com/gpu: 1", "cpu: \"500m\"")
@@ -104,7 +104,7 @@ func TestE2E(t *testing.T) {
 			return
 		}
 		manifest := string(b)
-		manifest = strings.ReplaceAll(manifest, "image: IMAGE_PLACEHOLDER", "image: inference-test:e2e\n        imagePullPolicy: Never")
+		manifest = strings.ReplaceAll(manifest, "image: inference-test:latest", "image: inference-test:e2e\n        imagePullPolicy: Never")
 
 		// Tweak for CPU
 		manifest = strings.ReplaceAll(manifest, "nvidia.com/gpu: 1", "cpu: \"500m\"")
