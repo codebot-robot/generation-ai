@@ -65,8 +65,8 @@ def main():
     with open(manifest_path, 'r') as f:
         manifest_content = f.read()
     
-    manifest_content = manifest_content.replace("SERVER_IMAGE_PLACEHOLDER", server_image)
-    manifest_content = manifest_content.replace("CLIENT_IMAGE_PLACEHOLDER", client_image)
+    manifest_content = manifest_content.replace("finetuning-server:latest", server_image)
+    manifest_content = manifest_content.replace("finetuning-client:latest", client_image)
     
     # Write to temp file
     temp_manifest = f"/tmp/finetuning-{timestamp}.yaml"
