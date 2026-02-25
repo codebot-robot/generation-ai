@@ -46,7 +46,7 @@ func TestE2E(t *testing.T) {
 		t.Fatalf("Failed to read manifest: %v", err)
 	}
 	manifest := string(b)
-	manifest = strings.ReplaceAll(manifest, "image: BEMA_IMAGE_PLACEHOLDER", "image: bema:e2e\n          imagePullPolicy: Never")
+	manifest = strings.ReplaceAll(manifest, "image: bema:latest", "image: bema:e2e\n          imagePullPolicy: Never")
 
 	// Apply manifests
 	h.DeleteService("bema")

@@ -40,7 +40,7 @@ spec:
     spec:
       containers:
       - name: server
-        image: SERVER_IMAGE_PLACEHOLDER
+        image: finetuning-server:latest
         ports:
         - containerPort: 50051
         resources:
@@ -60,7 +60,7 @@ spec:
     spec:
       containers:
       - name: client
-        image: CLIENT_IMAGE_PLACEHOLDER
+        image: finetuning-client:latest
         args: ["--host", "finetuning-server:50051", "--max_steps", "5"]
       restartPolicy: Never
   backoffLimit: 0

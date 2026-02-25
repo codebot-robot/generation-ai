@@ -69,7 +69,7 @@ spec:
       serviceAccountName: modelstore
       containers:
         - name: modelstore
-          image: MODELSTORE_IMAGE_PLACEHOLDER
+          image: modelstore:latest
           ports:
             - containerPort: 8080
           volumeMounts:

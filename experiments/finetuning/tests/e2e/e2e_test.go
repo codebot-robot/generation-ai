@@ -51,7 +51,7 @@ func TestE2E(t *testing.T) {
 		t.Fatalf("Failed to read modelstore manifest: %v", err)
 	}
 	msManifest := string(msb)
-	msManifest = strings.ReplaceAll(msManifest, "image: MODELSTORE_IMAGE_PLACEHOLDER", "image: modelstore:e2e\n          imagePullPolicy: Never")
+	msManifest = strings.ReplaceAll(msManifest, "image: modelstore:latest", "image: modelstore:e2e\n          imagePullPolicy: Never")
 
 	// Read manifest and replace placeholders
 	manifestPath := filepath.Join(experimentRoot, "k8s/manifest.yaml")
@@ -60,8 +60,8 @@ func TestE2E(t *testing.T) {
 		t.Fatalf("Failed to read manifest: %v", err)
 	}
 	manifest := string(b)
-	manifest = strings.ReplaceAll(manifest, "image: SERVER_IMAGE_PLACEHOLDER", "image: finetuning-server:e2e\n        imagePullPolicy: Never")
-	manifest = strings.ReplaceAll(manifest, "image: CLIENT_IMAGE_PLACEHOLDER", "image: finetuning-client:e2e\n        imagePullPolicy: Never")
+	manifest = strings.ReplaceAll(manifest, "image: finetuning-server:latest", "image: finetuning-server:e2e\n        imagePullPolicy: Never")
+	manifest = strings.ReplaceAll(manifest, "image: finetuning-client:latest", "image: finetuning-client:e2e\n        imagePullPolicy: Never")
 
 	// Add HF_ENDPOINT to server
 	envVar := `        env:

@@ -23,7 +23,7 @@ spec:
       subdomain: inference-test-headless
       containers:
       - name: inference-test
-        image: IMAGE_PLACEHOLDER
+        image: inference-test:latest
         env:
         - name: HF_ENDPOINT
           value: http://modelstore
