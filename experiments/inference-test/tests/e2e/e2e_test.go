@@ -32,12 +32,34 @@ func TestE2E(t *testing.T) {
 
 	gitRoot := h.GetGitRoot()
 	experimentRoot := filepath.Join(gitRoot, "experiments/inference-test")
+	modelstoreRoot := filepath.Join(gitRoot, "modelstore")
 
-	// Build image
+	// Build images
 	h.DockerBuild("inference-test:e2e", filepath.Join(experimentRoot, "images/inference-test/Dockerfile"), experimentRoot)
+	h.DockerBuild("modelstore:e2e", filepath.Join(modelstoreRoot, "images/modelstore/Dockerfile"), modelstoreRoot)
 
-	// Load image into Kind
+	// Load images into Kind
 	h.KindLoad("inference-test:e2e")
+	h.KindLoad("modelstore:e2e")
+
+	// Apply Modelstore CRD
+	crdPath := filepath.Join(modelstoreRoot, "k8s/crds/generationai.labs.gke.io_models.yaml")
+	h.RunCommand("kubectl", "apply", "-f", crdPath)
+
+	// Read modelstore manifest
+	msManifestPath := filepath.Join(modelstoreRoot, "k8s/manifest.yaml")
+	msb, err := os.ReadFile(msManifestPath)
+	if err != nil {
+		t.Fatalf("Failed to read modelstore manifest: %v", err)
+	}
+	msManifest := string(msb)
+	msManifest = strings.ReplaceAll(msManifest, "image: MODELSTORE_IMAGE_PLACEHOLDER", "image: modelstore:e2e\n          imagePullPolicy: Never")
+
+	// Deploy modelstore
+	h.DeleteStatefulSet("modelstore")
+	h.DeleteService("modelstore")
+	h.KubectlApplyContent("modelstore", msManifest)
+	h.WaitForStatefulSet("modelstore", 2*time.Minute)
 
 	// 1. Run Single-node CPU Test
 	t.Run("SingleNodeCPU", func(t *testing.T) {
