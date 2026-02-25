@@ -41,7 +41,7 @@ spec:
     spec:
       containers:
         - name: bema
-          image: BEMA_IMAGE_PLACEHOLDER
+          image: bema:latest
           ports:
             - containerPort: 50051
           volumeMounts:
