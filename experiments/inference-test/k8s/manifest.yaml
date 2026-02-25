@@ -8,6 +8,9 @@ spec:
       containers:
       - name: inference-test
         image: IMAGE_PLACEHOLDER
+        env:
+        - name: HF_ENDPOINT
+          value: http://modelstore
         resources:
           limits:
             nvidia.com/gpu: 1
