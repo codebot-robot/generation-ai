@@ -16,6 +16,7 @@ package proxy
 
 import (
 	"bytes"
+	"compress/gzip"
 	"encoding/json"
 	"fmt"
 	"io"
@@ -187,5 +188,90 @@ func TestBlobAndModelAPI(t *testing.T) {
 	}
 	if list.Items[0].Name != "test-model" {
 		t.Errorf("Expected model name 'test-model', got '%s'", list.Items[0].Name)
+	}
+}
+
+func TestProxyCompression(t *testing.T) {
+	// Create a temporary cache directory
+	cacheDir, err := os.MkdirTemp("", "modelstore-test-compression-*")
+	if err != nil {
+		t.Fatalf("Failed to create temp dir: %v", err)
+	}
+	defer os.RemoveAll(cacheDir)
+
+	uncompressedContent := "this is some content that will be gzipped"
+	var buf bytes.Buffer
+	zw := gzip.NewWriter(&buf)
+	if _, err := zw.Write([]byte(uncompressedContent)); err != nil {
+		t.Fatal(err)
+	}
+	if err := zw.Close(); err != nil {
+		t.Fatal(err)
+	}
+	compressedContent := buf.Bytes()
+
+	// Create a mock upstream server that serves gzipped content
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path == "/gzipped-file" {
+			w.Header().Set("Content-Encoding", "gzip")
+			w.Header().Set("Content-Type", "text/plain")
+			w.WriteHeader(http.StatusOK)
+			w.Write(compressedContent)
+			return
+		}
+		http.NotFound(w, r)
+	}))
+	defer upstream.Close()
+
+	p, err := NewProxy(upstream.URL, cacheDir, nil)
+	if err != nil {
+		t.Fatalf("Failed to create proxy: %v", err)
+	}
+
+	// First request - should fetch from upstream and cache
+	// We send Accept-Encoding: gzip to simulate a typical client
+	req := httptest.NewRequest(http.MethodGet, "/gzipped-file", nil)
+	req.Header.Set("Accept-Encoding", "gzip")
+	w := httptest.NewRecorder()
+	p.ServeHTTP(w, req)
+
+	resp := w.Result()
+	if resp.Header.Get("Content-Encoding") == "gzip" {
+		// If it's gzipped, we need to decompress it to check content
+		zr, err := gzip.NewReader(resp.Body)
+		if err != nil {
+			t.Fatalf("Failed to create gzip reader: %v", err)
+		}
+		body, _ := io.ReadAll(zr)
+		if string(body) != uncompressedContent {
+			t.Errorf("Expected '%s', got '%s'", uncompressedContent, string(body))
+		}
+	} else {
+		body, _ := io.ReadAll(resp.Body)
+		if string(body) != uncompressedContent {
+			t.Errorf("Expected '%s', got '%s'", uncompressedContent, string(body))
+		}
+	}
+
+	// Second request - should serve from cache
+	// Upstream is closed to ensure cache is used
+	upstream.Close()
+
+	req2 := httptest.NewRequest(http.MethodGet, "/gzipped-file", nil)
+	// We DON'T send Accept-Encoding: gzip this time, or even if we do,
+	// if we stored gzipped bytes without Content-Encoding header in cache,
+	// http.ServeFile will serve them as-is without Content-Encoding.
+	w2 := httptest.NewRecorder()
+	p.ServeHTTP(w2, req2)
+
+	resp2 := w2.Result()
+	body2, _ := io.ReadAll(resp2.Body)
+
+	if string(body2) == string(compressedContent) && resp2.Header.Get("Content-Encoding") == "" {
+		t.Errorf("Proxy served compressed content from cache without Content-Encoding header")
+	}
+
+	if string(body2) != uncompressedContent && resp2.Header.Get("Content-Encoding") != "gzip" {
+		t.Errorf("Proxy failed to serve uncompressed content or gzipped content with correct header. Got length %d, expected %d", len(body2), len(uncompressedContent))
 	}
 }

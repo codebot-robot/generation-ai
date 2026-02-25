@@ -331,6 +331,7 @@ func (p *Proxy) fetchAndStore(w http.ResponseWriter, r *http.Request, cachePath 
 	// Don't pass through some headers that might interfere with caching or range requests if we don't support them fully
 	req.Header.Del("If-None-Match")
 	req.Header.Del("If-Modified-Since")
+	req.Header.Del("Accept-Encoding")
 
 	resp, err := http.DefaultClient.Do(req)
 	if err != nil {
