@@ -15,6 +15,7 @@
 package e2e
 
 import (
+	"fmt"
 	"os"
 	"path/filepath"
 	"strings"
@@ -125,12 +126,15 @@ func TestE2E(t *testing.T) {
 
 	// Check logs (always, even on failure)
 	msLogs := h.GetPodLogs("app=modelstore")
+	fmt.Fprintf(os.Stderr, "Modelstore logs:\n%s\n", msLogs)
 	t.Logf("Modelstore logs:\n%s", msLogs)
 
 	logs := h.GetPodLogs("app=finetuning-server")
+	fmt.Fprintf(os.Stderr, "Server logs:\n%s\n", logs)
 	t.Logf("Server logs:\n%s", logs)
 
 	clientLogs := h.GetPodLogs("batch.kubernetes.io/job-name=finetuning-client")
+	fmt.Fprintf(os.Stderr, "Client logs:\n%s\n", clientLogs)
 	t.Logf("Client logs:\n%s", clientLogs)
 
 	if err != nil {
