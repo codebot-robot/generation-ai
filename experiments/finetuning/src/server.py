@@ -39,15 +39,24 @@ def calculate_sha256(file_path):
     return sha256_hash.hexdigest()
 
 def download_from_modelstore(model_id, modelstore_url, local_dir, log_queue):
-    """Downloads model files from modelstore."""
-    log_queue.put(f"Downloading model {model_id} from {modelstore_url} to {local_dir}...")
+    """Downloads model files from modelstore. Returns True if successful."""
+    log_queue.put(f"Checking for model {model_id} in modelstore at {modelstore_url}...")
+    
+    # Get model metadata
+    try:
+        resp = requests.get(f"{modelstore_url}/models/{model_id}", timeout=10)
+        if resp.status_code == 404:
+            log_queue.put(f"Model {model_id} not found in modelstore.")
+            return False
+        resp.raise_for_status()
+    except Exception as e:
+        log_queue.put(f"Error connecting to modelstore: {e}")
+        return False
+
+    model_data = resp.json()
+    log_queue.put(f"Downloading model {model_id} to {local_dir}...")
     local_path = Path(local_dir)
     local_path.mkdir(parents=True, exist_ok=True)
-
-    # Get model metadata
-    resp = requests.get(f"{modelstore_url}/models/{model_id}")
-    resp.raise_for_status()
-    model_data = resp.json()
 
     for file_info in model_data["spec"]["files"]:
         rel_path = file_info["path"]
@@ -66,6 +75,7 @@ def download_from_modelstore(model_id, modelstore_url, local_dir, log_queue):
                     f.write(chunk)
     
     log_queue.put("Download complete.")
+    return True
 
 def push_to_modelstore(model_dir, model_id, log_queue, modelstore_url=os.getenv("MODELSTORE_URL", "http://modelstore")):
     log_queue.put(f"Pushing fine-tuned model to modelstore at {modelstore_url}...")
@@ -156,11 +166,13 @@ class FinetuningService(finetuning_pb2_grpc.FinetuningServiceServicer):
         def run_training():
             try:
                 model_id = request.model_id
-                modelstore_url = os.environ.get("HF_ENDPOINT")
+                modelstore_url = os.environ.get("MODELSTORE_URL", "http://modelstore")
                 if modelstore_url:
                     local_model_dir = f"/tmp/models/{model_id}"
-                    download_from_modelstore(model_id, modelstore_url, local_model_dir, log_queue)
-                    model_id = local_model_dir
+                    if download_from_modelstore(model_id, modelstore_url, local_model_dir, log_queue):
+                        model_id = local_model_dir
+                    else:
+                        log_queue.put(f"Will attempt to load {model_id} from Hugging Face Hub (or local cache).")
 
                 # Load model and tokenizer
                 log_queue.put(f"Loading tokenizer for {model_id}...")

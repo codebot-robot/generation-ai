@@ -31,15 +31,24 @@ from torch.distributed.fsdp.wrap import (
 )
 
 def download_from_modelstore(model_id, modelstore_url, local_dir):
-    """Downloads model files from modelstore."""
-    print(f"Downloading model {model_id} from {modelstore_url} to {local_dir}...")
+    """Downloads model files from modelstore. Returns True if successful."""
+    print(f"Checking for model {model_id} in modelstore at {modelstore_url}...")
+    
+    # Get model metadata
+    try:
+        resp = requests.get(f"{modelstore_url}/models/{model_id}", timeout=10)
+        if resp.status_code == 404:
+            print(f"Model {model_id} not found in modelstore.")
+            return False
+        resp.raise_for_status()
+    except Exception as e:
+        print(f"Error connecting to modelstore: {e}")
+        return False
+
+    model_data = resp.json()
+    print(f"Downloading model {model_id} to {local_dir}...")
     local_path = Path(local_dir)
     local_path.mkdir(parents=True, exist_ok=True)
-
-    # Get model metadata
-    resp = requests.get(f"{modelstore_url}/models/{model_id}")
-    resp.raise_for_status()
-    model_data = resp.json()
 
     for file_info in model_data["spec"]["files"]:
         rel_path = file_info["path"]
@@ -58,6 +67,7 @@ def download_from_modelstore(model_id, modelstore_url, local_dir):
                     f.write(chunk)
     
     print("Download complete.")
+    return True
 
 def print_diagnostics():
     rank = int(os.environ.get("RANK", 0))
@@ -110,18 +120,27 @@ def main():
     print_diagnostics()
 
     model_id = args.model
-    modelstore_url = os.environ.get("HF_ENDPOINT")
+    modelstore_url = os.getenv("MODELSTORE_URL", "http://modelstore")
     
     if modelstore_url:
         # Use a local directory to download the model
         local_model_dir = f"/tmp/models/{model_id}"
+        success = False
         if rank == 0:
-            download_from_modelstore(model_id, modelstore_url, local_model_dir)
+            success = download_from_modelstore(model_id, modelstore_url, local_model_dir)
         
         if dist.is_initialized():
+            # Broadcast success to other ranks
+            device = torch.device(f"cuda:{local_rank}") if torch.cuda.is_available() else torch.device("cpu")
+            success_tensor = torch.tensor(1 if success else 0, device=device)
+            dist.broadcast(success_tensor, src=0)
+            success = success_tensor.item() == 1
             dist.barrier()
         
-        model_id = local_model_dir
+        if success:
+            model_id = local_model_dir
+        else:
+            print(f"[Rank {rank}] Will attempt to load {model_id} from Hugging Face Hub (or local cache).")
 
     print(f"[Rank {rank}] Loading model: {model_id}")
 

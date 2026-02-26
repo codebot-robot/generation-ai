@@ -64,9 +64,9 @@ func TestE2E(t *testing.T) {
 	manifest = strings.ReplaceAll(manifest, "image: finetuning-client:latest", "image: finetuning-client:e2e\n        imagePullPolicy: Never")
 	manifest = strings.ReplaceAll(manifest, "--max_steps\", \"5\"", "--max_steps\", \"5\", \"--model_id\", \"qwen2.5-0.5b-instruct\"")
 
-	// Add HF_ENDPOINT to server
+	// Add MODELSTORE_URL to server
 	envVar := `        env:
-        - name: HF_ENDPOINT
+        - name: MODELSTORE_URL
           value: http://modelstore`
 	manifest = strings.ReplaceAll(manifest, "- name: server", "- name: server\n"+envVar)
 
