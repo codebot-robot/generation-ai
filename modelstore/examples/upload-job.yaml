@@ -15,7 +15,7 @@
 apiVersion: batch/v1
 kind: Job
 metadata:
-  name: qwen2.5-0.5b-instruct-upload
+  name: qwen2.5-0.5b-instruct
 spec:
   template:
     spec:

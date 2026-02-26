@@ -62,6 +62,7 @@ func TestE2E(t *testing.T) {
 	manifest := string(b)
 	manifest = strings.ReplaceAll(manifest, "image: finetuning-server:latest", "image: finetuning-server:e2e\n        imagePullPolicy: Never")
 	manifest = strings.ReplaceAll(manifest, "image: finetuning-client:latest", "image: finetuning-client:e2e\n        imagePullPolicy: Never")
+	manifest = strings.ReplaceAll(manifest, "--max_steps\", \"5\"", "--max_steps\", \"5\", \"--model_id\", \"qwen2.5-0.5b-instruct\"")
 
 	// Add HF_ENDPOINT to server
 	envVar := `        env:
@@ -82,56 +83,35 @@ func TestE2E(t *testing.T) {
 	h.DeleteStatefulSet("modelstore")
 	h.DeleteService("modelstore")
 
+	// Apply modelstore CRD
+	crdPath := filepath.Join(modelstoreRoot, "k8s/crds/generationai.labs.gke.io_models.yaml")
+	crdb, err := os.ReadFile(crdPath)
+	if err != nil {
+		t.Fatalf("Failed to read modelstore CRD: %v", err)
+	}
+	h.KubectlApplyContent("modelstore-crd", string(crdb))
+
 	h.KubectlApplyContent("modelstore", msManifest)
 
 	// Wait for modelstore
 	h.WaitForStatefulSet("modelstore", 2*time.Minute)
 
 	// Upload the model to modelstore
-	uploadJob := `
-apiVersion: batch/v1
-kind: Job
-metadata:
-  name: model-upload
-spec:
-  template:
-    spec:
-      volumes:
-        - name: model-data
-          emptyDir: {}
-      initContainers:
-        - name: download
-          image: python:3.11-slim
-          command: ["bash", "-c"]
-          args:
-            - |
-              pip install huggingface_hub
-              python -c "from huggingface_hub import snapshot_download; snapshot_download(repo_id='facebook/opt-125m', local_dir='/data/opt-125m')"
-          volumeMounts:
-            - name: model-data
-              mountPath: /data
-      containers:
-        - name: upload
-          image: modelstore:e2e
-          imagePullPolicy: Never
-          command: ["/modelstore"]
-          args:
-            - "upload"
-            - "--modelstore-url=http://modelstore"
-            - "--model-name=facebook-opt-125m"
-            - "--model-dir=/data/opt-125m"
-          volumeMounts:
-            - name: model-data
-              mountPath: /data
-      restartPolicy: OnFailure
-`
-	h.DeleteJob("model-upload")
+	uploadJobPath := filepath.Join(modelstoreRoot, "examples/upload-job.yaml")
+	ujb, err := os.ReadFile(uploadJobPath)
+	if err != nil {
+		t.Fatalf("Failed to read upload job: %v", err)
+	}
+	uploadJob := string(ujb)
+	uploadJob = strings.ReplaceAll(uploadJob, "image: modelstore:latest", "image: modelstore:e2e\n          imagePullPolicy: Never")
+
+	h.DeleteJob("qwen2.5-0.5b-instruct")
 	h.KubectlApplyContent("model-upload", uploadJob)
 
 	// Wait for upload job
-	err = h.WaitForJobSuccess("model-upload", 10*time.Minute) // Might take time to download
+	err = h.WaitForJobSuccess("qwen2.5-0.5b-instruct", 10*time.Minute) // Might take time to download
 	if err != nil {
-		t.Logf("Model upload logs:\n%s", h.GetPodLogs("batch.kubernetes.io/job-name=model-upload"))
+		t.Logf("Model upload logs:\n%s", h.GetPodLogs("batch.kubernetes.io/job-name=qwen2.5-0.5b-instruct"))
 		t.Fatalf("Model upload job failed: %v", err)
 	}
 
