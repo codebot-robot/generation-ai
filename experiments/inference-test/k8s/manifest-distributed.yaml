@@ -25,7 +25,7 @@ spec:
       - name: inference-test
         image: inference-test:latest
         env:
-        - name: HF_ENDPOINT
+        - name: MODELSTORE_URL
           value: http://modelstore
         resources:
           limits:
