@@ -73,9 +73,9 @@ func TestE2E(t *testing.T) {
 
 	// Reduce resource requirements for E2E
 	manifest = strings.ReplaceAll(manifest, "cpu: \"2\"", "cpu: \"500m\"")
-	manifest = strings.ReplaceAll(manifest, "memory: \"8Gi\"", "memory: \"2Gi\"")
+	manifest = strings.ReplaceAll(manifest, "memory: \"8Gi\"", "memory: \"4Gi\"")
 	manifest = strings.ReplaceAll(manifest, "cpu: \"4\"", "cpu: \"1\"")
-	manifest = strings.ReplaceAll(manifest, "memory: \"16Gi\"", "memory: \"4Gi\"")
+	manifest = strings.ReplaceAll(manifest, "memory: \"16Gi\"", "memory: \"8Gi\"")
 
 	// Apply manifests
 	h.DeleteJob("finetuning-client")
