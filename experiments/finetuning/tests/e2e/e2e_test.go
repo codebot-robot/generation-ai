@@ -95,7 +95,12 @@ func TestE2E(t *testing.T) {
 	h.KubectlApplyContent("modelstore", msManifest)
 
 	// Wait for modelstore
-	h.WaitForStatefulSet("modelstore", 2*time.Minute)
+	if err := h.WaitForStatefulSet("modelstore", 2*time.Minute); err != nil {
+		fmt.Fprintf(os.Stderr, "Modelstore failed to start: %v\n", err)
+		fmt.Fprintf(os.Stderr, "Modelstore Pod YAML:\n%s\n", h.GetPodYaml("app=modelstore"))
+		fmt.Fprintf(os.Stderr, "Events:\n%s\n", h.GetEvents())
+		t.Fatalf("Modelstore failed to start: %v", err)
+	}
 
 	// Upload the model to modelstore
 	uploadJobPath := filepath.Join(modelstoreRoot, "examples/upload-job.yaml")
@@ -119,7 +124,12 @@ func TestE2E(t *testing.T) {
 	h.KubectlApplyContent("finetuning", manifest)
 
 	// Wait for server
-	h.WaitForDeployment("finetuning-server", 5*time.Minute)
+	if err := h.WaitForDeployment("finetuning-server", 5*time.Minute); err != nil {
+		fmt.Fprintf(os.Stderr, "Finetuning server failed to start: %v\n", err)
+		fmt.Fprintf(os.Stderr, "Finetuning server Pod YAML:\n%s\n", h.GetPodYaml("app=finetuning-server"))
+		fmt.Fprintf(os.Stderr, "Events:\n%s\n", h.GetEvents())
+		t.Fatalf("Finetuning server failed to start: %v", err)
+	}
 
 	// Wait for client job
 	err = h.WaitForJobSuccess("finetuning-client", 10*time.Minute)
