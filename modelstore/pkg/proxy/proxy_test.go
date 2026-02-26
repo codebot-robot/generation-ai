@@ -140,4 +140,57 @@ func TestBlobAndModelAPI(t *testing.T) {
 	if list.Items[0].Name != "test-model" {
 		t.Errorf("Expected model name 'test-model', got '%s'", list.Items[0].Name)
 	}
+
+	// 4. Test HF Metadata API
+	req = httptest.NewRequest(http.MethodGet, "/api/models/test-model", nil)
+	w = httptest.NewRecorder()
+	p.ServeHTTP(w, req)
+	if w.Code != http.StatusOK {
+		t.Errorf("Expected HF metadata status 200, got %d", w.Code)
+	}
+	var metadata map[string]any
+	json.NewDecoder(w.Body).Decode(&metadata)
+	if metadata["modelId"] != "test-model" {
+		t.Errorf("Expected modelId 'test-model', got '%v'", metadata["modelId"])
+	}
+
+	// 5. Test HF Download API
+	req = httptest.NewRequest(http.MethodGet, "/test-model/resolve/main/weights.bin", nil)
+	w = httptest.NewRecorder()
+	p.ServeHTTP(w, req)
+	if w.Code != http.StatusOK {
+		t.Errorf("Expected HF download status 200, got %d", w.Code)
+	}
+	if w.Body.String() != content {
+		t.Errorf("Expected '%s', got '%s'", content, w.Body.String())
+	}
+
+	// 6. Test HF API with slashes
+	slashModel := v1alpha1.Model{
+		ObjectMeta: metav1.ObjectMeta{
+			Name: "user-repo",
+		},
+		Spec: v1alpha1.ModelSpec{
+			Files: []v1alpha1.File{
+				{Path: "config.json", SHA256: sha},
+			},
+		},
+	}
+	modelJSON, _ = json.Marshal(slashModel)
+	req = httptest.NewRequest(http.MethodPost, "/models", bytes.NewReader(modelJSON))
+	p.ServeHTTP(httptest.NewRecorder(), req)
+
+	req = httptest.NewRequest(http.MethodGet, "/api/models/user/repo", nil)
+	w = httptest.NewRecorder()
+	p.ServeHTTP(w, req)
+	if w.Code != http.StatusOK {
+		t.Errorf("Expected HF metadata status 200 for user/repo, got %d", w.Code)
+	}
+
+	req = httptest.NewRequest(http.MethodGet, "/user/repo/resolve/main/config.json", nil)
+	w = httptest.NewRecorder()
+	p.ServeHTTP(w, req)
+	if w.Code != http.StatusOK {
+		t.Errorf("Expected HF download status 200 for user/repo, got %d", w.Code)
+	}
 }

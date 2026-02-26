@@ -15,7 +15,7 @@
 apiVersion: batch/v1
 kind: Job
 metadata:
-  name: gpt2-upload
+  name: qwen2.5-0.5b-instruct-upload
 spec:
   template:
     spec:
@@ -29,7 +29,7 @@ spec:
           args:
             - |
               pip install huggingface_hub
-              python -c "from huggingface_hub import snapshot_download; snapshot_download(repo_id='gpt2', local_dir='/data/gpt2')"
+              python -c "from huggingface_hub import snapshot_download; snapshot_download(repo_id='Qwen/Qwen2.5-0.5B-Instruct', local_dir='/data/qwen2.5-0.5b-instruct')"
           volumeMounts:
             - name: model-data
               mountPath: /data
@@ -40,8 +40,8 @@ spec:
           args:
             - "upload"
             - "--modelstore-url=http://modelstore"
-            - "--model-name=gpt2"
-            - "--model-dir=/data/gpt2"
+            - "--model-name=qwen2.5-0.5b-instruct"
+            - "--model-dir=/data/qwen2.5-0.5b-instruct"
           volumeMounts:
             - name: model-data
               mountPath: /data

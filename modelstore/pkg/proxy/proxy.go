@@ -27,6 +27,7 @@ import (
 	"sync"
 
 	"github.com/gke-labs/generation-ai/modelstore/apis/v1alpha1"
+	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/klog/v2"
 	"sigs.k8s.io/controller-runtime/pkg/client"
@@ -79,6 +80,16 @@ func (p *Proxy) serve(w http.ResponseWriter, r *http.Request) error {
 		}
 	}
 
+	// Handle HF metadata API: /api/models/{model_id}
+	if strings.HasPrefix(r.URL.Path, "/api/models/") {
+		return p.handleHFMetadata(w, r)
+	}
+
+	// Handle HF download API: /{model_id}/resolve/{revision}/{path}
+	if strings.Contains(r.URL.Path, "/resolve/") {
+		return p.handleHFDownload(w, r)
+	}
+
 	// For legacy compatibility or direct access to cached files by path
 	if r.Method == http.MethodGet {
 		cachePath := filepath.Join(p.cacheDir, r.URL.Path)
@@ -89,6 +100,89 @@ func (p *Proxy) serve(w http.ResponseWriter, r *http.Request) error {
 	}
 
 	http.NotFound(w, r)
+	return nil
+}
+
+func (p *Proxy) handleHFMetadata(w http.ResponseWriter, r *http.Request) error {
+	ctx := r.Context()
+	repoID := strings.TrimPrefix(r.URL.Path, "/api/models/")
+	modelName := strings.ReplaceAll(repoID, "/", "-")
+
+	var model v1alpha1.Model
+	if err := p.kube.Get(ctx, client.ObjectKey{Name: modelName}, &model); err != nil {
+		if apierrors.IsNotFound(err) {
+			http.NotFound(w, r)
+			return nil
+		}
+		return fmt.Errorf("failed to get model %s: %w", modelName, err)
+	}
+
+	// Return a minimal HF-compatible metadata response
+	resp := map[string]any{
+		"modelId": repoID,
+		"id":      repoID,
+		"siblings": func() []map[string]string {
+			var siblings []map[string]string
+			for _, f := range model.Spec.Files {
+				siblings = append(siblings, map[string]string{"rfilename": f.Path})
+			}
+			return siblings
+		}(),
+	}
+
+	w.Header().Set("Content-Type", "application/json")
+	return json.NewEncoder(w).Encode(resp)
+}
+
+func (p *Proxy) handleHFDownload(w http.ResponseWriter, r *http.Request) error {
+	ctx := r.Context()
+	parts := strings.Split(r.URL.Path, "/resolve/")
+	if len(parts) != 2 {
+		http.NotFound(w, r)
+		return nil
+	}
+
+	repoID := strings.TrimPrefix(parts[0], "/")
+	modelName := strings.ReplaceAll(repoID, "/", "-")
+
+	// revisionAndPath is like "main/config.json"
+	revAndPath := parts[1]
+	revParts := strings.Split(revAndPath, "/")
+	if len(revParts) < 2 {
+		http.NotFound(w, r)
+		return nil
+	}
+	// revision := revParts[0] // currently ignored
+	path := strings.Join(revParts[1:], "/")
+
+	var model v1alpha1.Model
+	if err := p.kube.Get(ctx, client.ObjectKey{Name: modelName}, &model); err != nil {
+		if apierrors.IsNotFound(err) {
+			http.NotFound(w, r)
+			return nil
+		}
+		return fmt.Errorf("failed to get model %s: %w", modelName, err)
+	}
+
+	var sha string
+	for _, f := range model.Spec.Files {
+		if f.Path == path {
+			sha = f.SHA256
+			break
+		}
+	}
+
+	if sha == "" {
+		http.NotFound(w, r)
+		return nil
+	}
+
+	blobPath := filepath.Join(p.cacheDir, "blobs", sha)
+	if _, err := os.Stat(blobPath); err != nil {
+		return fmt.Errorf("blob %s not found in cache: %w", sha, err)
+	}
+
+	http.ServeFile(w, r, blobPath)
 	return nil
 }
 

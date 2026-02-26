@@ -83,10 +83,59 @@ func TestE2E(t *testing.T) {
 	h.DeleteService("modelstore")
 
 	h.KubectlApplyContent("modelstore", msManifest)
-	h.KubectlApplyContent("finetuning", manifest)
 
 	// Wait for modelstore
 	h.WaitForStatefulSet("modelstore", 2*time.Minute)
+
+	// Upload the model to modelstore
+	uploadJob := `
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: model-upload
+spec:
+  template:
+    spec:
+      volumes:
+        - name: model-data
+          emptyDir: {}
+      initContainers:
+        - name: download
+          image: python:3.11-slim
+          command: ["bash", "-c"]
+          args:
+            - |
+              pip install huggingface_hub
+              python -c "from huggingface_hub import snapshot_download; snapshot_download(repo_id='facebook/opt-125m', local_dir='/data/opt-125m')"
+          volumeMounts:
+            - name: model-data
+              mountPath: /data
+      containers:
+        - name: upload
+          image: modelstore:e2e
+          imagePullPolicy: Never
+          command: ["/modelstore"]
+          args:
+            - "upload"
+            - "--modelstore-url=http://modelstore"
+            - "--model-name=facebook-opt-125m"
+            - "--model-dir=/data/opt-125m"
+          volumeMounts:
+            - name: model-data
+              mountPath: /data
+      restartPolicy: OnFailure
+`
+	h.DeleteJob("model-upload")
+	h.KubectlApplyContent("model-upload", uploadJob)
+
+	// Wait for upload job
+	err = h.WaitForJobSuccess("model-upload", 10*time.Minute) // Might take time to download
+	if err != nil {
+		t.Logf("Model upload logs:\n%s", h.GetPodLogs("batch.kubernetes.io/job-name=model-upload"))
+		t.Fatalf("Model upload job failed: %v", err)
+	}
+
+	h.KubectlApplyContent("finetuning", manifest)
 
 	// Wait for server
 	h.WaitForDeployment("finetuning-server", 5*time.Minute)
