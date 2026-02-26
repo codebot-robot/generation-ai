@@ -31,7 +31,8 @@ RUN pip install --no-cache-dir --break-system-packages \
     trl==0.12.1 \
     peft==0.13.2 \
     grpcio \
-    grpcio-tools
+    grpcio-tools \
+    requests
 
 # Copy source code
 COPY src/ /app/src/

@@ -76,7 +76,10 @@ func (p *Proxy) serve(w http.ResponseWriter, r *http.Request) error {
 			return p.handleModelCreate(w, r)
 		}
 		if r.Method == http.MethodGet {
-			return p.handleModelList(w, r)
+			if r.URL.Path == "/models" || r.URL.Path == "/models/" {
+				return p.handleModelList(w, r)
+			}
+			return p.handleModelGet(w, r)
 		}
 	}
 
@@ -315,4 +318,21 @@ func (p *Proxy) handleModelList(w http.ResponseWriter, r *http.Request) error {
 
 	w.Header().Set("Content-Type", "application/json")
 	return json.NewEncoder(w).Encode(list)
+}
+
+func (p *Proxy) handleModelGet(w http.ResponseWriter, r *http.Request) error {
+	ctx := r.Context()
+	modelName := strings.TrimPrefix(r.URL.Path, "/models/")
+
+	var model v1alpha1.Model
+	if err := p.kube.Get(ctx, client.ObjectKey{Name: modelName}, &model); err != nil {
+		if apierrors.IsNotFound(err) {
+			http.NotFound(w, r)
+			return nil
+		}
+		return fmt.Errorf("failed to get model %s: %w", modelName, err)
+	}
+
+	w.Header().Set("Content-Type", "application/json")
+	return json.NewEncoder(w).Encode(model)
 }

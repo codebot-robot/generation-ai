@@ -19,6 +19,9 @@ import torch
 import torch.distributed as dist
 import functools
 import types
+import requests
+import json
+from pathlib import Path
 from transformers import AutoModelForCausalLM, AutoTokenizer
 from torch.distributed.fsdp import (
     FullyShardedDataParallel as FSDP,
@@ -26,6 +29,35 @@ from torch.distributed.fsdp import (
 from torch.distributed.fsdp.wrap import (
     transformer_auto_wrap_policy,
 )
+
+def download_from_modelstore(model_id, modelstore_url, local_dir):
+    """Downloads model files from modelstore."""
+    print(f"Downloading model {model_id} from {modelstore_url} to {local_dir}...")
+    local_path = Path(local_dir)
+    local_path.mkdir(parents=True, exist_ok=True)
+
+    # Get model metadata
+    resp = requests.get(f"{modelstore_url}/models/{model_id}")
+    resp.raise_for_status()
+    model_data = resp.json()
+
+    for file_info in model_data["spec"]["files"]:
+        rel_path = file_info["path"]
+        sha256 = file_info["sha256"]
+        
+        file_local_path = local_path / rel_path
+        file_local_path.parent.mkdir(parents=True, exist_ok=True)
+        
+        # Download blob
+        print(f"  Downloading {rel_path}...")
+        blob_url = f"{modelstore_url}/blobs/{sha256}"
+        with requests.get(blob_url, stream=True) as r:
+            r.raise_for_status()
+            with open(file_local_path, 'wb') as f:
+                for chunk in r.iter_content(chunk_size=8192):
+                    f.write(chunk)
+    
+    print("Download complete.")
 
 def print_diagnostics():
     rank = int(os.environ.get("RANK", 0))
@@ -78,6 +110,19 @@ def main():
     print_diagnostics()
 
     model_id = args.model
+    modelstore_url = os.environ.get("HF_ENDPOINT")
+    
+    if modelstore_url:
+        # Use a local directory to download the model
+        local_model_dir = f"/tmp/models/{model_id}"
+        if rank == 0:
+            download_from_modelstore(model_id, modelstore_url, local_model_dir)
+        
+        if dist.is_initialized():
+            dist.barrier()
+        
+        model_id = local_model_dir
+
     print(f"[Rank {rank}] Loading model: {model_id}")
 
     # Set seed for reproducibility and consistency across ranks

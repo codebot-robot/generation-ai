@@ -28,6 +28,8 @@ import http.client
 import json
 import hashlib
 from urllib.parse import urlparse
+import requests
+from pathlib import Path
 
 def calculate_sha256(file_path):
     sha256_hash = hashlib.sha256()
@@ -35,6 +37,35 @@ def calculate_sha256(file_path):
         for byte_block in iter(lambda: f.read(4096), b""):
             sha256_hash.update(byte_block)
     return sha256_hash.hexdigest()
+
+def download_from_modelstore(model_id, modelstore_url, local_dir, log_queue):
+    """Downloads model files from modelstore."""
+    log_queue.put(f"Downloading model {model_id} from {modelstore_url} to {local_dir}...")
+    local_path = Path(local_dir)
+    local_path.mkdir(parents=True, exist_ok=True)
+
+    # Get model metadata
+    resp = requests.get(f"{modelstore_url}/models/{model_id}")
+    resp.raise_for_status()
+    model_data = resp.json()
+
+    for file_info in model_data["spec"]["files"]:
+        rel_path = file_info["path"]
+        sha256 = file_info["sha256"]
+        
+        file_local_path = local_path / rel_path
+        file_local_path.parent.mkdir(parents=True, exist_ok=True)
+        
+        # Download blob
+        log_queue.put(f"  Downloading {rel_path}...")
+        blob_url = f"{modelstore_url}/blobs/{sha256}"
+        with requests.get(blob_url, stream=True) as r:
+            r.raise_for_status()
+            with open(file_local_path, 'wb') as f:
+                for chunk in r.iter_content(chunk_size=8192):
+                    f.write(chunk)
+    
+    log_queue.put("Download complete.")
 
 def push_to_modelstore(model_dir, model_id, log_queue, modelstore_url=os.getenv("MODELSTORE_URL", "http://modelstore")):
     log_queue.put(f"Pushing fine-tuned model to modelstore at {modelstore_url}...")
@@ -124,15 +155,22 @@ class FinetuningService(finetuning_pb2_grpc.FinetuningServiceServicer):
         
         def run_training():
             try:
+                model_id = request.model_id
+                modelstore_url = os.environ.get("HF_ENDPOINT")
+                if modelstore_url:
+                    local_model_dir = f"/tmp/models/{model_id}"
+                    download_from_modelstore(model_id, modelstore_url, local_model_dir, log_queue)
+                    model_id = local_model_dir
+
                 # Load model and tokenizer
-                log_queue.put(f"Loading tokenizer for {request.model_id}...")
-                tokenizer = AutoTokenizer.from_pretrained(request.model_id)
+                log_queue.put(f"Loading tokenizer for {model_id}...")
+                tokenizer = AutoTokenizer.from_pretrained(model_id)
                 if tokenizer.pad_token is None:
                     tokenizer.pad_token = tokenizer.eos_token
                 
-                log_queue.put(f"Loading model {request.model_id}...")
+                log_queue.put(f"Loading model {model_id}...")
                 model = AutoModelForCausalLM.from_pretrained(
-                    request.model_id,
+                    model_id,
                     device_map="auto",
                     torch_dtype=torch.float32 if not torch.cuda.is_available() else "auto"
                 )
