@@ -15,7 +15,7 @@
 apiVersion: batch/v1
 kind: Job
 metadata:
-  name: qwen2.5-0.5b-instruct
+  name: opt-125m
 spec:
   template:
     spec:
@@ -29,7 +29,7 @@ spec:
           args:
             - |
               pip install huggingface_hub
-              python -c "from huggingface_hub import snapshot_download; snapshot_download(repo_id='Qwen/Qwen2.5-0.5B-Instruct', local_dir='/data/qwen2.5-0.5b-instruct')"
+              python -c "from huggingface_hub import snapshot_download; snapshot_download(repo_id='facebook/opt-125m', local_dir='/data/opt-125m')"
           volumeMounts:
             - name: model-data
               mountPath: /data
@@ -40,8 +40,8 @@ spec:
           args:
             - "upload"
             - "--modelstore-url=http://modelstore"
-            - "--model-name=qwen2.5-0.5b-instruct"
-            - "--model-dir=/data/qwen2.5-0.5b-instruct"
+            - "--model-name=opt-125m"
+            - "--model-dir=/data/opt-125m"
           volumeMounts:
             - name: model-data
               mountPath: /data

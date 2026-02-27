@@ -97,7 +97,7 @@ def get_transformer_layer_cls(model):
 
 def main():
     parser = argparse.ArgumentParser(description="Run simple inference benchmark")
-    parser.add_argument("--model", type=str, default="Qwen/Qwen2.5-0.5B-Instruct", help="Model ID to use")
+    parser.add_argument("--model", type=str, default="facebook/opt-125m", help="Model ID to use")
     parser.add_argument("--enable-fsdp", action="store_true", help="Enable FSDP sharding")
     args = parser.parse_args()
 
@@ -140,7 +140,8 @@ def main():
         if success:
             model_id = local_model_dir
         else:
-            print(f"[Rank {rank}] Will attempt to load {model_id} from Hugging Face Hub (or local cache).")
+            print(f"[Rank {rank}] Failed to download model {model_id} from modelstore at {modelstore_url}")
+            exit(1)
 
     print(f"[Rank {rank}] Loading model: {model_id}")
 

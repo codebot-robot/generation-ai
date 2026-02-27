@@ -27,9 +27,9 @@ echo "Building Docker image..."
 docker build -t "${IMAGE_NAME}" -f images/inference-test/Dockerfile .
 
 echo "Running single-node test (CPU)..."
-docker run --rm "${IMAGE_NAME}" --model Qwen/Qwen2.5-0.5B-Instruct
+docker run --rm "${IMAGE_NAME}" --model facebook/opt-125m
 
 echo "Running distributed test (2 ranks, CPU, FSDP requested but should fallback)..."
-docker run --rm --entrypoint torchrun "${IMAGE_NAME}" --nproc_per_node=2 src/main.py --model Qwen/Qwen2.5-0.5B-Instruct --enable-fsdp
+docker run --rm --entrypoint torchrun "${IMAGE_NAME}" --nproc_per_node=2 src/main.py --model facebook/opt-125m --enable-fsdp
 
 echo "E2E Test Passed!"

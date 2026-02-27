@@ -172,7 +172,8 @@ class FinetuningService(finetuning_pb2_grpc.FinetuningServiceServicer):
                     if download_from_modelstore(model_id, modelstore_url, local_model_dir, log_queue):
                         model_id = local_model_dir
                     else:
-                        log_queue.put(f"Will attempt to load {model_id} from Hugging Face Hub (or local cache).")
+                        log_queue.put(f"Failed to download model {model_id} from modelstore at {modelstore_url}")
+                        return
 
                 # Load model and tokenizer
                 log_queue.put(f"Loading tokenizer for {model_id}...")

@@ -63,7 +63,7 @@ func TestE2E(t *testing.T) {
 	manifest := string(b)
 	manifest = strings.ReplaceAll(manifest, "image: finetuning-server:latest", "image: finetuning-server:e2e\n        imagePullPolicy: Never")
 	manifest = strings.ReplaceAll(manifest, "image: finetuning-client:latest", "image: finetuning-client:e2e\n        imagePullPolicy: Never")
-	manifest = strings.ReplaceAll(manifest, "--max_steps\", \"5\"", "--max_steps\", \"5\", \"--model_id\", \"qwen2.5-0.5b-instruct\"")
+	manifest = strings.ReplaceAll(manifest, "--max_steps\", \"5\"", "--max_steps\", \"5\", \"--model_id\", \"opt-125m\"")
 
 	// Add MODELSTORE_URL to server
 	envVar := `        env:
@@ -111,13 +111,13 @@ func TestE2E(t *testing.T) {
 	uploadJob := string(ujb)
 	uploadJob = strings.ReplaceAll(uploadJob, "image: modelstore:latest", "image: modelstore:e2e\n          imagePullPolicy: Never")
 
-	h.DeleteJob("qwen2.5-0.5b-instruct")
+	h.DeleteJob("opt-125m")
 	h.KubectlApplyContent("model-upload", uploadJob)
 
 	// Wait for upload job
-	err = h.WaitForJobSuccess("qwen2.5-0.5b-instruct", 10*time.Minute) // Might take time to download
+	err = h.WaitForJobSuccess("opt-125m", 10*time.Minute) // Might take time to download
 	if err != nil {
-		t.Logf("Model upload logs:\n%s", h.GetPodLogs("batch.kubernetes.io/job-name=qwen2.5-0.5b-instruct"))
+		t.Logf("Model upload logs:\n%s", h.GetPodLogs("batch.kubernetes.io/job-name=opt-125m"))
 		t.Fatalf("Model upload job failed: %v", err)
 	}
 

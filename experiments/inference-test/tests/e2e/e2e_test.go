@@ -77,13 +77,13 @@ func TestE2E(t *testing.T) {
 	uploadJob := string(ujb)
 	uploadJob = strings.ReplaceAll(uploadJob, "image: modelstore:latest", "image: modelstore:e2e\n          imagePullPolicy: Never")
 
-	h.DeleteJob("qwen2.5-0.5b-instruct")
+	h.DeleteJob("opt-125m")
 	h.KubectlApplyContent("model-upload", uploadJob)
 
 	// Wait for upload job
-	err = h.WaitForJobSuccess("qwen2.5-0.5b-instruct", 10*time.Minute)
+	err = h.WaitForJobSuccess("opt-125m", 10*time.Minute)
 	if err != nil {
-		fmt.Fprintf(os.Stderr, "Model upload logs:\n%s\n", h.GetPodLogs("batch.kubernetes.io/job-name=qwen2.5-0.5b-instruct"))
+		fmt.Fprintf(os.Stderr, "Model upload logs:\n%s\n", h.GetPodLogs("batch.kubernetes.io/job-name=opt-125m"))
 		t.Fatalf("Model upload job failed: %v", err)
 	}
 
@@ -99,7 +99,7 @@ func TestE2E(t *testing.T) {
 		manifest := string(b)
 		manifest = strings.ReplaceAll(manifest, "name: inference-test", "name: inference-test-single")
 		manifest = strings.ReplaceAll(manifest, "image: inference-test:latest", "image: inference-test:e2e\n        imagePullPolicy: Never")
-		manifest = strings.ReplaceAll(manifest, "Qwen/Qwen2.5-0.5B-Instruct", "qwen2.5-0.5b-instruct")
+		manifest = strings.ReplaceAll(manifest, "facebook/opt-125m", "opt-125m")
 
 		// Remove GPU requirement for CPU test
 		manifest = strings.ReplaceAll(manifest, "nvidia.com/gpu: 1", "cpu: \"500m\"")
@@ -114,7 +114,10 @@ func TestE2E(t *testing.T) {
 		if err != nil {
 			msLogs := h.GetPodLogs("app=modelstore")
 			fmt.Fprintf(os.Stderr, "Modelstore logs:\n%s\n", msLogs)
+			fmt.Fprintf(os.Stderr, "Modelstore Pod YAML:\n%s\n", h.GetPodYaml("app=modelstore"))
 			fmt.Fprintf(os.Stderr, "Single-node logs:\n%s\n", logs)
+			fmt.Fprintf(os.Stderr, "Single-node Pod YAML:\n%s\n", h.GetPodYaml("batch.kubernetes.io/job-name=inference-test-single"))
+			fmt.Fprintf(os.Stderr, "Events:\n%s\n", h.GetEvents())
 			t.Fatalf("Job failed: %v", err)
 		}
 		t.Logf("Single-node logs:\n%s", logs)
@@ -142,7 +145,7 @@ func TestE2E(t *testing.T) {
 		manifest = strings.ReplaceAll(manifest, "cloud.google.com/gke-accelerator: nvidia-l4", "")
 
 		// Use smaller model for E2E
-		manifest = strings.ReplaceAll(manifest, "Qwen/Qwen2.5-7B-Instruct", "qwen2.5-0.5b-instruct")
+		manifest = strings.ReplaceAll(manifest, "facebook/opt-125m", "opt-125m")
 
 		// Add small memory limit
 		manifest = strings.ReplaceAll(manifest, "resources:", "resources:\n          requests:\n            memory: \"4Gi\"\n          limits:\n            memory: \"8Gi\"")
@@ -153,7 +156,10 @@ func TestE2E(t *testing.T) {
 		if err != nil {
 			msLogs := h.GetPodLogs("app=modelstore")
 			fmt.Fprintf(os.Stderr, "Modelstore logs:\n%s\n", msLogs)
+			fmt.Fprintf(os.Stderr, "Modelstore Pod YAML:\n%s\n", h.GetPodYaml("app=modelstore"))
 			fmt.Fprintf(os.Stderr, "Distributed logs:\n%s\n", logs)
+			fmt.Fprintf(os.Stderr, "Distributed Pod YAML:\n%s\n", h.GetPodYaml("app=inference-test"))
+			fmt.Fprintf(os.Stderr, "Events:\n%s\n", h.GetEvents())
 			t.Fatalf("Job failed: %v", err)
 		}
 		t.Logf("Distributed logs:\n%s", logs)

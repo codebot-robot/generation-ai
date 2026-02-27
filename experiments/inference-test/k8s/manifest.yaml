@@ -14,7 +14,7 @@ spec:
         resources:
           limits:
             nvidia.com/gpu: 1
-        args: ["--model", "Qwen/Qwen2.5-0.5B-Instruct"]
+        args: ["--model", "facebook/opt-125m"]
       nodeSelector:
         cloud.google.com/gke-accelerator: nvidia-l4
       restartPolicy: Never
