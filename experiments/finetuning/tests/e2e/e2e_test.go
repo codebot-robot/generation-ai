@@ -15,6 +15,7 @@
 package e2e
 
 import (
+	"fmt"
 	"os"
 	"path/filepath"
 	"strings"
@@ -62,18 +63,19 @@ func TestE2E(t *testing.T) {
 	manifest := string(b)
 	manifest = strings.ReplaceAll(manifest, "image: finetuning-server:latest", "image: finetuning-server:e2e\n        imagePullPolicy: Never")
 	manifest = strings.ReplaceAll(manifest, "image: finetuning-client:latest", "image: finetuning-client:e2e\n        imagePullPolicy: Never")
+	manifest = strings.ReplaceAll(manifest, "--max_steps\", \"5\"", "--max_steps\", \"5\", \"--model_id\", \"opt-125m\"")
 
-	// Add HF_ENDPOINT to server
+	// Add MODELSTORE_URL to server
 	envVar := `        env:
-        - name: HF_ENDPOINT
+        - name: MODELSTORE_URL
           value: http://modelstore`
 	manifest = strings.ReplaceAll(manifest, "- name: server", "- name: server\n"+envVar)
 
 	// Reduce resource requirements for E2E
 	manifest = strings.ReplaceAll(manifest, "cpu: \"2\"", "cpu: \"500m\"")
-	manifest = strings.ReplaceAll(manifest, "memory: \"8Gi\"", "memory: \"2Gi\"")
+	manifest = strings.ReplaceAll(manifest, "memory: \"8Gi\"", "memory: \"4Gi\"")
 	manifest = strings.ReplaceAll(manifest, "cpu: \"4\"", "cpu: \"1\"")
-	manifest = strings.ReplaceAll(manifest, "memory: \"16Gi\"", "memory: \"4Gi\"")
+	manifest = strings.ReplaceAll(manifest, "memory: \"16Gi\"", "memory: \"8Gi\"")
 
 	// Apply manifests
 	h.DeleteJob("finetuning-client")
@@ -82,26 +84,67 @@ func TestE2E(t *testing.T) {
 	h.DeleteStatefulSet("modelstore")
 	h.DeleteService("modelstore")
 
+	// Apply modelstore CRD
+	crdPath := filepath.Join(modelstoreRoot, "k8s/crds/generationai.labs.gke.io_models.yaml")
+	crdb, err := os.ReadFile(crdPath)
+	if err != nil {
+		t.Fatalf("Failed to read modelstore CRD: %v", err)
+	}
+	h.KubectlApplyContent("modelstore-crd", string(crdb))
+
 	h.KubectlApplyContent("modelstore", msManifest)
-	h.KubectlApplyContent("finetuning", manifest)
 
 	// Wait for modelstore
-	h.WaitForStatefulSet("modelstore", 2*time.Minute)
+	if err := h.WaitForStatefulSet("modelstore", 2*time.Minute); err != nil {
+		fmt.Fprintf(os.Stderr, "Modelstore failed to start: %v\n", err)
+		fmt.Fprintf(os.Stderr, "Modelstore Pod YAML:\n%s\n", h.GetPodYaml("app=modelstore"))
+		fmt.Fprintf(os.Stderr, "Events:\n%s\n", h.GetEvents())
+		t.Fatalf("Modelstore failed to start: %v", err)
+	}
+
+	// Upload the model to modelstore
+	uploadJobPath := filepath.Join(modelstoreRoot, "examples/upload-job.yaml")
+	ujb, err := os.ReadFile(uploadJobPath)
+	if err != nil {
+		t.Fatalf("Failed to read upload job: %v", err)
+	}
+	uploadJob := string(ujb)
+	uploadJob = strings.ReplaceAll(uploadJob, "image: modelstore:latest", "image: modelstore:e2e\n          imagePullPolicy: Never")
+
+	h.DeleteJob("opt-125m")
+	h.KubectlApplyContent("model-upload", uploadJob)
+
+	// Wait for upload job
+	err = h.WaitForJobSuccess("opt-125m", 10*time.Minute) // Might take time to download
+	if err != nil {
+		t.Logf("Model upload logs:\n%s", h.GetPodLogs("batch.kubernetes.io/job-name=opt-125m"))
+		t.Fatalf("Model upload job failed: %v", err)
+	}
+
+	h.KubectlApplyContent("finetuning", manifest)
 
 	// Wait for server
-	h.WaitForDeployment("finetuning-server", 5*time.Minute)
+	if err := h.WaitForDeployment("finetuning-server", 5*time.Minute); err != nil {
+		fmt.Fprintf(os.Stderr, "Finetuning server failed to start: %v\n", err)
+		fmt.Fprintf(os.Stderr, "Finetuning server Pod YAML:\n%s\n", h.GetPodYaml("app=finetuning-server"))
+		fmt.Fprintf(os.Stderr, "Events:\n%s\n", h.GetEvents())
+		t.Fatalf("Finetuning server failed to start: %v", err)
+	}
 
 	// Wait for client job
 	err = h.WaitForJobSuccess("finetuning-client", 10*time.Minute)
 
 	// Check logs (always, even on failure)
 	msLogs := h.GetPodLogs("app=modelstore")
+	fmt.Fprintf(os.Stderr, "Modelstore logs:\n%s\n", msLogs)
 	t.Logf("Modelstore logs:\n%s", msLogs)
 
 	logs := h.GetPodLogs("app=finetuning-server")
+	fmt.Fprintf(os.Stderr, "Server logs:\n%s\n", logs)
 	t.Logf("Server logs:\n%s", logs)
 
 	clientLogs := h.GetPodLogs("batch.kubernetes.io/job-name=finetuning-client")
+	fmt.Fprintf(os.Stderr, "Client logs:\n%s\n", clientLogs)
 	t.Logf("Client logs:\n%s", clientLogs)
 
 	if err != nil {

@@ -18,7 +18,7 @@ WORKDIR /app
 
 # Install dependencies
 # accelerate is needed for device_map="auto"
-RUN pip install --no-cache-dir --break-system-packages transformers accelerate protobuf
+RUN pip install --no-cache-dir --break-system-packages transformers accelerate protobuf requests
 
 # Copy source code
 COPY src/ /app/src/

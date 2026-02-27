@@ -21,32 +21,26 @@ import (
 	"fmt"
 	"io"
 	"net/http"
-	"net/url"
 	"os"
 	"path/filepath"
 	"strings"
 	"sync"
 
 	"github.com/gke-labs/generation-ai/modelstore/apis/v1alpha1"
+	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/klog/v2"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 )
 
 type Proxy struct {
-	upstream *url.URL
 	cacheDir string
 	mu       sync.Mutex
 	kube     client.Client
 }
 
-func NewProxy(upstreamURL, cacheDir string, kube client.Client) (*Proxy, error) {
-	u, err := url.Parse(upstreamURL)
-	if err != nil {
-		return nil, fmt.Errorf("invalid upstream URL %q: %w", upstreamURL, err)
-	}
+func NewProxy(ignoredUpstreamURL, cacheDir string, kube client.Client) (*Proxy, error) {
 	return &Proxy{
-		upstream: u,
 		cacheDir: cacheDir,
 		kube:     kube,
 	}, nil
@@ -57,9 +51,6 @@ func (p *Proxy) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		ctx := r.Context()
 		log := klog.FromContext(ctx)
 		log.Error(err, "request failed", "path", r.URL.Path, "method", r.Method)
-		// We don't use http.Error because we might have already written headers or part of the body
-		// but in most cases for the errors we catch here, we haven't.
-		// However, the reviewer specifically asked to log and send http.StatusInternalServerError.
 		if !p.isResponseStarted(w) {
 			http.Error(w, err.Error(), http.StatusInternalServerError)
 		}
@@ -67,20 +58,15 @@ func (p *Proxy) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 }
 
 func (p *Proxy) isResponseStarted(w http.ResponseWriter) bool {
-	// This is a bit tricky with standard http.ResponseWriter.
-	// For now we'll assume we can send the error if it's early enough.
 	return false
 }
 
 func (p *Proxy) serve(w http.ResponseWriter, r *http.Request) error {
-	ctx := r.Context()
-	log := klog.FromContext(ctx)
-
 	if strings.HasPrefix(r.URL.Path, "/blobs/") {
 		if r.Method == http.MethodPut {
 			return p.handleBlobPut(w, r)
 		}
-		if r.Method == http.MethodGet {
+		if r.Method == http.MethodGet || r.Method == http.MethodHead {
 			return p.handleBlobGet(w, r)
 		}
 	}
@@ -90,97 +76,116 @@ func (p *Proxy) serve(w http.ResponseWriter, r *http.Request) error {
 			return p.handleModelCreate(w, r)
 		}
 		if r.Method == http.MethodGet {
-			return p.handleModelList(w, r)
+			if r.URL.Path == "/models" || r.URL.Path == "/models/" {
+				return p.handleModelList(w, r)
+			}
+			return p.handleModelGet(w, r)
 		}
 	}
 
-	if r.Method == http.MethodPut {
-		return p.handlePut(w, r)
+	// Handle HF metadata API: /api/models/{model_id}
+	if strings.HasPrefix(r.URL.Path, "/api/models/") {
+		return p.handleHFMetadata(w, r)
 	}
 
-	// Only cache GET requests
-	if r.Method != http.MethodGet {
-		return p.proxyOnly(w, r)
+	// Handle HF download API: /{model_id}/resolve/{revision}/{path}
+	if strings.Contains(r.URL.Path, "/resolve/") {
+		return p.handleHFDownload(w, r)
 	}
 
-	cachePath := filepath.Join(p.cacheDir, r.URL.Path)
-
-	// Check if file is in cache
-	if _, err := os.Stat(cachePath); err == nil {
-		log.V(2).Info("serving from cache", "path", r.URL.Path)
-		http.ServeFile(w, r, cachePath)
-		return nil
+	// For legacy compatibility or direct access to cached files by path
+	if r.Method == http.MethodGet {
+		cachePath := filepath.Join(p.cacheDir, r.URL.Path)
+		if _, err := os.Stat(cachePath); err == nil {
+			http.ServeFile(w, r, cachePath)
+			return nil
+		}
 	}
 
-	// Not in cache, fetch and store
-	return p.fetchAndStore(w, r, cachePath)
-}
-
-var noRedirectClient = &http.Client{
-	CheckRedirect: func(req *http.Request, via []*http.Request) error {
-		return http.ErrUseLastResponse
-	},
-}
-
-func (p *Proxy) proxyOnly(w http.ResponseWriter, r *http.Request) error {
-	ctx := r.Context()
-	log := klog.FromContext(ctx)
-
-	target := *p.upstream
-	target.Path = r.URL.Path
-	target.RawQuery = r.URL.RawQuery
-
-	req, err := http.NewRequestWithContext(ctx, r.Method, target.String(), r.Body)
-	if err != nil {
-		log.Error(err, "failed to create proxy request", "url", target.String())
-		return fmt.Errorf("failed to create request for %q: %w", target.String(), err)
-	}
-	req.Header = r.Header.Clone()
-	req.Header.Del("Host")
-
-	resp, err := noRedirectClient.Do(req)
-	if err != nil {
-		log.Error(err, "failed to execute proxy request", "url", target.String())
-		return fmt.Errorf("failed to proxy request to %q: %w", target.String(), err)
-	}
-	defer resp.Body.Close()
-
-	for k, v := range resp.Header {
-		w.Header()[k] = v
-	}
-	w.WriteHeader(resp.StatusCode)
-	n, err := io.Copy(w, resp.Body)
-	if err != nil {
-		log.Error(err, "failed to copy response body", "url", target.String())
-		return nil // We already wrote headers and potentially some body
-	}
-
-	log.Info("proxied request", "url", target.String(), "status", resp.StatusCode, "bytes", n)
+	http.NotFound(w, r)
 	return nil
 }
 
-func (p *Proxy) handlePut(w http.ResponseWriter, r *http.Request) error {
+func (p *Proxy) handleHFMetadata(w http.ResponseWriter, r *http.Request) error {
 	ctx := r.Context()
-	log := klog.FromContext(ctx)
+	repoID := strings.TrimPrefix(r.URL.Path, "/api/models/")
+	modelName := strings.ReplaceAll(repoID, "/", "-")
 
-	cachePath := filepath.Join(p.cacheDir, r.URL.Path)
-	if err := os.MkdirAll(filepath.Dir(cachePath), 0755); err != nil {
-		return fmt.Errorf("failed to create directory: %w", err)
+	var model v1alpha1.Model
+	if err := p.kube.Get(ctx, client.ObjectKey{Name: modelName}, &model); err != nil {
+		if apierrors.IsNotFound(err) {
+			http.NotFound(w, r)
+			return nil
+		}
+		return fmt.Errorf("failed to get model %s: %w", modelName, err)
 	}
 
-	f, err := os.Create(cachePath)
-	if err != nil {
-		return fmt.Errorf("failed to create file: %w", err)
+	// Return a minimal HF-compatible metadata response
+	resp := map[string]any{
+		"modelId": repoID,
+		"id":      repoID,
+		"siblings": func() []map[string]string {
+			var siblings []map[string]string
+			for _, f := range model.Spec.Files {
+				siblings = append(siblings, map[string]string{"rfilename": f.Path})
+			}
+			return siblings
+		}(),
 	}
-	defer f.Close()
 
-	n, err := io.Copy(f, r.Body)
-	if err != nil {
-		return fmt.Errorf("failed to save file: %w", err)
+	w.Header().Set("Content-Type", "application/json")
+	return json.NewEncoder(w).Encode(resp)
+}
+
+func (p *Proxy) handleHFDownload(w http.ResponseWriter, r *http.Request) error {
+	ctx := r.Context()
+	parts := strings.Split(r.URL.Path, "/resolve/")
+	if len(parts) != 2 {
+		http.NotFound(w, r)
+		return nil
 	}
 
-	log.Info("stored file", "path", r.URL.Path, "bytes", n)
-	w.WriteHeader(http.StatusCreated)
+	repoID := strings.TrimPrefix(parts[0], "/")
+	modelName := strings.ReplaceAll(repoID, "/", "-")
+
+	// revisionAndPath is like "main/config.json"
+	revAndPath := parts[1]
+	revParts := strings.Split(revAndPath, "/")
+	if len(revParts) < 2 {
+		http.NotFound(w, r)
+		return nil
+	}
+	// revision := revParts[0] // currently ignored
+	path := strings.Join(revParts[1:], "/")
+
+	var model v1alpha1.Model
+	if err := p.kube.Get(ctx, client.ObjectKey{Name: modelName}, &model); err != nil {
+		if apierrors.IsNotFound(err) {
+			http.NotFound(w, r)
+			return nil
+		}
+		return fmt.Errorf("failed to get model %s: %w", modelName, err)
+	}
+
+	var sha string
+	for _, f := range model.Spec.Files {
+		if f.Path == path {
+			sha = f.SHA256
+			break
+		}
+	}
+
+	if sha == "" {
+		http.NotFound(w, r)
+		return nil
+	}
+
+	blobPath := filepath.Join(p.cacheDir, "blobs", sha)
+	if _, err := os.Stat(blobPath); err != nil {
+		return fmt.Errorf("blob %s not found in cache: %w", sha, err)
+	}
+
+	http.ServeFile(w, r, blobPath)
 	return nil
 }
 
@@ -262,6 +267,10 @@ func (p *Proxy) handleBlobGet(w http.ResponseWriter, r *http.Request) error {
 		return fmt.Errorf("failed to check blob: %w", err)
 	}
 
+	if r.Method == http.MethodHead {
+		return nil
+	}
+
 	http.ServeFile(w, r, blobPath)
 	return nil
 }
@@ -311,91 +320,19 @@ func (p *Proxy) handleModelList(w http.ResponseWriter, r *http.Request) error {
 	return json.NewEncoder(w).Encode(list)
 }
 
-func (p *Proxy) fetchAndStore(w http.ResponseWriter, r *http.Request, cachePath string) error {
+func (p *Proxy) handleModelGet(w http.ResponseWriter, r *http.Request) error {
 	ctx := r.Context()
-	log := klog.FromContext(ctx)
+	modelName := strings.TrimPrefix(r.URL.Path, "/models/")
 
-	target := *p.upstream
-	target.Path = r.URL.Path
-	target.RawQuery = r.URL.RawQuery
-
-	log.Info("fetching from upstream", "url", target.String())
-
-	req, err := http.NewRequestWithContext(ctx, http.MethodGet, target.String(), nil)
-	if err != nil {
-		log.Error(err, "failed to create fetch request", "url", target.String())
-		return fmt.Errorf("failed to create request for %q: %w", target.String(), err)
-	}
-	req.Header = r.Header.Clone()
-	req.Header.Del("Host")
-	// Don't pass through some headers that might interfere with caching or range requests if we don't support them fully
-	req.Header.Del("If-None-Match")
-	req.Header.Del("If-Modified-Since")
-	req.Header.Del("Accept-Encoding")
-
-	resp, err := http.DefaultClient.Do(req)
-	if err != nil {
-		log.Error(err, "failed to execute fetch request", "url", target.String())
-		return fmt.Errorf("failed to fetch %q: %w", target.String(), err)
-	}
-	defer resp.Body.Close()
-
-	if resp.StatusCode != http.StatusOK {
-		log.Info("upstream returned non-OK status, proxying without caching", "status", resp.StatusCode, "url", target.String())
-		// Just proxy non-OK responses without caching
-		for k, v := range resp.Header {
-			w.Header()[k] = v
+	var model v1alpha1.Model
+	if err := p.kube.Get(ctx, client.ObjectKey{Name: modelName}, &model); err != nil {
+		if apierrors.IsNotFound(err) {
+			http.NotFound(w, r)
+			return nil
 		}
-		w.WriteHeader(resp.StatusCode)
-		_, err := io.Copy(w, resp.Body)
-		return err
+		return fmt.Errorf("failed to get model %s: %w", modelName, err)
 	}
 
-	// Create parent directories
-	if err := os.MkdirAll(filepath.Dir(cachePath), 0755); err != nil {
-		return fmt.Errorf("failed to create cache directory: %w", err)
-	}
-
-	// Create temporary file to avoid partial reads from other processes
-	tmpFile, err := os.CreateTemp(p.cacheDir, "modelstore-*")
-	if err != nil {
-		return fmt.Errorf("failed to create temp file: %w", err)
-	}
-	tmpPath := tmpFile.Name()
-	moved := false
-	defer func() {
-		tmpFile.Close()
-		if !moved {
-			if err := os.Remove(tmpPath); err != nil && !os.IsNotExist(err) {
-				log.Error(err, "failed to remove temp file", "path", tmpPath)
-			}
-		}
-	}()
-
-	// Set headers for the response to client
-	for k, v := range resp.Header {
-		w.Header()[k] = v
-	}
-	w.WriteHeader(resp.StatusCode)
-
-	// Tee the body to both the client and the temporary file
-	mw := io.MultiWriter(w, tmpFile)
-	n, err := io.Copy(mw, resp.Body)
-	if err != nil {
-		return fmt.Errorf("error copying body from %q: %w", target.String(), err)
-	}
-
-	if err := tmpFile.Close(); err != nil {
-		return fmt.Errorf("error closing tmp file: %w", err)
-	}
-
-	// Move to final location
-	p.mu.Lock()
-	defer p.mu.Unlock()
-	if err := os.Rename(tmpPath, cachePath); err != nil {
-		return fmt.Errorf("error renaming tmp file to %q: %w", cachePath, err)
-	}
-	moved = true
-	log.Info("cached file", "url", target.String(), "path", cachePath, "bytes", n)
-	return nil
+	w.Header().Set("Content-Type", "application/json")
+	return json.NewEncoder(w).Encode(model)
 }

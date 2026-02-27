@@ -25,7 +25,7 @@ spec:
       - name: inference-test
         image: inference-test:latest
         env:
-        - name: HF_ENDPOINT
+        - name: MODELSTORE_URL
           value: http://modelstore
         resources:
           limits:
@@ -49,7 +49,7 @@ spec:
             --node_rank=$RANK \
             --master_addr=$MASTER_ADDR \
             --master_port=$MASTER_PORT \
-            src/main.py --model Qwen/Qwen2.5-7B-Instruct --enable-fsdp
+            src/main.py --model facebook/opt-125m --enable-fsdp
       nodeSelector:
         cloud.google.com/gke-accelerator: nvidia-l4
       restartPolicy: Never

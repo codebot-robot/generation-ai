@@ -16,9 +16,7 @@ package proxy
 
 import (
 	"bytes"
-	"compress/gzip"
 	"encoding/json"
-	"fmt"
 	"io"
 	"net/http"
 	"net/http/httptest"
@@ -33,7 +31,7 @@ import (
 	"sigs.k8s.io/controller-runtime/pkg/client/fake"
 )
 
-func TestProxy(t *testing.T) {
+func TestLocalFileServing(t *testing.T) {
 	// Create a temporary cache directory
 	cacheDir, err := os.MkdirTemp("", "modelstore-test-*")
 	if err != nil {
@@ -41,84 +39,29 @@ func TestProxy(t *testing.T) {
 	}
 	defer os.RemoveAll(cacheDir)
 
-	// Create a mock upstream server
-	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		if r.URL.Path == "/test-file" {
-			fmt.Fprint(w, "upstream content")
-			return
-		}
-		http.NotFound(w, r)
-	}))
-	defer upstream.Close()
+	// Pre-populate a file in the cache
+	content := "local content"
+	err = os.WriteFile(filepath.Join(cacheDir, "test-file"), []byte(content), 0644)
+	if err != nil {
+		t.Fatalf("Failed to write test file: %v", err)
+	}
 
-	p, err := NewProxy(upstream.URL, cacheDir, nil)
+	p, err := NewProxy("", cacheDir, nil)
 	if err != nil {
 		t.Fatalf("Failed to create proxy: %v", err)
 	}
 
-	// First request - should fetch from upstream and cache
 	req := httptest.NewRequest(http.MethodGet, "/test-file", nil)
 	w := httptest.NewRecorder()
 	p.ServeHTTP(w, req)
 
 	resp := w.Result()
+	if resp.StatusCode != http.StatusOK {
+		t.Errorf("Expected status 200, got %d", resp.StatusCode)
+	}
 	body, _ := io.ReadAll(resp.Body)
-	if string(body) != "upstream content" {
-		t.Errorf("Expected 'upstream content', got '%s'", string(body))
-	}
-
-	// Verify it's in cache
-	cachePath := filepath.Join(cacheDir, "test-file")
-	if _, err := os.Stat(cachePath); os.IsNotExist(err) {
-		t.Errorf("Expected file to be cached at %s", cachePath)
-	}
-
-	// Second request - should serve from cache
-	// Change upstream content to verify it's NOT used
-	// (Actually easier to just shut down upstream or check logs)
-	upstream.Close() // Upstream is now closed, if it tries to fetch it will fail
-
-	w2 := httptest.NewRecorder()
-	p.ServeHTTP(w2, req)
-
-	resp2 := w2.Result()
-	body2, _ := io.ReadAll(resp2.Body)
-	if string(body2) != "upstream content" {
-		t.Errorf("Expected 'upstream content' from cache, got '%s'", string(body2))
-	}
-}
-
-func TestProxyPut(t *testing.T) {
-	// Create a temporary cache directory
-	cacheDir, err := os.MkdirTemp("", "modelstore-test-*")
-	if err != nil {
-		t.Fatalf("Failed to create temp dir: %v", err)
-	}
-	defer os.RemoveAll(cacheDir)
-
-	p, err := NewProxy("http://localhost:1234", cacheDir, nil) // Upstream doesn't matter for PUT
-	if err != nil {
-		t.Fatalf("Failed to create proxy: %v", err)
-	}
-
-	content := "finetuned model content"
-	req := httptest.NewRequest(http.MethodPut, "/finetuned/model.bin", strings.NewReader(content))
-	w := httptest.NewRecorder()
-	p.ServeHTTP(w, req)
-
-	resp := w.Result()
-	if resp.StatusCode != http.StatusCreated {
-		t.Errorf("Expected status 201 Created, got %d", resp.StatusCode)
-	}
-
-	// Verify it's in cache
-	cachePath := filepath.Join(cacheDir, "finetuned/model.bin")
-	gotContent, err := os.ReadFile(cachePath)
-	if err != nil {
-		t.Fatalf("Failed to read cached file: %v", err)
-	}
-	if string(gotContent) != content {
-		t.Errorf("Expected '%s', got '%s'", content, string(gotContent))
+	if string(body) != content {
+		t.Errorf("Expected '%s', got '%s'", content, string(body))
 	}
 }
 
@@ -133,7 +76,7 @@ func TestBlobAndModelAPI(t *testing.T) {
 	_ = v1alpha1.AddToScheme(scheme)
 	kube := fake.NewClientBuilder().WithScheme(scheme).Build()
 
-	p, err := NewProxy("http://localhost:1234", cacheDir, kube)
+	p, err := NewProxy("", cacheDir, kube)
 	if err != nil {
 		t.Fatalf("Failed to create proxy: %v", err)
 	}
@@ -147,6 +90,14 @@ func TestBlobAndModelAPI(t *testing.T) {
 
 	if w.Code != http.StatusCreated {
 		t.Errorf("Expected blob PUT status 201, got %d", w.Code)
+	}
+
+	// Verify HEAD request for blob
+	req = httptest.NewRequest(http.MethodHead, "/blobs/"+sha, nil)
+	w = httptest.NewRecorder()
+	p.ServeHTTP(w, req)
+	if w.Code != http.StatusOK {
+		t.Errorf("Expected blob HEAD status 200, got %d", w.Code)
 	}
 
 	// 2. Create a model
@@ -189,89 +140,57 @@ func TestBlobAndModelAPI(t *testing.T) {
 	if list.Items[0].Name != "test-model" {
 		t.Errorf("Expected model name 'test-model', got '%s'", list.Items[0].Name)
 	}
-}
 
-func TestProxyCompression(t *testing.T) {
-	// Create a temporary cache directory
-	cacheDir, err := os.MkdirTemp("", "modelstore-test-compression-*")
-	if err != nil {
-		t.Fatalf("Failed to create temp dir: %v", err)
-	}
-	defer os.RemoveAll(cacheDir)
-
-	uncompressedContent := "this is some content that will be gzipped"
-	var buf bytes.Buffer
-	zw := gzip.NewWriter(&buf)
-	if _, err := zw.Write([]byte(uncompressedContent)); err != nil {
-		t.Fatal(err)
-	}
-	if err := zw.Close(); err != nil {
-		t.Fatal(err)
-	}
-	compressedContent := buf.Bytes()
-
-	// Create a mock upstream server that serves gzipped content
-	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		if r.URL.Path == "/gzipped-file" {
-			w.Header().Set("Content-Encoding", "gzip")
-			w.Header().Set("Content-Type", "text/plain")
-			w.WriteHeader(http.StatusOK)
-			w.Write(compressedContent)
-			return
-		}
-		http.NotFound(w, r)
-	}))
-	defer upstream.Close()
-
-	p, err := NewProxy(upstream.URL, cacheDir, nil)
-	if err != nil {
-		t.Fatalf("Failed to create proxy: %v", err)
-	}
-
-	// First request - should fetch from upstream and cache
-	// We send Accept-Encoding: gzip to simulate a typical client
-	req := httptest.NewRequest(http.MethodGet, "/gzipped-file", nil)
-	req.Header.Set("Accept-Encoding", "gzip")
-	w := httptest.NewRecorder()
+	// 4. Test HF Metadata API
+	req = httptest.NewRequest(http.MethodGet, "/api/models/test-model", nil)
+	w = httptest.NewRecorder()
 	p.ServeHTTP(w, req)
-
-	resp := w.Result()
-	if resp.Header.Get("Content-Encoding") == "gzip" {
-		// If it's gzipped, we need to decompress it to check content
-		zr, err := gzip.NewReader(resp.Body)
-		if err != nil {
-			t.Fatalf("Failed to create gzip reader: %v", err)
-		}
-		body, _ := io.ReadAll(zr)
-		if string(body) != uncompressedContent {
-			t.Errorf("Expected '%s', got '%s'", uncompressedContent, string(body))
-		}
-	} else {
-		body, _ := io.ReadAll(resp.Body)
-		if string(body) != uncompressedContent {
-			t.Errorf("Expected '%s', got '%s'", uncompressedContent, string(body))
-		}
+	if w.Code != http.StatusOK {
+		t.Errorf("Expected HF metadata status 200, got %d", w.Code)
+	}
+	var metadata map[string]any
+	json.NewDecoder(w.Body).Decode(&metadata)
+	if metadata["modelId"] != "test-model" {
+		t.Errorf("Expected modelId 'test-model', got '%v'", metadata["modelId"])
 	}
 
-	// Second request - should serve from cache
-	// Upstream is closed to ensure cache is used
-	upstream.Close()
-
-	req2 := httptest.NewRequest(http.MethodGet, "/gzipped-file", nil)
-	// We DON'T send Accept-Encoding: gzip this time, or even if we do,
-	// if we stored gzipped bytes without Content-Encoding header in cache,
-	// http.ServeFile will serve them as-is without Content-Encoding.
-	w2 := httptest.NewRecorder()
-	p.ServeHTTP(w2, req2)
-
-	resp2 := w2.Result()
-	body2, _ := io.ReadAll(resp2.Body)
-
-	if string(body2) == string(compressedContent) && resp2.Header.Get("Content-Encoding") == "" {
-		t.Errorf("Proxy served compressed content from cache without Content-Encoding header")
+	// 5. Test HF Download API
+	req = httptest.NewRequest(http.MethodGet, "/test-model/resolve/main/weights.bin", nil)
+	w = httptest.NewRecorder()
+	p.ServeHTTP(w, req)
+	if w.Code != http.StatusOK {
+		t.Errorf("Expected HF download status 200, got %d", w.Code)
+	}
+	if w.Body.String() != content {
+		t.Errorf("Expected '%s', got '%s'", content, w.Body.String())
 	}
 
-	if string(body2) != uncompressedContent && resp2.Header.Get("Content-Encoding") != "gzip" {
-		t.Errorf("Proxy failed to serve uncompressed content or gzipped content with correct header. Got length %d, expected %d", len(body2), len(uncompressedContent))
+	// 6. Test HF API with slashes
+	slashModel := v1alpha1.Model{
+		ObjectMeta: metav1.ObjectMeta{
+			Name: "user-repo",
+		},
+		Spec: v1alpha1.ModelSpec{
+			Files: []v1alpha1.File{
+				{Path: "config.json", SHA256: sha},
+			},
+		},
+	}
+	modelJSON, _ = json.Marshal(slashModel)
+	req = httptest.NewRequest(http.MethodPost, "/models", bytes.NewReader(modelJSON))
+	p.ServeHTTP(httptest.NewRecorder(), req)
+
+	req = httptest.NewRequest(http.MethodGet, "/api/models/user/repo", nil)
+	w = httptest.NewRecorder()
+	p.ServeHTTP(w, req)
+	if w.Code != http.StatusOK {
+		t.Errorf("Expected HF metadata status 200 for user/repo, got %d", w.Code)
+	}
+
+	req = httptest.NewRequest(http.MethodGet, "/user/repo/resolve/main/config.json", nil)
+	w = httptest.NewRecorder()
+	p.ServeHTTP(w, req)
+	if w.Code != http.StatusOK {
+		t.Errorf("Expected HF download status 200 for user/repo, got %d", w.Code)
 	}
 }

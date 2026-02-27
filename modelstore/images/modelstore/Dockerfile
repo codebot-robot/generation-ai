@@ -15,8 +15,7 @@
 FROM golang:1.26 AS builder
 
 WORKDIR /app
-COPY go.mod ./
-# No go.sum yet, will be generated if needed
+COPY go.mod go.sum ./
 RUN go mod download
 
 COPY . .
@@ -26,4 +25,4 @@ FROM gcr.io/distroless/static-debian13:latest
 COPY --from=builder /app/modelstore /modelstore
 EXPOSE 8080
 ENTRYPOINT ["/modelstore"]
-CMD ["--port=8080", "--cache-dir=/cache"]
+CMD ["serve", "--port=8080", "--cache-dir=/cache"]

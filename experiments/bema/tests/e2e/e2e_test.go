@@ -15,6 +15,7 @@
 package e2e
 
 import (
+	"fmt"
 	"os"
 	"path/filepath"
 	"strings"
@@ -55,7 +56,12 @@ func TestE2E(t *testing.T) {
 	h.KubectlApplyContent("bema", manifest)
 
 	// Wait for server
-	h.WaitForStatefulSet("bema", 2*time.Minute)
+	if err := h.WaitForStatefulSet("bema", 2*time.Minute); err != nil {
+		fmt.Fprintf(os.Stderr, "Bema failed to start: %v\n", err)
+		fmt.Fprintf(os.Stderr, "Bema Pod YAML:\n%s\n", h.GetPodYaml("app=bema"))
+		fmt.Fprintf(os.Stderr, "Events:\n%s\n", h.GetEvents())
+		t.Fatalf("Bema failed to start: %v", err)
+	}
 
 	// In a real e2e test we would run a client here.
 	// For now, we just verify it starts up.

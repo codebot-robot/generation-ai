@@ -112,16 +112,24 @@ func (h *Harness) KubectlApplyContent(name, content string) {
 	}
 }
 
-func (h *Harness) WaitForDeployment(name string, timeout time.Duration) {
+func (h *Harness) WaitForDeployment(name string, timeout time.Duration) error {
 	h.t.Helper()
 	h.t.Logf("Waiting for deployment %s", name)
-	h.RunCommand("kubectl", "rollout", "status", "deployment/"+name, "--timeout="+timeout.String())
+	cmd := exec.Command("kubectl", "rollout", "status", "deployment/"+name, "--timeout="+timeout.String())
+	if out, err := cmd.CombinedOutput(); err != nil {
+		return fmt.Errorf("deployment %s failed to become ready: %v\nOutput: %s", name, err, out)
+	}
+	return nil
 }
 
-func (h *Harness) WaitForStatefulSet(name string, timeout time.Duration) {
+func (h *Harness) WaitForStatefulSet(name string, timeout time.Duration) error {
 	h.t.Helper()
 	h.t.Logf("Waiting for statefulset %s", name)
-	h.RunCommand("kubectl", "rollout", "status", "statefulset/"+name, "--timeout="+timeout.String())
+	cmd := exec.Command("kubectl", "rollout", "status", "statefulset/"+name, "--timeout="+timeout.String())
+	if out, err := cmd.CombinedOutput(); err != nil {
+		return fmt.Errorf("statefulset %s failed to become ready: %v\nOutput: %s", name, err, out)
+	}
+	return nil
 }
 
 func (h *Harness) DeleteDeployment(name string) {
@@ -158,7 +166,28 @@ func (h *Harness) GetPodLogs(labelSelector string) string {
 	h.t.Helper()
 	out, err := exec.Command("kubectl", "logs", "-l", labelSelector).CombinedOutput()
 	if err != nil {
-		h.t.Fatalf("Failed to get logs for selector %s: %v", labelSelector, err)
+		h.t.Logf("Warning: failed to get logs for selector %s: %v", labelSelector, err)
+		return string(out)
+	}
+	return string(out)
+}
+
+func (h *Harness) GetPodYaml(labelSelector string) string {
+	h.t.Helper()
+	out, err := exec.Command("kubectl", "get", "pod", "-l", labelSelector, "-o", "yaml").CombinedOutput()
+	if err != nil {
+		h.t.Logf("Warning: failed to get pod yaml for selector %s: %v", labelSelector, err)
+		return string(out)
+	}
+	return string(out)
+}
+
+func (h *Harness) GetEvents() string {
+	h.t.Helper()
+	out, err := exec.Command("kubectl", "get", "events", "--sort-by=.lastTimestamp").CombinedOutput()
+	if err != nil {
+		h.t.Logf("Warning: failed to get events: %v", err)
+		return string(out)
 	}
 	return string(out)
 }

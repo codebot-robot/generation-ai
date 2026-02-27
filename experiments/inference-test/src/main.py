@@ -19,6 +19,9 @@ import torch
 import torch.distributed as dist
 import functools
 import types
+import requests
+import json
+from pathlib import Path
 from transformers import AutoModelForCausalLM, AutoTokenizer
 from torch.distributed.fsdp import (
     FullyShardedDataParallel as FSDP,
@@ -26,6 +29,45 @@ from torch.distributed.fsdp import (
 from torch.distributed.fsdp.wrap import (
     transformer_auto_wrap_policy,
 )
+
+def download_from_modelstore(model_id, modelstore_url, local_dir):
+    """Downloads model files from modelstore. Returns True if successful."""
+    print(f"Checking for model {model_id} in modelstore at {modelstore_url}...")
+    
+    # Get model metadata
+    try:
+        resp = requests.get(f"{modelstore_url}/models/{model_id}", timeout=10)
+        if resp.status_code == 404:
+            print(f"Model {model_id} not found in modelstore.")
+            return False
+        resp.raise_for_status()
+    except Exception as e:
+        print(f"Error connecting to modelstore: {e}")
+        return False
+
+    model_data = resp.json()
+    print(f"Downloading model {model_id} to {local_dir}...")
+    local_path = Path(local_dir)
+    local_path.mkdir(parents=True, exist_ok=True)
+
+    for file_info in model_data["spec"]["files"]:
+        rel_path = file_info["path"]
+        sha256 = file_info["sha256"]
+        
+        file_local_path = local_path / rel_path
+        file_local_path.parent.mkdir(parents=True, exist_ok=True)
+        
+        # Download blob
+        print(f"  Downloading {rel_path}...")
+        blob_url = f"{modelstore_url}/blobs/{sha256}"
+        with requests.get(blob_url, stream=True) as r:
+            r.raise_for_status()
+            with open(file_local_path, 'wb') as f:
+                for chunk in r.iter_content(chunk_size=8192):
+                    f.write(chunk)
+    
+    print("Download complete.")
+    return True
 
 def print_diagnostics():
     rank = int(os.environ.get("RANK", 0))
@@ -55,7 +97,7 @@ def get_transformer_layer_cls(model):
 
 def main():
     parser = argparse.ArgumentParser(description="Run simple inference benchmark")
-    parser.add_argument("--model", type=str, default="Qwen/Qwen2.5-0.5B-Instruct", help="Model ID to use")
+    parser.add_argument("--model", type=str, default="facebook/opt-125m", help="Model ID to use")
     parser.add_argument("--enable-fsdp", action="store_true", help="Enable FSDP sharding")
     args = parser.parse_args()
 
@@ -78,6 +120,29 @@ def main():
     print_diagnostics()
 
     model_id = args.model
+    modelstore_url = os.getenv("MODELSTORE_URL", "http://modelstore")
+    
+    if modelstore_url:
+        # Use a local directory to download the model
+        local_model_dir = f"/tmp/models/{model_id}"
+        success = False
+        if rank == 0:
+            success = download_from_modelstore(model_id, modelstore_url, local_model_dir)
+        
+        if dist.is_initialized():
+            # Broadcast success to other ranks
+            device = torch.device(f"cuda:{local_rank}") if torch.cuda.is_available() else torch.device("cpu")
+            success_tensor = torch.tensor(1 if success else 0, device=device)
+            dist.broadcast(success_tensor, src=0)
+            success = success_tensor.item() == 1
+            dist.barrier()
+        
+        if success:
+            model_id = local_model_dir
+        else:
+            print(f"[Rank {rank}] Failed to download model {model_id} from modelstore at {modelstore_url}")
+            exit(1)
+
     print(f"[Rank {rank}] Loading model: {model_id}")
 
     # Set seed for reproducibility and consistency across ranks
