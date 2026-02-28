@@ -64,6 +64,10 @@ def main():
     manifest_path = os.path.join(base_dir, "k8s/manifest.yaml")
     with open(manifest_path, 'r') as f:
         manifest_content = f.read()
+
+    job_manifest_path = os.path.join(base_dir, "examples/simple/manifest.yaml")
+    with open(job_manifest_path, 'r') as f:
+        manifest_content += "\n---\n" + f.read()
     
     manifest_content = manifest_content.replace("finetuning-server:latest", server_image)
     manifest_content = manifest_content.replace("finetuning-client:latest", client_image)

@@ -60,7 +60,13 @@ func TestE2E(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Failed to read manifest: %v", err)
 	}
-	manifest := string(b)
+	jobManifestPath := filepath.Join(experimentRoot, "examples/simple/manifest.yaml")
+	jb, err := os.ReadFile(jobManifestPath)
+	if err != nil {
+		t.Fatalf("Failed to read job manifest: %v", err)
+	}
+
+	manifest := string(b) + "\n---\n" + string(jb)
 	manifest = strings.ReplaceAll(manifest, "image: finetuning-server:latest", "image: finetuning-server:e2e\n        imagePullPolicy: Never")
 	manifest = strings.ReplaceAll(manifest, "image: finetuning-client:latest", "image: finetuning-client:e2e\n        imagePullPolicy: Never")
 	manifest = strings.ReplaceAll(manifest, "--max_steps\", \"5\"", "--max_steps\", \"5\", \"--model_id\", \"opt-125m\"")
