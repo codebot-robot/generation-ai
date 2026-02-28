@@ -116,7 +116,6 @@ func TestE2E(t *testing.T) {
 	}
 	uploadJob := string(ujb)
 	uploadJob = strings.ReplaceAll(uploadJob, "image: modelstore:latest", "image: modelstore:e2e\n          imagePullPolicy: Never")
-	uploadJob = strings.ReplaceAll(uploadJob, "--modelstore-url=http://modelstore", "--modelstore-url=http://modelstore.modelstore")
 
 	h.DeleteJob("opt-125m", "modelstore")
 	h.KubectlApplyContent("model-upload", uploadJob, "-n", "modelstore")

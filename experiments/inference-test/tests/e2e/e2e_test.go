@@ -76,7 +76,6 @@ func TestE2E(t *testing.T) {
 	}
 	uploadJob := string(ujb)
 	uploadJob = strings.ReplaceAll(uploadJob, "image: modelstore:latest", "image: modelstore:e2e\n          imagePullPolicy: Never")
-	uploadJob = strings.ReplaceAll(uploadJob, "--modelstore-url=http://modelstore", "--modelstore-url=http://modelstore.modelstore")
 
 	h.DeleteJob("opt-125m", "modelstore")
 	h.KubectlApplyContent("model-upload", uploadJob, "-n", "modelstore")
@@ -101,7 +100,6 @@ func TestE2E(t *testing.T) {
 		manifest = strings.ReplaceAll(manifest, "name: inference-test", "name: inference-test-single")
 		manifest = strings.ReplaceAll(manifest, "image: inference-test:latest", "image: inference-test:e2e\n        imagePullPolicy: Never")
 		manifest = strings.ReplaceAll(manifest, "facebook/opt-125m", "opt-125m")
-		manifest = strings.ReplaceAll(manifest, "value: http://modelstore", "value: http://modelstore.modelstore")
 
 		// Remove GPU requirement for CPU test
 		manifest = strings.ReplaceAll(manifest, "nvidia.com/gpu: 1", "cpu: \"500m\"")
@@ -141,7 +139,6 @@ func TestE2E(t *testing.T) {
 		}
 		manifest := string(b)
 		manifest = strings.ReplaceAll(manifest, "image: inference-test:latest", "image: inference-test:e2e\n        imagePullPolicy: Never")
-		manifest = strings.ReplaceAll(manifest, "value: http://modelstore", "value: http://modelstore.modelstore")
 
 		// Tweak for CPU
 		manifest = strings.ReplaceAll(manifest, "nvidia.com/gpu: 1", "cpu: \"500m\"")
