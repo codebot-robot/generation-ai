@@ -45,9 +45,11 @@ def main():
     run_command(f"docker push {image_tag}")
     
     # 3. Deploy Job
-    manifest_file = "manifest-distributed.yaml" if args.distributed else "manifest.yaml"
-    manifest_path = os.path.join(base_dir, f"k8s/{manifest_file}")
-    print(f"Using manifest: {manifest_file}")
+    if args.distributed:
+        manifest_path = os.path.join(base_dir, "examples/distributed/manifest.yaml")
+    else:
+        manifest_path = os.path.join(base_dir, "examples/simple/manifest.yaml")
+    print(f"Using manifest: {manifest_path}")
 
     with open(manifest_path, 'r') as f:
         manifest_content = f.read()
