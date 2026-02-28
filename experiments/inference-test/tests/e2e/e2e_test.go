@@ -91,7 +91,7 @@ func TestE2E(t *testing.T) {
 	t.Run("SingleNodeCPU", func(t *testing.T) {
 		h.DeleteJob("inference-test-single", "default")
 
-		manifestPath := filepath.Join(experimentRoot, "k8s/manifest.yaml")
+		manifestPath := filepath.Join(experimentRoot, "examples/simple/manifest.yaml")
 		b, err := os.ReadFile(manifestPath)
 		if err != nil {
 			t.Fatalf("Failed to read manifest: %v", err)
@@ -131,10 +131,10 @@ func TestE2E(t *testing.T) {
 		h.DeleteJob("inference-test", "default")
 		h.DeleteService("inference-test-headless", "default")
 
-		manifestPath := filepath.Join(experimentRoot, "k8s/manifest-distributed.yaml")
+		manifestPath := filepath.Join(experimentRoot, "examples/distributed/manifest.yaml")
 		b, err := os.ReadFile(manifestPath)
 		if err != nil {
-			t.Log("manifest-distributed.yaml not found, skipping distributed test")
+			t.Log("manifest.yaml not found in distributed examples, skipping distributed test")
 			return
 		}
 		manifest := string(b)
