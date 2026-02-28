@@ -98,93 +98,98 @@ func (h *Harness) KindLoad(tag string) {
 	h.RunCommand("kind", "load", "docker-image", tag, "--name", h.ClusterName)
 }
 
-func (h *Harness) KubectlApplyContent(name, content string) {
+func (h *Harness) KubectlApplyContent(name, content string, args ...string) {
 	h.t.Helper()
 	snippet := content
 	if len(snippet) > 100 {
 		snippet = snippet[:100] + "..."
 	}
 	h.t.Logf("Applying manifest content for %s:\n%s", name, snippet)
-	cmd := exec.Command("kubectl", "apply", "-f", "-")
+	cmdArgs := append([]string{"apply", "-f", "-"}, args...)
+	cmd := exec.Command("kubectl", cmdArgs...)
 	cmd.Stdin = bytes.NewBufferString(content)
 	if out, err := cmd.CombinedOutput(); err != nil {
 		h.t.Fatalf("Failed to apply content for %s: %v\nOutput: %s\nFull manifest:\n%s", name, err, out, content)
 	}
 }
 
-func (h *Harness) WaitForDeployment(name string, timeout time.Duration) error {
+func (h *Harness) WaitForDeployment(name, namespace string, timeout time.Duration) error {
 	h.t.Helper()
-	h.t.Logf("Waiting for deployment %s", name)
-	cmd := exec.Command("kubectl", "rollout", "status", "deployment/"+name, "--timeout="+timeout.String())
+	h.t.Logf("Waiting for deployment %s in namespace %s", name, namespace)
+	cmd := exec.Command("kubectl", "rollout", "status", "deployment/"+name, "-n", namespace, "--timeout="+timeout.String())
 	if out, err := cmd.CombinedOutput(); err != nil {
 		return fmt.Errorf("deployment %s failed to become ready: %v\nOutput: %s", name, err, out)
 	}
 	return nil
 }
 
-func (h *Harness) WaitForStatefulSet(name string, timeout time.Duration) error {
+func (h *Harness) WaitForStatefulSet(name, namespace string, timeout time.Duration) error {
 	h.t.Helper()
-	h.t.Logf("Waiting for statefulset %s", name)
-	cmd := exec.Command("kubectl", "rollout", "status", "statefulset/"+name, "--timeout="+timeout.String())
+	h.t.Logf("Waiting for statefulset %s in namespace %s", name, namespace)
+	cmd := exec.Command("kubectl", "rollout", "status", "statefulset/"+name, "-n", namespace, "--timeout="+timeout.String())
 	if out, err := cmd.CombinedOutput(); err != nil {
 		return fmt.Errorf("statefulset %s failed to become ready: %v\nOutput: %s", name, err, out)
 	}
 	return nil
 }
 
-func (h *Harness) DeleteDeployment(name string) {
+func (h *Harness) DeleteDeployment(name, namespace string) {
 	h.t.Helper()
 	// Ignore errors if deployment doesn't exist
-	exec.Command("kubectl", "delete", "deployment", name, "--ignore-not-found").Run()
+	exec.Command("kubectl", "delete", "deployment", name, "-n", namespace, "--ignore-not-found").Run()
 }
 
-func (h *Harness) DeleteStatefulSet(name string) {
+func (h *Harness) DeleteStatefulSet(name, namespace string) {
 	h.t.Helper()
 	// Ignore errors if statefulset doesn't exist
-	exec.Command("kubectl", "delete", "statefulset", name, "--ignore-not-found").Run()
+	exec.Command("kubectl", "delete", "statefulset", name, "-n", namespace, "--ignore-not-found").Run()
 }
 
-func (h *Harness) DeleteService(name string) {
+func (h *Harness) DeleteService(name, namespace string) {
 	h.t.Helper()
 	// Ignore errors if service doesn't exist
-	exec.Command("kubectl", "delete", "service", name, "--ignore-not-found").Run()
+	exec.Command("kubectl", "delete", "service", name, "-n", namespace, "--ignore-not-found").Run()
 }
 
-func (h *Harness) DeletePod(name string) {
+func (h *Harness) DeletePod(name, namespace string) {
 	h.t.Helper()
 	// Ignore errors if pod doesn't exist
-	exec.Command("kubectl", "delete", "pod", name, "--ignore-not-found").Run()
+	exec.Command("kubectl", "delete", "pod", name, "-n", namespace, "--ignore-not-found").Run()
 }
 
-func (h *Harness) DeleteJob(name string) {
+func (h *Harness) DeleteJob(name, namespace string) {
 	h.t.Helper()
 	// Ignore errors if job doesn't exist
-	exec.Command("kubectl", "delete", "job", name, "--ignore-not-found").Run()
+	exec.Command("kubectl", "delete", "job", name, "-n", namespace, "--ignore-not-found").Run()
 }
 
-func (h *Harness) GetPodLogs(labelSelector string) string {
+func (h *Harness) GetPodLogs(labelSelector, namespace string) string {
 	h.t.Helper()
-	out, err := exec.Command("kubectl", "logs", "-l", labelSelector).CombinedOutput()
+	out, err := exec.Command("kubectl", "logs", "-l", labelSelector, "-n", namespace).CombinedOutput()
 	if err != nil {
-		h.t.Logf("Warning: failed to get logs for selector %s: %v", labelSelector, err)
+		h.t.Logf("Warning: failed to get logs for selector %s in namespace %s: %v", labelSelector, namespace, err)
 		return string(out)
 	}
 	return string(out)
 }
 
-func (h *Harness) GetPodYaml(labelSelector string) string {
+func (h *Harness) GetPodYaml(labelSelector, namespace string) string {
 	h.t.Helper()
-	out, err := exec.Command("kubectl", "get", "pod", "-l", labelSelector, "-o", "yaml").CombinedOutput()
+	out, err := exec.Command("kubectl", "get", "pod", "-l", labelSelector, "-n", namespace, "-o", "yaml").CombinedOutput()
 	if err != nil {
-		h.t.Logf("Warning: failed to get pod yaml for selector %s: %v", labelSelector, err)
+		h.t.Logf("Warning: failed to get pod yaml for selector %s in namespace %s: %v", labelSelector, namespace, err)
 		return string(out)
 	}
 	return string(out)
 }
 
-func (h *Harness) GetEvents() string {
+func (h *Harness) GetEvents(namespace string) string {
 	h.t.Helper()
-	out, err := exec.Command("kubectl", "get", "events", "--sort-by=.lastTimestamp").CombinedOutput()
+	cmdArgs := []string{"get", "events", "--sort-by=.lastTimestamp"}
+	if namespace != "" {
+		cmdArgs = append(cmdArgs, "-n", namespace)
+	}
+	out, err := exec.Command("kubectl", cmdArgs...).CombinedOutput()
 	if err != nil {
 		h.t.Logf("Warning: failed to get events: %v", err)
 		return string(out)
@@ -192,22 +197,22 @@ func (h *Harness) GetEvents() string {
 	return string(out)
 }
 
-func (h *Harness) WaitForJobSuccess(name string, timeout time.Duration) error {
+func (h *Harness) WaitForJobSuccess(name, namespace string, timeout time.Duration) error {
 	h.t.Helper()
-	h.t.Logf("Waiting for job %s to succeed (timeout: %s)", name, timeout)
+	h.t.Logf("Waiting for job %s to succeed in namespace %s (timeout: %s)", name, namespace, timeout)
 	start := time.Now()
 	for {
 		if time.Since(start) > timeout {
 			return fmt.Errorf("timed out waiting for job %s to succeed after %s", name, timeout)
 		}
-		cmd := exec.Command("kubectl", "get", "job", name, "-o", "jsonpath={.status.succeeded}")
+		cmd := exec.Command("kubectl", "get", "job", name, "-n", namespace, "-o", "jsonpath={.status.succeeded}")
 		out, err := cmd.Output()
 		if err == nil && string(out) == "1" {
 			h.t.Logf("Job %s succeeded", name)
 			return nil
 		}
 
-		cmd = exec.Command("kubectl", "get", "job", name, "-o", "jsonpath={.status.failed}")
+		cmd = exec.Command("kubectl", "get", "job", name, "-n", namespace, "-o", "jsonpath={.status.failed}")
 		out, err = cmd.Output()
 		if err == nil && string(out) == "1" {
 			return fmt.Errorf("job %s failed", name)

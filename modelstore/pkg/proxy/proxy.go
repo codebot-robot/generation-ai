@@ -301,7 +301,7 @@ func (p *Proxy) handleModelCreate(w http.ResponseWriter, r *http.Request) error 
 	model.CreationTimestamp = metav1.Time{}
 
 	if err := p.kube.Create(ctx, &model); err != nil {
-		return fmt.Errorf("failed to create model CRD: %w", err)
+		return fmt.Errorf("failed to create model: %w", err)
 	}
 
 	log.Info("created model", "name", model.Name)

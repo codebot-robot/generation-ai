@@ -43,10 +43,6 @@ func TestE2E(t *testing.T) {
 	h.KindLoad("inference-test:e2e")
 	h.KindLoad("modelstore:e2e")
 
-	// Apply Modelstore CRD
-	crdPath := filepath.Join(modelstoreRoot, "k8s/crds/generationai.labs.gke.io_models.yaml")
-	h.RunCommand("kubectl", "apply", "-f", crdPath)
-
 	// Read modelstore manifest
 	msManifestPath := filepath.Join(modelstoreRoot, "k8s/manifest.yaml")
 	msb, err := os.ReadFile(msManifestPath)
@@ -56,15 +52,19 @@ func TestE2E(t *testing.T) {
 	msManifest := string(msb)
 	msManifest = strings.ReplaceAll(msManifest, "image: modelstore:latest", "image: modelstore:e2e\n          imagePullPolicy: Never")
 
+	// Apply Modelstore CRD
+	crdPath := filepath.Join(modelstoreRoot, "k8s/crds/generationai.labs.gke.io_models.yaml")
+	h.RunCommand("kubectl", "apply", "-f", crdPath)
+
 	// Deploy modelstore
-	h.DeleteStatefulSet("modelstore")
-	h.DeleteService("modelstore")
+	h.DeleteStatefulSet("modelstore", "modelstore")
+	h.DeleteService("modelstore", "modelstore")
 
 	h.KubectlApplyContent("modelstore", msManifest)
-	if err := h.WaitForStatefulSet("modelstore", 2*time.Minute); err != nil {
+	if err := h.WaitForStatefulSet("modelstore", "modelstore", 2*time.Minute); err != nil {
 		fmt.Fprintf(os.Stderr, "Modelstore failed to start: %v\n", err)
-		fmt.Fprintf(os.Stderr, "Modelstore Pod YAML:\n%s\n", h.GetPodYaml("app=modelstore"))
-		fmt.Fprintf(os.Stderr, "Events:\n%s\n", h.GetEvents())
+		fmt.Fprintf(os.Stderr, "Modelstore Pod YAML:\n%s\n", h.GetPodYaml("app=modelstore", "modelstore"))
+		fmt.Fprintf(os.Stderr, "Events:\n%s\n", h.GetEvents("modelstore"))
 		t.Fatalf("Modelstore failed to start: %v", err)
 	}
 
@@ -77,19 +77,19 @@ func TestE2E(t *testing.T) {
 	uploadJob := string(ujb)
 	uploadJob = strings.ReplaceAll(uploadJob, "image: modelstore:latest", "image: modelstore:e2e\n          imagePullPolicy: Never")
 
-	h.DeleteJob("opt-125m")
-	h.KubectlApplyContent("model-upload", uploadJob)
+	h.DeleteJob("opt-125m", "modelstore")
+	h.KubectlApplyContent("model-upload", uploadJob, "-n", "modelstore")
 
 	// Wait for upload job
-	err = h.WaitForJobSuccess("opt-125m", 10*time.Minute)
+	err = h.WaitForJobSuccess("opt-125m", "modelstore", 10*time.Minute)
 	if err != nil {
-		fmt.Fprintf(os.Stderr, "Model upload logs:\n%s\n", h.GetPodLogs("batch.kubernetes.io/job-name=opt-125m"))
+		fmt.Fprintf(os.Stderr, "Model upload logs:\n%s\n", h.GetPodLogs("batch.kubernetes.io/job-name=opt-125m", "modelstore"))
 		t.Fatalf("Model upload job failed: %v", err)
 	}
 
 	// 1. Run Single-node CPU Test
 	t.Run("SingleNodeCPU", func(t *testing.T) {
-		h.DeleteJob("inference-test-single")
+		h.DeleteJob("inference-test-single", "default")
 
 		manifestPath := filepath.Join(experimentRoot, "k8s/manifest.yaml")
 		b, err := os.ReadFile(manifestPath)
@@ -109,15 +109,15 @@ func TestE2E(t *testing.T) {
 		manifest = strings.ReplaceAll(manifest, "resources:", "resources:\n          requests:\n            memory: \"4Gi\"\n          limits:\n            memory: \"8Gi\"")
 
 		h.KubectlApplyContent("inference-test-single", manifest)
-		err = h.WaitForJobSuccess("inference-test-single", 10*time.Minute)
-		logs := h.GetPodLogs("batch.kubernetes.io/job-name=inference-test-single")
+		err = h.WaitForJobSuccess("inference-test-single", "default", 10*time.Minute)
+		logs := h.GetPodLogs("batch.kubernetes.io/job-name=inference-test-single", "default")
 		if err != nil {
-			msLogs := h.GetPodLogs("app=modelstore")
+			msLogs := h.GetPodLogs("app=modelstore", "modelstore")
 			fmt.Fprintf(os.Stderr, "Modelstore logs:\n%s\n", msLogs)
-			fmt.Fprintf(os.Stderr, "Modelstore Pod YAML:\n%s\n", h.GetPodYaml("app=modelstore"))
+			fmt.Fprintf(os.Stderr, "Modelstore Pod YAML:\n%s\n", h.GetPodYaml("app=modelstore", "modelstore"))
 			fmt.Fprintf(os.Stderr, "Single-node logs:\n%s\n", logs)
-			fmt.Fprintf(os.Stderr, "Single-node Pod YAML:\n%s\n", h.GetPodYaml("batch.kubernetes.io/job-name=inference-test-single"))
-			fmt.Fprintf(os.Stderr, "Events:\n%s\n", h.GetEvents())
+			fmt.Fprintf(os.Stderr, "Single-node Pod YAML:\n%s\n", h.GetPodYaml("batch.kubernetes.io/job-name=inference-test-single", "default"))
+			fmt.Fprintf(os.Stderr, "Events:\n%s\n", h.GetEvents("default"))
 			t.Fatalf("Job failed: %v", err)
 		}
 		t.Logf("Single-node logs:\n%s", logs)
@@ -128,8 +128,8 @@ func TestE2E(t *testing.T) {
 
 	// 2. Run Distributed CPU Test (FSDP requested but fallback)
 	t.Run("DistributedCPU", func(t *testing.T) {
-		h.DeleteJob("inference-test")
-		h.DeleteService("inference-test-headless")
+		h.DeleteJob("inference-test", "default")
+		h.DeleteService("inference-test-headless", "default")
 
 		manifestPath := filepath.Join(experimentRoot, "k8s/manifest-distributed.yaml")
 		b, err := os.ReadFile(manifestPath)
@@ -151,15 +151,15 @@ func TestE2E(t *testing.T) {
 		manifest = strings.ReplaceAll(manifest, "resources:", "resources:\n          requests:\n            memory: \"4Gi\"\n          limits:\n            memory: \"8Gi\"")
 
 		h.KubectlApplyContent("inference-test-distributed", manifest)
-		err = h.WaitForJobSuccess("inference-test", 10*time.Minute)
-		logs := h.GetPodLogs("app=inference-test")
+		err = h.WaitForJobSuccess("inference-test", "default", 10*time.Minute)
+		logs := h.GetPodLogs("app=inference-test", "default")
 		if err != nil {
-			msLogs := h.GetPodLogs("app=modelstore")
+			msLogs := h.GetPodLogs("app=modelstore", "modelstore")
 			fmt.Fprintf(os.Stderr, "Modelstore logs:\n%s\n", msLogs)
-			fmt.Fprintf(os.Stderr, "Modelstore Pod YAML:\n%s\n", h.GetPodYaml("app=modelstore"))
+			fmt.Fprintf(os.Stderr, "Modelstore Pod YAML:\n%s\n", h.GetPodYaml("app=modelstore", "modelstore"))
 			fmt.Fprintf(os.Stderr, "Distributed logs:\n%s\n", logs)
-			fmt.Fprintf(os.Stderr, "Distributed Pod YAML:\n%s\n", h.GetPodYaml("app=inference-test"))
-			fmt.Fprintf(os.Stderr, "Events:\n%s\n", h.GetEvents())
+			fmt.Fprintf(os.Stderr, "Distributed Pod YAML:\n%s\n", h.GetPodYaml("app=inference-test", "default"))
+			fmt.Fprintf(os.Stderr, "Events:\n%s\n", h.GetEvents("default"))
 			t.Fatalf("Job failed: %v", err)
 		}
 		t.Logf("Distributed logs:\n%s", logs)

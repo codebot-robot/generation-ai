@@ -50,16 +50,16 @@ func TestE2E(t *testing.T) {
 	manifest = strings.ReplaceAll(manifest, "image: bema:latest", "image: bema:e2e\n          imagePullPolicy: Never")
 
 	// Apply manifests
-	h.DeleteService("bema")
-	h.DeleteStatefulSet("bema")
+	h.DeleteService("bema", "default")
+	h.DeleteStatefulSet("bema", "default")
 
 	h.KubectlApplyContent("bema", manifest)
 
 	// Wait for server
-	if err := h.WaitForStatefulSet("bema", 2*time.Minute); err != nil {
+	if err := h.WaitForStatefulSet("bema", "default", 2*time.Minute); err != nil {
 		fmt.Fprintf(os.Stderr, "Bema failed to start: %v\n", err)
-		fmt.Fprintf(os.Stderr, "Bema Pod YAML:\n%s\n", h.GetPodYaml("app=bema"))
-		fmt.Fprintf(os.Stderr, "Events:\n%s\n", h.GetEvents())
+		fmt.Fprintf(os.Stderr, "Bema Pod YAML:\n%s\n", h.GetPodYaml("app=bema", "default"))
+		fmt.Fprintf(os.Stderr, "Events:\n%s\n", h.GetEvents("default"))
 		t.Fatalf("Bema failed to start: %v", err)
 	}
 

@@ -77,7 +77,7 @@ def download_from_modelstore(model_id, modelstore_url, local_dir, log_queue):
     log_queue.put("Download complete.")
     return True
 
-def push_to_modelstore(model_dir, model_id, log_queue, modelstore_url=os.getenv("MODELSTORE_URL", "http://modelstore")):
+def push_to_modelstore(model_dir, model_id, log_queue, modelstore_url=os.getenv("MODELSTORE_URL", "http://modelstore.modelstore")):
     log_queue.put(f"Pushing fine-tuned model to modelstore at {modelstore_url}...")
     parsed_url = urlparse(modelstore_url)
     
@@ -166,7 +166,7 @@ class FinetuningService(finetuning_pb2_grpc.FinetuningServiceServicer):
         def run_training():
             try:
                 model_id = request.model_id
-                modelstore_url = os.environ.get("MODELSTORE_URL", "http://modelstore")
+                modelstore_url = os.environ.get("MODELSTORE_URL", "http://modelstore.modelstore")
                 if modelstore_url:
                     local_model_dir = f"/tmp/models/{model_id}"
                     if download_from_modelstore(model_id, modelstore_url, local_model_dir, log_queue):
