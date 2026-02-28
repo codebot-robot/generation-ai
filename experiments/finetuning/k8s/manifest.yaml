@@ -50,17 +50,3 @@ spec:
           limits:
             cpu: "4"
             memory: "16Gi"
----
-apiVersion: batch/v1
-kind: Job
-metadata:
-  name: finetuning-client
-spec:
-  template:
-    spec:
-      containers:
-      - name: client
-        image: finetuning-client:latest
-        args: ["--host", "finetuning-server:50051", "--max_steps", "5"]
-      restartPolicy: Never
-  backoffLimit: 0
