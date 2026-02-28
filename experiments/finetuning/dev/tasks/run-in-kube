@@ -51,12 +51,12 @@ def main():
     print(f"Base dir: {base_dir}")
     
     # Build and Push Server
-    server_dockerfile = os.path.join(base_dir, "images/server/Dockerfile")
+    server_dockerfile = os.path.join(base_dir, "images/finetuning-server/Dockerfile")
     run_command(f"docker build -t {server_image} -f {server_dockerfile} {base_dir}")
     run_command(f"docker push {server_image}")
     
     # Build and Push Client
-    client_dockerfile = os.path.join(base_dir, "images/client/Dockerfile")
+    client_dockerfile = os.path.join(base_dir, "images/finetuning-client/Dockerfile")
     run_command(f"docker build -t {client_image} -f {client_dockerfile} {base_dir}")
     run_command(f"docker push {client_image}")
     
