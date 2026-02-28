@@ -74,7 +74,7 @@ func TestE2E(t *testing.T) {
 	// Add MODELSTORE_URL to server
 	envVar := `        env:
         - name: MODELSTORE_URL
-          value: http://modelstore`
+          value: http://modelstore.modelstore`
 	manifest = strings.ReplaceAll(manifest, "- name: server", "- name: server\n"+envVar)
 
 	// Reduce resource requirements for E2E
@@ -84,11 +84,11 @@ func TestE2E(t *testing.T) {
 	manifest = strings.ReplaceAll(manifest, "memory: \"16Gi\"", "memory: \"8Gi\"")
 
 	// Apply manifests
-	h.DeleteJob("finetuning-client")
-	h.DeleteDeployment("finetuning-server")
-	h.DeleteService("finetuning-server")
-	h.DeleteStatefulSet("modelstore")
-	h.DeleteService("modelstore")
+	h.DeleteJob("finetuning-client", "default")
+	h.DeleteDeployment("finetuning-server", "default")
+	h.DeleteService("finetuning-server", "default")
+	h.DeleteStatefulSet("modelstore", "modelstore")
+	h.DeleteService("modelstore", "modelstore")
 
 	// Apply modelstore CRD
 	crdPath := filepath.Join(modelstoreRoot, "k8s/crds/generationai.labs.gke.io_models.yaml")
@@ -101,10 +101,10 @@ func TestE2E(t *testing.T) {
 	h.KubectlApplyContent("modelstore", msManifest)
 
 	// Wait for modelstore
-	if err := h.WaitForStatefulSet("modelstore", 2*time.Minute); err != nil {
+	if err := h.WaitForStatefulSet("modelstore", "modelstore", 2*time.Minute); err != nil {
 		fmt.Fprintf(os.Stderr, "Modelstore failed to start: %v\n", err)
-		fmt.Fprintf(os.Stderr, "Modelstore Pod YAML:\n%s\n", h.GetPodYaml("app=modelstore"))
-		fmt.Fprintf(os.Stderr, "Events:\n%s\n", h.GetEvents())
+		fmt.Fprintf(os.Stderr, "Modelstore Pod YAML:\n%s\n", h.GetPodYaml("app=modelstore", "modelstore"))
+		fmt.Fprintf(os.Stderr, "Events:\n%s\n", h.GetEvents("modelstore"))
 		t.Fatalf("Modelstore failed to start: %v", err)
 	}
 
@@ -116,40 +116,41 @@ func TestE2E(t *testing.T) {
 	}
 	uploadJob := string(ujb)
 	uploadJob = strings.ReplaceAll(uploadJob, "image: modelstore:latest", "image: modelstore:e2e\n          imagePullPolicy: Never")
+	uploadJob = strings.ReplaceAll(uploadJob, "--modelstore-url=http://modelstore", "--modelstore-url=http://modelstore.modelstore")
 
-	h.DeleteJob("opt-125m")
-	h.KubectlApplyContent("model-upload", uploadJob)
+	h.DeleteJob("opt-125m", "modelstore")
+	h.KubectlApplyContent("model-upload", uploadJob, "-n", "modelstore")
 
 	// Wait for upload job
-	err = h.WaitForJobSuccess("opt-125m", 10*time.Minute) // Might take time to download
+	err = h.WaitForJobSuccess("opt-125m", "modelstore", 10*time.Minute) // Might take time to download
 	if err != nil {
-		t.Logf("Model upload logs:\n%s", h.GetPodLogs("batch.kubernetes.io/job-name=opt-125m"))
+		t.Logf("Model upload logs:\n%s", h.GetPodLogs("batch.kubernetes.io/job-name=opt-125m", "modelstore"))
 		t.Fatalf("Model upload job failed: %v", err)
 	}
 
 	h.KubectlApplyContent("finetuning", manifest)
 
 	// Wait for server
-	if err := h.WaitForDeployment("finetuning-server", 5*time.Minute); err != nil {
+	if err := h.WaitForDeployment("finetuning-server", "default", 5*time.Minute); err != nil {
 		fmt.Fprintf(os.Stderr, "Finetuning server failed to start: %v\n", err)
-		fmt.Fprintf(os.Stderr, "Finetuning server Pod YAML:\n%s\n", h.GetPodYaml("app=finetuning-server"))
-		fmt.Fprintf(os.Stderr, "Events:\n%s\n", h.GetEvents())
+		fmt.Fprintf(os.Stderr, "Finetuning server Pod YAML:\n%s\n", h.GetPodYaml("app=finetuning-server", "default"))
+		fmt.Fprintf(os.Stderr, "Events:\n%s\n", h.GetEvents("default"))
 		t.Fatalf("Finetuning server failed to start: %v", err)
 	}
 
 	// Wait for client job
-	err = h.WaitForJobSuccess("finetuning-client", 10*time.Minute)
+	err = h.WaitForJobSuccess("finetuning-client", "default", 10*time.Minute)
 
 	// Check logs (always, even on failure)
-	msLogs := h.GetPodLogs("app=modelstore")
+	msLogs := h.GetPodLogs("app=modelstore", "modelstore")
 	fmt.Fprintf(os.Stderr, "Modelstore logs:\n%s\n", msLogs)
 	t.Logf("Modelstore logs:\n%s", msLogs)
 
-	logs := h.GetPodLogs("app=finetuning-server")
+	logs := h.GetPodLogs("app=finetuning-server", "default")
 	fmt.Fprintf(os.Stderr, "Server logs:\n%s\n", logs)
 	t.Logf("Server logs:\n%s", logs)
 
-	clientLogs := h.GetPodLogs("batch.kubernetes.io/job-name=finetuning-client")
+	clientLogs := h.GetPodLogs("batch.kubernetes.io/job-name=finetuning-client", "default")
 	fmt.Fprintf(os.Stderr, "Client logs:\n%s\n", clientLogs)
 	t.Logf("Client logs:\n%s", clientLogs)
 

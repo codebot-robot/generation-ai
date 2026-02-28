@@ -120,7 +120,7 @@ def main():
     print_diagnostics()
 
     model_id = args.model
-    modelstore_url = os.getenv("MODELSTORE_URL", "http://modelstore")
+    modelstore_url = os.getenv("MODELSTORE_URL", "http://modelstore.modelstore")
     
     if modelstore_url:
         # Use a local directory to download the model

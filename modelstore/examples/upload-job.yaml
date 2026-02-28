@@ -16,9 +16,11 @@ apiVersion: batch/v1
 kind: Job
 metadata:
   name: opt-125m
+  namespace: modelstore
 spec:
   template:
     spec:
+      serviceAccountName: modelstore
       volumes:
         - name: model-data
           emptyDir: {}
@@ -39,7 +41,7 @@ spec:
           command: ["/modelstore"]
           args:
             - "upload"
-            - "--modelstore-url=http://modelstore"
+            - "--modelstore-url=http://modelstore.modelstore"
             - "--model-name=opt-125m"
             - "--model-dir=/data/opt-125m"
           volumeMounts:
