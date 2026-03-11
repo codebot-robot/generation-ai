@@ -16,15 +16,12 @@ package server
 
 import (
 	"context"
-	"os"
-	"path/filepath"
 	"sync"
 
 	pb "github.com/gke-labs/generation-ai/experiments/bema/pkg/api/v1alpha1"
 	"github.com/google/uuid"
 	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/status"
-	"google.golang.org/protobuf/encoding/protojson"
 	"google.golang.org/protobuf/types/known/timestamppb"
 	"k8s.io/klog/v2"
 )
@@ -32,73 +29,23 @@ import (
 type BemaServer struct {
 	pb.UnimplementedBemaServiceServer
 
-	storageDir string
-	backend    Backend
-	executor   Executor
+	store    SessionStore
+	backend  Backend
+	executor Executor
 
 	mu       sync.RWMutex
-	sessions map[string]*pb.Session
 	watchers map[string][]chan *pb.SessionEvent
 }
 
-func NewBemaServer(storageDir string, backend Backend, executor Executor) (*BemaServer, error) {
-	if err := os.MkdirAll(storageDir, 0755); err != nil {
-		return nil, err
-	}
-
+func NewBemaServer(store SessionStore, backend Backend, executor Executor) (*BemaServer, error) {
 	s := &BemaServer{
-		storageDir: storageDir,
-		backend:    backend,
-		executor:   executor,
-		sessions:   make(map[string]*pb.Session),
-		watchers:   make(map[string][]chan *pb.SessionEvent),
-	}
-
-	if err := s.loadSessions(); err != nil {
-		return nil, err
+		store:    store,
+		backend:  backend,
+		executor: executor,
+		watchers: make(map[string][]chan *pb.SessionEvent),
 	}
 
 	return s, nil
-}
-
-func (s *BemaServer) loadSessions() error {
-	entries, err := os.ReadDir(s.storageDir)
-	if err != nil {
-		return err
-	}
-
-	for _, entry := range entries {
-		if entry.IsDir() || filepath.Ext(entry.Name()) != ".json" {
-			continue
-		}
-
-		path := filepath.Join(s.storageDir, entry.Name())
-		data, err := os.ReadFile(path)
-		if err != nil {
-			klog.ErrorS(err, "failed to read session file", "path", path)
-			continue
-		}
-
-		session := &pb.Session{}
-		if err := protojson.Unmarshal(data, session); err != nil {
-			klog.ErrorS(err, "failed to unmarshal session", "path", path)
-			continue
-		}
-
-		s.sessions[session.Id] = session
-	}
-	return nil
-}
-
-func (s *BemaServer) saveSession(session *pb.Session) error {
-	m := protojson.MarshalOptions{Multiline: true}
-	data, err := m.Marshal(session)
-	if err != nil {
-		return err
-	}
-
-	path := filepath.Join(s.storageDir, session.Id+".json")
-	return os.WriteFile(path, data, 0644)
 }
 
 func (s *BemaServer) CreateSession(ctx context.Context, req *pb.CreateSessionRequest) (*pb.Session, error) {
@@ -116,20 +63,19 @@ func (s *BemaServer) CreateSession(ctx context.Context, req *pb.CreateSessionReq
 		Status:    "idle",
 	}
 
-	if err := s.saveSession(session); err != nil {
+	if err := s.store.SaveSession(ctx, session); err != nil {
 		return nil, status.Errorf(codes.Internal, "failed to save session: %v", err)
 	}
 
-	s.sessions[id] = session
 	return session, nil
 }
 
 func (s *BemaServer) GetSession(ctx context.Context, req *pb.GetSessionRequest) (*pb.Session, error) {
-	s.mu.RLock()
-	defer s.mu.RUnlock()
-
-	session, ok := s.sessions[req.Id]
-	if !ok {
+	session, err := s.store.GetSession(ctx, req.Id)
+	if err != nil {
+		return nil, status.Errorf(codes.Internal, "failed to get session: %v", err)
+	}
+	if session == nil {
 		return nil, status.Errorf(codes.NotFound, "session %s not found", req.Id)
 	}
 
@@ -137,12 +83,9 @@ func (s *BemaServer) GetSession(ctx context.Context, req *pb.GetSessionRequest) 
 }
 
 func (s *BemaServer) ListSessions(ctx context.Context, req *pb.ListSessionsRequest) (*pb.ListSessionsResponse, error) {
-	s.mu.RLock()
-	defer s.mu.RUnlock()
-
-	sessions := make([]*pb.Session, 0, len(s.sessions))
-	for _, session := range s.sessions {
-		sessions = append(sessions, session)
+	sessions, err := s.store.ListSessions(ctx)
+	if err != nil {
+		return nil, status.Errorf(codes.Internal, "failed to list sessions: %v", err)
 	}
 
 	return &pb.ListSessionsResponse{Sessions: sessions}, nil
@@ -152,8 +95,11 @@ func (s *BemaServer) AppendMessage(ctx context.Context, req *pb.AppendMessageReq
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
-	session, ok := s.sessions[req.Id]
-	if !ok {
+	session, err := s.store.GetSession(ctx, req.Id)
+	if err != nil {
+		return nil, status.Errorf(codes.Internal, "failed to get session: %v", err)
+	}
+	if session == nil {
 		return nil, status.Errorf(codes.NotFound, "session %s not found", req.Id)
 	}
 
@@ -165,7 +111,7 @@ func (s *BemaServer) AppendMessage(ctx context.Context, req *pb.AppendMessageReq
 	session.Messages = append(session.Messages, msg)
 	session.UpdatedAt = timestamppb.Now()
 
-	if err := s.saveSession(session); err != nil {
+	if err := s.store.SaveSession(ctx, session); err != nil {
 		return nil, status.Errorf(codes.Internal, "failed to save session: %v", err)
 	}
 
@@ -180,13 +126,15 @@ func (s *BemaServer) AppendMessage(ctx context.Context, req *pb.AppendMessageReq
 
 func (s *BemaServer) generateBackendResponse(ctx context.Context, sessionID string) {
 	for {
-		s.mu.RLock()
-		session, ok := s.sessions[sessionID]
-		if !ok {
-			s.mu.RUnlock()
+		session, err := s.store.GetSession(ctx, sessionID)
+		if err != nil {
+			klog.ErrorS(err, "failed to get session", "sessionID", sessionID)
 			return
 		}
-		s.mu.RUnlock()
+		if session == nil {
+			klog.V(2).InfoS("session not found, stopping backend response generation", "sessionID", sessionID)
+			return
+		}
 
 		resp, err := s.backend.GenerateResponse(ctx, session)
 		if err != nil {
@@ -240,13 +188,15 @@ func (s *BemaServer) generateBackendResponse(ctx context.Context, sessionID stri
 }
 
 func (s *BemaServer) WatchSession(req *pb.WatchSessionRequest, stream pb.BemaService_WatchSessionServer) error {
-	s.mu.Lock()
-	session, ok := s.sessions[req.Id]
-	if !ok {
-		s.mu.Unlock()
+	session, err := s.store.GetSession(stream.Context(), req.Id)
+	if err != nil {
+		return status.Errorf(codes.Internal, "failed to get session: %v", err)
+	}
+	if session == nil {
 		return status.Errorf(codes.NotFound, "session %s not found", req.Id)
 	}
 
+	s.mu.Lock()
 	ch := make(chan *pb.SessionEvent, 10)
 	s.watchers[req.Id] = append(s.watchers[req.Id], ch)
 	s.mu.Unlock()

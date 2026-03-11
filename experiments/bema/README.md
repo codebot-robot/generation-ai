@@ -7,6 +7,7 @@ Bema is a platform for session-based chat, designed to support agentic lifecycle
 - **Session-based API**: Manage chat sessions as persistent resources.
 - **Watch Support**: Get notified of all changes to a session in real-time.
 - **Persistence**: Sessions are stored persistently, allowing clients to disconnect and reconnect without losing state.
+- **Scaling**: Designed to scale to a billion sessions (not all of which will be active at once!). Session storage is pluggable, supporting different backends like SQL for large-scale deployments.
 
 ## Directory Structure
 

@@ -31,12 +31,16 @@ func TestBemaServer(t *testing.T) {
 	}
 	defer os.RemoveAll(tmpDir)
 
-	s, err := NewBemaServer(tmpDir, nil, nil)
+	store, err := NewFileSessionStore(tmpDir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	s, err := NewBemaServer(store, nil, nil)
 	if err != nil {
 		t.Fatal(err)
 	}
 
-	ctx := context.Background()
+	ctx := t.Context()
 
 	// 1. Create session
 	sess, err := s.CreateSession(ctx, &pb.CreateSessionRequest{})
@@ -78,7 +82,11 @@ func TestBemaServer(t *testing.T) {
 	}
 
 	// 4. Persistence test
-	s2, err := NewBemaServer(tmpDir, nil, nil)
+	store2, err := NewFileSessionStore(tmpDir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	s2, err := NewBemaServer(store2, nil, nil)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -113,12 +121,16 @@ func TestWatchSession(t *testing.T) {
 	}
 	defer os.RemoveAll(tmpDir)
 
-	s, err := NewBemaServer(tmpDir, nil, nil)
+	store, err := NewFileSessionStore(tmpDir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	s, err := NewBemaServer(store, nil, nil)
 	if err != nil {
 		t.Fatal(err)
 	}
 
-	ctx, cancel := context.WithCancel(context.Background())
+	ctx, cancel := context.WithCancel(t.Context())
 	defer cancel()
 
 	sess, _ := s.CreateSession(ctx, &pb.CreateSessionRequest{})
@@ -202,12 +214,16 @@ func TestBackendTriggered(t *testing.T) {
 		},
 	}
 
-	s, err := NewBemaServer(tmpDir, mock, nil)
+	store, err := NewFileSessionStore(tmpDir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	s, err := NewBemaServer(store, mock, nil)
 	if err != nil {
 		t.Fatal(err)
 	}
 
-	ctx := context.Background()
+	ctx := t.Context()
 	sess, _ := s.CreateSession(ctx, &pb.CreateSessionRequest{})
 
 	s.AppendMessage(ctx, &pb.AppendMessageRequest{
@@ -302,12 +318,16 @@ func TestToolCalling(t *testing.T) {
 		},
 	}
 
-	s, err := NewBemaServer(tmpDir, backend, executor)
+	store, err := NewFileSessionStore(tmpDir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	s, err := NewBemaServer(store, backend, executor)
 	if err != nil {
 		t.Fatal(err)
 	}
 
-	ctx := context.Background()
+	ctx := t.Context()
 	sess, _ := s.CreateSession(ctx, &pb.CreateSessionRequest{})
 
 	// Change backend response for the second call

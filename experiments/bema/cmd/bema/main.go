@@ -59,7 +59,12 @@ func main() {
 	}
 
 	s := grpc.NewServer()
-	bemaServer, err := server.NewBemaServer(*storageDir, backend, executor)
+	store, err := server.NewFileSessionStore(*storageDir)
+	if err != nil {
+		klog.Fatalf("failed to create session store: %v", err)
+	}
+
+	bemaServer, err := server.NewBemaServer(store, backend, executor)
 	if err != nil {
 		klog.Fatalf("failed to create bema server: %v", err)
 	}
