@@ -24,13 +24,6 @@ spec:
       port: 50051
       targetPort: 50051
 ---
-apiVersion: v1
-kind: Secret
-metadata:
-  name: bema
-stringData:
-  GEMINI_API_KEY: ""
----
 apiVersion: apps/v1
 kind: StatefulSet
 metadata:
