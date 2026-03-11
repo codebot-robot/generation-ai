@@ -51,7 +51,7 @@ The `bema-cli` supports the following options:
 - `--list`: List all available sessions.
 - `--session <id>`: Resume a specific session.
 
-Special support for Kubernetes: if you specify a server URL like `http://bema.default.svc.cluster.local`, the CLI will automatically set up a `kubectl port-forward` to the service.
+Special support for Kubernetes: if you specify a server URL like `http://bema.bema.svc.cluster.local`, the CLI will automatically set up a `kubectl port-forward` to the service.
 
 Inside the CLI, you can use:
 - `/session <id>`: Switch to a different session.

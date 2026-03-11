@@ -13,9 +13,56 @@
 # limitations under the License.
 
 apiVersion: v1
+kind: Namespace
+metadata:
+  name: bema
+---
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: bema-sandboxes
+---
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: bema
+  namespace: bema
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  name: sandbox-manager
+  namespace: bema-sandboxes
+rules:
+  - apiGroups: ["agents.x-k8s.io"]
+    resources: ["sandboxes"]
+    verbs: ["get", "list", "watch", "create", "update", "patch", "delete"]
+  - apiGroups: [""]
+    resources: ["pods"]
+    verbs: ["get", "list", "watch"]
+  - apiGroups: [""]
+    resources: ["pods/exec"]
+    verbs: ["create"]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: bema-sandbox-manager
+  namespace: bema-sandboxes
+subjects:
+  - kind: ServiceAccount
+    name: bema
+    namespace: bema
+roleRef:
+  kind: Role
+  name: sandbox-manager
+  apiGroup: rbac.authorization.k8s.io
+---
+apiVersion: v1
 kind: Service
 metadata:
   name: bema
+  namespace: bema
 spec:
   selector:
     app: bema
@@ -28,6 +75,7 @@ apiVersion: apps/v1
 kind: StatefulSet
 metadata:
   name: bema
+  namespace: bema
 spec:
   serviceName: "bema"
   replicas: 1
@@ -39,6 +87,7 @@ spec:
       labels:
         app: bema
     spec:
+      serviceAccountName: bema
       containers:
         - name: bema
           image: bema:latest
