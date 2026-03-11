@@ -37,7 +37,7 @@ import (
 
 func main() {
 	klog.InitFlags(nil)
-	server := flag.String("server", "http://localhost:50051", "The server address (e.g., http://localhost:50051 or https://bema.example.com)")
+	server := flag.String("server", "http://bema.default.svc.cluster.local", "The server address (e.g., http://localhost:50051 or https://bema.example.com)")
 	sessionID := flag.String("session", "", "The session ID to resume")
 	list := flag.Bool("list", false, "List all sessions")
 	flag.Parse()
@@ -100,8 +100,8 @@ func parseServer(server string) (string, []grpc.DialOption, func(), error) {
 		return "", nil, nil, fmt.Errorf("unknown scheme: %s", u.Scheme)
 	}
 
-	if strings.HasSuffix(u.Hostname(), ".cluster.svc.local") {
-		// service.namespace.cluster.svc.local
+	if strings.HasSuffix(u.Hostname(), ".svc.cluster.local") {
+		// service.namespace.svc.cluster.local
 		parts := strings.Split(u.Hostname(), ".")
 		if len(parts) < 2 {
 			return "", nil, nil, fmt.Errorf("invalid kubernetes service URL: %s", u.Hostname())
