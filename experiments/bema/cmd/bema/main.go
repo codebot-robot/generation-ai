@@ -32,7 +32,7 @@ func main() {
 	klog.InitFlags(nil)
 	port := flag.String("port", "50051", "The server port")
 	storageDir := flag.String("storage-dir", "/tmp/bema", "Directory to store sessions")
-	backendType := flag.String("backend", "", "The LLM backend to use (e.g. gemini)")
+	backendType := flag.String("backend", "gemini", "The LLM backend to use (e.g. gemini)")
 	modelName := flag.String("model", "gemini-3-flash-preview", "The model name for the backend")
 	flag.Parse()
 

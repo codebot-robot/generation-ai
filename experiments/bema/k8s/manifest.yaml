@@ -24,6 +24,13 @@ spec:
       port: 50051
       targetPort: 50051
 ---
+apiVersion: v1
+kind: Secret
+metadata:
+  name: bema
+stringData:
+  GEMINI_API_KEY: ""
+---
 apiVersion: apps/v1
 kind: StatefulSet
 metadata:
@@ -42,8 +49,14 @@ spec:
       containers:
         - name: bema
           image: bema:latest
+          args:
+            - --storage-dir=/data/bema
+            - --backend=gemini
           ports:
             - containerPort: 50051
+          envFrom:
+            - secretRef:
+                name: bema
           volumeMounts:
             - name: data
               mountPath: /data
