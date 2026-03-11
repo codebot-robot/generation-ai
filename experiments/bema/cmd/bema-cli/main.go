@@ -37,7 +37,7 @@ import (
 
 func main() {
 	klog.InitFlags(nil)
-	server := flag.String("server", "http://bema.default.svc.cluster.local", "The server address (e.g., http://localhost:50051 or https://bema.example.com)")
+	server := flag.String("server", "http://bema.bema.svc.cluster.local", "The server address (e.g., http://localhost:50051 or https://bema.example.com)")
 	sessionID := flag.String("session", "", "The session ID to resume")
 	list := flag.Bool("list", false, "List all sessions")
 	flag.Parse()
