@@ -17,26 +17,38 @@ package main
 import (
 	"bufio"
 	"context"
+	"crypto/tls"
 	"flag"
 	"fmt"
 	"io"
+	"net"
+	"net/url"
 	"os"
+	"os/exec"
 	"strings"
+	"time"
 
 	pb "github.com/gke-labs/generation-ai/experiments/bema/pkg/api/v1alpha1"
 	"google.golang.org/grpc"
+	"google.golang.org/grpc/credentials"
 	"google.golang.org/grpc/credentials/insecure"
 	"k8s.io/klog/v2"
 )
 
 func main() {
 	klog.InitFlags(nil)
-	addr := flag.String("addr", "localhost:50051", "The server address")
+	server := flag.String("server", "http://localhost:50051", "The server address (e.g., http://localhost:50051 or https://bema.example.com)")
 	sessionID := flag.String("session", "", "The session ID to resume")
 	list := flag.Bool("list", false, "List all sessions")
 	flag.Parse()
 
-	conn, err := grpc.Dial(*addr, grpc.WithTransportCredentials(insecure.NewCredentials()))
+	addr, dialOpts, cleanup, err := parseServer(*server)
+	if err != nil {
+		klog.Fatalf("failed to parse server: %v", err)
+	}
+	defer cleanup()
+
+	conn, err := grpc.NewClient(addr, dialOpts...)
 	if err != nil {
 		klog.Fatalf("did not connect: %v", err)
 	}
@@ -68,6 +80,83 @@ func main() {
 	}
 
 	runChat(client, session.Id)
+}
+
+func parseServer(server string) (string, []grpc.DialOption, func(), error) {
+	u, err := url.Parse(server)
+	if err != nil {
+		return "", nil, nil, fmt.Errorf("failed to parse server URL: %v", err)
+	}
+
+	var dialOpts []grpc.DialOption
+	addr := u.Host
+
+	switch u.Scheme {
+	case "https":
+		dialOpts = append(dialOpts, grpc.WithTransportCredentials(credentials.NewTLS(&tls.Config{})))
+	case "http":
+		dialOpts = append(dialOpts, grpc.WithTransportCredentials(insecure.NewCredentials()))
+	default:
+		return "", nil, nil, fmt.Errorf("unknown scheme: %s", u.Scheme)
+	}
+
+	if strings.HasSuffix(u.Hostname(), ".cluster.svc.local") {
+		// service.namespace.cluster.svc.local
+		parts := strings.Split(u.Hostname(), ".")
+		if len(parts) < 2 {
+			return "", nil, nil, fmt.Errorf("invalid kubernetes service URL: %s", u.Hostname())
+		}
+		serviceName := parts[0]
+		namespace := parts[1]
+
+		remotePort := u.Port()
+		if remotePort == "" {
+			remotePort = "50051" // Default Bema port
+		}
+
+		// Find a free local port
+		l, err := net.Listen("tcp", "localhost:0")
+		if err != nil {
+			return "", nil, nil, fmt.Errorf("failed to find free local port: %v", err)
+		}
+		localAddr := l.Addr().String()
+		l.Close()
+		_, localPort, _ := net.SplitHostPort(localAddr)
+
+		klog.Infof("starting kubectl port-forward to %s in namespace %s", serviceName, namespace)
+		cmd := exec.Command("kubectl", "port-forward", "-n", namespace, "svc/"+serviceName, localPort+":"+remotePort)
+		if err := cmd.Start(); err != nil {
+			return "", nil, nil, fmt.Errorf("failed to start kubectl port-forward: %v", err)
+		}
+
+		cleanup := func() {
+			if cmd.Process != nil {
+				cmd.Process.Kill()
+			}
+		}
+
+		// Try to connect to the local port until it's ready
+		ready := false
+		for i := 0; i < 20; i++ {
+			conn, err := net.DialTimeout("tcp", "localhost:"+localPort, 100*time.Millisecond)
+			if err == nil {
+				conn.Close()
+				ready = true
+				break
+			}
+			time.Sleep(200 * time.Millisecond)
+		}
+
+		if !ready {
+			cleanup()
+			return "", nil, nil, fmt.Errorf("kubectl port-forward failed to become ready")
+		}
+
+		addr = "localhost:" + localPort
+		return addr, dialOpts, cleanup, nil
+	}
+
+	return addr, dialOpts, func() {}, nil
 }
 
 func listSessions(client pb.BemaServiceClient) {

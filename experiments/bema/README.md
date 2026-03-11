@@ -39,16 +39,18 @@ go test ./...
 go run cmd/bema/main.go --storage-dir=/tmp/bema
 
 # In another terminal, run the CLI client
-go run cmd/bema-cli/main.go
+go run cmd/bema-cli/main.go --server=http://localhost:50051
 ```
 
 ## CLI Client
 
 The `bema-cli` supports the following options:
 
-- `--addr`: Server address (default "localhost:50051").
+- `--server`: Server address (e.g., `http://localhost:50051`, `https://bema.example.com`).
 - `--list`: List all available sessions.
 - `--session <id>`: Resume a specific session.
+
+Special support for Kubernetes: if you specify a server URL like `http://bema.default.cluster.svc.local`, the CLI will automatically set up a `kubectl port-forward` to the service.
 
 Inside the CLI, you can use:
 - `/session <id>`: Switch to a different session.
