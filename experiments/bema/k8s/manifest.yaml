@@ -42,8 +42,14 @@ spec:
       containers:
         - name: bema
           image: bema:latest
+          args:
+            - --storage-dir=/data/bema
+            - --backend=gemini
           ports:
             - containerPort: 50051
+          envFrom:
+            - secretRef:
+                name: bema
           volumeMounts:
             - name: data
               mountPath: /data
