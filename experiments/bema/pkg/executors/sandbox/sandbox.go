@@ -15,18 +15,25 @@
 package sandbox
 
 import (
+	"bytes"
 	"context"
 	"fmt"
 	"os"
-	"os/exec"
+	"time"
 
 	pb "github.com/gke-labs/generation-ai/experiments/bema/pkg/api/v1alpha1"
 	"google.golang.org/protobuf/types/known/structpb"
 	"google.golang.org/protobuf/types/known/timestamppb"
-	"k8s.io/apimachinery/pkg/apis/meta/v1"
+	corev1 "k8s.io/api/core/v1"
+	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
 	"k8s.io/apimachinery/pkg/runtime/schema"
+	"k8s.io/apimachinery/pkg/util/wait"
 	"k8s.io/client-go/dynamic"
+	"k8s.io/client-go/kubernetes"
+	"k8s.io/client-go/kubernetes/scheme"
+	"k8s.io/client-go/rest"
+	"k8s.io/client-go/tools/remotecommand"
 	"sigs.k8s.io/controller-runtime/pkg/client/config"
 )
 
@@ -39,8 +46,10 @@ var (
 )
 
 type SandboxExecutor struct {
-	client    dynamic.Interface
-	namespace string
+	client     dynamic.Interface
+	kubeClient kubernetes.Interface
+	config     *rest.Config
+	namespace  string
 }
 
 func New(ctx context.Context) (*SandboxExecutor, error) {
@@ -54,14 +63,21 @@ func New(ctx context.Context) (*SandboxExecutor, error) {
 		return nil, fmt.Errorf("failed to create dynamic client: %v", err)
 	}
 
+	kubeClient, err := kubernetes.NewForConfig(restConfig)
+	if err != nil {
+		return nil, fmt.Errorf("failed to create kubernetes client: %v", err)
+	}
+
 	ns := os.Getenv("NAMESPACE")
 	if ns == "" {
 		ns = "bema-sandboxes"
 	}
 
 	return &SandboxExecutor{
-		client:    client,
-		namespace: ns,
+		client:     client,
+		kubeClient: kubeClient,
+		config:     restConfig,
+		namespace:  ns,
 	}, nil
 }
 
@@ -132,9 +148,9 @@ func (e *SandboxExecutor) Execute(ctx context.Context, sessionID string, message
 func (e *SandboxExecutor) ensureSandbox(ctx context.Context, sessionID string) error {
 	name := "bema-" + sessionID
 
-	_, err := e.client.Resource(agentSandboxGVR).Namespace(e.namespace).Get(ctx, name, v1.GetOptions{})
+	_, err := e.client.Resource(agentSandboxGVR).Namespace(e.namespace).Get(ctx, name, metav1.GetOptions{})
 	if err == nil {
-		return nil
+		return e.waitForSandboxReady(ctx, name)
 	}
 
 	// Create it
@@ -161,18 +177,38 @@ func (e *SandboxExecutor) ensureSandbox(ctx context.Context, sessionID string) e
 		},
 	}
 
-	_, err = e.client.Resource(agentSandboxGVR).Namespace(e.namespace).Create(ctx, sandbox, v1.CreateOptions{})
+	_, err = e.client.Resource(agentSandboxGVR).Namespace(e.namespace).Create(ctx, sandbox, metav1.CreateOptions{})
 	if err != nil {
 		return fmt.Errorf("failed to create Sandbox: %v", err)
 	}
 
-	// Wait for it to be ready
-	cmd := exec.CommandContext(ctx, "kubectl", "wait", "--for=condition=Ready", "sandbox", "-n", e.namespace, name, "--timeout=60s")
-	if output, err := cmd.CombinedOutput(); err != nil {
-		return fmt.Errorf("failed to wait for Sandbox readiness: %v: %s", err, string(output))
-	}
+	return e.waitForSandboxReady(ctx, name)
+}
 
-	return nil
+func (e *SandboxExecutor) waitForSandboxReady(ctx context.Context, name string) error {
+	return wait.PollUntilContextTimeout(ctx, 1*time.Second, 60*time.Second, true, func(ctx context.Context) (bool, error) {
+		sandbox, err := e.client.Resource(agentSandboxGVR).Namespace(e.namespace).Get(ctx, name, metav1.GetOptions{})
+		if err != nil {
+			return false, nil // Continue polling
+		}
+
+		conditions, found, err := unstructured.NestedSlice(sandbox.Object, "status", "conditions")
+		if err != nil || !found {
+			return false, nil
+		}
+
+		for _, c := range conditions {
+			condition, ok := c.(map[string]any)
+			if !ok {
+				continue
+			}
+			if condition["type"] == "Ready" && condition["status"] == "True" {
+				return true, nil
+			}
+		}
+
+		return false, nil
+	})
 }
 
 func (e *SandboxExecutor) executeInSandbox(ctx context.Context, sessionID string, command string) (string, error) {
@@ -182,12 +218,44 @@ func (e *SandboxExecutor) executeInSandbox(ctx context.Context, sessionID string
 
 	name := "bema-" + sessionID
 
-	// We use kubectl exec.
-	// Since we are using Sandbox, we should try to exec into the pod created by it.
-	// We'll assume for now that the pod has the same name or we can find it by label.
+	req := e.kubeClient.CoreV1().RESTClient().Post().
+		Resource("pods").
+		Name(name).
+		Namespace(e.namespace).
+		SubResource("exec")
 
-	cmd := exec.CommandContext(ctx, "kubectl", "exec", "-n", e.namespace, name, "--", "sh", "-c", command)
-	output, err := cmd.CombinedOutput()
+	option := &corev1.PodExecOptions{
+		Container: "sandbox",
+		Command:   []string{"sh", "-c", command},
+		Stdin:     false,
+		Stdout:    true,
+		Stderr:    true,
+		TTY:       false,
+	}
 
-	return string(output), err
+	req.VersionedParams(
+		option,
+		scheme.ParameterCodec,
+	)
+
+	exec, err := remotecommand.NewSPDYExecutor(e.config, "POST", req.URL())
+	if err != nil {
+		return "", fmt.Errorf("failed to create SPDY executor: %v", err)
+	}
+
+	var stdout, stderr bytes.Buffer
+	err = exec.StreamWithContext(ctx, remotecommand.StreamOptions{
+		Stdout: &stdout,
+		Stderr: &stderr,
+	})
+
+	output := stdout.String()
+	if stderr.Len() > 0 {
+		if output != "" {
+			output += "\n"
+		}
+		output += stderr.String()
+	}
+
+	return output, err
 }
