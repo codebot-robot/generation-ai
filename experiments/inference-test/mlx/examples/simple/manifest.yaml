@@ -1,0 +1,32 @@
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: mlx-inference-gpu
+spec:
+  template:
+    spec:
+      containers:
+      - name: mlx-inference
+        image: mlx-inference:latest
+        resources:
+          limits:
+            nvidia.com/gpu: 1
+        args: ["--model", "mlx-community/functiongemma-270m-it-6bit", "--device", "gpu"]
+      nodeSelector:
+        cloud.google.com/gke-accelerator: nvidia-l4
+      restartPolicy: Never
+  backoffLimit: 0
+---
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: mlx-inference-cpu
+spec:
+  template:
+    spec:
+      containers:
+      - name: mlx-inference
+        image: mlx-inference:latest
+        args: ["--model", "mlx-community/functiongemma-270m-it-6bit", "--device", "cpu"]
+      restartPolicy: Never
+  backoffLimit: 0
