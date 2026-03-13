@@ -43,21 +43,18 @@ def main():
 
     print(f"Prompt: {args.prompt}")
     print("Starting generation...")
-    
     start_time = time.time()
-    
+
     # mlx_lm.generate returns the response string
     response = generate(model, tokenizer, prompt=prompt, verbose=True)
-    
+
     end_time = time.time()
-    
-    print("
-Response:")
+
+    print("\nResponse:")
     print(response)
-    
+
     duration = end_time - start_time
-    print(f"
-Duration: {duration:.4f} seconds")
+    print(f"\nDuration: {duration:.4f} seconds")
     
     # Estimate tokens
     tokens = tokenizer.encode(response)

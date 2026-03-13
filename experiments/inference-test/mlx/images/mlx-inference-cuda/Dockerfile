@@ -12,12 +12,12 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-FROM pytorch/pytorch:2.10.0-cuda13.0-cudnn9-runtime
+FROM pytorch/pytorch:2.10.0-cuda12.8-cudnn9-runtime
 
 WORKDIR /app
 
 # Install dependencies
-RUN pip install --no-cache-dir --break-system-packages "mlx-lm" "mlx[cuda13]" requests
+RUN pip install --no-cache-dir --break-system-packages "mlx-lm" "mlx[cuda12]" requests
 
 # Copy source code
 COPY src/ /app/src/

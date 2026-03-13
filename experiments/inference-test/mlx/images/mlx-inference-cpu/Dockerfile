@@ -1,5 +1,3 @@
-#!/bin/bash
-
 # Copyright 2026 Google LLC
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
@@ -14,21 +12,14 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-set -o errexit
-set -o nounset
-set -o pipefail
+FROM python:3.11-slim
 
-SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-cd "${SCRIPT_DIR}"
+WORKDIR /app
 
-IMAGE_NAME="mlx-inference-cpu"
+# Install dependencies
+RUN pip install --no-cache-dir "mlx-lm" "mlx[cpu]" requests
 
-echo "Building MLX Docker image..."
-docker build -t "${IMAGE_NAME}" -f images/mlx-inference-cpu/Dockerfile .
+# Copy source code
+COPY src/ /app/src/
 
-echo "Running MLX inference test (CPU)..."
-# Using a very small model if possible for testing, or just the default.
-# FunctionGemma 270m is small enough.
-docker run --rm "${IMAGE_NAME}" --model mlx-community/functiongemma-270m-it-6bit --device cpu
-
-echo "MLX E2E Test Passed!"
+ENTRYPOINT ["python", "src/main.py"]
