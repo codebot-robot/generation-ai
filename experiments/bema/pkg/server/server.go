@@ -16,6 +16,7 @@ package server
 
 import (
 	"context"
+	"os"
 	"sync"
 
 	pb "github.com/gke-labs/generation-ai/experiments/bema/pkg/api/v1alpha1"
@@ -23,7 +24,9 @@ import (
 	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/status"
 	"google.golang.org/protobuf/types/known/timestamppb"
+	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/klog/v2"
+	"sigs.k8s.io/controller-runtime/pkg/client"
 )
 
 type BemaServer struct {
@@ -32,16 +35,18 @@ type BemaServer struct {
 	store    SessionStore
 	backend  Backend
 	executor Executor
+	client   client.Client
 
 	mu       sync.RWMutex
 	watchers map[string][]chan *pb.SessionEvent
 }
 
-func NewBemaServer(store SessionStore, backend Backend, executor Executor) (*BemaServer, error) {
+func NewBemaServer(store SessionStore, backend Backend, executor Executor, client client.Client) (*BemaServer, error) {
 	s := &BemaServer{
 		store:    store,
 		backend:  backend,
 		executor: executor,
+		client:   client,
 		watchers: make(map[string][]chan *pb.SessionEvent),
 	}
 
@@ -143,7 +148,7 @@ func (s *BemaServer) generateBackendResponse(ctx context.Context, sessionID stri
 		}
 
 		// Append the response
-		_, err = s.AppendMessage(ctx, &pb.AppendMessageRequest{
+		session, err = s.AppendMessage(ctx, &pb.AppendMessageRequest{
 			Id:      sessionID,
 			Message: resp,
 		})
@@ -162,10 +167,25 @@ func (s *BemaServer) generateBackendResponse(ctx context.Context, sessionID stri
 		}
 
 		if hasFunctionCalls && s.executor != nil {
-			toolResp, err := s.executor.Execute(ctx, sessionID, resp)
+			actions, toolResp, err := s.executor.Execute(ctx, sessionID, resp)
 			if err != nil {
 				klog.ErrorS(err, "failed to execute tools", "sessionID", sessionID)
 				return
+			}
+
+			// Save actions to K8s
+			for _, action := range actions {
+				action.Spec.Timestamp = metav1.NewTime(resp.Timestamp.AsTime())
+				if action.Namespace == "" {
+					ns := os.Getenv("BEMA_NAMESPACE")
+					if ns == "" {
+						ns = "bema"
+					}
+					action.Namespace = ns
+				}
+				if err := s.client.Create(ctx, action); err != nil {
+					klog.ErrorS(err, "failed to create AgentAction", "actionName", action.Name)
+				}
 			}
 
 			if toolResp != nil {

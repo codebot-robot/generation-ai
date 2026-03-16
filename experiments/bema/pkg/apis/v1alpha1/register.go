@@ -19,4 +19,6 @@ var (
 	ChatSessionGVR        = GroupVersion.WithResource("chatsessions")
 	ChatSessionMessageGVK = GroupVersion.WithKind("ChatSessionMessage")
 	ChatSessionMessageGVR = GroupVersion.WithResource("chatsessionmessages")
+	AgentActionGVK        = GroupVersion.WithKind("AgentAction")
+	AgentActionGVR        = GroupVersion.WithResource("agentactions")
 )

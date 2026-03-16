@@ -20,12 +20,16 @@ import (
 	"net"
 
 	"github.com/gke-labs/generation-ai/experiments/bema/pkg/api/v1alpha1"
+	bemav1alpha1 "github.com/gke-labs/generation-ai/experiments/bema/pkg/apis/v1alpha1"
 	"github.com/gke-labs/generation-ai/experiments/bema/pkg/backend/gemini"
 	"github.com/gke-labs/generation-ai/experiments/bema/pkg/executors/sandbox"
 	"github.com/gke-labs/generation-ai/experiments/bema/pkg/server"
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/reflection"
+	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/klog/v2"
+	ctrl "sigs.k8s.io/controller-runtime"
+	"sigs.k8s.io/controller-runtime/pkg/client"
 )
 
 func main() {
@@ -37,6 +41,21 @@ func main() {
 	flag.Parse()
 
 	ctx := context.Background()
+
+	scheme := runtime.NewScheme()
+	if err := bemav1alpha1.AddToScheme(scheme); err != nil {
+		klog.Fatalf("failed to add bema v1alpha1 to scheme: %v", err)
+	}
+
+	config, err := ctrl.GetConfig()
+	if err != nil {
+		klog.Fatalf("failed to get kubeconfig: %v", err)
+	}
+
+	k8sClient, err := client.New(config, client.Options{Scheme: scheme})
+	if err != nil {
+		klog.Fatalf("failed to create k8s client: %v", err)
+	}
 
 	var backend server.Backend
 	if *backendType == "gemini" {
@@ -64,7 +83,7 @@ func main() {
 		klog.Fatalf("failed to create session store: %v", err)
 	}
 
-	bemaServer, err := server.NewBemaServer(store, backend, executor)
+	bemaServer, err := server.NewBemaServer(store, backend, executor, k8sClient)
 	if err != nil {
 		klog.Fatalf("failed to create bema server: %v", err)
 	}
