@@ -62,14 +62,48 @@ type ChatSessionMessageSpec struct {
 	Role string `json:"role"`
 
 	// Parts is the content of the message.
-	// +kubebuilder:pruning:PreserveUnknownFields
-	Parts runtime.RawExtension `json:"parts,omitempty"`
+	Parts []Part `json:"parts,omitempty"`
 
 	// Timestamp is the time the message was created.
 	Timestamp metav1.Time `json:"timestamp,omitempty"`
+}
 
-	// Index is the order of the message in the session.
-	Index int32 `json:"index"`
+// Part represents a part of a message.
+type Part struct {
+	// Text is the text content of the message part.
+	Text string `json:"text,omitempty"`
+
+	// FunctionRequest is a request to call a function.
+	FunctionRequest *FunctionCall `json:"functionRequest,omitempty"`
+
+	// FunctionResponse is the response from a function call.
+	FunctionResponse *FunctionResponse `json:"functionResponse,omitempty"`
+
+	// Thought indicates if this part is a thought.
+	Thought bool `json:"thought,omitempty"`
+
+	// ThoughtSignature is the signature of the thought.
+	ThoughtSignature []byte `json:"thoughtSignature,omitempty"`
+}
+
+// FunctionCall represents a request to call a function.
+type FunctionCall struct {
+	// Name is the name of the function to call.
+	Name string `json:"name"`
+
+	// Args are the arguments to the function call.
+	// +kubebuilder:pruning:PreserveUnknownFields
+	Args runtime.RawExtension `json:"args,omitempty"`
+}
+
+// FunctionResponse represents the response from a function call.
+type FunctionResponse struct {
+	// Name is the name of the function that was called.
+	Name string `json:"name"`
+
+	// Response is the response from the function call.
+	// +kubebuilder:pruning:PreserveUnknownFields
+	Response runtime.RawExtension `json:"response,omitempty"`
 }
 
 // +kubebuilder:object:root=true

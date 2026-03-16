@@ -19,6 +19,7 @@ import (
 
 	pb "github.com/gke-labs/generation-ai/experiments/bema/pkg/api/v1alpha1"
 	bemav1alpha1 "github.com/gke-labs/generation-ai/experiments/bema/pkg/apis/v1alpha1"
+	"google.golang.org/protobuf/types/known/structpb"
 	"k8s.io/client-go/kubernetes/scheme"
 	"sigs.k8s.io/controller-runtime/pkg/client/fake"
 )
@@ -70,35 +71,62 @@ func TestK8sSessionStore(t *testing.T) {
 		t.Errorf("Expected message content 'Hello', got '%s'", sess2.Messages[0].Parts[0].GetText())
 	}
 
-	// 3. Append another message
+	// 3. Append another message with function call
+	args, _ := structpb.NewStruct(map[string]any{"arg1": "val1"})
 	sess2.Messages = append(sess2.Messages, &pb.Message{
 		Role: "model",
 		Parts: []*pb.Part{
 			{
-				Data: &pb.Part_Text{
-					Text: "Hi there!",
+				Data: &pb.Part_FunctionCall{
+					FunctionCall: &pb.FunctionCall{
+						Name: "my-func",
+						Args: args,
+					},
 				},
 			},
 		},
 	})
 
 	if err := store.SaveSession(ctx, sess2); err != nil {
-		t.Fatalf("SaveSession (update) failed: %v", err)
+		t.Fatalf("SaveSession (update with func call) failed: %v", err)
 	}
 
-	// 4. Verify order and content
+	// 4. Append function response
+	resp, _ := structpb.NewStruct(map[string]any{"result": "ok"})
+	sess2.Messages = append(sess2.Messages, &pb.Message{
+		Role: "function",
+		Parts: []*pb.Part{
+			{
+				Data: &pb.Part_FunctionResponse{
+					FunctionResponse: &pb.FunctionResponse{
+						Name:     "my-func",
+						Response: resp,
+					},
+				},
+			},
+		},
+	})
+
+	if err := store.SaveSession(ctx, sess2); err != nil {
+		t.Fatalf("SaveSession (update with func response) failed: %v", err)
+	}
+
+	// 5. Verify order and content
 	sess3, err := store.GetSession(ctx, "test-session")
 	if err != nil {
 		t.Fatalf("GetSession (final) failed: %v", err)
 	}
-	if len(sess3.Messages) != 2 {
-		t.Errorf("Expected 2 messages, got %d", len(sess3.Messages))
+	if len(sess3.Messages) != 3 {
+		t.Errorf("Expected 3 messages, got %d", len(sess3.Messages))
 	}
-	if sess3.Messages[1].Parts[0].GetText() != "Hi there!" {
-		t.Errorf("Expected second message content 'Hi there!', got '%s'", sess3.Messages[1].Parts[0].GetText())
+	if sess3.Messages[1].Parts[0].GetFunctionCall().Name != "my-func" {
+		t.Errorf("Expected second message function call 'my-func', got '%s'", sess3.Messages[1].Parts[0].GetFunctionCall().GetName())
+	}
+	if sess3.Messages[2].Parts[0].GetFunctionResponse().Response.GetFields()["result"].GetStringValue() != "ok" {
+		t.Errorf("Expected third message function response 'ok', got '%v'", sess3.Messages[2].Parts[0].GetFunctionResponse().GetResponse())
 	}
 
-	// 5. List sessions
+	// 6. List sessions
 	sessions, err := store.ListSessions(ctx)
 	if err != nil {
 		t.Fatalf("ListSessions failed: %v", err)

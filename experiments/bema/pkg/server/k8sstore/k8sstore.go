@@ -16,7 +16,6 @@ package k8sstore
 
 import (
 	"context"
-	"encoding/json"
 	"fmt"
 	"sort"
 
@@ -67,7 +66,10 @@ func (s *K8sSessionStore) GetSession(ctx context.Context, id string) (*pb.Sessio
 	}
 
 	sort.Slice(messageList.Items, func(i, j int) bool {
-		return messageList.Items[i].Spec.Index < messageList.Items[j].Spec.Index
+		if !messageList.Items[i].Spec.Timestamp.Equal(&messageList.Items[j].Spec.Timestamp) {
+			return messageList.Items[i].Spec.Timestamp.Before(&messageList.Items[j].Spec.Timestamp)
+		}
+		return messageList.Items[i].Name < messageList.Items[j].Name
 	})
 
 	session := &pb.Session{
@@ -93,18 +95,64 @@ func (s *K8sSessionStore) GetSession(ctx context.Context, id string) (*pb.Sessio
 			pbMsg.Timestamp = timestamppb.New(msg.Spec.Timestamp.Time)
 		}
 
-		if msg.Spec.Parts.Raw != nil {
-			// Parts is stored as a JSON array of Part objects.
-			// Reconstruct a JSON that matches pb.Message structure.
-			partsJSON := fmt.Sprintf(`{"parts": %s}`, string(msg.Spec.Parts.Raw))
-			if err := protojson.Unmarshal([]byte(partsJSON), pbMsg); err != nil {
-				return nil, fmt.Errorf("unmarshaling parts for message %d: %w", msg.Spec.Index, err)
+		for _, part := range msg.Spec.Parts {
+			pbPart := &pb.Part{
+				Thought:          part.Thought,
+				ThoughtSignature: part.ThoughtSignature,
 			}
+			if part.Text != "" {
+				pbPart.Data = &pb.Part_Text{Text: part.Text}
+			} else if part.FunctionRequest != nil {
+				args, err := rawExtensionToStruct(part.FunctionRequest.Args)
+				if err != nil {
+					return nil, fmt.Errorf("converting function request args: %w", err)
+				}
+				pbPart.Data = &pb.Part_FunctionCall{
+					FunctionCall: &pb.FunctionCall{
+						Name: part.FunctionRequest.Name,
+						Args: args,
+					},
+				}
+			} else if part.FunctionResponse != nil {
+				response, err := rawExtensionToStruct(part.FunctionResponse.Response)
+				if err != nil {
+					return nil, fmt.Errorf("converting function response: %w", err)
+				}
+				pbPart.Data = &pb.Part_FunctionResponse{
+					FunctionResponse: &pb.FunctionResponse{
+						Name:     part.FunctionResponse.Name,
+						Response: response,
+					},
+				}
+			}
+			pbMsg.Parts = append(pbMsg.Parts, pbPart)
 		}
 		session.Messages = append(session.Messages, pbMsg)
 	}
 
 	return session, nil
+}
+
+func structToRawExtension(s *structpb.Struct) (runtime.RawExtension, error) {
+	if s == nil {
+		return runtime.RawExtension{}, nil
+	}
+	b, err := protojson.Marshal(s)
+	if err != nil {
+		return runtime.RawExtension{}, err
+	}
+	return runtime.RawExtension{Raw: b}, nil
+}
+
+func rawExtensionToStruct(re runtime.RawExtension) (*structpb.Struct, error) {
+	if re.Raw == nil {
+		return nil, nil
+	}
+	s := &structpb.Struct{}
+	if err := protojson.Unmarshal(re.Raw, s); err != nil {
+		return nil, err
+	}
+	return s, nil
 }
 
 // SaveSession updates an existing session.
@@ -155,26 +203,39 @@ func (s *K8sSessionStore) SaveSession(ctx context.Context, session *pb.Session) 
 			Spec: bemav1alpha1.ChatSessionMessageSpec{
 				SessionID: session.Id,
 				Role:      msg.Role,
-				Index:     int32(i),
 			},
 		}
 		if msg.Timestamp != nil {
 			chatMsg.Spec.Timestamp = metav1.NewTime(msg.Timestamp.AsTime())
 		}
-		if len(msg.Parts) > 0 {
-			// Use a dummy message to marshal only parts using protojson.
-			dummy := &pb.Message{Parts: msg.Parts}
-			msgBytes, err := protojson.Marshal(dummy)
-			if err != nil {
-				return fmt.Errorf("marshaling message %d: %w", i, err)
+		for _, part := range msg.Parts {
+			p := bemav1alpha1.Part{
+				Thought:          part.Thought,
+				ThoughtSignature: part.ThoughtSignature,
 			}
-
-			// Extract only the "parts" array.
-			var data map[string]json.RawMessage
-			if err := json.Unmarshal(msgBytes, &data); err != nil {
-				return fmt.Errorf("unmarshaling message JSON into map: %w", err)
+			switch d := part.Data.(type) {
+			case *pb.Part_Text:
+				p.Text = d.Text
+			case *pb.Part_FunctionCall:
+				args, err := structToRawExtension(d.FunctionCall.Args)
+				if err != nil {
+					return fmt.Errorf("converting function call args: %w", err)
+				}
+				p.FunctionRequest = &bemav1alpha1.FunctionCall{
+					Name: d.FunctionCall.Name,
+					Args: args,
+				}
+			case *pb.Part_FunctionResponse:
+				response, err := structToRawExtension(d.FunctionResponse.Response)
+				if err != nil {
+					return fmt.Errorf("converting function response: %w", err)
+				}
+				p.FunctionResponse = &bemav1alpha1.FunctionResponse{
+					Name:     d.FunctionResponse.Name,
+					Response: response,
+				}
 			}
-			chatMsg.Spec.Parts = runtime.RawExtension{Raw: data["parts"]}
+			chatMsg.Spec.Parts = append(chatMsg.Spec.Parts, p)
 		}
 
 		existingMsg := &bemav1alpha1.ChatSessionMessage{}

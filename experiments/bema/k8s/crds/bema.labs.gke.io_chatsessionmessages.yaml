@@ -40,14 +40,51 @@ spec:
           spec:
             description: ChatSessionMessageSpec defines the desired state of ChatSessionMessage
             properties:
-              index:
-                description: Index is the order of the message in the session.
-                format: int32
-                type: integer
               parts:
                 description: Parts is the content of the message.
-                type: object
-                x-kubernetes-preserve-unknown-fields: true
+                items:
+                  description: Part represents a part of a message.
+                  properties:
+                    functionRequest:
+                      description: FunctionRequest is a request to call a function.
+                      properties:
+                        args:
+                          description: Args are the arguments to the function call.
+                          type: object
+                          x-kubernetes-preserve-unknown-fields: true
+                        name:
+                          description: Name is the name of the function to call.
+                          type: string
+                      required:
+                      - name
+                      type: object
+                    functionResponse:
+                      description: FunctionResponse is the response from a function
+                        call.
+                      properties:
+                        name:
+                          description: Name is the name of the function that was called.
+                          type: string
+                        response:
+                          description: Response is the response from the function
+                            call.
+                          type: object
+                          x-kubernetes-preserve-unknown-fields: true
+                      required:
+                      - name
+                      type: object
+                    text:
+                      description: Text is the text content of the message part.
+                      type: string
+                    thought:
+                      description: Thought indicates if this part is a thought.
+                      type: boolean
+                    thoughtSignature:
+                      description: ThoughtSignature is the signature of the thought.
+                      format: byte
+                      type: string
+                  type: object
+                type: array
               role:
                 description: Role is the role of the message (e.g. user, model, system,
                   function).
@@ -61,7 +98,6 @@ spec:
                 format: date-time
                 type: string
             required:
-            - index
             - role
             - sessionId
             type: object
