@@ -21,7 +21,11 @@ import (
 	"time"
 
 	pb "github.com/gke-labs/generation-ai/experiments/bema/pkg/api/v1alpha1"
+	"github.com/gke-labs/generation-ai/experiments/bema/pkg/apis/v1alpha1"
 	"google.golang.org/protobuf/types/known/structpb"
+	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/apimachinery/pkg/runtime"
+	"sigs.k8s.io/controller-runtime/pkg/client/fake"
 )
 
 func TestBemaServer(t *testing.T) {
@@ -31,11 +35,15 @@ func TestBemaServer(t *testing.T) {
 	}
 	defer os.RemoveAll(tmpDir)
 
+	scheme := runtime.NewScheme()
+	_ = v1alpha1.AddToScheme(scheme)
+	k8sClient := fake.NewClientBuilder().WithScheme(scheme).Build()
+
 	store, err := NewFileSessionStore(tmpDir)
 	if err != nil {
 		t.Fatal(err)
 	}
-	s, err := NewBemaServer(store, nil, nil)
+	s, err := NewBemaServer(store, nil, nil, k8sClient)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -86,7 +94,7 @@ func TestBemaServer(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	s2, err := NewBemaServer(store2, nil, nil)
+	s2, err := NewBemaServer(store2, nil, nil, k8sClient)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -125,7 +133,10 @@ func TestWatchSession(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	s, err := NewBemaServer(store, nil, nil)
+	scheme := runtime.NewScheme()
+	_ = v1alpha1.AddToScheme(scheme)
+	k8sClient := fake.NewClientBuilder().WithScheme(scheme).Build()
+	s, err := NewBemaServer(store, nil, nil, k8sClient)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -218,7 +229,10 @@ func TestBackendTriggered(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	s, err := NewBemaServer(store, mock, nil)
+	scheme := runtime.NewScheme()
+	_ = v1alpha1.AddToScheme(scheme)
+	k8sClient := fake.NewClientBuilder().WithScheme(scheme).Build()
+	s, err := NewBemaServer(store, mock, nil, k8sClient)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -261,11 +275,12 @@ func TestBackendTriggered(t *testing.T) {
 type mockExecutor struct {
 	triggered chan bool
 	response  *pb.Message
+	actions   []*v1alpha1.AgentAction
 }
 
-func (m *mockExecutor) Execute(ctx context.Context, sessionID string, message *pb.Message) (*pb.Message, error) {
+func (m *mockExecutor) Execute(ctx context.Context, sessionID string, message *pb.Message) ([]*v1alpha1.AgentAction, *pb.Message, error) {
 	m.triggered <- true
-	return m.response, nil
+	return m.actions, m.response, nil
 }
 
 func TestToolCalling(t *testing.T) {
@@ -301,6 +316,19 @@ func TestToolCalling(t *testing.T) {
 	response, _ := structpb.NewStruct(map[string]any{
 		"output": "file1.txt",
 	})
+	actions := []*v1alpha1.AgentAction{
+		{
+			ObjectMeta: metav1.ObjectMeta{
+				Name: "test-action",
+			},
+			Spec: v1alpha1.AgentActionSpec{
+				ToolName: "exec",
+			},
+			Status: v1alpha1.AgentActionStatus{
+				Status: "Completed",
+			},
+		},
+	}
 	executor := &mockExecutor{
 		triggered: executorTriggered,
 		response: &pb.Message{
@@ -316,13 +344,17 @@ func TestToolCalling(t *testing.T) {
 				},
 			},
 		},
+		actions: actions,
 	}
 
 	store, err := NewFileSessionStore(tmpDir)
 	if err != nil {
 		t.Fatal(err)
 	}
-	s, err := NewBemaServer(store, backend, executor)
+	scheme := runtime.NewScheme()
+	_ = v1alpha1.AddToScheme(scheme)
+	k8sClient := fake.NewClientBuilder().WithScheme(scheme).Build()
+	s, err := NewBemaServer(store, backend, executor, k8sClient)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -379,5 +411,21 @@ func TestToolCalling(t *testing.T) {
 	// 1: user, 2: assistant (tool call), 3: tool (output), 4: assistant (final)
 	if len(sess2.Messages) != 4 {
 		t.Errorf("Expected 4 messages, got %d", len(sess2.Messages))
+	}
+
+	// Verify actions in K8s
+	var actionList v1alpha1.AgentActionList
+	if err := k8sClient.List(ctx, &actionList); err != nil {
+		t.Fatalf("Failed to list actions from k8s: %v", err)
+	}
+	if len(actionList.Items) != 1 {
+		t.Errorf("Expected 1 action, got %d", len(actionList.Items))
+	}
+	if actionList.Items[0].Spec.ToolName != "exec" {
+		t.Errorf("Expected action tool name 'exec', got '%s'", actionList.Items[0].Spec.ToolName)
+	}
+	expectedTimestamp := metav1.NewTime(sess2.Messages[1].Timestamp.AsTime())
+	if actionList.Items[0].Spec.Timestamp.Unix() != expectedTimestamp.Unix() {
+		t.Errorf("Expected action timestamp %v, got %v", expectedTimestamp, actionList.Items[0].Spec.Timestamp)
 	}
 }

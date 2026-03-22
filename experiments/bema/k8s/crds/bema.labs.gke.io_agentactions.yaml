@@ -1,0 +1,82 @@
+---
+apiVersion: apiextensions.k8s.io/v1
+kind: CustomResourceDefinition
+metadata:
+  annotations:
+    controller-gen.kubebuilder.io/version: v0.17.2
+  name: agentactions.bema.labs.gke.io
+spec:
+  group: bema.labs.gke.io
+  names:
+    kind: AgentAction
+    listKind: AgentActionList
+    plural: agentactions
+    singular: agentaction
+  scope: Namespaced
+  versions:
+  - name: v1alpha1
+    schema:
+      openAPIV3Schema:
+        description: AgentAction is the Schema for the agentactions API
+        properties:
+          apiVersion:
+            description: |-
+              APIVersion defines the versioned schema of this representation of an object.
+              Servers should convert recognized schemas to the latest internal value, and
+              may reject unrecognized values.
+              More info: https://git.k8s.io/community/contributors/devel/sig-architecture/api-conventions.md#resources
+            type: string
+          kind:
+            description: |-
+              Kind is a string value representing the REST resource this object represents.
+              Servers may infer this from the endpoint the client submits requests to.
+              Cannot be updated.
+              In CamelCase.
+              More info: https://git.k8s.io/community/contributors/devel/sig-architecture/api-conventions.md#types-kinds
+            type: string
+          metadata:
+            type: object
+          spec:
+            description: AgentActionSpec defines the desired state of AgentAction
+            properties:
+              sessionId:
+                description: SessionID is the ID of the session this action belongs
+                  to.
+                type: string
+              timestamp:
+                description: Timestamp is the timestamp of the message that triggered
+                  this action.
+                format: date-time
+                type: string
+              toolArgs:
+                description: ToolArgs are the arguments for the tool.
+                type: object
+                x-kubernetes-preserve-unknown-fields: true
+              toolName:
+                description: ToolName is the name of the tool to be executed.
+                type: string
+            required:
+            - sessionId
+            - timestamp
+            - toolName
+            type: object
+          status:
+            description: AgentActionStatus defines the observed state of AgentAction
+            properties:
+              status:
+                description: Status is the current status of the action.
+                type: string
+              toolOutput:
+                description: ToolOutput is the output of the tool execution.
+                type: object
+                x-kubernetes-preserve-unknown-fields: true
+              undoData:
+                description: UndoData is the data needed to undo the action.
+                type: object
+                x-kubernetes-preserve-unknown-fields: true
+            type: object
+        type: object
+    served: true
+    storage: true
+    subresources:
+      status: {}

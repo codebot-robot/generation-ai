@@ -31,6 +31,30 @@ metadata:
 apiVersion: rbac.authorization.k8s.io/v1
 kind: Role
 metadata:
+  name: bema
+  namespace: bema
+rules:
+  - apiGroups: ["bema.labs.gke.io"]
+    resources: ["chatsessions", "chatsessionmessages", "agentactions"]
+    verbs: ["get", "list", "watch", "create", "update", "patch", "delete"]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: bema
+  namespace: bema
+subjects:
+  - kind: ServiceAccount
+    name: bema
+    namespace: bema
+roleRef:
+  kind: Role
+  name: bema
+  apiGroup: rbac.authorization.k8s.io
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
   name: sandbox-manager
   namespace: bema-sandboxes
 rules:
@@ -96,6 +120,11 @@ spec:
             - --backend=gemini
           ports:
             - containerPort: 50051
+          env:
+            - name: BEMA_NAMESPACE
+              valueFrom:
+                fieldRef:
+                  fieldPath: metadata.namespace
           envFrom:
             - secretRef:
                 name: bema

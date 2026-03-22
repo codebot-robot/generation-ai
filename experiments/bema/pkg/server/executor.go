@@ -18,10 +18,11 @@ import (
 	"context"
 
 	pb "github.com/gke-labs/generation-ai/experiments/bema/pkg/api/v1alpha1"
+	bemav1alpha1 "github.com/gke-labs/generation-ai/experiments/bema/pkg/apis/v1alpha1"
 )
 
 // Executor is the interface for executing tools.
 type Executor interface {
 	// Execute executes tool calls for the given session.
-	Execute(ctx context.Context, sessionID string, message *pb.Message) (*pb.Message, error)
+	Execute(ctx context.Context, sessionID string, message *pb.Message) ([]*bemav1alpha1.AgentAction, *pb.Message, error)
 }

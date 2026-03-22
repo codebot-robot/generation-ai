@@ -22,11 +22,14 @@ import (
 	"time"
 
 	pb "github.com/gke-labs/generation-ai/experiments/bema/pkg/api/v1alpha1"
+	"github.com/google/uuid"
+	"google.golang.org/protobuf/encoding/protojson"
 	"google.golang.org/protobuf/types/known/structpb"
 	"google.golang.org/protobuf/types/known/timestamppb"
 	corev1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
+	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/apimachinery/pkg/runtime/schema"
 	"k8s.io/apimachinery/pkg/util/wait"
 	"k8s.io/client-go/dynamic"
@@ -35,6 +38,8 @@ import (
 	"k8s.io/client-go/rest"
 	"k8s.io/client-go/tools/remotecommand"
 	"sigs.k8s.io/controller-runtime/pkg/client/config"
+
+	"github.com/gke-labs/generation-ai/experiments/bema/pkg/apis/v1alpha1"
 )
 
 var (
@@ -81,8 +86,9 @@ func New(ctx context.Context) (*SandboxExecutor, error) {
 	}, nil
 }
 
-func (e *SandboxExecutor) Execute(ctx context.Context, sessionID string, message *pb.Message) (*pb.Message, error) {
+func (e *SandboxExecutor) Execute(ctx context.Context, sessionID string, message *pb.Message) ([]*v1alpha1.AgentAction, *pb.Message, error) {
 	var pbParts []*pb.Part
+	var actions []*v1alpha1.AgentAction
 
 	for _, p := range message.Parts {
 		fcPart, ok := p.Data.(*pb.Part_FunctionCall)
@@ -92,6 +98,9 @@ func (e *SandboxExecutor) Execute(ctx context.Context, sessionID string, message
 		fc := fcPart.FunctionCall
 		name := fc.Name
 		args := fc.Args
+
+		var action *v1alpha1.AgentAction
+		var toolResponse *pb.Part_FunctionResponse
 
 		if name == "exec" {
 			command := args.Fields["command"].GetStringValue()
@@ -105,40 +114,68 @@ func (e *SandboxExecutor) Execute(ctx context.Context, sessionID string, message
 			}
 			responseStruct, err := structpb.NewStruct(result)
 			if err != nil {
-				return nil, err
+				return nil, nil, err
 			}
 
-			pbParts = append(pbParts, &pb.Part{
-				Data: &pb.Part_FunctionResponse{
-					FunctionResponse: &pb.FunctionResponse{
-						Name:     name,
-						Response: responseStruct,
-					},
+			toolResponse = &pb.Part_FunctionResponse{
+				FunctionResponse: &pb.FunctionResponse{
+					Name:     name,
+					Response: responseStruct,
 				},
-			})
+			}
+
+			status := "Completed"
+			if err != nil {
+				status = "Failed"
+			}
+
+			argsRaw, _ := protojson.Marshal(args)
+			outputRaw, _ := protojson.Marshal(responseStruct)
+
+			action = &v1alpha1.AgentAction{
+				ObjectMeta: metav1.ObjectMeta{
+					Name: uuid.New().String(),
+				},
+				Spec: v1alpha1.AgentActionSpec{
+					SessionID: sessionID,
+					ToolName:  name,
+					ToolArgs:  runtime.RawExtension{Raw: argsRaw},
+				},
+				Status: v1alpha1.AgentActionStatus{
+					Status:     status,
+					ToolOutput: runtime.RawExtension{Raw: outputRaw},
+				},
+			}
 		} else {
 			responseStruct, err := structpb.NewStruct(map[string]any{
 				"error": "unknown tool",
 			})
 			if err != nil {
-				return nil, err
+				return nil, nil, err
 			}
-			pbParts = append(pbParts, &pb.Part{
-				Data: &pb.Part_FunctionResponse{
-					FunctionResponse: &pb.FunctionResponse{
-						Name:     name,
-						Response: responseStruct,
-					},
+			toolResponse = &pb.Part_FunctionResponse{
+				FunctionResponse: &pb.FunctionResponse{
+					Name:     name,
+					Response: responseStruct,
 				},
+			}
+		}
+
+		if toolResponse != nil {
+			pbParts = append(pbParts, &pb.Part{
+				Data: toolResponse,
 			})
+		}
+		if action != nil {
+			actions = append(actions, action)
 		}
 	}
 
 	if len(pbParts) == 0 {
-		return nil, nil
+		return nil, nil, nil
 	}
 
-	return &pb.Message{
+	return actions, &pb.Message{
 		Role:      "function",
 		Parts:     pbParts,
 		Timestamp: timestamppb.Now(),
