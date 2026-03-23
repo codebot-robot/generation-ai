@@ -34,6 +34,8 @@ type ChatSessionStatus struct {
 
 // +kubebuilder:object:root=true
 // +kubebuilder:subresource:status
+// +kubebuilder:printcolumn:name="Status",type="string",JSONPath=".status.status"
+// +kubebuilder:printcolumn:name="Age",type="date",JSONPath=".metadata.creationTimestamp"
 
 // ChatSession is the Schema for the chatsessions API
 type ChatSession struct {
@@ -107,6 +109,9 @@ type FunctionResponse struct {
 }
 
 // +kubebuilder:object:root=true
+// +kubebuilder:printcolumn:name="Session",type="string",JSONPath=".spec.sessionId"
+// +kubebuilder:printcolumn:name="Role",type="string",JSONPath=".spec.role"
+// +kubebuilder:printcolumn:name="Age",type="date",JSONPath=".metadata.creationTimestamp"
 
 // ChatSessionMessage is the Schema for the chatsessionmessages API
 type ChatSessionMessage struct {
