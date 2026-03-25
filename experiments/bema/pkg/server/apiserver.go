@@ -35,6 +35,31 @@ type APIServer struct {
 	Store SessionStore
 }
 
+var (
+	group        = bemav1alpha1.GroupVersion.Group
+	version      = bemav1alpha1.GroupVersion.Version
+	groupVersion = bemav1alpha1.GroupVersion.String()
+
+	apiResources = []metav1.APIResource{
+		{
+			Name:         "chatsessions",
+			SingularName: "chatsession",
+			Namespaced:   true,
+			Kind:         "ChatSession",
+			Verbs:        []string{"get", "list"},
+			ShortNames:   []string{"cs"},
+		},
+		{
+			Name:         "chatsessionmessages",
+			SingularName: "chatsessionmessage",
+			Namespaced:   true,
+			Kind:         "ChatSessionMessage",
+			Verbs:        []string{"get", "list"},
+			ShortNames:   []string{"csm"},
+		},
+	}
+)
+
 // NewAPIServer creates a new APIServer.
 func NewAPIServer(store SessionStore) *APIServer {
 	return &APIServer{Store: store}
@@ -47,11 +72,11 @@ func (s *APIServer) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	switch {
 	case path == "/apis":
 		s.handleAPIs(w)
-	case path == "/apis/bema.labs.gke.io":
+	case path == "/apis/"+group:
 		s.handleBemaGroup(w)
-	case path == "/apis/bema.labs.gke.io/v1alpha1":
+	case path == "/apis/"+groupVersion:
 		s.handleBemaV1alpha1(w)
-	case strings.HasPrefix(path, "/apis/bema.labs.gke.io/v1alpha1/"):
+	case strings.HasPrefix(path, "/apis/"+groupVersion+"/"):
 		s.handleResource(w, r)
 	default:
 		http.NotFound(w, r)
@@ -66,16 +91,16 @@ func (s *APIServer) handleAPIs(w http.ResponseWriter) {
 		},
 		Groups: []metav1.APIGroup{
 			{
-				Name: "bema.labs.gke.io",
+				Name: group,
 				Versions: []metav1.GroupVersionForDiscovery{
 					{
-						GroupVersion: "bema.labs.gke.io/v1alpha1",
-						Version:      "v1alpha1",
+						GroupVersion: groupVersion,
+						Version:      version,
 					},
 				},
 				PreferredVersion: metav1.GroupVersionForDiscovery{
-					GroupVersion: "bema.labs.gke.io/v1alpha1",
-					Version:      "v1alpha1",
+					GroupVersion: groupVersion,
+					Version:      version,
 				},
 			},
 		},
@@ -88,16 +113,16 @@ func (s *APIServer) handleBemaGroup(w http.ResponseWriter) {
 			Kind:       "APIGroup",
 			APIVersion: "v1",
 		},
-		Name: "bema.labs.gke.io",
+		Name: group,
 		Versions: []metav1.GroupVersionForDiscovery{
 			{
-				GroupVersion: "bema.labs.gke.io/v1alpha1",
-				Version:      "v1alpha1",
+				GroupVersion: groupVersion,
+				Version:      version,
 			},
 		},
 		PreferredVersion: metav1.GroupVersionForDiscovery{
-			GroupVersion: "bema.labs.gke.io/v1alpha1",
-			Version:      "v1alpha1",
+			GroupVersion: groupVersion,
+			Version:      version,
 		},
 	})
 }
@@ -108,30 +133,13 @@ func (s *APIServer) handleBemaV1alpha1(w http.ResponseWriter) {
 			Kind:       "APIResourceList",
 			APIVersion: "v1",
 		},
-		GroupVersion: "bema.labs.gke.io/v1alpha1",
-		APIResources: []metav1.APIResource{
-			{
-				Name:         "chatsessions",
-				SingularName: "chatsession",
-				Namespaced:   true,
-				Kind:         "ChatSession",
-				Verbs:        []string{"get", "list"},
-				ShortNames:   []string{"cs"},
-			},
-			{
-				Name:         "chatsessionmessages",
-				SingularName: "chatsessionmessage",
-				Namespaced:   true,
-				Kind:         "ChatSessionMessage",
-				Verbs:        []string{"get", "list"},
-				ShortNames:   []string{"csm"},
-			},
-		},
+		GroupVersion: groupVersion,
+		APIResources: apiResources,
 	})
 }
 
 func (s *APIServer) handleResource(w http.ResponseWriter, r *http.Request) {
-	parts := strings.Split(strings.TrimPrefix(r.URL.Path, "/apis/bema.labs.gke.io/v1alpha1/"), "/")
+	parts := strings.Split(strings.TrimPrefix(r.URL.Path, "/apis/"+groupVersion+"/"), "/")
 
 	var resource, ns, name string
 
@@ -178,7 +186,7 @@ func (s *APIServer) handleList(w http.ResponseWriter, r *http.Request, resource,
 		list := &bemav1alpha1.ChatSessionList{
 			TypeMeta: metav1.TypeMeta{
 				Kind:       "ChatSessionList",
-				APIVersion: "bema.labs.gke.io/v1alpha1",
+				APIVersion: groupVersion,
 			},
 			Items: []bemav1alpha1.ChatSession{},
 		}
@@ -190,7 +198,7 @@ func (s *APIServer) handleList(w http.ResponseWriter, r *http.Request, resource,
 		list := &bemav1alpha1.ChatSessionMessageList{
 			TypeMeta: metav1.TypeMeta{
 				Kind:       "ChatSessionMessageList",
-				APIVersion: "bema.labs.gke.io/v1alpha1",
+				APIVersion: groupVersion,
 			},
 			Items: []bemav1alpha1.ChatSessionMessage{},
 		}
@@ -313,7 +321,7 @@ func convertToChatSession(sess *pb.Session, namespace string) *bemav1alpha1.Chat
 	cs := &bemav1alpha1.ChatSession{
 		TypeMeta: metav1.TypeMeta{
 			Kind:       "ChatSession",
-			APIVersion: "bema.labs.gke.io/v1alpha1",
+			APIVersion: groupVersion,
 		},
 		ObjectMeta: metav1.ObjectMeta{
 			Name:              sess.Id,
@@ -339,14 +347,14 @@ func convertToChatSessionMessage(sessionID string, index int, msg *pb.Message, n
 	csm := &bemav1alpha1.ChatSessionMessage{
 		TypeMeta: metav1.TypeMeta{
 			Kind:       "ChatSessionMessage",
-			APIVersion: "bema.labs.gke.io/v1alpha1",
+			APIVersion: groupVersion,
 		},
 		ObjectMeta: metav1.ObjectMeta{
 			Name:              name,
 			Namespace:         namespace,
 			CreationTimestamp: metav1.NewTime(msg.Timestamp.AsTime()),
 			Labels: map[string]string{
-				"bema.labs.gke.io/session-id": sessionID,
+				fmt.Sprintf("%s/session-id", group): sessionID,
 			},
 		},
 		Spec: bemav1alpha1.ChatSessionMessageSpec{
