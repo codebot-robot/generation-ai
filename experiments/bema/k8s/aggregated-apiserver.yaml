@@ -12,6 +12,11 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+# This manifest registers the Bema aggregated API server with Kubernetes.
+# Note: You MUST provide a valid caBundle (base64 encoded) that matches
+# the certificate served by the Bema pod.
+# The register-apiserver.sh script handles this automatically.
+
 apiVersion: apiregistration.k8s.io/v1
 kind: APIService
 metadata:
@@ -20,10 +25,9 @@ spec:
   service:
     name: bema
     namespace: bema
-    port: 8080
+    port: 443
   group: bema.labs.gke.io
   version: v1alpha1
   groupPriorityMinimum: 100
   versionPriority: 100
-  # caBundle should be set to the base64-encoded CA certificate that signed the Bema API server's certificate.
-  caBundle: <BASE64_CA_BUNDLE>
+  caBundle: <BASE64_ENCODED_CA_BUNDLE>

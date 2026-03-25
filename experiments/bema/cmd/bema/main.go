@@ -36,7 +36,7 @@ import (
 func main() {
 	klog.InitFlags(nil)
 	port := flag.String("port", "50051", "The server port")
-	httpPort := flag.String("http-port", "8080", "The HTTP server port")
+	httpPort := flag.String("http-port", "8443", "The HTTP server port")
 	tlsCertFile := flag.String("tls-cert-file", "", "File containing the TLS certificate")
 	tlsKeyFile := flag.String("tls-key-file", "", "File containing the TLS private key")
 	storageDir := flag.String("storage-dir", "/tmp/bema", "Directory to store sessions")

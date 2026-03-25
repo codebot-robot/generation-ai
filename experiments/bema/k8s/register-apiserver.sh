@@ -18,7 +18,7 @@ set -e
 # Configuration
 NAMESPACE="${BEMA_NAMESPACE:-bema}"
 SERVICE_NAME="bema"
-APISERVER_PORT="8080"
+APISERVER_PORT="443"
 SECRET_NAME="bema-apiserver-tls"
 GROUP="bema.labs.gke.io"
 VERSION="v1alpha1"
@@ -40,13 +40,66 @@ kubectl create secret tls ${SECRET_NAME} \
   --dry-run=client -o yaml | kubectl apply -f -
 
 # Patch StatefulSet to use TLS
-# We use kubectl patch to add the TLS flags and volumes to the existing StatefulSet.
-kubectl patch statefulset bema -n ${NAMESPACE} --type='json' -p='[
-  {"op": "add", "path": "/spec/template/spec/containers/0/args/-", "value": "--tls-cert-file=/etc/tls/tls.crt"},
-  {"op": "add", "path": "/spec/template/spec/containers/0/args/-", "value": "--tls-key-file=/etc/tls/tls.key"},
-  {"op": "add", "path": "/spec/template/spec/containers/0/volumeMounts/-", "value": {"name": "tls", "mountPath": "/etc/tls", "readOnly": true}},
-  {"op": "add", "path": "/spec/template/spec/volumes/-", "value": {"name": "tls", "secret": {"secretName": "'${SECRET_NAME}'"}}}
-]'
+# We use a python script for more robust patching of lists that might not exist.
+python3 - <<EOF
+import json, subprocess, sys
+
+NAMESPACE="${NAMESPACE}"
+SECRET_NAME="${SECRET_NAME}"
+
+def patch():
+    try:
+        ss = json.loads(subprocess.check_output(["kubectl", "get", "statefulset", "bema", "-n", NAMESPACE, "-o", "json"]))
+    except subprocess.CalledProcessError:
+        print("StatefulSet bema not found in namespace " + NAMESPACE)
+        sys.exit(1)
+
+    # In StatefulSet, the pod spec is in .spec.template.spec
+    pod_spec = ss["spec"]["template"]["spec"]
+    container = pod_spec["containers"][0]
+
+    # Add TLS args
+    args = container.get("args", [])
+    tls_args = ["--tls-cert-file=/etc/tls/tls.crt", "--tls-key-file=/etc/tls/tls.key"]
+    for arg in tls_args:
+        if arg not in args:
+            args.append(arg)
+    container["args"] = args
+
+    # Add volume mount
+    vms = container.get("volumeMounts", [])
+    if not any(vm["name"] == "tls" for vm in vms):
+        vms.append({"name": "tls", "mountPath": "/etc/tls", "readOnly": True})
+    container["volumeMounts"] = vms
+
+    # Add volume
+    volumes = pod_spec.get("volumes", [])
+    if not any(v["name"] == "tls" for v in volumes):
+        volumes.append({"name": "tls", "secret": {"secretName": SECRET_NAME}})
+    pod_spec["volumes"] = volumes
+
+    # We use a strategic merge patch style update
+    patch_data = {
+        "spec": {
+            "template": {
+                "spec": {
+                    "containers": [
+                        {
+                            "name": container["name"],
+                            "args": args,
+                            "volumeMounts": vms
+                        }
+                    ],
+                    "volumes": volumes
+                }
+            }
+        }
+    }
+    
+    subprocess.run(["kubectl", "patch", "statefulset", "bema", "-n", NAMESPACE, "--patch", json.dumps(patch_data)], check=True)
+
+patch()
+EOF
 
 # Register APIService
 CA_BUNDLE=$(cat .certs/server.crt | base64 | tr -d '\n')
