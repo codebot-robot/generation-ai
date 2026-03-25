@@ -222,7 +222,7 @@ func (s *APIServer) handleTableList(w http.ResponseWriter, r *http.Request, reso
 		}
 		for _, sess := range sessions {
 			table.Rows = append(table.Rows, metav1.TableRow{
-				Cells: []interface{}{sess.Id, sess.Status, translateTimestamp(sess.CreatedAt)},
+				Cells: []any{sess.Id, sess.Status, translateTimestamp(sess.CreatedAt)},
 				Object: runtime.RawExtension{
 					Object: convertToChatSession(sess, ns),
 				},
@@ -238,7 +238,7 @@ func (s *APIServer) handleTableList(w http.ResponseWriter, r *http.Request, reso
 		for _, sess := range sessions {
 			for i, msg := range sess.Messages {
 				table.Rows = append(table.Rows, metav1.TableRow{
-					Cells: []interface{}{fmt.Sprintf("%s-%d", sess.Id, i), sess.Id, msg.Role, translateTimestamp(msg.Timestamp)},
+					Cells: []any{fmt.Sprintf("%s-%d", sess.Id, i), sess.Id, msg.Role, translateTimestamp(msg.Timestamp)},
 					Object: runtime.RawExtension{
 						Object: convertToChatSessionMessage(sess.Id, i, msg, ns),
 					},
@@ -299,7 +299,7 @@ func (s *APIServer) handleGet(w http.ResponseWriter, r *http.Request, resource, 
 	}
 }
 
-func sendJSON(w http.ResponseWriter, obj interface{}) {
+func sendJSON(w http.ResponseWriter, obj any) {
 	w.Header().Set("Content-Type", "application/json")
 	if err := json.NewEncoder(w).Encode(obj); err != nil {
 		klog.Errorf("failed to encode JSON: %v", err)

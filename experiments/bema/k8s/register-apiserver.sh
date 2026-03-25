@@ -27,30 +27,29 @@ echo "Registering Bema aggregated API server..."
 
 # Generate certificates
 mkdir -p .certs
-openssl req -x509 -nodes -days 365 -newkey rsa:2048 
-  -keyout .certs/server.key -out .certs/server.crt 
-  -subj "/CN=${SERVICE_NAME}.${NAMESPACE}.svc" 
+openssl req -x509 -nodes -days 365 -newkey rsa:2048 \
+  -keyout .certs/server.key -out .certs/server.crt \
+  -subj "/CN=${SERVICE_NAME}.${NAMESPACE}.svc" \
   -addext "subjectAltName = DNS:${SERVICE_NAME}.${NAMESPACE}.svc"
 
 # Create TLS secret
-kubectl create secret tls ${SECRET_NAME} 
-  --cert=.certs/server.crt 
-  --key=.certs/server.key 
-  -n ${NAMESPACE} 
+kubectl create secret tls ${SECRET_NAME} \
+  --cert=.certs/server.crt \
+  --key=.certs/server.key \
+  -n ${NAMESPACE} \
   --dry-run=client -o yaml | kubectl apply -f -
 
 # Patch StatefulSet to use TLS
 # We use kubectl patch to add the TLS flags and volumes to the existing StatefulSet.
-kubectl patch statefulset bema -n ${NAMESPACE} --type='json' -p="[
+kubectl patch statefulset bema -n ${NAMESPACE} --type='json' -p='[
   {"op": "add", "path": "/spec/template/spec/containers/0/args/-", "value": "--tls-cert-file=/etc/tls/tls.crt"},
   {"op": "add", "path": "/spec/template/spec/containers/0/args/-", "value": "--tls-key-file=/etc/tls/tls.key"},
   {"op": "add", "path": "/spec/template/spec/containers/0/volumeMounts/-", "value": {"name": "tls", "mountPath": "/etc/tls", "readOnly": true}},
-  {"op": "add", "path": "/spec/template/spec/volumes/-", "value": {"name": "tls", "secret": {"secretName": "${SECRET_NAME}"}}}
-]"
+  {"op": "add", "path": "/spec/template/spec/volumes/-", "value": {"name": "tls", "secret": {"secretName": "'${SECRET_NAME}'"}}}
+]'
 
 # Register APIService
-CA_BUNDLE=$(cat .certs/server.crt | base64 | tr -d '
-')
+CA_BUNDLE=$(cat .certs/server.crt | base64 | tr -d '\n')
 
 cat <<EOF | kubectl apply -f -
 apiVersion: apiregistration.k8s.io/v1

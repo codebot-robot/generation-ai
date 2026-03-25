@@ -70,7 +70,7 @@ func TestAPIServer_Discovery(t *testing.T) {
 			t.Errorf("%s: expected status 200, got %d", tt.path, w.Code)
 		}
 
-		var resp map[string]interface{}
+		var resp map[string]any
 		if err := json.Unmarshal(w.Body.Bytes(), &resp); err != nil {
 			t.Fatalf("%s: failed to unmarshal: %v", tt.path, err)
 		}
