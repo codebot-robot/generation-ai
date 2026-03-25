@@ -18,6 +18,7 @@ import (
 	"context"
 	"flag"
 	"net"
+	"net/http"
 
 	"github.com/gke-labs/generation-ai/experiments/bema/pkg/api/v1alpha1"
 	bemav1alpha1 "github.com/gke-labs/generation-ai/experiments/bema/pkg/apis/v1alpha1"
@@ -35,6 +36,9 @@ import (
 func main() {
 	klog.InitFlags(nil)
 	port := flag.String("port", "50051", "The server port")
+	httpPort := flag.String("http-port", "8443", "The HTTP server port")
+	tlsCertFile := flag.String("tls-cert-file", "", "File containing the TLS certificate")
+	tlsKeyFile := flag.String("tls-key-file", "", "File containing the TLS private key")
 	storageDir := flag.String("storage-dir", "/tmp/bema", "Directory to store sessions")
 	backendType := flag.String("backend", "gemini", "The LLM backend to use (e.g. gemini)")
 	modelName := flag.String("model", "gemini-3-flash-preview", "The model name for the backend")
@@ -90,6 +94,21 @@ func main() {
 
 	v1alpha1.RegisterBemaServiceServer(s, bemaServer)
 	reflection.Register(s)
+
+	apiServer := server.NewAPIServer(store)
+	go func() {
+		if *tlsCertFile != "" && *tlsKeyFile != "" {
+			klog.Infof("HTTP server listening (TLS) at :%s", *httpPort)
+			if err := http.ListenAndServeTLS(":"+*httpPort, *tlsCertFile, *tlsKeyFile, apiServer); err != nil {
+				klog.Fatalf("failed to serve HTTPS: %v", err)
+			}
+		} else {
+			klog.Infof("HTTP server listening at :%s", *httpPort)
+			if err := http.ListenAndServe(":"+*httpPort, apiServer); err != nil {
+				klog.Fatalf("failed to serve HTTP: %v", err)
+			}
+		}
+	}()
 
 	klog.Infof("server listening at %v", lis.Addr())
 	if err := s.Serve(lis); err != nil {

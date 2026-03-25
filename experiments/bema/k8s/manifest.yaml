@@ -91,9 +91,14 @@ spec:
   selector:
     app: bema
   ports:
-    - protocol: TCP
+    - name: grpc
+      protocol: TCP
       port: 50051
       targetPort: 50051
+    - name: http
+      protocol: TCP
+      port: 443
+      targetPort: 8443
 ---
 apiVersion: apps/v1
 kind: StatefulSet
@@ -120,6 +125,7 @@ spec:
             - --backend=gemini
           ports:
             - containerPort: 50051
+            - containerPort: 8443
           env:
             - name: BEMA_NAMESPACE
               valueFrom:
