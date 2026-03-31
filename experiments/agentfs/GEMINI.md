@@ -15,4 +15,6 @@ AgentFS aims to scale with thousands of agents, providing each with its own ephe
 ## Development Status
 
 - Currently implementing the node daemon to serve ephemeral storage.
-- Future work: Controller for snapshotting and volume management.
+- Implemented node daemon snapshotting (push/pull) to the controller.
+- Implemented AgentFS Controller to serve snapshots and blobs.
+- Future work: Advanced volume management and multi-node coordination.

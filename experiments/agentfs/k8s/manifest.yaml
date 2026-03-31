@@ -104,6 +104,7 @@ spec:
             - "--endpoint=unix:///csi/csi.sock"
             - "--nodeid=$(NODE_ID)"
             - "--storage-path=/var/lib/agentfs"
+            - "--controller-address=agentfs-controller:50051"
           env:
             - name: NODE_ID
               valueFrom:
@@ -135,6 +136,58 @@ spec:
           hostPath:
             path: /var/lib/agentfs
             type: DirectoryOrCreate
+
+---
+
+apiVersion: v1
+kind: Service
+metadata:
+  name: agentfs-controller
+  namespace: workspace-github-gke-labs-generation-ai-97
+spec:
+  selector:
+    app: agentfs-controller
+  ports:
+    - port: 50051
+      targetPort: 50051
+
+---
+
+apiVersion: apps/v1
+kind: StatefulSet
+metadata:
+  name: agentfs-controller
+  namespace: workspace-github-gke-labs-generation-ai-97
+spec:
+  serviceName: agentfs-controller
+  replicas: 1
+  selector:
+    matchLabels:
+      app: agentfs-controller
+  template:
+    metadata:
+      labels:
+        app: agentfs-controller
+    spec:
+      containers:
+        - name: agentfs-controller
+          image: agentfs-controller:latest # Should be updated with real image
+          args:
+            - "--v=5"
+            - "--data-path=/data"
+          ports:
+            - containerPort: 50051
+          volumeMounts:
+            - name: data
+              mountPath: /data
+  volumeClaimTemplates:
+    - metadata:
+        name: data
+      spec:
+        accessModes: ["ReadWriteOnce"]
+        resources:
+          requests:
+            storage: 10Gi
 
 ---
 

@@ -18,8 +18,10 @@ package main
 
 import (
 	"context"
+	"crypto/sha256"
 	"flag"
 	"fmt"
+	"io"
 	"net"
 	"os"
 	"path/filepath"
@@ -27,14 +29,18 @@ import (
 	"syscall"
 
 	"github.com/container-storage-interface/spec/lib/go/csi"
+	pb "github.com/gke-labs/generation-ai/experiments/agentfs/pkg/api/v1alpha1"
 	"google.golang.org/grpc"
+	"google.golang.org/grpc/credentials/insecure"
+	"google.golang.org/protobuf/types/known/timestamppb"
 	"k8s.io/klog/v2"
 )
 
 var (
-	endpoint    = flag.String("endpoint", "unix:///tmp/csi.sock", "CSI endpoint")
-	nodeID      = flag.String("nodeid", "", "node id")
-	storagePath = flag.String("storage-path", "/var/lib/agentfs", "Base path for storage")
+	endpoint          = flag.String("endpoint", "unix:///tmp/csi.sock", "CSI endpoint")
+	nodeID            = flag.String("nodeid", "", "node id")
+	storagePath       = flag.String("storage-path", "/var/lib/agentfs", "Base path for storage")
+	controllerAddress = flag.String("controller-address", "agentfs-controller:50051", "AgentFS Controller address")
 )
 
 func main() {
@@ -154,6 +160,13 @@ func (d *agentFSDriver) NodePublishVolume(ctx context.Context, req *csi.NodePubl
 		return nil, fmt.Errorf("failed to create source path %s: %v", sourcePath, err)
 	}
 
+	// Pull snapshot from controller
+	if err := d.pullSnapshot(ctx, volumeID, sourcePath); err != nil {
+		klog.Errorf("failed to pull snapshot for volume %s: %v", volumeID, err)
+		// Continue anyway? The issue says "we should first populate all the files",
+		// implying it might be important. But for a fresh volume it will be empty.
+	}
+
 	if err := os.MkdirAll(targetPath, 0755); err != nil {
 		return nil, fmt.Errorf("failed to create target path %s: %v", targetPath, err)
 	}
@@ -196,7 +209,211 @@ func (d *agentFSDriver) NodeUnpublishVolume(ctx context.Context, req *csi.NodeUn
 		return nil, fmt.Errorf("failed to unmount %s: %v", targetPath, err)
 	}
 
+	// Push snapshot to controller
+	sourcePath := filepath.Join(*storagePath, volumeID)
+	if err := d.pushSnapshot(ctx, volumeID, sourcePath); err != nil {
+		klog.Errorf("failed to push snapshot for volume %s: %v", volumeID, err)
+	} else {
+		if err := os.RemoveAll(sourcePath); err != nil {
+			klog.Errorf("failed to cleanup source path %s: %v", sourcePath, err)
+		}
+	}
+
 	return &csi.NodeUnpublishVolumeResponse{}, nil
+}
+
+func (d *agentFSDriver) pullSnapshot(ctx context.Context, volumeID, sourcePath string) error {
+	conn, err := grpc.Dial(*controllerAddress, grpc.WithTransportCredentials(insecure.NewCredentials()))
+	if err != nil {
+		return err
+	}
+	defer conn.Close()
+
+	client := pb.NewAgentFSControllerClient(conn)
+	resp, err := client.GetLatestSnapshot(ctx, &pb.GetLatestSnapshotRequest{VolumeId: volumeID})
+	if err != nil {
+		return err
+	}
+
+	if resp.Snapshot == nil {
+		klog.Infof("No snapshot found for volume %s", volumeID)
+		return nil
+	}
+
+	for _, file := range resp.Snapshot.Files {
+		targetFile := filepath.Join(sourcePath, file.Path)
+
+		// Ensure directory exists
+		if err := os.MkdirAll(filepath.Dir(targetFile), 0755); err != nil {
+			return err
+		}
+
+		// Check if file exists and has correct sha256
+		if _, err := os.Stat(targetFile); err == nil {
+			sha, _ := calculateSHA256(targetFile)
+			if sha == file.Sha256 {
+				continue
+			}
+		}
+
+		// Download blob
+		if err := d.downloadBlob(ctx, client, file.Sha256, targetFile); err != nil {
+			return fmt.Errorf("failed to download blob %s: %v", file.Sha256, err)
+		}
+
+		// Set mode and mod time
+		if err := os.Chmod(targetFile, os.FileMode(file.Mode)); err != nil {
+			klog.Warningf("failed to set mode for %s: %v", targetFile, err)
+		}
+		if err := os.Chtimes(targetFile, file.ModTime.AsTime(), file.ModTime.AsTime()); err != nil {
+			klog.Warningf("failed to set times for %s: %v", targetFile, err)
+		}
+	}
+
+	return nil
+}
+
+func (d *agentFSDriver) pushSnapshot(ctx context.Context, volumeID, sourcePath string) error {
+	conn, err := grpc.Dial(*controllerAddress, grpc.WithTransportCredentials(insecure.NewCredentials()))
+	if err != nil {
+		return err
+	}
+	defer conn.Close()
+
+	client := pb.NewAgentFSControllerClient(conn)
+
+	snapshot := &pb.SnapshotMetadata{}
+
+	err = filepath.Walk(sourcePath, func(path string, info os.FileInfo, err error) error {
+		if err != nil {
+			return err
+		}
+		if info.IsDir() {
+			return nil
+		}
+
+		relPath, err := filepath.Rel(sourcePath, path)
+		if err != nil {
+			return err
+		}
+
+		sha, err := calculateSHA256(path)
+		if err != nil {
+			return err
+		}
+
+		snapshot.Files = append(snapshot.Files, &pb.FileMetadata{
+			Path:    relPath,
+			Mode:    uint32(info.Mode()),
+			Size:    info.Size(),
+			ModTime: timestamppb.New(info.ModTime()),
+			Sha256:  sha,
+		})
+
+		// Check if controller has the blob
+		hasResp, err := client.HasBlob(ctx, &pb.HasBlobRequest{Sha256: sha})
+		if err != nil {
+			return err
+		}
+
+		if !hasResp.Exists {
+			if err := d.uploadBlob(ctx, client, sha, path); err != nil {
+				return err
+			}
+		}
+
+		return nil
+	})
+
+	if err != nil {
+		return err
+	}
+
+	_, err = client.UploadSnapshot(ctx, &pb.UploadSnapshotRequest{
+		VolumeId: volumeID,
+		Snapshot: snapshot,
+	})
+	return err
+}
+
+func (d *agentFSDriver) downloadBlob(ctx context.Context, client pb.AgentFSControllerClient, sha, targetPath string) error {
+	stream, err := client.DownloadBlob(ctx, &pb.DownloadBlobRequest{Sha256: sha})
+	if err != nil {
+		return err
+	}
+
+	f, err := os.Create(targetPath)
+	if err != nil {
+		return err
+	}
+	defer f.Close()
+
+	for {
+		resp, err := stream.Recv()
+		if err == io.EOF {
+			break
+		}
+		if err != nil {
+			return err
+		}
+		if _, err := f.Write(resp.Content); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+func (d *agentFSDriver) uploadBlob(ctx context.Context, client pb.AgentFSControllerClient, sha, sourceFile string) error {
+	stream, err := client.UploadBlob(ctx)
+	if err != nil {
+		return err
+	}
+
+	if err := stream.Send(&pb.UploadBlobRequest{
+		Data: &pb.UploadBlobRequest_Sha256{Sha256: sha},
+	}); err != nil {
+		return err
+	}
+
+	f, err := os.Open(sourceFile)
+	if err != nil {
+		return err
+	}
+	defer f.Close()
+
+	buffer := make([]byte, 1024*1024) // 1MB buffer
+	for {
+		n, err := f.Read(buffer)
+		if err == io.EOF {
+			break
+		}
+		if err != nil {
+			return err
+		}
+		if err := stream.Send(&pb.UploadBlobRequest{
+			Data: &pb.UploadBlobRequest_Content{Content: buffer[:n]},
+		}); err != nil {
+			return err
+		}
+	}
+
+	_, err = stream.CloseAndRecv()
+	return err
+}
+
+func calculateSHA256(path string) (string, error) {
+	f, err := os.Open(path)
+	if err != nil {
+		return "", err
+	}
+	defer f.Close()
+
+	h := sha256.New()
+	if _, err := io.Copy(h, f); err != nil {
+		return "", err
+	}
+
+	return fmt.Sprintf("%x", h.Sum(nil)), nil
 }
 
 // isNotMountPoint checks if a directory is NOT a mount point.
