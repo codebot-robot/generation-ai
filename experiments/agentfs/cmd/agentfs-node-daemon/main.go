@@ -26,6 +26,7 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+	"sync"
 	"syscall"
 
 	"github.com/container-storage-interface/spec/lib/go/csi"
@@ -103,6 +104,9 @@ type agentFSDriver struct {
 	csi.UnimplementedNodeServer
 
 	nodeID string
+
+	// volumeMappings maps K8s volume ID to logical volume ID (if provided in volumeContext)
+	volumeMappings sync.Map
 }
 
 func (d *agentFSDriver) GetPluginInfo(ctx context.Context, req *csi.GetPluginInfoRequest) (*csi.GetPluginInfoResponse, error) {
@@ -151,20 +155,24 @@ func (d *agentFSDriver) NodeGetCapabilities(ctx context.Context, req *csi.NodeGe
 }
 
 func (d *agentFSDriver) NodePublishVolume(ctx context.Context, req *csi.NodePublishVolumeRequest) (*csi.NodePublishVolumeResponse, error) {
-	volumeID := req.GetVolumeId()
-	targetPath := req.GetTargetPath()
-	klog.Infof("Publishing volume %s to %s", volumeID, targetPath)
+	k8sVolumeID := req.GetVolumeId()
+	logicalVolumeID := k8sVolumeID
+	if v, ok := req.GetVolumeContext()["volumeID"]; ok {
+		logicalVolumeID = v
+	}
+	d.volumeMappings.Store(k8sVolumeID, logicalVolumeID)
 
-	sourcePath := filepath.Join(*storagePath, volumeID)
+	targetPath := req.GetTargetPath()
+	klog.Infof("Publishing volume %s (logical: %s) to %s", k8sVolumeID, logicalVolumeID, targetPath)
+
+	sourcePath := filepath.Join(*storagePath, k8sVolumeID)
 	if err := os.MkdirAll(sourcePath, 0755); err != nil {
 		return nil, fmt.Errorf("failed to create source path %s: %v", sourcePath, err)
 	}
 
 	// Pull snapshot from controller
-	if err := d.pullSnapshot(ctx, volumeID, sourcePath); err != nil {
-		klog.Errorf("failed to pull snapshot for volume %s: %v", volumeID, err)
-		// Continue anyway? The issue says "we should first populate all the files",
-		// implying it might be important. But for a fresh volume it will be empty.
+	if err := d.pullSnapshot(ctx, logicalVolumeID, sourcePath); err != nil {
+		klog.Errorf("failed to pull snapshot for volume %s (logical: %s): %v", k8sVolumeID, logicalVolumeID, err)
 	}
 
 	if err := os.MkdirAll(targetPath, 0755); err != nil {
@@ -177,7 +185,7 @@ func (d *agentFSDriver) NodePublishVolume(ctx context.Context, req *csi.NodePubl
 		return nil, fmt.Errorf("failed to check if %s is a mount point: %v", targetPath, err)
 	}
 	if !notMnt {
-		klog.Infof("Volume %s already mounted at %s", volumeID, targetPath)
+		klog.Infof("Volume %s already mounted at %s", k8sVolumeID, targetPath)
 		return &csi.NodePublishVolumeResponse{}, nil
 	}
 
@@ -190,29 +198,29 @@ func (d *agentFSDriver) NodePublishVolume(ctx context.Context, req *csi.NodePubl
 }
 
 func (d *agentFSDriver) NodeUnpublishVolume(ctx context.Context, req *csi.NodeUnpublishVolumeRequest) (*csi.NodeUnpublishVolumeResponse, error) {
-	volumeID := req.GetVolumeId()
+	k8sVolumeID := req.GetVolumeId()
+	logicalVolumeID := k8sVolumeID
+	if v, ok := d.volumeMappings.Load(k8sVolumeID); ok {
+		logicalVolumeID = v.(string)
+	}
+	d.volumeMappings.Delete(k8sVolumeID)
+
 	targetPath := req.GetTargetPath()
-	klog.Infof("Unpublishing volume %s from %s", volumeID, targetPath)
+	klog.Infof("Unpublishing volume %s (logical: %s) from %s", k8sVolumeID, logicalVolumeID, targetPath)
 
-	// Check if already mounted
-	notMnt, err := isNotMountPoint(targetPath)
-	if err != nil {
-		return nil, fmt.Errorf("failed to check if %s is a mount point: %v", targetPath, err)
-	}
-	if notMnt {
-		klog.Infof("Volume %s not mounted at %s", volumeID, targetPath)
-		return &csi.NodeUnpublishVolumeResponse{}, nil
-	}
-
-	// Unmount the target path
+	// Try to unmount the target path. Ignore if not a mount point.
 	if err := syscall.Unmount(targetPath, 0); err != nil {
-		return nil, fmt.Errorf("failed to unmount %s: %v", targetPath, err)
+		if err != syscall.EINVAL {
+			klog.Warningf("Failed to unmount %s: %v", targetPath, err)
+		} else {
+			klog.Infof("Volume %s not mounted at %s (or already unmounted)", k8sVolumeID, targetPath)
+		}
 	}
 
 	// Push snapshot to controller
-	sourcePath := filepath.Join(*storagePath, volumeID)
-	if err := d.pushSnapshot(ctx, volumeID, sourcePath); err != nil {
-		klog.Errorf("failed to push snapshot for volume %s: %v", volumeID, err)
+	sourcePath := filepath.Join(*storagePath, k8sVolumeID)
+	if err := d.pushSnapshot(ctx, logicalVolumeID, sourcePath); err != nil {
+		klog.Errorf("failed to push snapshot for volume %s (logical: %s): %v", k8sVolumeID, logicalVolumeID, err)
 	} else {
 		if err := os.RemoveAll(sourcePath); err != nil {
 			klog.Errorf("failed to cleanup source path %s: %v", sourcePath, err)
