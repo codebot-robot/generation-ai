@@ -251,12 +251,12 @@ func (h *Harness) WaitForPodReady(name, namespace string, timeout time.Duration)
 		}
 		cmd := exec.Command("kubectl", "get", "pod", name, "-n", namespace, "-o", "jsonpath={.status.phase}")
 		phase, _ := cmd.Output()
-		
+
 		cmd = exec.Command("kubectl", "get", "pod", name, "-n", namespace, "-o", "jsonpath={.status.containerStatuses[*].ready}")
 		ready, _ := cmd.Output()
-		
+
 		h.t.Logf("Pod %s phase: %s, ready: %s", name, string(phase), string(ready))
-		
+
 		if (string(phase) == "Running" || string(phase) == "Succeeded") && !strings.Contains(string(ready), "false") && string(ready) != "" {
 			h.t.Logf("Pod %s is ready (phase: %s)", name, string(phase))
 			return nil

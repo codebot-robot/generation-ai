@@ -149,7 +149,7 @@ spec:
 		t.Fatalf("Pod 2 did not see 'hello agentfs' in its logs")
 	}
 	t.Logf("Pod 2 verified, deleting")
-	
+
 	h.DeletePod(pod2Name, "default")
 	t.Logf("Pod 2 deleted")
 
