@@ -29,6 +29,12 @@ func TestE2E(t *testing.T) {
         // Apply all manifests
         k8sDir := filepath.Join(experimentRoot, "k8s")
         files, err := os.ReadDir(k8sDir)
+        // Sort files to ensure manifest.yaml is first
+        for i := 0; i < len(files); i++ {
+                if files[i].Name() == "manifest.yaml" {
+                        files[0], files[i] = files[i], files[0]
+                }
+        }
         if err != nil {
                 t.Fatalf("Failed to read k8s dir: %v", err)
         }
