@@ -26,15 +26,13 @@ func TestE2E(t *testing.T) {
         // Load images into Kind
         h.KindLoad("bema:e2e")
 
+        // Create namespace and secret first
+        h.RunCommand("kubectl", "create", "namespace", "bema")
+        h.RunCommand("kubectl", "create", "secret", "generic", "bema", "--from-literal=dummy=value", "-n", "bema")
+
         // Apply all manifests
         k8sDir := filepath.Join(experimentRoot, "k8s")
         files, err := os.ReadDir(k8sDir)
-        // Sort files to ensure manifest.yaml is first
-        for i := 0; i < len(files); i++ {
-                if files[i].Name() == "manifest.yaml" {
-                        files[0], files[i] = files[i], files[0]
-                }
-        }
         if err != nil {
                 t.Fatalf("Failed to read k8s dir: %v", err)
         }
@@ -51,12 +49,9 @@ func TestE2E(t *testing.T) {
                 if file.Name() == "manifest.yaml" {
                         manifest = strings.ReplaceAll(manifest, "image: bema:latest", "image: bema:e2e\n          imagePullPolicy: Never")
                 }
-                if file.Name() == "cert-manager.yaml" { 
-                        h.RunCommand("kubectl", "apply", "-f", "https://github.com/cert-manager/cert-manager/releases/download/v1.17.1/cert-manager.yaml") 
-                        time.Sleep(30 * time.Second) 
-                }
-                if file.Name() == "manifest.yaml" { 
-                        h.RunCommand("kubectl", "create", "secret", "generic", "bema", "--from-literal=dummy=value", "-n", "bema") 
+                if file.Name() == "cert-manager.yaml" {
+                        h.RunCommand("kubectl", "apply", "-f", "https://github.com/cert-manager/cert-manager/releases/download/v1.17.1/cert-manager.yaml")
+                        time.Sleep(30 * time.Second)
                 }
                 h.KubectlApplyContent(file.Name(), manifest)
         }
@@ -69,4 +64,3 @@ func TestE2E(t *testing.T) {
                 t.Fatalf("Bema failed to start: %v", err)
         }
 }
-// I'll update the loop to install cert-manager before other manifests
