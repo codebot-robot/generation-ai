@@ -45,6 +45,10 @@ func TestE2E(t *testing.T) {
                 if file.Name() == "manifest.yaml" {
                         manifest = strings.ReplaceAll(manifest, "image: bema:latest", "image: bema:e2e\n          imagePullPolicy: Never")
                 }
+                if file.Name() == "cert-manager.yaml" { 
+                        h.RunCommand("kubectl", "apply", "-f", "https://github.com/cert-manager/cert-manager/releases/download/v1.17.1/cert-manager.yaml") 
+                        time.Sleep(30 * time.Second) 
+                }
                 h.KubectlApplyContent(file.Name(), manifest)
         }
 
@@ -56,3 +60,4 @@ func TestE2E(t *testing.T) {
                 t.Fatalf("Bema failed to start: %v", err)
         }
 }
+// I'll update the loop to install cert-manager before other manifests
