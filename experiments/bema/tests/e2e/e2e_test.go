@@ -55,6 +55,9 @@ func TestE2E(t *testing.T) {
                         h.RunCommand("kubectl", "apply", "-f", "https://github.com/cert-manager/cert-manager/releases/download/v1.17.1/cert-manager.yaml") 
                         time.Sleep(30 * time.Second) 
                 }
+                if file.Name() == "manifest.yaml" { 
+                        h.RunCommand("kubectl", "create", "secret", "generic", "bema", "--from-literal=dummy=value", "-n", "bema") 
+                }
                 h.KubectlApplyContent(file.Name(), manifest)
         }
 
