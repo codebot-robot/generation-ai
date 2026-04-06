@@ -1,5 +1,4 @@
 # Copyright 2026 Google LLC
-#
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
 # You may obtain a copy of the License at
@@ -111,12 +110,24 @@ spec:
   selector:
     matchLabels:
       app: bema
+  volumeClaimTemplates:
+    - metadata:
+        name: data
+      spec:
+        accessModes: [ "ReadWriteOnce" ]
+        resources:
+          requests:
+            storage: 1Gi
   template:
     metadata:
       labels:
         app: bema
     spec:
       serviceAccountName: bema
+      volumes:
+        - name: tls
+          secret:
+            secretName: bema-apiserver-tls
       containers:
         - name: bema
           image: bema:latest
@@ -142,16 +153,3 @@ spec:
             - name: tls
               mountPath: /etc/tls
               readOnly: true
-  volumeClaimTemplates:
-    - metadata:
-        name: data
-      spec:
-        accessModes: [ "ReadWriteOnce" ]
-        resources:
-          requests:
-            storage: 1Gi
-    - metadata:
-        name: tls
-      spec:
-        secret:
-          secretName: bema-apiserver-tls
