@@ -21,6 +21,8 @@ import (
 	"strings"
 	"testing"
 	"time"
+
+	"github.com/gke-labs/generation-ai/pkg/ktesting/e2e"
 )
 
 func TestE2E(t *testing.T) {
@@ -28,8 +30,14 @@ func TestE2E(t *testing.T) {
 		t.Skip("Skipping E2E test; RUN_E2E not set")
 	}
 
-	h := NewHarness(t, "agentfs-e2e")
+	h := e2e.NewHarness(t, "agentfs-e2e")
 	h.Setup()
+	h.TrackNamespace("default")
+	defer func() {
+		if t.Failed() {
+			h.CollectArtifacts("TestE2E")
+		}
+	}()
 
 	gitRoot := h.GetGitRoot()
 	experimentRoot := filepath.Join(gitRoot, "experiments/agentfs")

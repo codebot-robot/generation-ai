@@ -3,6 +3,7 @@ module github.com/gke-labs/generation-ai/experiments/bema
 go 1.25.7
 
 require (
+	github.com/gke-labs/generation-ai/pkg/ktesting/e2e v0.0.0-00010101000000-000000000000
 	github.com/google/uuid v1.6.0
 	google.golang.org/genai v1.47.0
 	google.golang.org/grpc v1.79.3
@@ -81,3 +82,5 @@ require (
 	sigs.k8s.io/structured-merge-diff/v6 v6.3.2-0.20260122202528-d9cc6641c482 // indirect
 	sigs.k8s.io/yaml v1.6.0 // indirect
 )
+
+replace github.com/gke-labs/generation-ai/pkg/ktesting/e2e => ../../pkg/ktesting/e2e

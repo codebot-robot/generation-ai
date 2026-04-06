@@ -20,6 +20,8 @@ import (
 	"strings"
 	"testing"
 	"time"
+
+	"github.com/gke-labs/generation-ai/pkg/ktesting/e2e"
 )
 
 func TestE2E(t *testing.T) {
@@ -27,7 +29,7 @@ func TestE2E(t *testing.T) {
 		t.Skip("Skipping E2E test; RUN_E2E not set")
 	}
 
-	h := NewHarness(t, "bema-e2e")
+	h := e2e.NewHarness(t, "bema-e2e")
 	h.Setup()
 	h.TrackNamespace("bema")
 	defer func() {

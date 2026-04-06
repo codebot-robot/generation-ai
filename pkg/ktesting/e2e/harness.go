@@ -27,6 +27,7 @@ import (
 
 type Harness struct {
 	ClusterName string
+	Namespace   string
 	t           *testing.T
 	Namespaces  []string
 }
@@ -34,6 +35,7 @@ type Harness struct {
 func NewHarness(t *testing.T, clusterName string) *Harness {
 	return &Harness{
 		ClusterName: clusterName,
+		Namespace:   "default",
 		t:           t,
 	}
 }
@@ -75,7 +77,7 @@ func (h *Harness) CollectArtifacts(testName string) {
 
 		podList, _ := exec.Command("kubectl", "get", "pods", "-n", ns, "-o", "jsonpath={.items[*].metadata.name}").Output()
 		for _, pod := range strings.Fields(string(podList)) {
-			logs, _ := exec.Command("kubectl", "logs", pod, "-n", ns).Output()
+			logs, _ := exec.Command("kubectl", "logs", pod, "-n", ns, "--all-containers=true").Output()
 			os.WriteFile(filepath.Join(logsDir, pod+".log"), logs, 0644)
 		}
 	}
@@ -98,14 +100,11 @@ func (h *Harness) Setup() {
 		h.RunCommand("kind", "export", "kubeconfig", "--name", h.ClusterName)
 	} else {
 		h.t.Logf("Creating cluster %s", h.ClusterName)
-		cmd = exec.Command("kind", "create", "cluster", "--name", h.ClusterName)
-		if out, err := cmd.CombinedOutput(); err != nil {
-			h.t.Fatalf("Failed to create cluster: %v\nOutput: %s", err, out)
-		}
+		h.RunCommand("kind", "create", "cluster", "--name", h.ClusterName)
 	}
 
 	// Ensure default namespace is used, avoiding issues with environment-specific defaults
-	h.RunCommand("kubectl", "config", "set-context", "--current", "--namespace=default")
+	h.RunCommand("kubectl", "config", "set-context", "--current", "--namespace="+h.Namespace)
 
 	h.t.Cleanup(func() {
 		h.Teardown()
@@ -186,41 +185,61 @@ func (h *Harness) WaitForStatefulSet(name, namespace string, timeout time.Durati
 	return nil
 }
 
+func (h *Harness) WaitForDaemonSet(name, namespace string, timeout time.Duration) error {
+	h.t.Helper()
+	h.t.Logf("Waiting for daemonset %s in namespace %s", name, namespace)
+	cmd := exec.Command("kubectl", "rollout", "status", "daemonset/"+name, "-n", namespace, "--timeout="+timeout.String())
+	if out, err := cmd.CombinedOutput(); err != nil {
+		return fmt.Errorf("daemonset %s failed to become ready: %v\nOutput: %s", name, err, out)
+	}
+	return nil
+}
+
 func (h *Harness) DeleteDeployment(name, namespace string) {
 	h.t.Helper()
-	// Ignore errors if deployment doesn't exist
 	exec.Command("kubectl", "delete", "deployment", name, "-n", namespace, "--ignore-not-found").Run()
 }
 
 func (h *Harness) DeleteStatefulSet(name, namespace string) {
 	h.t.Helper()
-	// Ignore errors if statefulset doesn't exist
 	exec.Command("kubectl", "delete", "statefulset", name, "-n", namespace, "--ignore-not-found").Run()
+}
+
+func (h *Harness) DeleteDaemonSet(name, namespace string) {
+	h.t.Helper()
+	exec.Command("kubectl", "delete", "daemonset", name, "-n", namespace, "--ignore-not-found").Run()
 }
 
 func (h *Harness) DeleteService(name, namespace string) {
 	h.t.Helper()
-	// Ignore errors if service doesn't exist
 	exec.Command("kubectl", "delete", "service", name, "-n", namespace, "--ignore-not-found").Run()
 }
 
 func (h *Harness) DeletePod(name, namespace string) {
 	h.t.Helper()
-	// Ignore errors if pod doesn't exist
-	exec.Command("kubectl", "delete", "pod", name, "-n", namespace, "--ignore-not-found").Run()
+	exec.Command("kubectl", "delete", "pod", name, "-n", namespace, "--ignore-not-found", "--wait=true").Run()
 }
 
 func (h *Harness) DeleteJob(name, namespace string) {
 	h.t.Helper()
-	// Ignore errors if job doesn't exist
 	exec.Command("kubectl", "delete", "job", name, "-n", namespace, "--ignore-not-found").Run()
 }
 
 func (h *Harness) GetPodLogs(labelSelector, namespace string) string {
 	h.t.Helper()
-	out, err := exec.Command("kubectl", "logs", "-l", labelSelector, "-n", namespace).CombinedOutput()
+	out, err := exec.Command("kubectl", "logs", "-l", labelSelector, "-n", namespace, "--all-containers=true").CombinedOutput()
 	if err != nil {
 		h.t.Logf("Warning: failed to get logs for selector %s in namespace %s: %v", labelSelector, namespace, err)
+		return string(out)
+	}
+	return string(out)
+}
+
+func (h *Harness) GetPodLogsByName(name, namespace string) string {
+	h.t.Helper()
+	out, err := exec.Command("kubectl", "logs", name, "-n", namespace, "--all-containers=true").CombinedOutput()
+	if err != nil {
+		h.t.Logf("Warning: failed to get logs for pod %s in namespace %s: %v", name, namespace, err)
 		return string(out)
 	}
 	return string(out)
@@ -271,11 +290,39 @@ func (h *Harness) WaitForJobSuccess(name, namespace string, timeout time.Duratio
 			return fmt.Errorf("job %s failed", name)
 		}
 
-		// Optional: Log status every 30 seconds
-		if int(time.Since(start).Seconds())%30 < 2 {
-			h.t.Logf("Still waiting for job %s...", name)
-		}
-
 		time.Sleep(2 * time.Second)
 	}
+}
+
+func (h *Harness) WaitForPodReady(name, namespace string, timeout time.Duration) error {
+	h.t.Helper()
+	h.t.Logf("Waiting for pod %s to be ready in namespace %s", name, namespace)
+	start := time.Now()
+	for {
+		if time.Since(start) > timeout {
+			return fmt.Errorf("timed out waiting for pod %s to be ready after %s", name, timeout)
+		}
+		cmd := exec.Command("kubectl", "get", "pod", name, "-n", namespace, "-o", "jsonpath={.status.phase}")
+		phase, _ := cmd.Output()
+
+		cmd = exec.Command("kubectl", "get", "pod", name, "-n", namespace, "-o", "jsonpath={.status.containerStatuses[*].ready}")
+		ready, _ := cmd.Output()
+
+		h.t.Logf("Pod %s phase: %s, ready: %s", name, string(phase), string(ready))
+
+		if (string(phase) == "Running" || string(phase) == "Succeeded") && !strings.Contains(string(ready), "false") && string(ready) != "" {
+			h.t.Logf("Pod %s is ready (phase: %s)", name, string(phase))
+			return nil
+		}
+
+		time.Sleep(5 * time.Second)
+	}
+}
+
+func (h *Harness) RunInPod(podName, namespace string, command ...string) (string, error) {
+	h.t.Helper()
+	args := append([]string{"exec", podName, "-n", namespace, "--"}, command...)
+	cmd := exec.Command("kubectl", args...)
+	out, err := cmd.CombinedOutput()
+	return string(out), err
 }

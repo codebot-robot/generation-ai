@@ -4,6 +4,7 @@ go 1.25.7
 
 require (
 	github.com/container-storage-interface/spec v1.11.0
+	github.com/gke-labs/generation-ai/pkg/ktesting/e2e v0.0.0-00010101000000-000000000000
 	google.golang.org/grpc v1.79.3
 	google.golang.org/protobuf v1.36.10
 	k8s.io/klog/v2 v2.130.1
@@ -16,3 +17,5 @@ require (
 	golang.org/x/text v0.32.0 // indirect
 	google.golang.org/genproto/googleapis/rpc v0.0.0-20251202230838-ff82c1b0f217 // indirect
 )
+
+replace github.com/gke-labs/generation-ai/pkg/ktesting/e2e => ../../pkg/ktesting/e2e
