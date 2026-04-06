@@ -21,6 +21,8 @@ apiVersion: apiregistration.k8s.io/v1
 kind: APIService
 metadata:
   name: v1alpha1.bema.labs.gke.io
+  annotations:
+    cert-manager.io/inject-ca-from: bema/bema-serving-cert
 spec:
   service:
     name: bema
@@ -30,4 +32,3 @@ spec:
   version: v1alpha1
   groupPriorityMinimum: 100
   versionPriority: 100
-  caBundle: <BASE64_ENCODED_CA_BUNDLE>

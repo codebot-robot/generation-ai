@@ -123,6 +123,8 @@ spec:
           args:
             - --storage-dir=/data/bema
             - --backend=gemini
+            - --tls-cert-file=/etc/tls/tls.crt
+            - --tls-key-file=/etc/tls/tls.key
           ports:
             - containerPort: 50051
             - containerPort: 8443
@@ -137,6 +139,9 @@ spec:
           volumeMounts:
             - name: data
               mountPath: /data
+            - name: tls
+              mountPath: /etc/tls
+              readOnly: true
   volumeClaimTemplates:
     - metadata:
         name: data
@@ -145,3 +150,8 @@ spec:
         resources:
           requests:
             storage: 1Gi
+    - metadata:
+        name: tls
+      spec:
+        secret:
+          secretName: bema-apiserver-tls
