@@ -31,6 +31,10 @@ func TestE2E(t *testing.T) {
 	h := NewHarness(t, "inference-test-e2e")
 	h.Setup()
 
+	if strings.Contains(h.ClusterName, "kind") {
+		t.Skip("Skipping test in Kind cluster as inference tests require GPU")
+	}
+
 	gitRoot := h.GetGitRoot()
 	experimentRoot := filepath.Join(gitRoot, "experiments/inference-test")
 	modelstoreRoot := filepath.Join(gitRoot, "modelstore")
@@ -89,9 +93,6 @@ func TestE2E(t *testing.T) {
 
 	// 1. Run Single-node CPU Test
 	t.Run("SingleNodeCPU", func(t *testing.T) {
-		if strings.Contains(h.ClusterName, "kind") {
-			t.Skip("Skipping test in Kind cluster")
-		}
 		h.DeleteJob("inference-test-single", "default")
 
 		manifestPath := filepath.Join(experimentRoot, "examples/simple/manifest.yaml")
@@ -131,9 +132,6 @@ func TestE2E(t *testing.T) {
 
 	// 2. Run Distributed CPU Test (FSDP requested but fallback)
 	t.Run("DistributedCPU", func(t *testing.T) {
-		if strings.Contains(h.ClusterName, "kind") {
-			t.Skip("Skipping test in Kind cluster")
-		}
 		h.DeleteJob("inference-test", "default")
 		h.DeleteService("inference-test-headless", "default")
 

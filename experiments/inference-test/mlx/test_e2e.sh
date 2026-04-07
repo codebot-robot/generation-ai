@@ -21,6 +21,11 @@ set -o pipefail
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 cd "${SCRIPT_DIR}"
 
+if [[ "$(kubectl config current-context)" == *"kind-"* ]]; then
+    echo "Kind cluster detected. Skipping MLX inference-test e2e tests as they require GPU."
+    exit 0
+fi
+
 IMAGE_NAME="mlx-inference-cpu"
 
 echo "Building MLX Docker image..."
