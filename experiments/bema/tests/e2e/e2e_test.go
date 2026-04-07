@@ -30,6 +30,12 @@ func TestE2E(t *testing.T) {
 
 	h := NewHarness(t, "bema-e2e")
 	h.Setup()
+	h.TrackNamespace("bema")
+	defer func() {
+		if t.Failed() {
+			h.CollectArtifacts("TestE2E")
+		}
+	}()
 
 	gitRoot := h.GetGitRoot()
 	experimentRoot := filepath.Join(gitRoot, "experiments/bema")

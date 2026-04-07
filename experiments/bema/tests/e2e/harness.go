@@ -26,6 +26,7 @@ import (
 type Harness struct {
 	ClusterName string
 	t           *testing.T
+	Namespaces  []string
 }
 
 func NewHarness(t *testing.T, clusterName string) *Harness {
@@ -33,6 +34,45 @@ func NewHarness(t *testing.T, clusterName string) *Harness {
 		ClusterName: clusterName,
 		t:           t,
 	}
+}
+
+func (h *Harness) TrackNamespace(namespace string) {
+	h.Namespaces = append(h.Namespaces, namespace)
+}
+
+func (h *Harness) CollectArtifacts(testName string) {
+	artifactsDir := os.Getenv("ARTIFACTS")
+	if artifactsDir == "" {
+		return
+	}
+	h.t.Logf("Collecting artifacts to %s", artifactsDir)
+
+	for _, ns := range h.Namespaces {
+		nsDir := filepath.Join(artifactsDir, "tests", testName, "objects", ns)
+		os.MkdirAll(nsDir, 0755)
+
+		pods, _ := exec.Command("kubectl", "get", "pods", "-n", ns).Output()
+		os.WriteFile(filepath.Join(nsDir, "pods.txt"), pods, 0644)
+
+		podsYaml, _ := exec.Command("kubectl", "get", "pods", "-n", ns, "-o", "yaml").Output()
+		os.WriteFile(filepath.Join(nsDir, "pods.yaml"), podsYaml, 0644)
+
+		logsDir := filepath.Join(artifactsDir, "tests", testName, "logs", ns)
+		os.MkdirAll(logsDir, 0755)
+
+		podList, _ := exec.Command("kubectl", "get", "pods", "-n", ns, "-o", "jsonpath={.items[*].metadata.name}").Output()
+		for _, pod := range strings.Fields(string(podList)) {
+			logs, _ := exec.Command("kubectl", "logs", pod, "-n", ns).Output()
+			os.WriteFile(filepath.Join(logsDir, pod+".log"), logs, 0644)
+		}
+	}
+
+	clusterDir := filepath.Join(artifactsDir, "tests", testName, "objects", "_cluster")
+	os.MkdirAll(clusterDir, 0755)
+	nodes, _ := exec.Command("kubectl", "get", "nodes").Output()
+	os.WriteFile(filepath.Join(clusterDir, "nodes.txt"), nodes, 0644)
+	nodesYaml, _ := exec.Command("kubectl", "get", "nodes", "-o", "yaml").Output()
+	os.WriteFile(filepath.Join(clusterDir, "nodes.yaml"), nodesYaml, 0644)
 }
 
 func (h *Harness) Setup() {
