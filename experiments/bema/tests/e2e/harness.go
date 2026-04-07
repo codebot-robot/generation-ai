@@ -17,7 +17,9 @@ package e2e
 import (
 	"bytes"
 	"fmt"
+	"os"
 	"os/exec"
+	"path/filepath"
 	"strings"
 	"testing"
 	"time"
