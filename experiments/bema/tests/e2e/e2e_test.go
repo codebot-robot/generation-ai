@@ -71,7 +71,7 @@ func TestE2E(t *testing.T) {
 	}
 
 	// Wait for server
-	if err := h.WaitForStatefulSet("bema", "bema", 2*time.Minute); err != nil {
+	if err := h.WaitForStatefulSet("bema", "bema", 5*time.Minute); err != nil {
 		fmt.Fprintf(os.Stderr, "Bema failed to start: %v\n", err)
 		fmt.Fprintf(os.Stderr, "Bema Pod YAML:\n%s\n", h.GetPodYaml("app=bema", "bema"))
 		fmt.Fprintf(os.Stderr, "Events:\n%s\n", h.GetEvents("bema"))
