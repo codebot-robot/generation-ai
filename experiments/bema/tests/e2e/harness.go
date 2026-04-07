@@ -42,6 +42,17 @@ func (h *Harness) TrackNamespace(namespace string) {
 	h.Namespaces = append(h.Namespaces, namespace)
 }
 
+func (h *Harness) CreateTempNamespace(prefix string) string {
+	h.t.Helper()
+	ns := fmt.Sprintf("%s-%d", prefix, time.Now().UnixNano())
+	h.RunCommand("kubectl", "create", "namespace", ns)
+	h.TrackNamespace(ns)
+	h.t.Cleanup(func() {
+		h.RunCommand("kubectl", "delete", "namespace", ns, "--ignore-not-found")
+	})
+	return ns
+}
+
 func (h *Harness) CollectArtifacts(testName string) {
 	artifactsDir := os.Getenv("ARTIFACTS")
 	if artifactsDir == "" {

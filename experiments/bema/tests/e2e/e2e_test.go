@@ -15,7 +15,6 @@
 package e2e
 
 import (
-	"fmt"
 	"os"
 	"path/filepath"
 	"strings"
@@ -78,10 +77,6 @@ func TestE2E(t *testing.T) {
 
 	// Wait for server
 	if err := h.WaitForStatefulSet("bema", "bema", 5*time.Minute); err != nil {
-
-		fmt.Fprintf(os.Stderr, "Bema failed to start: %v\n", err)
-		fmt.Fprintf(os.Stderr, "Bema Pod YAML:\n%s\n", h.GetPodYaml("app=bema", "bema"))
-		fmt.Fprintf(os.Stderr, "Events:\n%s\n", h.GetEvents("bema"))
 		t.Fatalf("Bema failed to start: %v", err)
 	}
 }
