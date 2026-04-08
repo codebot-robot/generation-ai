@@ -49,7 +49,7 @@ func TestE2E(t *testing.T) {
 		t.Fatalf("Failed to read manifest: %v", err)
 	}
 	manifest := string(b)
-	manifest = strings.ReplaceAll(manifest, "namespace: workspace-github-gke-labs-generation-ai-97", "namespace: default")
+	manifest = strings.ReplaceAll(manifest, "namespace: kube-agentfs-system", "namespace: default")
 	manifest = strings.ReplaceAll(manifest, "image: agentfs-controller:latest", "image: agentfs-controller:e2e\n          imagePullPolicy: Never")
 	manifest = strings.ReplaceAll(manifest, "image: agentfs-node-daemon:latest", "image: agentfs-node-daemon:e2e\n          imagePullPolicy: Never")
 
