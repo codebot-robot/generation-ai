@@ -1,3 +1,3 @@
 module github.com/gke-labs/generation-ai/experiments/inference-test
 
-go 1.25.0
+go 1.26.2

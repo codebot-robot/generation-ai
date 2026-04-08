@@ -1,6 +1,6 @@
 module github.com/gke-labs/generation-ai/experiments/scalingpolicy
 
-go 1.25.7
+go 1.26.2
 
 require (
 	k8s.io/apimachinery v0.35.3

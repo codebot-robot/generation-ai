@@ -1,6 +1,6 @@
 module github.com/gke-labs/generation-ai/modelstore
 
-go 1.26.0
+go 1.26.2
 
 require (
 	github.com/spf13/cobra v1.10.2
