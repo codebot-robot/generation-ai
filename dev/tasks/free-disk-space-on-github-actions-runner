@@ -30,7 +30,17 @@ fi
 echo "Before cleanup:"
 df -h /
 
-sudo rm -rf /opt/hostedtoolcache/*  # remove pre-installed tool versions
+echo "Contents of /opt/hostedtoolcache before cleanup:"
+ls -la /opt/hostedtoolcache || true
+
+# Remove a few specific large directories we know we don't need, to preserve 'go'
+sudo rm -rf /opt/hostedtoolcache/CodeQL
+sudo rm -rf /opt/hostedtoolcache/Ruby
+sudo rm -rf /opt/hostedtoolcache/Python
+sudo rm -rf /opt/hostedtoolcache/Java_Temurin-Hotspot_jdk
+sudo rm -rf /opt/hostedtoolcache/PyPy
+sudo rm -rf /opt/hostedtoolcache/node
+
 sudo rm -rf /usr/share/dotnet
 sudo docker system prune -af || true
 
