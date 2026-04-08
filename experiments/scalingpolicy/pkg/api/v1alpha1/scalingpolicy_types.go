@@ -34,8 +34,8 @@ type Input struct {
 type Value struct {
 	Path       string `json:"path"`
 	Expression string `json:"expression"`
-	Min        string `json:"min"`
-	Max        string `json:"max"`
+	Min        *int32 `json:"min,omitempty"`
+	Max        *int32 `json:"max,omitempty"`
 }
 
 // ScalingPolicySpec defines the desired state of ScalingPolicy.
