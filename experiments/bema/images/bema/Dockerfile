@@ -16,7 +16,7 @@ FROM golang:1.26 AS builder
 
 WORKDIR /app
 COPY go.mod go.sum ./
-RUN go mod download
+RUN sed -i '/github.com\/gke-labs\/generation-ai\/pkg\/ktesting\/e2e/d' go.mod && go mod download
 
 COPY . .
 RUN CGO_ENABLED=0 go build -o bema ./cmd/bema
