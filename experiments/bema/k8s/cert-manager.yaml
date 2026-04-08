@@ -1,0 +1,21 @@
+apiVersion: cert-manager.io/v1
+kind: Issuer
+metadata:
+  name: bema-issuer
+  namespace: bema
+spec:
+  selfSigned: {}
+---
+apiVersion: cert-manager.io/v1
+kind: Certificate
+metadata:
+  name: bema-serving-cert
+  namespace: bema
+spec:
+  dnsNames:
+  - bema.bema.svc
+  - bema.bema.svc.cluster.local
+  issuerRef:
+    kind: Issuer
+    name: bema-issuer
+  secretName: bema-apiserver-tls

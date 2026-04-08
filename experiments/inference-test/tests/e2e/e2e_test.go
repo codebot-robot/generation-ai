@@ -31,6 +31,10 @@ func TestE2E(t *testing.T) {
 	h := NewHarness(t, "inference-test-e2e")
 	h.Setup()
 
+	if strings.Contains(h.ClusterName, "kind") {
+		t.Skip("Skipping test in Kind cluster as inference tests require GPU")
+	}
+
 	gitRoot := h.GetGitRoot()
 	experimentRoot := filepath.Join(gitRoot, "experiments/inference-test")
 	modelstoreRoot := filepath.Join(gitRoot, "modelstore")
