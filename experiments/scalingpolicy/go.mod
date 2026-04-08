@@ -3,6 +3,7 @@ module github.com/gke-labs/generation-ai/experiments/scalingpolicy
 go 1.26.2
 
 require (
+	github.com/gke-labs/gke-labs-infra/ktesting v0.0.0-20260408153246-803d1804c826
 	k8s.io/apimachinery v0.35.3
 	k8s.io/client-go v0.35.0
 	sigs.k8s.io/controller-runtime v0.23.3
