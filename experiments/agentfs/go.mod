@@ -1,9 +1,10 @@
 module github.com/gke-labs/generation-ai/experiments/agentfs
 
-go 1.25.7
+go 1.26.2
 
 require (
 	github.com/container-storage-interface/spec v1.11.0
+	github.com/gke-labs/gke-labs-infra/ktesting v0.0.0-20260408153246-803d1804c826
 	google.golang.org/grpc v1.79.3
 	google.golang.org/protobuf v1.36.10
 	k8s.io/klog/v2 v2.130.1
