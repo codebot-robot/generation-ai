@@ -18,13 +18,17 @@ import (
 	"context"
 	"flag"
 	"os"
+	"time"
 
 	"github.com/google/cel-go/cel"
 	appsv1 "k8s.io/api/apps/v1"
+	corev1 "k8s.io/api/core/v1"
+	"k8s.io/apimachinery/pkg/api/resource"
 	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/apimachinery/pkg/types"
 	utilruntime "k8s.io/apimachinery/pkg/util/runtime"
 	clientgoscheme "k8s.io/client-go/kubernetes/scheme"
+	metricsv1beta1 "k8s.io/metrics/pkg/apis/metrics/v1beta1"
 	ctrl "sigs.k8s.io/controller-runtime"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/log/zap"
@@ -40,6 +44,7 @@ var (
 func init() {
 	utilruntime.Must(clientgoscheme.AddToScheme(scheme))
 	utilruntime.Must(scalingpolicyv1alpha1.AddToScheme(scheme))
+	utilruntime.Must(metricsv1beta1.AddToScheme(scheme))
 }
 
 type ScalingPolicyReconciler struct {
@@ -55,8 +60,6 @@ func (r *ScalingPolicyReconciler) Reconcile(ctx context.Context, req ctrl.Reques
 		return ctrl.Result{}, client.IgnoreNotFound(err)
 	}
 
-	log.Info("Reconciling ScalingPolicy", "name", scalingPolicy.Name)
-
 	if scalingPolicy.Spec.Target.Kind == "Deployment" {
 		var deploy appsv1.Deployment
 		if err := r.Get(ctx, types.NamespacedName{
@@ -66,60 +69,106 @@ func (r *ScalingPolicyReconciler) Reconcile(ctx context.Context, req ctrl.Reques
 			return ctrl.Result{}, client.IgnoreNotFound(err)
 		}
 
-		for _, val := range scalingPolicy.Spec.Values {
-			if val.Path == "spec.replicas" {
-				env, err := cel.NewEnv()
+		// Gather metrics
+		envMap := make(map[string]any)
+		for _, input := range scalingPolicy.Spec.Inputs {
+			if input.Metric == "memory" {
+				var podMetricsList metricsv1beta1.PodMetricsList
+				err := r.List(ctx, &podMetricsList, client.InNamespace(deploy.Namespace), client.MatchingLabels(deploy.Spec.Selector.MatchLabels))
 				if err != nil {
-					log.Error(err, "failed to create CEL env")
+					log.Error(err, "failed to list pod metrics")
 					continue
 				}
-				ast, iss := env.Compile(val.Expression)
-				if iss.Err() != nil {
-					log.Error(iss.Err(), "failed to compile CEL expression")
-					continue
-				}
-				prg, err := env.Program(ast)
-				if err != nil {
-					log.Error(err, "failed to create CEL program")
-					continue
-				}
-				out, _, err := prg.Eval(map[string]any{})
-				if err != nil {
-					log.Error(err, "failed to evaluate CEL expression")
-					continue
-				}
-
-				var replicasInt32 int32
-				switch v := out.Value().(type) {
-				case int64:
-					replicasInt32 = int32(v)
-				case int:
-					replicasInt32 = int32(v)
-				default:
-					log.Error(nil, "CEL expression did not evaluate to integer", "type", out.Type())
-					continue
-				}
-
-				if val.Min != nil && replicasInt32 < *val.Min {
-					replicasInt32 = *val.Min
-				}
-				if val.Max != nil && replicasInt32 > *val.Max {
-					replicasInt32 = *val.Max
-				}
-
-				if deploy.Spec.Replicas == nil || *deploy.Spec.Replicas != replicasInt32 {
-					deploy.Spec.Replicas = &replicasInt32
-					if err := r.Update(ctx, &deploy); err != nil {
-						log.Error(err, "failed to update deployment replicas")
-						return ctrl.Result{}, err
+				var maxMem int64
+				for _, pm := range podMetricsList.Items {
+					for _, container := range pm.Containers {
+						mem := container.Usage.Memory().Value()
+						if mem > maxMem {
+							maxMem = mem
+						}
 					}
-					log.Info("Updated Deployment replicas", "replicas", replicasInt32)
+				}
+				envMap[input.Name] = maxMem
+			}
+		}
+
+		updated := false
+		for _, val := range scalingPolicy.Spec.Values {
+			// Prepare CEL environment with variables
+			var celEnvOpts []cel.EnvOption
+			for k := range envMap {
+				celEnvOpts = append(celEnvOpts, cel.Variable(k, cel.IntType))
+			}
+			env, err := cel.NewEnv(celEnvOpts...)
+			if err != nil {
+				log.Error(err, "failed to create CEL env")
+				continue
+			}
+			ast, iss := env.Compile(val.Expression)
+			if iss.Err() != nil {
+				log.Error(iss.Err(), "failed to compile CEL expression")
+				continue
+			}
+			prg, err := env.Program(ast)
+			if err != nil {
+				log.Error(err, "failed to create CEL program")
+				continue
+			}
+			out, _, err := prg.Eval(envMap)
+			if err != nil {
+				log.Error(err, "failed to evaluate CEL expression")
+				continue
+			}
+
+			var resultInt64 int64
+			switch v := out.Value().(type) {
+			case int64:
+				resultInt64 = int64(v)
+			case int:
+				resultInt64 = int64(v)
+			default:
+				log.Error(nil, "CEL expression did not evaluate to integer", "type", out.Type())
+				continue
+			}
+
+			if val.Min != nil && resultInt64 < int64(*val.Min) {
+				resultInt64 = int64(*val.Min)
+			}
+			if val.Max != nil && resultInt64 > int64(*val.Max) {
+				resultInt64 = int64(*val.Max)
+			}
+
+			if val.Path == "spec.replicas" {
+				if deploy.Spec.Replicas == nil || *deploy.Spec.Replicas != int32(resultInt64) {
+					replicas := int32(resultInt64)
+                                        deploy.Spec.Replicas = &replicas
+					updated = true
+					log.Info("Prepared update Deployment replicas", "replicas", resultInt64)
+				}
+			} else if val.Path == "spec.template.spec.containers[0].resources.limits.memory" {
+				q := resource.NewQuantity(resultInt64, resource.BinarySI)
+				if deploy.Spec.Template.Spec.Containers[0].Resources.Limits == nil {
+					deploy.Spec.Template.Spec.Containers[0].Resources.Limits = corev1.ResourceList{}
+				}
+				current := deploy.Spec.Template.Spec.Containers[0].Resources.Limits.Memory()
+				if current.Value() != q.Value() {
+					deploy.Spec.Template.Spec.Containers[0].Resources.Limits[corev1.ResourceMemory] = *q
+					updated = true
+					log.Info("Prepared update Deployment memory limit", "memory", q.String())
 				}
 			}
 		}
+
+		if updated {
+			if err := r.Update(ctx, &deploy); err != nil {
+				log.Error(err, "failed to update deployment")
+				return ctrl.Result{}, err
+			}
+			log.Info("Successfully updated Deployment")
+		}
 	}
 
-	return ctrl.Result{}, nil
+	return ctrl.Result{RequeueAfter: 15 * time.Second}, nil
 }
 func main() {
 	var metricsAddr string
