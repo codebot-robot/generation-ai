@@ -13,4 +13,4 @@
 # limitations under the License.
 
 FROM memcached:1.6
-CMD ["memcached", "-m", "496"]
+CMD ["memcached", "-m", "496", "-I", "2m"]

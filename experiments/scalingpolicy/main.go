@@ -141,7 +141,7 @@ func (r *ScalingPolicyReconciler) Reconcile(ctx context.Context, req ctrl.Reques
 			if val.Path == "spec.replicas" {
 				if deploy.Spec.Replicas == nil || *deploy.Spec.Replicas != int32(resultInt64) {
 					replicas := int32(resultInt64)
-                                        deploy.Spec.Replicas = &replicas
+					deploy.Spec.Replicas = &replicas
 					updated = true
 					log.Info("Prepared update Deployment replicas", "replicas", resultInt64)
 				}
