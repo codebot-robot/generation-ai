@@ -49,10 +49,10 @@ spec:
                     expression:
                       type: string
                     min:
-                      type: string
+                      type: integer
                     max:
-                      type: string
-                  required: ["path", "expression", "min", "max"]
+                      type: integer
+                  required: ["path", "expression"]
             required: ["target", "inputs", "values"]
     subresources:
       status: {}

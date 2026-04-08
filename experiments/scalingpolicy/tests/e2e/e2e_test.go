@@ -16,6 +16,7 @@ package e2e
 
 import (
 	"os"
+	"os/exec"
 	"path/filepath"
 	"strings"
 	"testing"
@@ -67,4 +68,62 @@ func TestE2E(t *testing.T) {
 	}
 
 	t.Log("ScalingPolicy controller started successfully.")
+
+	testManifest := `
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: test-deployment
+  namespace: default
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: test-deployment
+  template:
+    metadata:
+      labels:
+        app: test-deployment
+    spec:
+      containers:
+      - name: nginx
+        image: nginx:latest
+---
+apiVersion: generation-ai.gke.io/v1alpha1
+kind: ScalingPolicy
+metadata:
+  name: test-policy
+  namespace: default
+spec:
+  target:
+    kind: Deployment
+    name: test-deployment
+  inputs:
+  - name: dummy
+    metric: dummy
+  values:
+  - path: spec.replicas
+    expression: "2"
+    min: 1
+    max: 3
+`
+	h.KubectlApplyContent("test-resources", testManifest)
+
+	// Wait for deployment to have 2 replicas
+	deadline := time.Now().Add(2 * time.Minute)
+	success := false
+	for time.Now().Before(deadline) {
+		cmd := exec.Command("kubectl", "get", "deployment", "test-deployment", "-n", "default", "-o", "jsonpath={.spec.replicas}")
+		out, err := cmd.Output()
+		if err == nil && string(out) == "2" {
+			success = true
+			break
+		}
+		time.Sleep(2 * time.Second)
+	}
+	if !success {
+		t.Fatalf("Deployment replicas did not scale to 2")
+	}
+
+	t.Log("ScalingPolicy successfully scaled deployment to 2 replicas.")
 }
