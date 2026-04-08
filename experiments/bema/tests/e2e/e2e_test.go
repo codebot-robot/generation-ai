@@ -47,7 +47,7 @@ func TestE2E(t *testing.T) {
 
 	// Create namespace and secret first
 	h.RunCommand("kubectl", "create", "namespace", "bema")
-	h.RunCommand("kubectl", "create", "secret", "generic", "bema", "--from-literal=dummy=value", "-n", "bema")
+	h.RunCommand("kubectl", "create", "secret", "generic", "bema", "--from-literal=GEMINI_API_KEY=dummy", "-n", "bema")
 
 	// Apply all manifests
 	k8sDir := filepath.Join(experimentRoot, "k8s")
