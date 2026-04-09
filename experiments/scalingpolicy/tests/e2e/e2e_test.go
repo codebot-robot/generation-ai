@@ -16,6 +16,7 @@ package e2e
 
 import (
 	"bytes"
+	"context"
 	"crypto/rand"
 	"fmt"
 	"github.com/bradfitz/gomemcache/memcache"
@@ -175,11 +176,19 @@ spec:
 	mc := memcache.New("localhost:11211")
 
 	// Write random values
-	go func() {
+	ctx, cancel := context.WithCancel(t.Context())
+	defer cancel()
+
+	go func(ctx context.Context) {
 		val := make([]byte, 512*1024) // 512KB chunks
 		totalWritten := 0
 		i := 0
-		for totalWritten < 600*1024*1024 {
+		for {
+			select {
+			case <-ctx.Done():
+				return
+			default:
+			}
 			rand.Read(val)
 			key := fmt.Sprintf("key-%d", i)
 			err := mc.Set(&memcache.Item{Key: key, Value: val})
@@ -194,13 +203,13 @@ spec:
 			}
 			time.Sleep(50 * time.Millisecond)
 		}
-	}()
+	}(ctx)
 
 	// Monitor memory limits
 	deadline := time.Now().Add(5 * time.Minute)
 	success := false
 	for time.Now().Before(deadline) {
-		cmd := exec.Command("kubectl", "get", "deployment", "memcache-deployment", "-n", "default", "-o", "jsonpath={.spec.template.spec.containers[0].resources.limits.memory}")
+		cmd := exec.Command("sh", "-c", "kubectl get pods -l app=memcache -n default -o jsonpath='{.items[0].spec.containers[0].resources.limits.memory}'")
 		out, err := cmd.Output()
 		if err == nil {
 			limitStr := string(out)

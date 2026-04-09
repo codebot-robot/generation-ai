@@ -53,9 +53,9 @@ func getCgroupMemoryLimit() (int64, error) {
 func getTargetMemMB() int64 {
 	limit, err := getCgroupMemoryLimit()
 	if err != nil || limit <= 0 {
-		return 64 // fallback
+		return 16 // fallback
 	}
-	target := float64(limit) * 0.9
+	target := float64(limit-10*1024*1024) * 0.9
 	return int64(target / (1024 * 1024))
 }
 
