@@ -12,5 +12,17 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+FROM golang:1.26.2 AS builder
+
+WORKDIR /app
+COPY go.mod go.sum ./
+RUN go mod download
+
+COPY cmd/test-memcache-server-agent/ cmd/test-memcache-server-agent/
+RUN CGO_ENABLED=0 go build -o test-memcache-server-agent ./cmd/test-memcache-server-agent/
+
 FROM memcached:1.6
-CMD ["memcached", "-m", "496", "-I", "2m"]
+USER root
+COPY --from=builder /app/test-memcache-server-agent /usr/local/bin/test-memcache-server-agent
+USER memcache
+CMD ["test-memcache-server-agent"]
