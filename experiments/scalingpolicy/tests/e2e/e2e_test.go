@@ -177,12 +177,20 @@ spec:
 	// Write random values
 	go func() {
 		val := make([]byte, 512*1024) // 512KB chunks
-		for i := 0; i < 1200; i++ {
+		totalWritten := 0
+		i := 0
+		for totalWritten < 600*1024*1024 {
 			rand.Read(val)
 			key := fmt.Sprintf("key-%d", i)
 			err := mc.Set(&memcache.Item{Key: key, Value: val})
 			if err != nil {
 				t.Logf("Failed to write to memcache: %v", err)
+			} else {
+				totalWritten += len(val)
+			}
+			i++
+			if i%10 == 0 {
+				t.Logf("Written %d MB to memcache", totalWritten/(1024*1024))
 			}
 			time.Sleep(50 * time.Millisecond)
 		}

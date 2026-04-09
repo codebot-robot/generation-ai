@@ -34,6 +34,11 @@ import (
 	"sigs.k8s.io/controller-runtime/pkg/log/zap"
 
 	scalingpolicyv1alpha1 "github.com/gke-labs/generation-ai/experiments/scalingpolicy/pkg/api/v1alpha1"
+
+	"encoding/json"
+	"fmt"
+	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/client-go/dynamic"
 )
 
 var (
@@ -49,7 +54,9 @@ func init() {
 
 type ScalingPolicyReconciler struct {
 	client.Client
-	Scheme *runtime.Scheme
+	UncachedClient client.Client
+	DynamicClient  dynamic.Interface
+	Scheme         *runtime.Scheme
 }
 
 func (r *ScalingPolicyReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl.Result, error) {
@@ -69,102 +76,236 @@ func (r *ScalingPolicyReconciler) Reconcile(ctx context.Context, req ctrl.Reques
 			return ctrl.Result{}, client.IgnoreNotFound(err)
 		}
 
-		// Gather metrics
-		envMap := make(map[string]any)
-		for _, input := range scalingPolicy.Spec.Inputs {
-			if input.Metric == "memory" {
-				var podMetricsList metricsv1beta1.PodMetricsList
-				err := r.List(ctx, &podMetricsList, client.InNamespace(deploy.Namespace), client.MatchingLabels(deploy.Spec.Selector.MatchLabels))
-				if err != nil {
-					log.Error(err, "failed to list pod metrics")
-					continue
-				}
-				var maxMem int64
-				for _, pm := range podMetricsList.Items {
-					for _, container := range pm.Containers {
-						mem := container.Usage.Memory().Value()
-						if mem > maxMem {
-							maxMem = mem
+		var podList corev1.PodList
+		if err := r.Client.List(ctx, &podList, client.InNamespace(deploy.Namespace), client.MatchingLabels(deploy.Spec.Selector.MatchLabels)); err != nil {
+			log.Error(err, "failed to list pods")
+			return ctrl.Result{}, err
+		}
+
+		deployUpdated := false
+		var deployUpdates []string
+
+		for _, val := range scalingPolicy.Spec.Values {
+			if val.Path == "spec.replicas" {
+				// Evaluate replicas (we can evaluate based on max metrics across pods like before, or we can just run it)
+				// For spec.replicas, we need a single value. We can compute maxMem as before.
+				envMap := make(map[string]any)
+				for _, input := range scalingPolicy.Spec.Inputs {
+					if input.Metric == "memory" {
+						var podMetricsList metricsv1beta1.PodMetricsList
+						err := r.UncachedClient.List(ctx, &podMetricsList, client.InNamespace(deploy.Namespace), client.MatchingLabels(deploy.Spec.Selector.MatchLabels))
+						if err != nil {
+							log.Error(err, "failed to list pod metrics")
+							return ctrl.Result{}, err
 						}
+						var maxMem int64
+						for _, pm := range podMetricsList.Items {
+							var podMem int64
+							for _, container := range pm.Containers {
+								podMem += container.Usage.Memory().Value()
+							}
+							if podMem > maxMem {
+								maxMem = podMem
+							}
+						}
+						envMap[input.Name] = maxMem
 					}
 				}
-				envMap[input.Name] = maxMem
-			}
-		}
 
-		updated := false
-		for _, val := range scalingPolicy.Spec.Values {
-			// Prepare CEL environment with variables
-			var celEnvOpts []cel.EnvOption
-			for k := range envMap {
-				celEnvOpts = append(celEnvOpts, cel.Variable(k, cel.IntType))
-			}
-			env, err := cel.NewEnv(celEnvOpts...)
-			if err != nil {
-				log.Error(err, "failed to create CEL env")
-				continue
-			}
-			ast, iss := env.Compile(val.Expression)
-			if iss.Err() != nil {
-				log.Error(iss.Err(), "failed to compile CEL expression")
-				continue
-			}
-			prg, err := env.Program(ast)
-			if err != nil {
-				log.Error(err, "failed to create CEL program")
-				continue
-			}
-			out, _, err := prg.Eval(envMap)
-			if err != nil {
-				log.Error(err, "failed to evaluate CEL expression")
-				continue
-			}
+				// Evaluate CEL
+				var celEnvOpts []cel.EnvOption
+				for k := range envMap {
+					celEnvOpts = append(celEnvOpts, cel.Variable(k, cel.IntType))
+				}
+				env, err := cel.NewEnv(celEnvOpts...)
+				if err != nil {
+					log.Error(err, "failed to create CEL env")
+					continue
+				}
+				ast, iss := env.Compile(val.Expression)
+				if iss.Err() != nil {
+					log.Error(iss.Err(), "failed to compile CEL expression")
+					continue
+				}
+				prg, err := env.Program(ast)
+				if err != nil {
+					log.Error(err, "failed to create CEL program")
+					continue
+				}
+				out, _, err := prg.Eval(envMap)
+				if err != nil {
+					log.Error(err, "failed to evaluate CEL expression")
+					continue
+				}
 
-			var resultInt64 int64
-			switch v := out.Value().(type) {
-			case int64:
-				resultInt64 = int64(v)
-			case int:
-				resultInt64 = int64(v)
-			default:
-				log.Error(nil, "CEL expression did not evaluate to integer", "type", out.Type())
-				continue
-			}
+				var resultInt64 int64
+				switch v := out.Value().(type) {
+				case int64:
+					resultInt64 = v
+				case int:
+					resultInt64 = int64(v)
+				default:
+					log.Error(nil, "CEL expression did not evaluate to integer", "type", out.Type())
+					continue
+				}
 
-			if val.Min != nil && resultInt64 < int64(*val.Min) {
-				resultInt64 = int64(*val.Min)
-			}
-			if val.Max != nil && resultInt64 > int64(*val.Max) {
-				resultInt64 = int64(*val.Max)
-			}
+				if val.Min != nil && resultInt64 < int64(*val.Min) {
+					resultInt64 = int64(*val.Min)
+				}
+				if val.Max != nil && resultInt64 > int64(*val.Max) {
+					resultInt64 = int64(*val.Max)
+				}
 
-			if val.Path == "spec.replicas" {
 				if deploy.Spec.Replicas == nil || *deploy.Spec.Replicas != int32(resultInt64) {
+					oldVal := int32(0)
+					if deploy.Spec.Replicas != nil {
+						oldVal = *deploy.Spec.Replicas
+					}
 					replicas := int32(resultInt64)
 					deploy.Spec.Replicas = &replicas
-					updated = true
-					log.Info("Prepared update Deployment replicas", "replicas", resultInt64)
-				}
-			} else if val.Path == "spec.template.spec.containers[0].resources.limits.memory" {
-				q := resource.NewQuantity(resultInt64, resource.BinarySI)
-				if deploy.Spec.Template.Spec.Containers[0].Resources.Limits == nil {
-					deploy.Spec.Template.Spec.Containers[0].Resources.Limits = corev1.ResourceList{}
-				}
-				current := deploy.Spec.Template.Spec.Containers[0].Resources.Limits.Memory()
-				if current.Value() != q.Value() {
-					deploy.Spec.Template.Spec.Containers[0].Resources.Limits[corev1.ResourceMemory] = *q
-					updated = true
-					log.Info("Prepared update Deployment memory limit", "memory", q.String())
+					deployUpdated = true
+					deployUpdates = append(deployUpdates, fmt.Sprintf("spec.replicas: %d -> %d", oldVal, replicas))
 				}
 			}
 		}
 
-		if updated {
+		if deployUpdated {
 			if err := r.Update(ctx, &deploy); err != nil {
 				log.Error(err, "failed to update deployment")
 				return ctrl.Result{}, err
 			}
-			log.Info("Successfully updated Deployment")
+			log.Info("Successfully updated Deployment", "updates", deployUpdates)
+		}
+
+		// Now evaluate per-pod updates
+		var podMetricsList metricsv1beta1.PodMetricsList
+		err := r.UncachedClient.List(ctx, &podMetricsList, client.InNamespace(deploy.Namespace), client.MatchingLabels(deploy.Spec.Selector.MatchLabels))
+		if err != nil {
+			log.Error(err, "failed to list pod metrics")
+			return ctrl.Result{}, err
+		}
+		metricsByPod := make(map[string]int64)
+		for _, pm := range podMetricsList.Items {
+			var podMem int64
+			for _, container := range pm.Containers {
+				podMem += container.Usage.Memory().Value()
+			}
+			metricsByPod[pm.Name] = podMem
+		}
+
+		for _, pod := range podList.Items {
+			envMap := make(map[string]any)
+			for _, input := range scalingPolicy.Spec.Inputs {
+				if input.Metric == "memory" {
+					envMap[input.Name] = metricsByPod[pod.Name]
+				}
+			}
+
+			podUpdated := false
+			var podUpdates []string
+			var patchBytes []byte
+			newLimits := make(corev1.ResourceList)
+
+			for _, val := range scalingPolicy.Spec.Values {
+				if val.Path == "spec.template.spec.containers[0].resources.limits.memory" {
+					var celEnvOpts []cel.EnvOption
+					for k := range envMap {
+						celEnvOpts = append(celEnvOpts, cel.Variable(k, cel.IntType))
+					}
+					env, err := cel.NewEnv(celEnvOpts...)
+					if err != nil {
+						log.Error(err, "failed to create CEL env")
+						continue
+					}
+					ast, iss := env.Compile(val.Expression)
+					if iss.Err() != nil {
+						log.Error(iss.Err(), "failed to compile CEL expression")
+						continue
+					}
+					prg, err := env.Program(ast)
+					if err != nil {
+						log.Error(err, "failed to create CEL program")
+						continue
+					}
+					out, _, err := prg.Eval(envMap)
+					if err != nil {
+						log.Error(err, "failed to evaluate CEL expression")
+						continue
+					}
+
+					var resultInt64 int64
+					switch v := out.Value().(type) {
+					case int64:
+						resultInt64 = v
+					case int:
+						resultInt64 = int64(v)
+					default:
+						log.Error(nil, "CEL expression did not evaluate to integer", "type", out.Type())
+						continue
+					}
+
+					if val.Min != nil && resultInt64 < int64(*val.Min) {
+						resultInt64 = int64(*val.Min)
+					}
+					if val.Max != nil && resultInt64 > int64(*val.Max) {
+						resultInt64 = int64(*val.Max)
+					}
+
+					q := resource.NewQuantity(resultInt64, resource.BinarySI)
+					current := resource.Quantity{}
+					if pod.Spec.Containers[0].Resources.Limits != nil {
+						current = pod.Spec.Containers[0].Resources.Limits[corev1.ResourceMemory]
+					}
+					if current.Value() != q.Value() {
+						podUpdated = true
+						podUpdates = append(podUpdates, fmt.Sprintf("spec.containers[0].resources.limits.memory: %s -> %s", current.String(), q.String()))
+						newLimits[corev1.ResourceMemory] = *q
+					}
+				}
+			}
+
+			if podUpdated {
+				type resourcePatch struct {
+					Limits corev1.ResourceList `json:"limits"`
+				}
+				type containerPatch struct {
+					Name      string        `json:"name"`
+					Resources resourcePatch `json:"resources"`
+				}
+				type podSpecPatch struct {
+					Containers []containerPatch `json:"containers"`
+				}
+				type patchRoot struct {
+					Spec podSpecPatch `json:"spec"`
+				}
+				p := patchRoot{
+					Spec: podSpecPatch{
+						Containers: []containerPatch{
+							{
+								Name: pod.Spec.Containers[0].Name,
+								Resources: resourcePatch{
+									Limits: newLimits,
+								},
+							},
+						},
+					},
+				}
+				patchBytes, err = json.Marshal(p)
+				if err != nil {
+					log.Error(err, "failed to marshal pod patch")
+					continue
+				}
+
+				gvr := corev1.SchemeGroupVersion.WithResource("pods")
+				_, err = r.DynamicClient.Resource(gvr).Namespace(pod.Namespace).Patch(
+					ctx, pod.Name, types.MergePatchType, patchBytes, metav1.PatchOptions{}, "resize",
+				)
+				if err != nil {
+					log.Error(err, "failed to patch pod resize subresource", "pod", pod.Name)
+				} else {
+					log.Info("Successfully patched Pod resize", "pod", pod.Name, "updates", podUpdates)
+				}
+			}
 		}
 	}
 
@@ -185,9 +326,22 @@ func main() {
 		os.Exit(1)
 	}
 
+	uncachedClient, err := client.New(mgr.GetConfig(), client.Options{Scheme: scheme})
+	if err != nil {
+		setupLog.Error(err, "unable to create uncached client")
+		os.Exit(1)
+	}
+	dynClient, err := dynamic.NewForConfig(mgr.GetConfig())
+	if err != nil {
+		setupLog.Error(err, "unable to create dynamic client")
+		os.Exit(1)
+	}
+
 	if err = (&ScalingPolicyReconciler{
-		Client: mgr.GetClient(),
-		Scheme: mgr.GetScheme(),
+		Client:         mgr.GetClient(),
+		UncachedClient: uncachedClient,
+		DynamicClient:  dynClient,
+		Scheme:         mgr.GetScheme(),
 	}).SetupWithManager(mgr); err != nil {
 		setupLog.Error(err, "unable to create controller", "controller", "ScalingPolicy")
 		os.Exit(1)
