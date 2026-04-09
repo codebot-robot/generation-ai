@@ -15,11 +15,6 @@
 package e2e
 
 import (
-	"bytes"
-	"context"
-	"crypto/rand"
-	"fmt"
-	"github.com/bradfitz/gomemcache/memcache"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -45,6 +40,9 @@ func TestE2E(t *testing.T) {
 
 	h.DockerBuild("test-memcache-server:e2e", filepath.Join(experimentRoot, "images/test-memcache-server/Dockerfile"), experimentRoot)
 	h.KindLoad("test-memcache-server:e2e")
+
+	h.DockerBuild("test-memcache-client:e2e", filepath.Join(experimentRoot, "images/test-memcache-client/Dockerfile"), experimentRoot)
+	h.KindLoad("test-memcache-client:e2e")
 
 	// Apply CRD
 	crdPath := filepath.Join(experimentRoot, "k8s/crds/scalingpolicy.yaml")
@@ -134,6 +132,42 @@ spec:
           limits:
             memory: 64Mi
 ---
+apiVersion: v1
+kind: Service
+metadata:
+  name: memcache-service
+  namespace: default
+spec:
+  selector:
+    app: memcache
+  ports:
+  - port: 11211
+    targetPort: 11211
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: memcache-client
+  namespace: default
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: memcache-client
+  template:
+    metadata:
+      labels:
+        app: memcache-client
+    spec:
+      containers:
+      - name: client
+        image: test-memcache-client:e2e
+        imagePullPolicy: Never
+        args:
+        - "-server=memcache-service:11211"
+        - "-min-ops=20"
+        - "-max-ops=50"
+---
 apiVersion: generation-ai.gke.io/v1alpha1
 kind: ScalingPolicy
 metadata:
@@ -160,50 +194,11 @@ spec:
 		t.Fatalf("memcache-deployment failed to start: %v\nOutput: %s", err, out)
 	}
 
-	// Port forward to memcache
-	pfCmd := exec.Command("kubectl", "port-forward", "deployment/memcache-deployment", "11211:11211", "-n", "default")
-	var pfOut bytes.Buffer
-	pfCmd.Stdout = &pfOut
-	pfCmd.Stderr = &pfOut
-	if err := pfCmd.Start(); err != nil {
-		t.Fatalf("Failed to start port-forward: %v", err)
+	// Wait for client deployment to be ready
+	cmd = exec.Command("kubectl", "rollout", "status", "deployment/memcache-client", "-n", "default", "--timeout=2m")
+	if out, err := cmd.CombinedOutput(); err != nil {
+		t.Fatalf("memcache-client failed to start: %v\nOutput: %s", err, out)
 	}
-	defer pfCmd.Process.Kill()
-
-	// Wait for port-forward to be ready
-	time.Sleep(5 * time.Second)
-
-	mc := memcache.New("localhost:11211")
-
-	// Write random values
-	ctx, cancel := context.WithCancel(t.Context())
-	defer cancel()
-
-	go func(ctx context.Context) {
-		val := make([]byte, 512*1024) // 512KB chunks
-		totalWritten := 0
-		i := 0
-		for {
-			select {
-			case <-ctx.Done():
-				return
-			default:
-			}
-			rand.Read(val)
-			key := fmt.Sprintf("key-%d", i)
-			err := mc.Set(&memcache.Item{Key: key, Value: val})
-			if err != nil {
-				t.Logf("Failed to write to memcache: %v", err)
-			} else {
-				totalWritten += len(val)
-			}
-			i++
-			if i%10 == 0 {
-				t.Logf("Written %d MB to memcache", totalWritten/(1024*1024))
-			}
-			time.Sleep(50 * time.Millisecond)
-		}
-	}(ctx)
 
 	// Monitor memory limits
 	deadline := time.Now().Add(5 * time.Minute)
