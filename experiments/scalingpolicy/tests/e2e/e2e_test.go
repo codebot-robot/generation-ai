@@ -148,7 +148,7 @@ spec:
     metric: memory
   values:
   - path: spec.template.spec.containers[0].resources.limits.memory
-    expression: "pod_memory + 64 * 1024 * 1024"
+    expression: "pod_memory + 128 * 1024 * 1024"
     min: 67108864 # 64MiB
     max: 536870912 # 512MiB
 `
