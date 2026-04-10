@@ -19,6 +19,7 @@ import (
 	"fmt"
 	"log"
 	"net"
+	"net/http"
 	"os"
 	"os/exec"
 	"strconv"
@@ -83,6 +84,65 @@ func updateMemcacheLimit(mb int64) error {
 	return nil
 }
 
+func scrapeStats() (map[string]string, error) {
+	conn, err := net.DialTimeout("tcp", "127.0.0.1:11211", 5*time.Second)
+	if err != nil {
+		return nil, err
+	}
+	defer conn.Close()
+
+	_, err = conn.Write([]byte("stats\r\n"))
+	if err != nil {
+		return nil, err
+	}
+
+	stats := make(map[string]string)
+	reader := bufio.NewReader(conn)
+	for {
+		line, err := reader.ReadString('\n')
+		if err != nil {
+			return nil, err
+		}
+		line = strings.TrimSpace(line)
+		if line == "END" {
+			break
+		}
+		if strings.HasPrefix(line, "STAT ") {
+			parts := strings.Split(line, " ")
+			if len(parts) == 3 {
+				stats[parts[1]] = parts[2]
+			}
+		}
+	}
+	return stats, nil
+}
+
+func metricsHandler(w http.ResponseWriter, r *http.Request) {
+	stats, err := scrapeStats()
+	if err != nil {
+		http.Error(w, "Failed to scrape memcached", http.StatusInternalServerError)
+		return
+	}
+
+	// Write Prometheus formatted metrics
+	w.Header().Set("Content-Type", "text/plain; version=0.0.4")
+	if hits, ok := stats["get_hits"]; ok {
+		fmt.Fprintf(w, "# HELP memcached_get_hits Total number of cache hits\n")
+		fmt.Fprintf(w, "# TYPE memcached_get_hits counter\n")
+		fmt.Fprintf(w, "memcached_get_hits %s\n", hits)
+	}
+	if misses, ok := stats["get_misses"]; ok {
+		fmt.Fprintf(w, "# HELP memcached_get_misses Total number of cache misses\n")
+		fmt.Fprintf(w, "# TYPE memcached_get_misses counter\n")
+		fmt.Fprintf(w, "memcached_get_misses %s\n", misses)
+	}
+	if bytes, ok := stats["bytes"]; ok {
+		fmt.Fprintf(w, "# HELP memcached_bytes Current number of bytes used to store items\n")
+		fmt.Fprintf(w, "# TYPE memcached_bytes gauge\n")
+		fmt.Fprintf(w, "memcached_bytes %s\n", bytes)
+	}
+}
+
 func main() {
 	initialMB := getTargetMemMB()
 	log.Printf("Starting memcached with -m %d", initialMB)
@@ -93,6 +153,14 @@ func main() {
 	if err := cmd.Start(); err != nil {
 		log.Fatalf("Failed to start memcached: %v", err)
 	}
+
+	go func() {
+		http.HandleFunc("/metrics", metricsHandler)
+		log.Printf("Starting metrics server on :8080")
+		if err := http.ListenAndServe(":8080", nil); err != nil {
+			log.Fatalf("Metrics server failed: %v", err)
+		}
+	}()
 
 	currentMB := initialMB
 
