@@ -52,6 +52,11 @@ func (h *Harness) InstallVPA(t *testing.T) {
 	if out, err := cmd.CombinedOutput(); err != nil {
 		t.Logf("Failed to install VPA: %v\nOutput: %s", err, string(out))
 	} else {
+		// Configure VPA to be more aggressive and use a smaller buffer
+		exec.Command("kubectl", "patch", "deployment", "vpa-recommender", "-n", "kube-system", "--type=json", "-p", `[{"op": "add", "path": "/spec/template/spec/containers/0/args/-", "value": "--recommendation-margin-fraction=0.05"}]`).Run()
+		exec.Command("kubectl", "patch", "deployment", "vpa-updater", "-n", "kube-system", "--type=json", "-p", `[{"op": "add", "path": "/spec/template/spec/containers/0/args/-", "value": "--pod-update-threshold=0.05"}]`).Run()
+		exec.Command("kubectl", "patch", "deployment", "vpa-updater", "-n", "kube-system", "--type=json", "-p", `[{"op": "add", "path": "/spec/template/spec/containers/0/args/-", "value": "--min-replicas=1"}]`).Run()
+
 		// Wait for VPA recommender to be ready
 		cmd = exec.Command("kubectl", "rollout", "status", "deployment/vpa-recommender", "-n", "kube-system", "--timeout=2m")
 		cmd.CombinedOutput()
