@@ -255,6 +255,12 @@ spec:
     name:       memcache-deployment
   updatePolicy:
     updateMode: "Auto"
+    minReplicas: 1
+  resourcePolicy:
+    containerPolicies:
+    - containerName: "*"
+      controlledResources: ["memory"]
+      controlledValues: "RequestsAndLimits"
 `
 		deployMemcacheApp(t, ns, vpa)
 
