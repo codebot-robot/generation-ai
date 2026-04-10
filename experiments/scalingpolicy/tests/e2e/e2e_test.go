@@ -217,6 +217,9 @@ spec:
 `
 		deployMemcacheApp(t, ns, policy)
 
+		sink := NewMetricsSink(t)
+		sink.StartCollecting(t, ns)
+
 		deadline := time.Now().Add(5 * time.Minute)
 		success := false
 		for time.Now().Before(deadline) {
@@ -255,6 +258,9 @@ spec:
 `
 		deployMemcacheApp(t, ns, vpa)
 
+		sink := NewMetricsSink(t)
+		sink.StartCollecting(t, ns)
+
 		// Let it run for 2 minutes to gather metrics and potentially scale
 		time.Sleep(2 * time.Minute)
 		writeMetricsToCSV(t, ns, "VPA")
@@ -264,6 +270,9 @@ spec:
 		ns := "test-fixed"
 		// No extra policy or VPA
 		deployMemcacheApp(t, ns, "")
+
+		sink := NewMetricsSink(t)
+		sink.StartCollecting(t, ns)
 
 		// Let it run for 2 minutes to gather metrics
 		time.Sleep(2 * time.Minute)
