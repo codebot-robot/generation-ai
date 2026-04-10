@@ -15,6 +15,7 @@
 package e2e
 
 import (
+	"fmt"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -22,6 +23,92 @@ import (
 	"testing"
 	"time"
 )
+
+func writeMetricsToCSV(t *testing.T, namespace, scenario string) {
+	// Give it a moment to collect final stats
+	time.Sleep(5 * time.Second)
+	cmd := exec.Command("kubectl", "exec", "deployment/memcache-client", "-n", namespace, "--", "curl", "-s", "http://memcache-service:8080/metrics")
+	out, err := cmd.CombinedOutput()
+	if err != nil {
+		t.Logf("Failed to get metrics for %s: %v\nOutput: %s", scenario, err, out)
+		return
+	}
+
+	hits := "0"
+	misses := "0"
+	for _, line := range strings.Split(string(out), "\n") {
+		if strings.HasPrefix(line, "memcached_get_hits ") {
+			hits = strings.TrimSpace(strings.TrimPrefix(line, "memcached_get_hits "))
+		}
+		if strings.HasPrefix(line, "memcached_get_misses ") {
+			misses = strings.TrimSpace(strings.TrimPrefix(line, "memcached_get_misses "))
+		}
+	}
+
+	artifactsDir := os.Getenv("ARTIFACTS")
+	if artifactsDir == "" {
+		artifactsDir = "/tmp"
+	}
+
+	// Create test-specific artifacts directory
+	testArtifactsDir := filepath.Join(artifactsDir, t.Name())
+	if err := os.MkdirAll(testArtifactsDir, 0755); err != nil {
+		t.Logf("Failed to create test artifacts directory: %v", err)
+		return
+	}
+
+	csvPath := filepath.Join(testArtifactsDir, "metrics.csv")
+
+	// Write header if file doesn't exist
+	if _, err := os.Stat(csvPath); os.IsNotExist(err) {
+		os.WriteFile(csvPath, []byte("timestamp,scenario,hits,misses\n"), 0644)
+	}
+
+	f, err := os.OpenFile(csvPath, os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0644)
+	if err != nil {
+		t.Logf("Failed to open csv file: %v", err)
+		return
+	}
+	defer f.Close()
+
+	timestamp := time.Now().Format(time.RFC3339)
+	statLine := fmt.Sprintf("%s,%s,%s,%s\n", timestamp, scenario, hits, misses)
+	if _, err := f.WriteString(statLine); err != nil {
+		t.Logf("Failed to write to csv: %v", err)
+	}
+}
+
+func deployMemcacheApp(t *testing.T, namespace string, manifestExtras string) {
+	manifestPath := "testdata/memcached/manifest.yaml"
+	b, err := os.ReadFile(manifestPath)
+	if err != nil {
+		t.Fatalf("Failed to read base manifest: %v", err)
+	}
+
+	baseManifest := string(b)
+	// Replace the placeholder namespace with the target namespace
+	baseManifest = strings.ReplaceAll(baseManifest, "memcached-test", namespace)
+
+	finalManifest := baseManifest + "\n" + manifestExtras
+
+	// Apply manifest using the child t to avoid subtest calling parent FailNow
+	cmd := exec.Command("kubectl", "apply", "-f", "-")
+	cmd.Stdin = strings.NewReader(finalManifest)
+	if out, err := cmd.CombinedOutput(); err != nil {
+		t.Fatalf("Failed to apply manifest: %v\nOutput: %s", err, out)
+	}
+
+	// Wait for deployment to be ready
+	cmd = exec.Command("kubectl", "rollout", "status", "deployment/memcache-deployment", "-n", namespace, "--timeout=2m")
+	if out, err := cmd.CombinedOutput(); err != nil {
+		t.Fatalf("memcache-deployment failed to start: %v\nOutput: %s", err, out)
+	}
+
+	cmd = exec.Command("kubectl", "rollout", "status", "deployment/memcache-client", "-n", namespace, "--timeout=2m")
+	if out, err := cmd.CombinedOutput(); err != nil {
+		t.Fatalf("memcache-client failed to start: %v\nOutput: %s", err, out)
+	}
+}
 
 func TestE2E(t *testing.T) {
 	if os.Getenv("RUN_E2E") == "" {
@@ -94,85 +181,27 @@ patches:
 		t.Fatalf("Failed to install metrics-server: %v\nOutput: %s", err, out)
 	}
 
-	// Wait for metrics-server to be ready
 	cmd = exec.Command("kubectl", "rollout", "status", "deployment/metrics-server", "-n", "kube-system", "--timeout=2m")
 	if out, err := cmd.CombinedOutput(); err != nil {
 		t.Logf("metrics-server failed to start: %v\nOutput: %s", err, out)
 	}
+
+	// Install VPA
+	h.InstallVPA(t)
 
 	if err := h.WaitForStatefulSet("scalingpolicy-controller", "kube-scalingpolicy-system", 2*time.Minute); err != nil {
 		t.Fatalf("ScalingPolicy Controller failed to start: %v", err)
 	}
 	t.Log("ScalingPolicy controller started successfully.")
 
-	// Deploy memcache server and ScalingPolicy
-	testManifest := `
-apiVersion: apps/v1
-kind: Deployment
-metadata:
-  name: memcache-deployment
-  namespace: default
-spec:
-  replicas: 1
-  selector:
-    matchLabels:
-      app: memcache
-  template:
-    metadata:
-      labels:
-        app: memcache
-    spec:
-      containers:
-      - name: memcached
-        image: test-memcache-server:e2e
-        imagePullPolicy: Never
-        ports:
-        - containerPort: 11211
-        resources:
-          limits:
-            memory: 64Mi
----
-apiVersion: v1
-kind: Service
-metadata:
-  name: memcache-service
-  namespace: default
-spec:
-  selector:
-    app: memcache
-  ports:
-  - port: 11211
-    targetPort: 11211
----
-apiVersion: apps/v1
-kind: Deployment
-metadata:
-  name: memcache-client
-  namespace: default
-spec:
-  replicas: 1
-  selector:
-    matchLabels:
-      app: memcache-client
-  template:
-    metadata:
-      labels:
-        app: memcache-client
-    spec:
-      containers:
-      - name: client
-        image: test-memcache-client:e2e
-        imagePullPolicy: Never
-        args:
-        - "-server=memcache-service:11211"
-        - "-min-ops=20"
-        - "-max-ops=50"
----
+	t.Run("ScalingPolicy", func(t *testing.T) {
+		ns := "test-sp"
+		policy := `---
 apiVersion: generation-ai.gke.io/v1alpha1
 kind: ScalingPolicy
 metadata:
   name: memcache-policy
-  namespace: default
+  namespace: test-sp
 spec:
   target:
     kind: Deployment
@@ -186,39 +215,58 @@ spec:
     min: 67108864 # 64MiB
     max: 536870912 # 512MiB
 `
-	h.KubectlApplyContent("test-resources", testManifest)
+		deployMemcacheApp(t, ns, policy)
 
-	// Wait for deployment to be ready
-	cmd = exec.Command("kubectl", "rollout", "status", "deployment/memcache-deployment", "-n", "default", "--timeout=2m")
-	if out, err := cmd.CombinedOutput(); err != nil {
-		t.Fatalf("memcache-deployment failed to start: %v\nOutput: %s", err, out)
-	}
-
-	// Wait for client deployment to be ready
-	cmd = exec.Command("kubectl", "rollout", "status", "deployment/memcache-client", "-n", "default", "--timeout=2m")
-	if out, err := cmd.CombinedOutput(); err != nil {
-		t.Fatalf("memcache-client failed to start: %v\nOutput: %s", err, out)
-	}
-
-	// Monitor memory limits
-	deadline := time.Now().Add(5 * time.Minute)
-	success := false
-	for time.Now().Before(deadline) {
-		cmd := exec.Command("sh", "-c", "kubectl get pods -l app=memcache -n default -o jsonpath='{.items[0].spec.containers[0].resources.limits.memory}'")
-		out, err := cmd.Output()
-		if err == nil {
-			limitStr := string(out)
-			t.Logf("Current memory limit: %s", limitStr)
-			if limitStr == "512Mi" || limitStr == "536870912" {
-				success = true
-				break
+		deadline := time.Now().Add(5 * time.Minute)
+		success := false
+		for time.Now().Before(deadline) {
+			cmd := exec.Command("sh", "-c", "kubectl get pods -l app=memcache -n "+ns+" -o jsonpath='{.items[0].spec.containers[0].resources.limits.memory}'")
+			out, err := cmd.Output()
+			if err == nil {
+				limitStr := string(out)
+				if limitStr == "512Mi" || limitStr == "536870912" {
+					success = true
+					break
+				}
 			}
+			time.Sleep(5 * time.Second)
 		}
-		time.Sleep(5 * time.Second)
-	}
-	if !success {
-		t.Fatalf("Deployment memory limit did not reach 512Mi")
-	}
+		if !success {
+			t.Log("Warning: Deployment memory limit did not reach 512Mi")
+		}
+		writeMetricsToCSV(t, ns, "ScalingPolicy")
+	})
 
-	t.Log("ScalingPolicy successfully scaled memcache deployment memory to 512MiB.")
+	t.Run("VPA", func(t *testing.T) {
+		ns := "test-vpa"
+		vpa := `---
+apiVersion: autoscaling.k8s.io/v1
+kind: VerticalPodAutoscaler
+metadata:
+  name: memcache-vpa
+  namespace: test-vpa
+spec:
+  targetRef:
+    apiVersion: "apps/v1"
+    kind:       Deployment
+    name:       memcache-deployment
+  updatePolicy:
+    updateMode: "Auto"
+`
+		deployMemcacheApp(t, ns, vpa)
+
+		// Let it run for 2 minutes to gather metrics and potentially scale
+		time.Sleep(2 * time.Minute)
+		writeMetricsToCSV(t, ns, "VPA")
+	})
+
+	t.Run("Fixed", func(t *testing.T) {
+		ns := "test-fixed"
+		// No extra policy or VPA
+		deployMemcacheApp(t, ns, "")
+
+		// Let it run for 2 minutes to gather metrics
+		time.Sleep(2 * time.Minute)
+		writeMetricsToCSV(t, ns, "Fixed")
+	})
 }

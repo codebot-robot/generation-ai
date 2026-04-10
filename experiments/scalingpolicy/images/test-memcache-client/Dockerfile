@@ -21,6 +21,7 @@ RUN go mod download
 COPY cmd/test-memcache-client/ cmd/test-memcache-client/
 RUN CGO_ENABLED=0 go build -o test-memcache-client ./cmd/test-memcache-client/
 
-FROM gcr.io/distroless/static:nonroot
+FROM debian:latest
+RUN apt-get update && apt-get install -y curl && rm -rf /var/lib/apt/lists/*
 COPY --from=builder /app/test-memcache-client /test-memcache-client
 ENTRYPOINT ["/test-memcache-client"]
