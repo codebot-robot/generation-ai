@@ -187,6 +187,7 @@ func (s *MetricsSink) collectOnce(t *testing.T, namespace string) {
 				Metadata struct {
 					Name string `json:"name"`
 				} `json:"metadata"`
+				Timestamp  time.Time `json:"timestamp"`
 				Containers []struct {
 					Name  string            `json:"name"`
 					Usage map[string]string `json:"usage"`
@@ -195,12 +196,16 @@ func (s *MetricsSink) collectOnce(t *testing.T, namespace string) {
 		}
 		if json.Unmarshal(out, &podMetrics) == nil {
 			for _, pod := range podMetrics.Items {
+				podTime := now
+				if !pod.Timestamp.IsZero() {
+					podTime = uint64(pod.Timestamp.UnixNano())
+				}
 				for _, container := range pod.Containers {
 					if cpuStr, ok := container.Usage["cpu"]; ok {
-						metrics = append(metrics, createMetric("pod_cpu_usage", pod.Metadata.Name, container.Name, parseK8sQuantity(cpuStr), now))
+						metrics = append(metrics, createMetric("pod_cpu_usage", pod.Metadata.Name, container.Name, parseK8sQuantity(cpuStr), podTime))
 					}
 					if memStr, ok := container.Usage["memory"]; ok {
-						metrics = append(metrics, createMetric("pod_memory_usage", pod.Metadata.Name, container.Name, parseK8sQuantity(memStr), now))
+						metrics = append(metrics, createMetric("pod_memory_usage", pod.Metadata.Name, container.Name, parseK8sQuantity(memStr), podTime))
 					}
 				}
 			}
