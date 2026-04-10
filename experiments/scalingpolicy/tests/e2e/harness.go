@@ -64,3 +64,15 @@ func (h *Harness) InstallVPA(t *testing.T) {
 		cmd.CombinedOutput()
 	}
 }
+
+func (h *Harness) InstallMetricsServer(t *testing.T) {
+	cmd := exec.Command("kubectl", "apply", "-k", "testdata/metrics-server")
+	if out, err := cmd.CombinedOutput(); err != nil {
+		t.Fatalf("Failed to install metrics-server: %v\nOutput: %s", err, out)
+	}
+
+	cmd = exec.Command("kubectl", "rollout", "status", "deployment/metrics-server", "-n", "kube-system", "--timeout=2m")
+	if out, err := cmd.CombinedOutput(); err != nil {
+		t.Logf("metrics-server failed to start: %v\nOutput: %s", err, out)
+	}
+}
