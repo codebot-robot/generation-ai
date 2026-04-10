@@ -49,7 +49,20 @@ func writeMetricsToCSV(t *testing.T, namespace, scenario string) {
 	if artifactsDir == "" {
 		artifactsDir = "/tmp"
 	}
-	csvPath := filepath.Join(artifactsDir, "metrics.csv")
+
+	// Create test-specific artifacts directory
+	testArtifactsDir := filepath.Join(artifactsDir, t.Name())
+	if err := os.MkdirAll(testArtifactsDir, 0755); err != nil {
+		t.Logf("Failed to create test artifacts directory: %v", err)
+		return
+	}
+
+	csvPath := filepath.Join(testArtifactsDir, "metrics.csv")
+
+	// Write header if file doesn't exist
+	if _, err := os.Stat(csvPath); os.IsNotExist(err) {
+		os.WriteFile(csvPath, []byte("timestamp,scenario,hits,misses\n"), 0644)
+	}
 
 	f, err := os.OpenFile(csvPath, os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0644)
 	if err != nil {
@@ -58,92 +71,35 @@ func writeMetricsToCSV(t *testing.T, namespace, scenario string) {
 	}
 	defer f.Close()
 
-	statLine := fmt.Sprintf("%s,%s,%s\n", scenario, hits, misses)
+	timestamp := time.Now().Format(time.RFC3339)
+	statLine := fmt.Sprintf("%s,%s,%s,%s\n", timestamp, scenario, hits, misses)
 	if _, err := f.WriteString(statLine); err != nil {
 		t.Logf("Failed to write to csv: %v", err)
 	}
 }
 
-func deployMemcacheApp(t *testing.T, h *Harness, namespace string, manifestExtras string) {
-	manifest := fmt.Sprintf(`
-apiVersion: v1
-kind: Namespace
-metadata:
-  name: %[1]s
----
-apiVersion: apps/v1
-kind: Deployment
-metadata:
-  name: memcache-deployment
-  namespace: %[1]s
-spec:
-  replicas: 1
-  selector:
-    matchLabels:
-      app: memcache
-  template:
-    metadata:
-      labels:
-        app: memcache
-    spec:
-      containers:
-      - name: memcached
-        image: test-memcache-server:e2e
-        imagePullPolicy: Never
-        ports:
-        - containerPort: 11211
-        - containerPort: 8080
-        resources:
-          limits:
-            memory: 64Mi
-          requests:
-            memory: 64Mi
----
-apiVersion: v1
-kind: Service
-metadata:
-  name: memcache-service
-  namespace: %[1]s
-spec:
-  selector:
-    app: memcache
-  ports:
-  - port: 11211
-    targetPort: 11211
-    name: memcache
-  - port: 8080
-    targetPort: 8080
-    name: metrics
----
-apiVersion: apps/v1
-kind: Deployment
-metadata:
-  name: memcache-client
-  namespace: %[1]s
-spec:
-  replicas: 1
-  selector:
-    matchLabels:
-      app: memcache-client
-  template:
-    metadata:
-      labels:
-        app: memcache-client
-    spec:
-      containers:
-      - name: client
-        image: test-memcache-client:e2e
-        imagePullPolicy: Never
-        args:
-        - "-server=memcache-service:11211"
-        - "-min-ops=20"
-        - "-max-ops=50"
-%[2]s
-`, namespace, manifestExtras)
-	h.KubectlApplyContent("test-resources-"+namespace, manifest)
+func deployMemcacheApp(t *testing.T, namespace string, manifestExtras string) {
+	manifestPath := "testdata/memcached/manifest.yaml"
+	b, err := os.ReadFile(manifestPath)
+	if err != nil {
+		t.Fatalf("Failed to read base manifest: %v", err)
+	}
+
+	baseManifest := string(b)
+	// Replace the placeholder namespace with the target namespace
+	baseManifest = strings.ReplaceAll(baseManifest, "memcached-test", namespace)
+
+	finalManifest := baseManifest + "\n" + manifestExtras
+
+	// Apply manifest using the child t to avoid subtest calling parent FailNow
+	cmd := exec.Command("kubectl", "apply", "-f", "-")
+	cmd.Stdin = strings.NewReader(finalManifest)
+	if out, err := cmd.CombinedOutput(); err != nil {
+		t.Fatalf("Failed to apply manifest: %v\nOutput: %s", err, out)
+	}
 
 	// Wait for deployment to be ready
-	cmd := exec.Command("kubectl", "rollout", "status", "deployment/memcache-deployment", "-n", namespace, "--timeout=2m")
+	cmd = exec.Command("kubectl", "rollout", "status", "deployment/memcache-deployment", "-n", namespace, "--timeout=2m")
 	if out, err := cmd.CombinedOutput(); err != nil {
 		t.Fatalf("memcache-deployment failed to start: %v\nOutput: %s", err, out)
 	}
@@ -231,29 +187,12 @@ patches:
 	}
 
 	// Install VPA
-	cmd = exec.Command("kubectl", "apply", "-k", "github.com/kubernetes/autoscaler/vertical-pod-autoscaler/deploy/kustomize?ref=master")
-	if out, err := cmd.CombinedOutput(); err != nil {
-		t.Logf("Failed to install VPA, VPA tests might fail: %v\nOutput: %s", err, out)
-	} else {
-		// Wait for VPA recommender to be ready
-		cmd = exec.Command("kubectl", "rollout", "status", "deployment/vpa-recommender", "-n", "kube-system", "--timeout=2m")
-		cmd.CombinedOutput()
-		cmd = exec.Command("kubectl", "rollout", "status", "deployment/vpa-updater", "-n", "kube-system", "--timeout=2m")
-		cmd.CombinedOutput()
-	}
+	h.InstallVPA(t)
 
 	if err := h.WaitForStatefulSet("scalingpolicy-controller", "kube-scalingpolicy-system", 2*time.Minute); err != nil {
 		t.Fatalf("ScalingPolicy Controller failed to start: %v", err)
 	}
 	t.Log("ScalingPolicy controller started successfully.")
-
-	// CSV Header
-	artifactsDir := os.Getenv("ARTIFACTS")
-	if artifactsDir == "" {
-		artifactsDir = "/tmp"
-	}
-	csvPath := filepath.Join(artifactsDir, "metrics.csv")
-	os.WriteFile(csvPath, []byte("scenario,hits,misses\n"), 0644)
 
 	t.Run("ScalingPolicy", func(t *testing.T) {
 		ns := "test-sp"
@@ -276,7 +215,7 @@ spec:
     min: 67108864 # 64MiB
     max: 536870912 # 512MiB
 `
-		deployMemcacheApp(t, h, ns, policy)
+		deployMemcacheApp(t, ns, policy)
 
 		deadline := time.Now().Add(5 * time.Minute)
 		success := false
@@ -314,7 +253,7 @@ spec:
   updatePolicy:
     updateMode: "Auto"
 `
-		deployMemcacheApp(t, h, ns, vpa)
+		deployMemcacheApp(t, ns, vpa)
 
 		// Let it run for 2 minutes to gather metrics and potentially scale
 		time.Sleep(2 * time.Minute)
@@ -324,7 +263,7 @@ spec:
 	t.Run("Fixed", func(t *testing.T) {
 		ns := "test-fixed"
 		// No extra policy or VPA
-		deployMemcacheApp(t, h, ns, "")
+		deployMemcacheApp(t, ns, "")
 
 		// Let it run for 2 minutes to gather metrics
 		time.Sleep(2 * time.Minute)
