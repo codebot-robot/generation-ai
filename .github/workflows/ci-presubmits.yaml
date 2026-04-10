@@ -29,7 +29,7 @@ jobs:
       ARTIFACTS: /tmp/artifacts
     steps:
       - name: Checkout code
-        uses: actions/checkout@v4
+        uses: actions/checkout@v6
 
       - name: Free disk space
         run: ./dev/tasks/free-disk-space-on-github-actions-runner
@@ -42,14 +42,14 @@ jobs:
       ARTIFACTS: /tmp/artifacts
     steps:
       - name: Checkout code
-        uses: actions/checkout@v4
+        uses: actions/checkout@v6
 
       - name: Run ap-e2e-experiments-agentfs
         run: ./dev/ci/presubmits/ap-e2e-experiments-agentfs
 
       - name: Upload artifacts
         if: always()
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: artifacts-ap-e2e-experiments-agentfs
           path: /tmp/artifacts
@@ -59,14 +59,14 @@ jobs:
       ARTIFACTS: /tmp/artifacts
     steps:
       - name: Checkout code
-        uses: actions/checkout@v4
+        uses: actions/checkout@v6
 
       - name: Run ap-e2e-experiments-bema
         run: ./dev/ci/presubmits/ap-e2e-experiments-bema
 
       - name: Upload artifacts
         if: always()
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: artifacts-ap-e2e-experiments-bema
           path: /tmp/artifacts
@@ -76,14 +76,14 @@ jobs:
       ARTIFACTS: /tmp/artifacts
     steps:
       - name: Checkout code
-        uses: actions/checkout@v4
+        uses: actions/checkout@v6
 
       - name: Run ap-e2e-experiments-finetuning
         run: ./dev/ci/presubmits/ap-e2e-experiments-finetuning
 
       - name: Upload artifacts
         if: always()
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: artifacts-ap-e2e-experiments-finetuning
           path: /tmp/artifacts
@@ -93,14 +93,14 @@ jobs:
       ARTIFACTS: /tmp/artifacts
     steps:
       - name: Checkout code
-        uses: actions/checkout@v4
+        uses: actions/checkout@v6
 
       - name: Run ap-e2e-experiments-inference-test
         run: ./dev/ci/presubmits/ap-e2e-experiments-inference-test
 
       - name: Upload artifacts
         if: always()
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: artifacts-ap-e2e-experiments-inference-test
           path: /tmp/artifacts
@@ -110,14 +110,14 @@ jobs:
       ARTIFACTS: /tmp/artifacts
     steps:
       - name: Checkout code
-        uses: actions/checkout@v4
+        uses: actions/checkout@v6
 
       - name: Run ap-e2e-experiments-scalingpolicy
         run: ./dev/ci/presubmits/ap-e2e-experiments-scalingpolicy
 
       - name: Upload artifacts
         if: always()
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: artifacts-ap-e2e-experiments-scalingpolicy
           path: /tmp/artifacts
@@ -127,7 +127,7 @@ jobs:
       ARTIFACTS: /tmp/artifacts
     steps:
       - name: Checkout code
-        uses: actions/checkout@v4
+        uses: actions/checkout@v6
 
       - name: Run ap-lint
         run: ./dev/ci/presubmits/ap-lint
@@ -137,14 +137,14 @@ jobs:
       ARTIFACTS: /tmp/artifacts
     steps:
       - name: Checkout code
-        uses: actions/checkout@v4
+        uses: actions/checkout@v6
 
       - name: Run ap-test
         run: ./dev/ci/presubmits/ap-test
 
       - name: Upload artifacts
         if: always()
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: artifacts-ap-test
           path: /tmp/artifacts
@@ -154,7 +154,7 @@ jobs:
       ARTIFACTS: /tmp/artifacts
     steps:
       - name: Checkout code
-        uses: actions/checkout@v4
+        uses: actions/checkout@v6
 
       - name: Run ap-verify-generate
         run: ./dev/ci/presubmits/ap-verify-generate
