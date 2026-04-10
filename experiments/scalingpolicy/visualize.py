@@ -30,9 +30,9 @@ HTML_PAGE = """
     <script src="https://cdn.plot.ly/plotly-2.27.0.min.js"></script>
     <style>
         body { font-family: sans-serif; margin: 20px; background-color: #fafafa; }
-        .dashboard { display: grid; grid-template-columns: 1fr 1fr; gap: 20px; }
+        .dashboard { display: flex; flex-wrap: wrap; gap: 20px; }
         .scenario-container { border: 1px solid #ddd; padding: 15px; border-radius: 8px; background-color: white; margin-bottom: 20px; }
-        .plot-container { width: 100%; height: 400px; }
+        .plot-container { flex: 1 1 500px; height: 400px; min-width: 0; max-width: 100%; }
         .header { text-align: center; padding-bottom: 20px; }
     </style>
 </head>
@@ -65,7 +65,7 @@ HTML_PAGE = """
 
                 // 1. Memory Plot
                 const memTraces = [];
-                for (const metric of ['pod_memory_limit', 'pod_memory_request', 'pod_memory_usage', 'memcached_bytes']) {
+                for (const metric of ['pod_memory_limit', 'pod_memory_request', 'memcached_bytes']) {
                     if (!sData[metric]) continue;
                     for (const pod in sData[metric]) {
                         if (pod.includes("client")) continue; // Only server metrics
@@ -74,7 +74,6 @@ HTML_PAGE = """
                         let line_dash = null;
                         let name = metric;
                         
-                        if (metric === 'pod_memory_usage') { color = 'blue'; name = 'Pod Usage'; }
                         if (metric === 'pod_memory_limit') { color = 'red'; line_dash = 'dash'; name = 'Pod Limit'; }
                         if (metric === 'pod_memory_request') { color = 'orange'; line_dash = 'dot'; name = 'Pod Request'; }
                         if (metric === 'memcached_bytes') { color = 'purple'; name = 'App Bytes Used'; }
@@ -101,7 +100,7 @@ HTML_PAGE = """
                         title: 'Memory Profile',
                         xaxis: { title: 'Time' },
                         yaxis: { title: 'Memory (Bytes)', rangemode: 'tozero' }
-                    });
+                    }, {responsive: true});
                 }
                 
                 // 2. Cache Metrics Plot
@@ -137,7 +136,7 @@ HTML_PAGE = """
                         title: 'Cache Hit Ratio',
                         xaxis: { title: 'Time' },
                         yaxis: { title: 'Hit Ratio (%)', range: [0, 100] }
-                    });
+                    }, {responsive: true});
                 }
             }
         }
