@@ -1,0 +1,3 @@
+# Mark generated protobuf/gRPC Python files as generated so they are collapsed/hidden on GitHub
+experiments/model-manifest/src/*_pb2.py linguist-generated
+experiments/model-manifest/src/*_pb2_grpc.py linguist-generated
