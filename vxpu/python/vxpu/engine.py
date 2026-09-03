@@ -69,6 +69,15 @@ class Engine:
         # Tokenizer/processor files are not yet part of the manifest.
         self.tokenizer = AutoTokenizer.from_pretrained(
             self.manifest["source"]["repo"])
+        if getattr(self.tokenizer, "chat_template", None) is None:
+            self.tokenizer.chat_template = (
+                "{% for message in messages %}"
+                "{{ message['role'] | capitalize }}: {{ message['content'] }}\\n"
+                "{% endfor %}"
+                "{% if add_generation_prompt %}"
+                "Assistant:"
+                "{% endif %}"
+            )
 
         # Shared, read-only: fetched/computed exactly once. Shapes for
         # derived/state tensors come from the decode program itself.

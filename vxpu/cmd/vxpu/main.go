@@ -217,7 +217,7 @@ func portForward(pod string) (string, func(), error) {
 	}
 	stop := func() { _ = cmd.Process.Kill() }
 
-	re := regexp.MustCompile(`Forwarding from 127\.0\.0\.1:(\d+)`)
+	re := regexp.MustCompile(`Forwarding from (?:127\.0\.0\.1|\[::1\]):(\d+)`)
 	scanner := bufio.NewScanner(stdout)
 	for scanner.Scan() {
 		if m := re.FindStringSubmatch(scanner.Text()); m != nil {
