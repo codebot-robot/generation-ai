@@ -22,6 +22,11 @@ on:
   pull_request:
   merge_group:
 
+# Presubmits only read the repo; an explicit least-privilege grant
+# also keeps zizmor's excessive-permissions audit clean.
+permissions:
+  contents: read
+
 jobs:
   ap-build:
     runs-on: ubuntu-latest
@@ -29,7 +34,11 @@ jobs:
       ARTIFACTS: /tmp/artifacts
     steps:
       - name: Checkout code
-        uses: actions/checkout@v7
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # ratchet:actions/checkout@v7.0.1
+        with:
+          # Presubmit scripts never push; don't leave the token in
+          # .git/config (zizmor: artipacked).
+          persist-credentials: false
 
       - name: Free disk space
         run: ./dev/tasks/free-disk-space-on-github-actions-runner
@@ -42,14 +51,18 @@ jobs:
       ARTIFACTS: /tmp/artifacts
     steps:
       - name: Checkout code
-        uses: actions/checkout@v7
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # ratchet:actions/checkout@v7.0.1
+        with:
+          # Presubmit scripts never push; don't leave the token in
+          # .git/config (zizmor: artipacked).
+          persist-credentials: false
 
       - name: Run ap-e2e-experiments-agentfs
         run: ./dev/ci/presubmits/ap-e2e-experiments-agentfs
 
       - name: Upload artifacts
         if: always()
-        uses: actions/upload-artifact@v7
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # ratchet:actions/upload-artifact@v7.0.1
         with:
           name: artifacts-ap-e2e-experiments-agentfs
           path: /tmp/artifacts
@@ -59,14 +72,18 @@ jobs:
       ARTIFACTS: /tmp/artifacts
     steps:
       - name: Checkout code
-        uses: actions/checkout@v7
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # ratchet:actions/checkout@v7.0.1
+        with:
+          # Presubmit scripts never push; don't leave the token in
+          # .git/config (zizmor: artipacked).
+          persist-credentials: false
 
       - name: Run ap-e2e-experiments-bema
         run: ./dev/ci/presubmits/ap-e2e-experiments-bema
 
       - name: Upload artifacts
         if: always()
-        uses: actions/upload-artifact@v7
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # ratchet:actions/upload-artifact@v7.0.1
         with:
           name: artifacts-ap-e2e-experiments-bema
           path: /tmp/artifacts
@@ -76,14 +93,18 @@ jobs:
       ARTIFACTS: /tmp/artifacts
     steps:
       - name: Checkout code
-        uses: actions/checkout@v7
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # ratchet:actions/checkout@v7.0.1
+        with:
+          # Presubmit scripts never push; don't leave the token in
+          # .git/config (zizmor: artipacked).
+          persist-credentials: false
 
       - name: Run ap-e2e-experiments-finetuning
         run: ./dev/ci/presubmits/ap-e2e-experiments-finetuning
 
       - name: Upload artifacts
         if: always()
-        uses: actions/upload-artifact@v7
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # ratchet:actions/upload-artifact@v7.0.1
         with:
           name: artifacts-ap-e2e-experiments-finetuning
           path: /tmp/artifacts
@@ -93,14 +114,18 @@ jobs:
       ARTIFACTS: /tmp/artifacts
     steps:
       - name: Checkout code
-        uses: actions/checkout@v7
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # ratchet:actions/checkout@v7.0.1
+        with:
+          # Presubmit scripts never push; don't leave the token in
+          # .git/config (zizmor: artipacked).
+          persist-credentials: false
 
       - name: Run ap-e2e-experiments-inference-test
         run: ./dev/ci/presubmits/ap-e2e-experiments-inference-test
 
       - name: Upload artifacts
         if: always()
-        uses: actions/upload-artifact@v7
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # ratchet:actions/upload-artifact@v7.0.1
         with:
           name: artifacts-ap-e2e-experiments-inference-test
           path: /tmp/artifacts
@@ -110,14 +135,18 @@ jobs:
       ARTIFACTS: /tmp/artifacts
     steps:
       - name: Checkout code
-        uses: actions/checkout@v7
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # ratchet:actions/checkout@v7.0.1
+        with:
+          # Presubmit scripts never push; don't leave the token in
+          # .git/config (zizmor: artipacked).
+          persist-credentials: false
 
       - name: Run ap-e2e-experiments-scalingpolicy
         run: ./dev/ci/presubmits/ap-e2e-experiments-scalingpolicy
 
       - name: Upload artifacts
         if: always()
-        uses: actions/upload-artifact@v7
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # ratchet:actions/upload-artifact@v7.0.1
         with:
           name: artifacts-ap-e2e-experiments-scalingpolicy
           path: /tmp/artifacts
@@ -127,7 +156,11 @@ jobs:
       ARTIFACTS: /tmp/artifacts
     steps:
       - name: Checkout code
-        uses: actions/checkout@v7
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # ratchet:actions/checkout@v7.0.1
+        with:
+          # Presubmit scripts never push; don't leave the token in
+          # .git/config (zizmor: artipacked).
+          persist-credentials: false
 
       - name: Run ap-lint
         run: ./dev/ci/presubmits/ap-lint
@@ -137,14 +170,18 @@ jobs:
       ARTIFACTS: /tmp/artifacts
     steps:
       - name: Checkout code
-        uses: actions/checkout@v7
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # ratchet:actions/checkout@v7.0.1
+        with:
+          # Presubmit scripts never push; don't leave the token in
+          # .git/config (zizmor: artipacked).
+          persist-credentials: false
 
       - name: Run ap-test
         run: ./dev/ci/presubmits/ap-test
 
       - name: Upload artifacts
         if: always()
-        uses: actions/upload-artifact@v7
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # ratchet:actions/upload-artifact@v7.0.1
         with:
           name: artifacts-ap-test
           path: /tmp/artifacts
@@ -154,7 +191,11 @@ jobs:
       ARTIFACTS: /tmp/artifacts
     steps:
       - name: Checkout code
-        uses: actions/checkout@v7
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # ratchet:actions/checkout@v7.0.1
+        with:
+          # Presubmit scripts never push; don't leave the token in
+          # .git/config (zizmor: artipacked).
+          persist-credentials: false
 
       - name: Run ap-verify-generate
         run: ./dev/ci/presubmits/ap-verify-generate

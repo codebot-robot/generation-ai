@@ -12,17 +12,10 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-FROM golang:1.27.1 AS builder
+"""vXPU: run PyTorch models on remote accelerators via portable artifacts.
 
-WORKDIR /app
-COPY go.mod go.sum ./
-RUN go mod download
+Export locally without weights (meta device), ship a small artifact,
+execute wherever the accelerators are.
+"""
 
-COPY cmd/test-memcache-server-agent/ cmd/test-memcache-server-agent/
-RUN CGO_ENABLED=0 go build -o test-memcache-server-agent ./cmd/test-memcache-server-agent/
-
-FROM memcached:1.6
-USER root
-COPY --from=builder /app/test-memcache-server-agent /usr/local/bin/test-memcache-server-agent
-USER memcache
-CMD ["test-memcache-server-agent"]
+__version__ = "0.1.0"
