@@ -5,7 +5,7 @@ go 1.26.2
 require (
 	github.com/bradfitz/gomemcache v0.0.0-20250403215159-8d39553ac7cf
 	github.com/gke-labs/gke-labs-infra/ktesting v0.0.0-20260408153246-803d1804c826
-	github.com/google/cel-go v0.28.0
+	github.com/google/cel-go v0.29.0
 	go.opentelemetry.io/proto/otlp v1.10.0
 	google.golang.org/protobuf v1.36.11
 	k8s.io/api v0.35.3
