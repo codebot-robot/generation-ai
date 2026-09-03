@@ -1,3 +1,5 @@
 module github.com/gke-labs/generation-ai/experiments/finetuning
 
-go 1.26.2
+go 1.27.0
+
+toolchain go1.27.1
