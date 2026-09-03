@@ -154,8 +154,9 @@ class TestRehydrateAndCache(unittest.TestCase):
             src, dst = replace_called_with[0]
             self.assertTrue(src.startswith(self.cas_dir))
             self.assertTrue("tmp" in os.path.basename(src))
+            url = self.files[self.ref["file_sha256"]]["source"]
             self.assertEqual(dst, os.path.join(self.cas_dir, hashlib.sha256(
-                f"{self.ref['file_sha256']}:{self.ref['offset']}:{self.ref['length']}"
+                f"{self.ref['file_sha256']}:{self.ref['offset']}:{self.ref['length']}:{url}"
                 .encode()).hexdigest()))
 
     def test_cache_pruning(self):

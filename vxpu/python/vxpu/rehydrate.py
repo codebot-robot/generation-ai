@@ -43,7 +43,53 @@ DTYPES = {
 }
 
 
-def fetch_tensor(ref, files, cas_dir=None):
+def prune_cache_if_needed(cas_dir, cas_max_size_gb, extra_bytes_needed=0):
+    """Keep CAS cache size bounded, pruning oldest entries first.
+
+    Guarantees the high-water mark stays below cas_max_size_gb during a load
+    by running before each new tensor is written.
+    """
+    if not cas_dir or cas_max_size_gb <= 0:
+        return
+    max_size_bytes = int(cas_max_size_gb * 1024 * 1024 * 1024)
+    try:
+        if not os.path.exists(cas_dir):
+            return
+        files = []
+        total_size = 0
+        for entry in os.scandir(cas_dir):
+            if entry.is_file():
+                try:
+                    stat = entry.stat()
+                    last_used = max(stat.st_atime, stat.st_mtime)
+                    files.append((last_used, stat.st_size, entry.path))
+                    total_size += stat.st_size
+                except Exception:
+                    pass
+        
+        target_size = max_size_bytes - extra_bytes_needed
+        if total_size <= target_size:
+            return
+            
+        # Sort files by last_used ascending (oldest first)
+        files.sort(key=lambda x: x[0])
+        
+        for last_used, size, path in files:
+            if total_size <= target_size:
+                break
+            try:
+                os.unlink(path)
+                total_size -= size
+                print(f"[vxpu] pruned cached tensor from CAS: {path} ({size / 1e6:.1f} MB)", flush=True)
+            except Exception as e:
+                import sys
+                print(f"[vxpu] failed to delete {path}: {e}", file=sys.stderr, flush=True)
+    except Exception as e:
+        import sys
+        print(f"[vxpu] error pruning cache: {e}", file=sys.stderr, flush=True)
+
+
+def fetch_tensor(ref, files, cas_dir=None, cas_max_size_gb=100):
     """One ranged read per tensor.
 
     With cas_dir set, bytes are cached on disk under a content-derived
@@ -73,11 +119,28 @@ def fetch_tensor(ref, files, cas_dir=None):
         data = bytearray(download())
         downloaded = ref["length"]
     else:
+        url = files[ref["file_sha256"]]["source"]
+        # Include source URL in cache key to completely prevent cache-poisoning vulnerabilities
+        # where a malicious model uses the same file_sha256/offset/length but a different URL.
         key = hashlib.sha256(
-            f"{ref['file_sha256']}:{ref['offset']}:{ref['length']}"
+            f"{ref['file_sha256']}:{ref['offset']}:{ref['length']}:{url}"
             .encode()).hexdigest()
         path = os.path.join(cas_dir, key)
-        if not os.path.exists(path):
+        
+        # Verify cached file is valid (e.g. exists and has correct size)
+        cache_valid = False
+        if os.path.exists(path):
+            try:
+                if os.path.getsize(path) == ref["length"]:
+                    cache_valid = True
+                else:
+                    os.unlink(path)
+            except Exception:
+                pass
+
+        if not cache_valid:
+            # Enforce cache size bounds BEFORE writing/downloading
+            prune_cache_if_needed(cas_dir, cas_max_size_gb, extra_bytes_needed=ref["length"])
             os.makedirs(cas_dir, exist_ok=True)
             content = download()
             with tempfile.NamedTemporaryFile(dir=cas_dir, delete=False) as tmp_f:

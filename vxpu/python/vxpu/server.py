@@ -39,6 +39,7 @@ import torch
 
 from . import vxpu_pb2, vxpu_pb2_grpc
 from .engine import Engine
+from .rehydrate import prune_cache_if_needed
 
 MAX_MESSAGE_BYTES = 128 * 1024 * 1024
 
@@ -85,7 +86,8 @@ class ExecutorServicer(vxpu_pb2_grpc.ExecutorServicer):
             started = time.time()
             engine = Engine(artifact_dir, device=self.device,
                             compile_decode=self.compile_decode,
-                            cas_dir=self.cas_dir)
+                            cas_dir=self.cas_dir,
+                            cas_max_size_gb=self.cas_max_size_gb)
             with self.lock:
                 if self.loading == digest:
                     self.engine = engine
@@ -102,44 +104,10 @@ class ExecutorServicer(vxpu_pb2_grpc.ExecutorServicer):
                 if self.loading == digest:
                     self.load_error = str(e)
                     self.loading = None
+            self._prune_cache()
 
     def _prune_cache(self):
-        if not self.cas_dir or self.cas_max_size_gb <= 0:
-            return
-        max_size_bytes = self.cas_max_size_gb * 1024 * 1024 * 1024
-        try:
-            if not os.path.exists(self.cas_dir):
-                return
-            # Get list of files with their size and last access/modification time
-            files = []
-            total_size = 0
-            for entry in os.scandir(self.cas_dir):
-                if entry.is_file():
-                    try:
-                        stat = entry.stat()
-                        last_used = max(stat.st_atime, stat.st_mtime)
-                        files.append((last_used, stat.st_size, entry.path))
-                        total_size += stat.st_size
-                    except Exception:
-                        pass
-            
-            if total_size <= max_size_bytes:
-                return
-                
-            # Sort files by last_used ascending (oldest first)
-            files.sort(key=lambda x: x[0])
-            
-            for last_used, size, path in files:
-                if total_size <= max_size_bytes:
-                    break
-                try:
-                    os.unlink(path)
-                    total_size -= size
-                    print(f"[vxpu] pruned cached tensor from CAS: {path} ({size / 1e6:.1f} MB)", flush=True)
-                except Exception as e:
-                    print(f"[vxpu] failed to delete {path}: {e}", file=sys.stderr, flush=True)
-        except Exception as e:
-            print(f"[vxpu] error pruning cache: {e}", file=sys.stderr, flush=True)
+        prune_cache_if_needed(self.cas_dir, self.cas_max_size_gb, extra_bytes_needed=0)
 
     def LoadModel(self, request, context):
         """Accepts the artifact and loads asynchronously: clients poll
@@ -273,7 +241,7 @@ def main():
                         help="seconds to keep an idle model loaded")
     parser.add_argument(
         "--cas-dir",
-        default=os.environ.get("VXPU_CAS_DIR", "/var/vxpu/cache"),
+        default=os.environ.get("VXPU_CAS_DIR", "/tmp/vxpu/cache"),
         help="content-addressable storage cache directory (empty string to disable)")
     parser.add_argument(
         "--cas-max-size-gb", type=float,

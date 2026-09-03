@@ -47,7 +47,7 @@ from .rehydrate import (derived_tensor, fetch_tensor, load_program,
 
 class Engine:
     def __init__(self, artifact_dir, device="cpu", compile_decode=False,
-                 cas_dir=None):
+                 cas_dir=None, cas_max_size_gb=100):
         from transformers import AutoTokenizer
         from transformers.models.auto.configuration_auto import (
             CONFIG_MAPPING)
@@ -83,7 +83,7 @@ class Engine:
         self.bytes_fetched = 0
         for fqn, ref in self.binding["bound"].items():
             tensor, downloaded = fetch_tensor(
-                ref, self.manifest["files"], cas_dir)
+                ref, self.manifest["files"], cas_dir, cas_max_size_gb)
             self.shared[fqn] = tensor.to(device)
             self.bytes_fetched += downloaded
         for fqn in self.binding["derived"]:
