@@ -27,6 +27,10 @@ spec:
     - name: work
       emptyDir:
         sizeLimit: 80Gi
+    - name: cache
+      hostPath:
+        path: /var/vxpu/cache
+        type: DirectoryOrCreate
   containers:
     - name: executor
       image: "IMAGE"
@@ -42,6 +46,8 @@ spec:
       volumeMounts:
         - name: work
           mountPath: /tmp/vxpu
+        - name: cache
+          mountPath: /var/vxpu/cache
       env:
         # GKE mounts the NVIDIA driver here; pip torch needs it on the
         # loader path.

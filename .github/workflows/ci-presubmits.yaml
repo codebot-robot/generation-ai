@@ -28,23 +28,6 @@ permissions:
   contents: read
 
 jobs:
-  ap-build:
-    runs-on: ubuntu-latest
-    env:
-      ARTIFACTS: /tmp/artifacts
-    steps:
-      - name: Checkout code
-        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # ratchet:actions/checkout@v7.0.1
-        with:
-          # Presubmit scripts never push; don't leave the token in
-          # .git/config (zizmor: artipacked).
-          persist-credentials: false
-
-      - name: Free disk space
-        run: ./dev/tasks/free-disk-space-on-github-actions-runner
-
-      - name: Run ap-build
-        run: ./dev/ci/presubmits/ap-build
   ap-e2e-experiments-agentfs:
     runs-on: ubuntu-latest
     env:

@@ -30,6 +30,7 @@ is exactly bincount).
 import hashlib
 import math
 import os
+import tempfile
 
 import requests
 import torch
@@ -77,8 +78,20 @@ def fetch_tensor(ref, files, cas_dir=None):
             .encode()).hexdigest()
         path = os.path.join(cas_dir, key)
         if not os.path.exists(path):
-            with open(path, "wb") as f:
-                f.write(download())
+            os.makedirs(cas_dir, exist_ok=True)
+            content = download()
+            with tempfile.NamedTemporaryFile(dir=cas_dir, delete=False) as tmp_f:
+                tmp_f.write(content)
+                tmp_path = tmp_f.name
+            try:
+                os.replace(tmp_path, path)
+            except Exception:
+                if os.path.exists(tmp_path):
+                    try:
+                        os.unlink(tmp_path)
+                    except Exception:
+                        pass
+                raise
             downloaded = ref["length"]
         with open(path, "rb") as f:
             data = bytearray(f.read())
