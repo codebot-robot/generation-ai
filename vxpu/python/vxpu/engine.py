@@ -12,7 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""Serving engine: shared weights, per-session KV caches.
+"""Serving engine: shared weights and compiled graphs, per-session KV.
 
 The binding's three categories map directly onto serving:
 
@@ -21,6 +21,14 @@ The binding's three categories map directly onto serving:
     state   -> allocated fresh per session; the graphs mutate it in
                place, so a session IS its state tensors
 
+The two graphs (prefill, decode) are built and compiled exactly once
+per model. Compilation is the expensive step (tens of seconds), and the
+decode graph is identical across sessions — only the state buffers it
+reads and mutates differ. So a session owns just its state tensors, and
+each turn binds them into the shared modules (a reference swap the
+compiled graph re-reads at call time — no recompile). One GPU serves
+turns serially anyway, so a lock around bind+run costs nothing real.
+
 Multi-turn conversation costs only the new tokens: the prefill graph
 has a dynamic sequence dimension and explicit cache positions, so a
 follow-up turn prefills the suffix at positions [cached_len, ...).
@@ -28,6 +36,7 @@ follow-up turn prefills the suffix at positions [cached_len, ...).
 
 import json
 import os
+import threading
 import time
 
 import torch
@@ -56,6 +65,7 @@ class Engine:
         self.config = CONFIG_MAPPING[
             self.manifest["config"]["model_type"]
         ].from_dict(self.manifest["config"])
+        self.max_cache_len = int(self.binding.get("max_cache_len", 1024))
         # Tokenizer/processor files are not yet part of the manifest.
         self.tokenizer = AutoTokenizer.from_pretrained(
             self.manifest["source"]["repo"])
@@ -85,50 +95,87 @@ class Engine:
 
         self.sessions = {}
         self._next_id = 0
+        self._lock = threading.Lock()
+        self._build()
 
-    def new_session(self):
-        session_id = f"s{self._next_id}"
-        self._next_id += 1
-
-        tensors = dict(self.shared)
-        for fqn, (shape, dtype) in self.state_specs.items():
-            tensors[fqn] = torch.zeros(shape, dtype=dtype,
-                                       device=self.device)
-
-        started = time.perf_counter()
-        prefill = load_program(
+    def _build(self):
+        """Build and compile the two graphs once. Scratch state is bound
+        now and overwritten per session at chat time."""
+        scratch = {
+            fqn: torch.zeros(shape, dtype=dtype, device=self.device)
+            for fqn, (shape, dtype) in self.state_specs.items()}
+        tensors = {**self.shared, **scratch}
+        self._prefill = load_program(
             os.path.join(self.artifact_dir, "prefill.pt2"),
             tensors, self.device).module()
-        decode = load_program(
+        self._decode = load_program(
             os.path.join(self.artifact_dir, "decode.pt2"),
             tensors, self.device).module()
-        shared = share_state(prefill, decode, self.binding["state"])
+        shared = share_state(self._prefill, self._decode,
+                             self.binding["state"])
         assert shared > 0, "prefill/decode share no cache state"
+        self._decode_run = self._decode
         if self.compile_decode:
-            strip_asserts(decode)
-            decode = torch.compile(decode)
+            strip_asserts(self._decode)
+            self._decode_run = torch.compile(self._decode)
 
-        self.sessions[session_id] = {
-            "prefill": prefill,
-            "decode": decode,
-            "messages": [],
-            "cached_len": 0,
-            "build_s": time.perf_counter() - started,
-        }
+    def _bind(self, state):
+        """Point both graphs' state buffers at this session's tensors.
+
+        A reference swap, O(number of buffers); the compiled decode
+        re-reads its buffers on each call, so this triggers no recompile.
+        """
+        for module in (self._prefill, self._decode):
+            for fqn, tensor in state.items():
+                parent, name = (fqn.rsplit(".", 1) if "." in fqn
+                                else ("", fqn))
+                target = (module.get_submodule(parent) if parent
+                          else module)
+                if name in target._buffers:
+                    target._buffers[name] = tensor
+
+    def new_session(self):
+        with self._lock:
+            session_id = f"s{self._next_id}"
+            self._next_id += 1
+            self.sessions[session_id] = {
+                "state": {
+                    fqn: torch.zeros(shape, dtype=dtype,
+                                     device=self.device)
+                    for fqn, (shape, dtype) in self.state_specs.items()},
+                "messages": [],
+                "cached_len": 0,
+            }
         return session_id
 
     def chat(self, session_id, text, max_new_tokens=96):
+        with self._lock:
+            return self._chat_locked(session_id, text, max_new_tokens)
+
+    def _chat_locked(self, session_id, text, max_new_tokens):
+        if session_id not in self.sessions:
+            raise ValueError(f"unknown session_id: {session_id}")
         session = self.sessions[session_id]
+        self._bind(session["state"])
         session["messages"].append({"role": "user", "content": text})
         ids = self.tokenizer.apply_chat_template(
             session["messages"], add_generation_prompt=True,
             return_tensors="pt", return_dict=True)["input_ids"]
         total_len = ids.shape[1]
         start = session["cached_len"]
+
+        if total_len > self.max_cache_len:
+            session["messages"].pop()
+            raise ValueError(
+                f"conversation length ({total_len} tokens) exceeds "
+                f"maximum cache capacity ({self.max_cache_len} tokens)")
+
+        allowed_tokens = self.max_cache_len - total_len
+        max_tokens_to_generate = max(0, min(max_new_tokens, allowed_tokens))
         new_ids = ids[:, start:].to(self.device)
 
         prefill_started = time.perf_counter()
-        logits = session["prefill"](
+        logits = self._prefill(
             input_ids=new_ids,
             cache_position=torch.arange(start, total_len,
                                         device=self.device))
@@ -137,11 +184,13 @@ class Engine:
         token_ids, position = [], total_len
         next_id = int(logits[0, -1].argmax())
         loop_started = time.perf_counter()
-        for _ in range(max_new_tokens):
+        for _ in range(max_tokens_to_generate):
             if next_id == self.tokenizer.eos_token_id:
                 break
             token_ids.append(next_id)
-            logits = session["decode"](
+            if position >= self.max_cache_len:
+                break
+            logits = self._decode_run(
                 input_ids=torch.tensor([[next_id]], device=self.device),
                 cache_position=torch.tensor([position],
                                             device=self.device))
