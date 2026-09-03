@@ -33,11 +33,12 @@ func TestE2E(t *testing.T) {
 	h.Setup()
 
 	gitRoot := h.GetGitRoot()
-	artifactDir := filepath.Join(gitRoot, "vxpu/tests/e2e/test_artifact")
-	vxpuBin := filepath.Join(gitRoot, "vxpu/tests/e2e/vxpu_bin")
+	vxpuRoot := filepath.Join(gitRoot, "vxpu")
+	artifactDir := filepath.Join(vxpuRoot, "tests/e2e/test_artifact")
+	vxpuBin := filepath.Join(vxpuRoot, "tests/e2e/vxpu_bin")
 
 	// Build the executor image
-	h.DockerBuild("vxpu-executor:e2e", filepath.Join(gitRoot, "vxpu/images/executor/Dockerfile"), gitRoot)
+	h.DockerBuild("vxpu-executor:e2e", filepath.Join(vxpuRoot, "images/executor/Dockerfile"), vxpuRoot)
 
 	// Load the executor image into Kind
 	h.KindLoad("vxpu-executor:e2e")
@@ -51,7 +52,7 @@ func TestE2E(t *testing.T) {
 
 	// Build the vxpu Go CLI binary
 	h.t.Logf("Building vxpu CLI binary to %s", vxpuBin)
-	h.RunCommand("go", "build", "-o", vxpuBin, filepath.Join(gitRoot, "vxpu/cmd/vxpu"))
+	h.RunCommand("go", "build", "-o", vxpuBin, filepath.Join(vxpuRoot, "cmd/vxpu"))
 
 	// Custom CPU-friendly vxpu-executor Pod manifest suitable for CPU-only Kind nodes
 	vxpuExecutorYaml := `apiVersion: v1
