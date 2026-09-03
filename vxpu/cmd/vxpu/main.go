@@ -1,0 +1,237 @@
+// Copyright 2026 Google LLC
+//
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+//     http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
+
+// vxpu runs vXPU artifacts on Kubernetes accelerators.
+//
+// The client is deliberately free of PyTorch, Python, and CUDA: it
+// ships an artifact directory (manifest + weightless graphs, tens of
+// MB) to an executor pod — creating the pod on demand — and chats over
+// gRPC. Weights never pass through this machine; the executor
+// rehydrates them from the manifest's content-addressed references.
+//
+//	vxpu ask --artifact ./gemma-e4b "Is the sky blue?"
+//	vxpu down
+package main
+
+import (
+	"bufio"
+	"context"
+	_ "embed"
+	"flag"
+	"fmt"
+	"log"
+	"os"
+	"os/exec"
+	"path/filepath"
+	"regexp"
+	"strings"
+	"time"
+
+	"google.golang.org/grpc"
+	"google.golang.org/grpc/codes"
+	"google.golang.org/grpc/credentials/insecure"
+	"google.golang.org/grpc/status"
+
+	pb "github.com/gke-labs/generation-ai/vxpu/pkg/api/v1alpha1"
+)
+
+//go:embed executor.yaml
+var executorManifest string
+
+const maxMessageBytes = 128 * 1024 * 1024
+
+func main() {
+	if len(os.Args) < 2 {
+		fmt.Fprintln(os.Stderr,
+			"usage: vxpu ask [flags] PROMPT | vxpu down [flags]")
+		os.Exit(2)
+	}
+	switch os.Args[1] {
+	case "ask":
+		cmdAsk(os.Args[2:])
+	case "down":
+		cmdDown(os.Args[2:])
+	default:
+		fmt.Fprintf(os.Stderr, "unknown command %q\n", os.Args[1])
+		os.Exit(2)
+	}
+}
+
+func cmdAsk(args []string) {
+	flags := flag.NewFlagSet("ask", flag.ExitOnError)
+	artifact := flags.String("artifact", ".",
+		"artifact directory (manifest.json, binding.json, *.pt2)")
+	pod := flags.String("pod", "vxpu-executor", "executor pod name")
+	image := flags.String("image",
+		os.Getenv("VXPU_EXECUTOR_IMAGE"), "executor image")
+	accelerator := flags.String("accelerator", "nvidia-l4",
+		"GKE accelerator label for the executor pod")
+	maxNewTokens := flags.Int("max-new-tokens", 96, "tokens per reply")
+	timeout := flags.Duration("timeout", 20*time.Minute,
+		"end-to-end timeout (cold loads rehydrate all weights)")
+	_ = flags.Parse(args)
+	prompt := strings.Join(flags.Args(), " ")
+	if prompt == "" {
+		log.Fatal("usage: vxpu ask [flags] PROMPT")
+	}
+
+	if err := ensurePod(*pod, *image, *accelerator); err != nil {
+		log.Fatalf("ensure executor pod: %v", err)
+	}
+	addr, stop, err := portForward(*pod)
+	if err != nil {
+		log.Fatalf("port-forward: %v", err)
+	}
+	defer stop()
+
+	conn, err := grpc.NewClient(addr,
+		grpc.WithTransportCredentials(insecure.NewCredentials()),
+		grpc.WithDefaultCallOptions(
+			grpc.MaxCallSendMsgSize(maxMessageBytes),
+			grpc.MaxCallRecvMsgSize(maxMessageBytes)))
+	if err != nil {
+		log.Fatalf("dial %s: %v", addr, err)
+	}
+	defer conn.Close()
+	client := pb.NewExecutorClient(conn)
+	ctx, cancel := context.WithTimeout(context.Background(), *timeout)
+	defer cancel()
+
+	manifest := mustRead(filepath.Join(*artifact, "manifest.json"))
+	binding := mustRead(filepath.Join(*artifact, "binding.json"))
+	prefill := mustRead(filepath.Join(*artifact, "prefill.pt2"))
+	decode := mustRead(filepath.Join(*artifact, "decode.pt2"))
+	fmt.Printf("shipping artifact %s (%d MB graphs; weights stay remote)\n",
+		*artifact, (len(prefill)+len(decode))/(1024*1024))
+
+	started := time.Now()
+	// LoadModel accepts the artifact and loads asynchronously (it is
+	// idempotent by content digest); NewSession doubles as the
+	// readiness poll — no long-held RPC, so tunnels never sit idle.
+	if _, err := client.LoadModel(ctx, &pb.LoadModelRequest{
+		ManifestJson: string(manifest),
+		BindingJson:  string(binding),
+		PrefillGraph: prefill,
+		DecodeGraph:  decode,
+	}, grpc.WaitForReady(true)); err != nil {
+		log.Fatalf("LoadModel: %v", err)
+	}
+
+	var session *pb.NewSessionResponse
+	for {
+		var err error
+		session, err = client.NewSession(ctx, &pb.NewSessionRequest{})
+		if err == nil {
+			break
+		}
+		if status.Code(err) != codes.FailedPrecondition {
+			log.Fatalf("NewSession: %v", err)
+		}
+		if ctx.Err() != nil {
+			log.Fatalf("timed out waiting for model load: %v", err)
+		}
+		fmt.Printf("  loading... (%.0fs)\n", time.Since(started).Seconds())
+		time.Sleep(15 * time.Second)
+	}
+	fmt.Printf("model loaded in %.1fs\n", time.Since(started).Seconds())
+	started = time.Now()
+	reply, err := client.Chat(ctx, &pb.ChatRequest{
+		SessionId:    session.SessionId,
+		Text:         prompt,
+		MaxNewTokens: int32(*maxNewTokens),
+	})
+	if err != nil {
+		log.Fatalf("Chat: %v", err)
+	}
+	fmt.Printf("\n>>> %s\n%s\n\n(%d tokens, %.1f ms/token on the executor, "+
+		"%.1fs round trip)\n", prompt, reply.Text, reply.Generated,
+		reply.MsPerToken, time.Since(started).Seconds())
+}
+
+func cmdDown(args []string) {
+	flags := flag.NewFlagSet("down", flag.ExitOnError)
+	pod := flags.String("pod", "vxpu-executor", "executor pod name")
+	_ = flags.Parse(args)
+	out, err := exec.Command("kubectl", "delete", "pod", *pod,
+		"--ignore-not-found").CombinedOutput()
+	fmt.Print(string(out))
+	if err != nil {
+		log.Fatalf("delete pod: %v", err)
+	}
+}
+
+// ensurePod creates the executor pod if absent and waits until Ready.
+func ensurePod(pod, image, accelerator string) error {
+	if exec.Command("kubectl", "get", "pod", pod).Run() == nil {
+		return waitReady(pod)
+	}
+	if image == "" {
+		return fmt.Errorf(
+			"pod %q not found and no --image/VXPU_EXECUTOR_IMAGE set",
+			pod)
+	}
+	fmt.Printf("creating executor pod %s (image %s, accelerator %s)\n",
+		pod, image, accelerator)
+	manifest := strings.NewReplacer(
+		`"NAME"`, fmt.Sprintf("%q", pod),
+		`"IMAGE"`, fmt.Sprintf("%q", image),
+		`"ACCELERATOR"`, fmt.Sprintf("%q", accelerator),
+	).Replace(executorManifest)
+	apply := exec.Command("kubectl", "apply", "-f", "-")
+	apply.Stdin = strings.NewReader(manifest)
+	apply.Stdout, apply.Stderr = os.Stdout, os.Stderr
+	if err := apply.Run(); err != nil {
+		return err
+	}
+	return waitReady(pod)
+}
+
+func waitReady(pod string) error {
+	wait := exec.Command("kubectl", "wait", "--for=condition=Ready",
+		"pod/"+pod, "--timeout=900s")
+	wait.Stdout, wait.Stderr = os.Stdout, os.Stderr
+	return wait.Run()
+}
+
+// portForward tunnels an ephemeral local port to the executor.
+func portForward(pod string) (string, func(), error) {
+	cmd := exec.Command("kubectl", "port-forward", "pod/"+pod, ":50051")
+	stdout, err := cmd.StdoutPipe()
+	if err != nil {
+		return "", nil, err
+	}
+	cmd.Stderr = os.Stderr
+	if err := cmd.Start(); err != nil {
+		return "", nil, err
+	}
+	stop := func() { _ = cmd.Process.Kill() }
+
+	re := regexp.MustCompile(`Forwarding from 127\.0\.0\.1:(\d+)`)
+	scanner := bufio.NewScanner(stdout)
+	for scanner.Scan() {
+		if m := re.FindStringSubmatch(scanner.Text()); m != nil {
+			return "127.0.0.1:" + m[1], stop, nil
+		}
+	}
+	stop()
+	return "", nil, fmt.Errorf("port-forward to %s never became ready", pod)
+}
+
+func mustRead(path string) []byte {
+	data, err := os.ReadFile(path)
+	if err != nil {
+		log.Fatalf("read %s: %v", path, err)
+	}
+	return data
+}

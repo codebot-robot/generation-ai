@@ -1,0 +1,71 @@
+// Copyright 2026 Google LLC
+//
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+//     http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
+
+syntax = "proto3";
+
+package vxpu;
+
+option go_package = "github.com/gke-labs/generation-ai/vxpu/pkg/api/v1alpha1;v1alpha1";
+
+// Executor runs models shipped as vXPU artifacts: a content-addressed
+// manifest (architecture config + weight references), weightless
+// exported graphs, and a binding classifying every graph tensor as
+// bound (weight reference), derived (computed from config), or state
+// (session-owned, zero-initialized).
+//
+// The executor never receives weights over this API: it rehydrates
+// them from the manifest's content-addressed references.
+service Executor {
+  // LoadModel ships the artifact. Idempotent: the artifact's content
+  // digest identifies the model, and a matching digest reuses the
+  // already-loaded engine.
+  rpc LoadModel(LoadModelRequest) returns (LoadModelResponse) {}
+  // NewSession allocates fresh per-session state (KV cache).
+  rpc NewSession(NewSessionRequest) returns (NewSessionResponse) {}
+  // Chat runs one conversation turn in a session. Multi-turn reuses
+  // the session's cache: only new suffix tokens are prefilled.
+  rpc Chat(ChatRequest) returns (ChatResponse) {}
+}
+
+message LoadModelRequest {
+  string manifest_json = 1;
+  string binding_json = 2;
+  bytes prefill_graph = 3;
+  bytes decode_graph = 4;
+}
+
+message LoadModelResponse {
+  bool success = 1;
+}
+
+message NewSessionRequest {}
+
+message NewSessionResponse {
+  string session_id = 1;
+}
+
+message ChatRequest {
+  string session_id = 1;
+  string text = 2;
+  int32 max_new_tokens = 3;
+}
+
+message ChatResponse {
+  string text = 1;
+  int32 session_tokens = 2;
+  int32 new_prompt_tokens = 3;
+  int32 generated = 4;
+  float prefill_ms = 5;
+  float ms_per_token = 6;
+}
