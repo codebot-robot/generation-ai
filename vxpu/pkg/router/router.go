@@ -19,6 +19,8 @@ import (
 	"crypto/sha256"
 	"encoding/hex"
 	"fmt"
+	"net"
+	"os"
 	"strings"
 	"sync"
 	"time"
@@ -37,6 +39,7 @@ import (
 	"k8s.io/klog/v2"
 
 	pb "github.com/gke-labs/generation-ai/vxpu/pkg/api/v1alpha1"
+	"github.com/gke-labs/generation-ai/vxpu/pkg/blobserver"
 )
 
 type Server struct {
@@ -45,19 +48,29 @@ type Server struct {
 	namespace   string
 	imageName   string
 	accelerator string
+	blobServer  *blobserver.Server
 
 	mu          sync.RWMutex
 	peerToModel map[string]string // maps peer IP:port -> modelKey
 }
 
 func NewServer(clientset kubernetes.Interface, namespace, imageName, accelerator string) *Server {
-	return &Server{
+	bs, err := blobserver.NewServer("/tmp/vxpu-cache", 8080)
+	if err != nil {
+		klog.Errorf("Failed to initialize blobserver: %v", err)
+	} else {
+		bs.Start()
+	}
+
+	s := &Server{
 		clientset:   clientset,
 		namespace:   namespace,
 		imageName:   imageName,
 		accelerator: accelerator,
 		peerToModel: make(map[string]string),
+		blobServer:  bs,
 	}
+	return s
 }
 
 func getPeerKey(ctx context.Context) string {
@@ -227,10 +240,28 @@ func (s *Server) getOrStartPod(ctx context.Context, modelID string) (string, err
 func (s *Server) LoadModel(ctx context.Context, req *pb.LoadModelRequest) (*pb.LoadModelResponse, error) {
 	log := klog.FromContext(ctx)
 
-	// Derive modelKey from manifest_json
+	// Derive modelKey from manifest_json (using original ManifestJson for identity)
 	h := sha256.Sum256([]byte(req.ManifestJson))
 	modelKey := hex.EncodeToString(h[:16])
 	log.Info("LoadModel request received", "model_key", modelKey)
+
+	if s.blobServer == nil {
+		return nil, status.Errorf(codes.Internal, "blobserver is not initialized")
+	}
+
+	routerIP := getRouterIP()
+	rewrittenManifestJSON, err := s.blobServer.CacheAndRewriteManifest(ctx, req.ManifestJson, routerIP)
+	if err != nil {
+		return nil, status.Errorf(codes.Internal, "failed to cache and rewrite manifest: %v", err)
+	}
+
+	// Prepare rewritten request
+	reqCopy := &pb.LoadModelRequest{
+		ManifestJson: rewrittenManifestJSON,
+		BindingJson:  req.BindingJson,
+		PrefillGraph: req.PrefillGraph,
+		DecodeGraph:  req.DecodeGraph,
+	}
 
 	peerKey := getPeerKey(ctx)
 	if peerKey != "unknown" {
@@ -264,7 +295,7 @@ func (s *Server) LoadModel(ctx context.Context, req *pb.LoadModelRequest) (*pb.L
 	var loadErr error
 	for i := 0; i < 30; i++ {
 		loadCtx, cancel := context.WithTimeout(ctx, 30*time.Second)
-		_, loadErr = client.LoadModel(loadCtx, req)
+		_, loadErr = client.LoadModel(loadCtx, reqCopy)
 		cancel()
 		if loadErr == nil {
 			break
@@ -386,4 +417,21 @@ func (s *Server) SetPeerToModel(peerKey, modelKey string) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	s.peerToModel[peerKey] = modelKey
+}
+
+func getRouterIP() string {
+	if ip := os.Getenv("POD_IP"); ip != "" {
+		return ip
+	}
+	addrs, err := net.InterfaceAddrs()
+	if err == nil {
+		for _, addr := range addrs {
+			if ipnet, ok := addr.(*net.IPNet); ok && !ipnet.IP.IsLoopback() {
+				if ipnet.IP.To4() != nil {
+					return ipnet.IP.String()
+				}
+			}
+		}
+	}
+	return "127.0.0.1"
 }
