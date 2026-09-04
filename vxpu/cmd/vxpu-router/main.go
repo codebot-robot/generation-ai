@@ -62,10 +62,15 @@ func main() {
 	var err error
 	if kubeconfig := os.Getenv("KUBECONFIG"); kubeconfig != "" {
 		config, err = clientcmd.BuildConfigFromFlags("", kubeconfig)
-	} else if home := homedir.HomeDir(); home != "" {
-		config, err = clientcmd.BuildConfigFromFlags("", filepath.Join(home, ".kube", "config"))
+	} else if config, err = rest.InClusterConfig(); err == nil {
+		// successfully loaded in-cluster config
 	} else {
-		config, err = rest.InClusterConfig()
+		home := homedir.HomeDir()
+		if home != "" {
+			config, err = clientcmd.BuildConfigFromFlags("", filepath.Join(home, ".kube", "config"))
+		} else {
+			err = fmt.Errorf("neither in-cluster config nor local kubeconfig found")
+		}
 	}
 	if err != nil {
 		log.Error(err, "failed to load kubeconfig")

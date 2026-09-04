@@ -213,7 +213,15 @@ func waitReady(pod string) error {
 	wait := exec.Command("kubectl", "wait", "--for=condition=Ready",
 		"pod/"+pod, "--timeout=900s")
 	wait.Stdout, wait.Stderr = os.Stdout, os.Stderr
-	return wait.Run()
+	err := wait.Run()
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "pod %s failed to become ready. Printing pod details and logs:\n", pod)
+		out, _ := exec.Command("kubectl", "get", "pod", pod, "-o", "yaml").CombinedOutput()
+		fmt.Fprintf(os.Stderr, "Pod YAML:\n%s\n", string(out))
+		logs, _ := exec.Command("kubectl", "logs", pod, "--all-containers", "--tail=50").CombinedOutput()
+		fmt.Fprintf(os.Stderr, "Pod Logs:\n%s\n", string(logs))
+	}
+	return err
 }
 
 // portForward tunnels an ephemeral local port to the executor.
