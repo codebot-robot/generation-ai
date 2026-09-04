@@ -77,6 +77,7 @@ func cmdAsk(args []string) {
 		os.Getenv("VXPU_EXECUTOR_IMAGE"), "executor image")
 	accelerator := flags.String("accelerator", "nvidia-l4",
 		"GKE accelerator label for the executor pod")
+	routerAddr := flags.String("router", "", "vxpu-router address (e.g. localhost:50051); if set, skips direct pod creation")
 	maxNewTokens := flags.Int("max-new-tokens", 96, "tokens per reply")
 	timeout := flags.Duration("timeout", 20*time.Minute,
 		"end-to-end timeout (cold loads rehydrate all weights)")
@@ -86,12 +87,20 @@ func cmdAsk(args []string) {
 		log.Fatal("usage: vxpu ask [flags] PROMPT")
 	}
 
-	if err := ensurePod(*pod, *image, *accelerator); err != nil {
-		log.Fatalf("ensure executor pod: %v", err)
-	}
-	addr, stop, err := portForward(*pod)
-	if err != nil {
-		log.Fatalf("port-forward: %v", err)
+	var addr string
+	var stop func()
+	if *routerAddr != "" {
+		addr = *routerAddr
+		stop = func() {}
+	} else {
+		if err := ensurePod(*pod, *image, *accelerator); err != nil {
+			log.Fatalf("ensure executor pod: %v", err)
+		}
+		var err error
+		addr, stop, err = portForward(*pod)
+		if err != nil {
+			log.Fatalf("port-forward: %v", err)
+		}
 	}
 	defer stop()
 
