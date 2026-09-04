@@ -12,7 +12,7 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-package main
+package router
 
 import (
 	"crypto/sha256"
@@ -53,12 +53,7 @@ func TestGetOrStartPod_ExistingRunningPod(t *testing.T) {
 
 	clientset := fake.NewSimpleClientset(existingPod)
 
-	s := &server{
-		clientset:   clientset,
-		namespace:   namespace,
-		imageName:   "test-image",
-		peerToModel: make(map[string]string),
-	}
+	s := NewServer(clientset, namespace, "test-image", "")
 
 	ip, err := s.getOrStartPod(ctx, modelKey)
 	if err != nil {
@@ -116,9 +111,7 @@ func TestLoadModel_PeerMapping(t *testing.T) {
 	h := sha256.Sum256([]byte(manifest))
 	expectedKey := hex.EncodeToString(h[:16])
 
-	s := &server{
-		peerToModel: make(map[string]string),
-	}
+	s := NewServer(nil, "default", "test-image", "")
 
 	fakePeer := &peer.Peer{
 		Addr: fakeAddr{netType: "tcp", addrStr: "127.0.0.1:12345"},
@@ -126,13 +119,9 @@ func TestLoadModel_PeerMapping(t *testing.T) {
 	ctx := peer.NewContext(t.Context(), fakePeer)
 
 	peerKey := getPeerKey(ctx)
-	s.mu.Lock()
-	s.peerToModel[peerKey] = expectedKey
-	s.mu.Unlock()
+	s.SetPeerToModel(peerKey, expectedKey)
 
-	s.mu.RLock()
-	mapped, exists := s.peerToModel["127.0.0.1:12345"]
-	s.mu.RUnlock()
+	mapped, exists := s.GetPeerToModel("127.0.0.1:12345")
 
 	if !exists {
 		t.Fatalf("Expected peer mapping to exist")
@@ -143,9 +132,7 @@ func TestLoadModel_PeerMapping(t *testing.T) {
 }
 
 func TestNewSession_NoModelLoaded(t *testing.T) {
-	s := &server{
-		peerToModel: make(map[string]string),
-	}
+	s := NewServer(nil, "default", "test-image", "")
 
 	ctx := t.Context()
 	_, err := s.NewSession(ctx, &pb.NewSessionRequest{})

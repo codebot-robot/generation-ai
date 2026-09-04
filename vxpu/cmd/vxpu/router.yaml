@@ -12,47 +12,28 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-# vXPU executor pod, created on demand by the vxpu CLI.
-# Placeholders (IMAGE, NAME, ACCELERATOR) are substituted at apply time.
+# vXPU router pod, created on demand by the vxpu CLI.
+# Placeholders (IMAGE, NAME, EXECUTOR_IMAGE, ACCELERATOR) are substituted at apply time.
 apiVersion: v1
 kind: Pod
 metadata:
   name: "NAME"
   labels:
-    app: vxpu-executor
+    app: vxpu-router
 spec:
-  nodeSelector:
-    cloud.google.com/gke-accelerator: "ACCELERATOR"
-  volumes:
-    - name: work
-      emptyDir:
-        sizeLimit: 80Gi
   containers:
-    - name: executor
+    - name: router
       image: "IMAGE"
       ports:
         - containerPort: 50051
-      # Ready must mean "gRPC server listening", not "container started":
-      # clients connect the moment the pod reports Ready.
       readinessProbe:
         tcpSocket:
           port: 50051
         initialDelaySeconds: 3
         periodSeconds: 2
-      volumeMounts:
-        - name: work
-          mountPath: /tmp/vxpu
       env:
-        # GKE mounts the NVIDIA driver here; pip torch needs it on the
-        # loader path.
-        - name: LD_LIBRARY_PATH
-          value: /usr/local/nvidia/lib64
-      resources:
-        requests:
-          cpu: "4"
-          memory: 20Gi
-          ephemeral-storage: 60Gi
-        limits:
-          memory: 24Gi
-          nvidia.com/gpu: "1"
+        - name: VXPU_EXECUTOR_IMAGE
+          value: "EXECUTOR_IMAGE"
+        - name: VXPU_ACCELERATOR
+          value: "ACCELERATOR"
   restartPolicy: Never

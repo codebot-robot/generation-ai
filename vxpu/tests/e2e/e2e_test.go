@@ -21,7 +21,6 @@ import (
 	"path/filepath"
 	"strings"
 	"testing"
-	"time"
 )
 
 func TestE2E(t *testing.T) {
@@ -40,8 +39,12 @@ func TestE2E(t *testing.T) {
 	// Build the executor image
 	h.DockerBuild("vxpu-executor:e2e", filepath.Join(vxpuRoot, "images/executor/Dockerfile"), vxpuRoot)
 
-	// Load the executor image into Kind
+	// Build the router image
+	h.DockerBuild("vxpu-router:e2e", filepath.Join(vxpuRoot, "images/router/Dockerfile"), vxpuRoot)
+
+	// Load the executor and router images into Kind
 	h.KindLoad("vxpu-executor:e2e")
+	h.KindLoad("vxpu-router:e2e")
 
 	// Export the model using the built container image to guarantee environment consistency
 	h.t.Logf("Exporting model to %s", artifactDir)
@@ -54,54 +57,66 @@ func TestE2E(t *testing.T) {
 	h.t.Logf("Building vxpu CLI binary to %s", vxpuBin)
 	h.RunCommand("go", "build", "-o", vxpuBin, filepath.Join(vxpuRoot, "cmd/vxpu"))
 
-	// Custom CPU-friendly vxpu-executor Pod manifest suitable for CPU-only Kind nodes
-	vxpuExecutorYaml := `apiVersion: v1
-kind: Pod
+	// Create Pod-managing RBAC for the router's ServiceAccount (default)
+	podManagerRbacYaml := `apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
 metadata:
-  name: vxpu-executor
-  labels:
-    app: vxpu-executor
-spec:
-  containers:
-    - name: executor
-      image: vxpu-executor:e2e
-      imagePullPolicy: Never
-      ports:
-        - containerPort: 50051
-      readinessProbe:
-        tcpSocket:
-          port: 50051
-        initialDelaySeconds: 3
-        periodSeconds: 2
-      resources:
-        requests:
-          cpu: "500m"
-          memory: "1Gi"
-        limits:
-          memory: "2Gi"
-  restartPolicy: Never`
+  namespace: default
+  name: pod-manager
+rules:
+- apiGroups: [""]
+  resources: ["pods"]
+  verbs: ["get", "list", "watch", "create", "update", "patch", "delete"]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  namespace: default
+  name: pod-manager-binding
+subjects:
+- kind: ServiceAccount
+  name: default
+  namespace: default
+roleRef:
+  kind: Role
+  name: pod-manager
+  apiGroup: rbac.authorization.k8s.io`
 
-	// Ensure clean slate
-	h.DeletePod("vxpu-executor", "default")
+	// Apply RBAC
+	h.KubectlApplyContent("pod-manager-rbac", podManagerRbacYaml)
 
-	// Deploy the CPU-friendly executor pod
-	h.KubectlApplyContent("vxpu-executor", vxpuExecutorYaml)
-
-	// Wait for executor pod to be ready
-	if err := h.WaitForPodReady("vxpu-executor", "default", 5*time.Minute); err != nil {
-		fmt.Fprintf(os.Stderr, "Events:\n%s\n", h.GetEvents("default"))
-		t.Fatalf("vxpu-executor pod failed to become ready: %v", err)
+	// Clean any pre-existing pods
+	h.DeletePod("vxpu-router", "default")
+	// Clean any previous executor pods that may start with 'vxpu-executor-'
+	out, err := exec.Command("kubectl", "get", "pods", "-o", "jsonpath={.items[*].metadata.name}").Output()
+	if err == nil {
+		for _, podName := range strings.Fields(string(out)) {
+			if strings.HasPrefix(podName, "vxpu-executor-") {
+				h.DeletePod(podName, "default")
+			}
+		}
 	}
 
-	// Run vxpu CLI ask command to load the model, create a session, and generate responses
-	h.t.Log("Running vxpu ask command")
-	cmd := exec.Command(vxpuBin, "ask", "--artifact", artifactDir, "Is the sky blue?")
-	out, err := cmd.CombinedOutput()
+	// Run vxpu CLI ask command to launch router, which in turn launches executor and chats
+	h.t.Log("Running vxpu ask command via the router")
+	cmd := exec.Command(vxpuBin, "ask", "--artifact", artifactDir, "--accelerator", "none", "Is the sky blue?")
+	// Set the environment variables so vxpu CLI knows which images to orchestrate
+	cmd.Env = append(os.Environ(),
+		"VXPU_ROUTER_IMAGE=vxpu-router:e2e",
+		"VXPU_EXECUTOR_IMAGE=vxpu-executor:e2e",
+	)
 
-	// Get and print executor logs
-	podLogs := h.GetPodLogs("app=vxpu-executor", "default")
-	fmt.Fprintf(os.Stderr, "vxpu-executor logs:\n%s\n", podLogs)
-	t.Logf("vxpu-executor logs:\n%s", podLogs)
+	out, err = cmd.CombinedOutput()
+
+	// Get and print router logs
+	routerLogs := h.GetPodLogs("app=vxpu-router", "default")
+	fmt.Fprintf(os.Stderr, "vxpu-router logs:\n%s\n", routerLogs)
+	t.Logf("vxpu-router logs:\n%s", routerLogs)
+
+	// Get and print executor logs (any executor pod created by router starts with 'vxpu-executor-')
+	executorLogs := h.GetPodLogs("app=vxpu-executor", "default")
+	fmt.Fprintf(os.Stderr, "vxpu-executor logs:\n%s\n", executorLogs)
+	t.Logf("vxpu-executor logs:\n%s", executorLogs)
 
 	if err != nil {
 		t.Fatalf("vxpu ask failed: %v\nOutput: %s", err, string(out))

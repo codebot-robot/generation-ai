@@ -46,8 +46,8 @@ import (
 	pb "github.com/gke-labs/generation-ai/vxpu/pkg/api/v1alpha1"
 )
 
-//go:embed executor.yaml
-var executorManifest string
+//go:embed router.yaml
+var routerManifest string
 
 const maxMessageBytes = 128 * 1024 * 1024
 
@@ -72,8 +72,10 @@ func cmdAsk(args []string) {
 	flags := flag.NewFlagSet("ask", flag.ExitOnError)
 	artifact := flags.String("artifact", ".",
 		"artifact directory (manifest.json, binding.json, *.pt2)")
-	pod := flags.String("pod", "vxpu-executor", "executor pod name")
+	pod := flags.String("pod", "vxpu-router", "router pod name")
 	image := flags.String("image",
+		os.Getenv("VXPU_ROUTER_IMAGE"), "router image")
+	executorImage := flags.String("executor-image",
 		os.Getenv("VXPU_EXECUTOR_IMAGE"), "executor image")
 	accelerator := flags.String("accelerator", "nvidia-l4",
 		"GKE accelerator label for the executor pod")
@@ -93,8 +95,8 @@ func cmdAsk(args []string) {
 		addr = *routerAddr
 		stop = func() {}
 	} else {
-		if err := ensurePod(*pod, *image, *accelerator); err != nil {
-			log.Fatalf("ensure executor pod: %v", err)
+		if err := ensurePod(*pod, *image, *executorImage, *accelerator); err != nil {
+			log.Fatalf("ensure router pod: %v", err)
 		}
 		var err error
 		addr, stop, err = portForward(*pod)
@@ -170,7 +172,7 @@ func cmdAsk(args []string) {
 
 func cmdDown(args []string) {
 	flags := flag.NewFlagSet("down", flag.ExitOnError)
-	pod := flags.String("pod", "vxpu-executor", "executor pod name")
+	pod := flags.String("pod", "vxpu-router", "router pod name")
 	_ = flags.Parse(args)
 	out, err := exec.Command("kubectl", "delete", "pod", *pod,
 		"--ignore-not-found").CombinedOutput()
@@ -180,23 +182,24 @@ func cmdDown(args []string) {
 	}
 }
 
-// ensurePod creates the executor pod if absent and waits until Ready.
-func ensurePod(pod, image, accelerator string) error {
+// ensurePod creates the router pod if absent and waits until Ready.
+func ensurePod(pod, image, executorImage, accelerator string) error {
 	if exec.Command("kubectl", "get", "pod", pod).Run() == nil {
 		return waitReady(pod)
 	}
 	if image == "" {
 		return fmt.Errorf(
-			"pod %q not found and no --image/VXPU_EXECUTOR_IMAGE set",
+			"pod %q not found and no --image/VXPU_ROUTER_IMAGE set",
 			pod)
 	}
-	fmt.Printf("creating executor pod %s (image %s, accelerator %s)\n",
-		pod, image, accelerator)
+	fmt.Printf("creating router pod %s (image %s, executor-image %s, accelerator %s)\n",
+		pod, image, executorImage, accelerator)
 	manifest := strings.NewReplacer(
 		`"NAME"`, fmt.Sprintf("%q", pod),
 		`"IMAGE"`, fmt.Sprintf("%q", image),
+		`"EXECUTOR_IMAGE"`, fmt.Sprintf("%q", executorImage),
 		`"ACCELERATOR"`, fmt.Sprintf("%q", accelerator),
-	).Replace(executorManifest)
+	).Replace(routerManifest)
 	apply := exec.Command("kubectl", "apply", "-f", "-")
 	apply.Stdin = strings.NewReader(manifest)
 	apply.Stdout, apply.Stderr = os.Stdout, os.Stderr
