@@ -65,6 +65,31 @@ integer inputs — to its exact `bincount` equivalent), so one artifact
 serves heterogeneous executors: the graph carries reference semantics;
 each engine adapts it to its hardware.
 
+## Security & Trust Assumptions
+
+The vXPU executor **runs the artifact it is given**. There is currently no verification or sandboxing in the executor, and verifying the graph's structure is not a viable security control (a check strong enough to guarantee safety would mean we could have regenerated the graph ourselves).
+
+Consequently, the core operating assumption is: **only run artifacts you trust / produced.**
+
+### The Pickle Risk in `.pt2` Archives
+
+A `.pt2` file is actually a zip archive containing:
+- `models/model.json` — the declarative, non-executable exported graph (ATen ops + shapes).
+- `data/weights/*`, `data/constants/*` — raw tensor weights and constants.
+- `data/sample_inputs/model.pt` — **a `torch.save` archive containing `archive/data.pkl`, which is a Python pickle.**
+
+Unpickling runs Python `__reduce__`, which is a classic arbitrary code execution vector. A hostile `.pt2` file could carry a malicious payload inside this sample-inputs pickle that executes during load time before any graph inspection or execution occurs.
+
+### Investigation & Findings
+
+When the executor loads the program using `torch.export.load()`, we investigated its behavior regarding `data/sample_inputs/model.pt`:
+
+1. **Eager Deserialization**: `torch.export.load` utilizes an internal `unpackage_pt2` call that **eagerly** unpacks and unpickles the entire archive, including `data/sample_inputs/model.pt` (loaded into the `example_inputs` property). There is no native lazy-loading or skipping support for these inputs at load time.
+2. **Impact**: Because the unpickling happens eagerly upon calling `torch.export.load()`, code execution occurs immediately when loading an untrusted artifact.
+3. **Hardening Mitigation**: Since the serving executor only needs the declarative graph, weights, and configuration metadata to perform inference, the sample/example inputs are completely unnecessary at serving/load time.
+   - For future hardening, dropping the sample inputs during the export phase (e.g., by setting `exported_program.example_inputs = None` before calling `torch.export.save`) would completely prevent the creation of `/data/sample_inputs/model.pt` inside the zip archive.
+   - Dropping this pickle file would eliminate the primary arbitrary code execution surface of the `.pt2` artifact, leaving it entirely declarative.
+
 ## Layout
 
 ```
