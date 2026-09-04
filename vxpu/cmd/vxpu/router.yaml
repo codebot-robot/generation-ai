@@ -21,19 +21,40 @@ metadata:
   labels:
     app: vxpu-router
 spec:
+  volumes:
+    - name: cache-volume
+      emptyDir:
+        sizeLimit: 80Gi
   containers:
     - name: router
       image: "IMAGE"
       ports:
         - containerPort: 50051
+        - containerPort: 8080
       readinessProbe:
         tcpSocket:
           port: 50051
         initialDelaySeconds: 3
         periodSeconds: 2
+      volumeMounts:
+        - name: cache-volume
+          mountPath: /tmp/vxpu-cache
+      resources:
+        requests:
+          cpu: "500m"
+          memory: "1Gi"
+          ephemeral-storage: "60Gi"
+        limits:
+          cpu: "2"
+          memory: "4Gi"
+          ephemeral-storage: "80Gi"
       env:
         - name: VXPU_EXECUTOR_IMAGE
           value: "EXECUTOR_IMAGE"
         - name: VXPU_ACCELERATOR
           value: "ACCELERATOR"
+        - name: POD_IP
+          valueFrom:
+            fieldRef:
+              fieldPath: status.podIP
   restartPolicy: Never

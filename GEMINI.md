@@ -30,10 +30,10 @@ This file provides context and instructions for LLM coding agents working on the
 
 The project uses the `ap` tool for various tasks. Since `ap` is a custom tool, it should be run using `go run`:
 
-- `go run github.com/gke-labs/gke-labs-infra/ap@latest generate`: Regenerate any code and format.
+- `go run github.com/gke-labs/gke-labs-infra/ap@latest generate //...`: Regenerate any code and format.
 - `go run github.com/gke-labs/gke-labs-infra/ap@latest test`: Run unit tests.
 - `go run github.com/gke-labs/gke-labs-infra/ap@latest e2e`: Run e2e tests.
 - `go run github.com/gke-labs/gke-labs-infra/ap@latest lint`: For deeper static analysis.
 
-**Reminder**: Coding agents MUST run at least `ap generate` and `ap lint` before sending PRs, and preferably `ap e2e` as well!
-**CRITICAL**: Running `ap generate` is absolutely mandatory, otherwise the CI presubmit `ap-verify-generate` will fail.
+**Reminder**: Coding agents MUST run at least `ap generate //...` and `ap lint` before sending PRs, and preferably `ap e2e` as well!
+**CRITICAL**: Running `ap generate //...` is absolutely mandatory, otherwise the CI presubmit `ap-verify-generate` will fail.
