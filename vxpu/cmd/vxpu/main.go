@@ -46,8 +46,8 @@ import (
 	pb "github.com/gke-labs/generation-ai/vxpu/pkg/api/v1alpha1"
 )
 
-//go:embed executor.yaml
-var executorManifest string
+//go:embed router.yaml
+var routerManifest string
 
 const maxMessageBytes = 128 * 1024 * 1024
 
@@ -72,11 +72,14 @@ func cmdAsk(args []string) {
 	flags := flag.NewFlagSet("ask", flag.ExitOnError)
 	artifact := flags.String("artifact", ".",
 		"artifact directory (manifest.json, binding.json, *.pt2)")
-	pod := flags.String("pod", "vxpu-executor", "executor pod name")
+	pod := flags.String("pod", "vxpu-router", "router pod name")
 	image := flags.String("image",
+		os.Getenv("VXPU_ROUTER_IMAGE"), "router image")
+	executorImage := flags.String("executor-image",
 		os.Getenv("VXPU_EXECUTOR_IMAGE"), "executor image")
 	accelerator := flags.String("accelerator", "nvidia-l4",
 		"GKE accelerator label for the executor pod")
+	routerAddr := flags.String("router", "", "vxpu-router address (e.g. localhost:50051); if set, skips direct pod creation")
 	maxNewTokens := flags.Int("max-new-tokens", 96, "tokens per reply")
 	timeout := flags.Duration("timeout", 20*time.Minute,
 		"end-to-end timeout (cold loads rehydrate all weights)")
@@ -86,12 +89,20 @@ func cmdAsk(args []string) {
 		log.Fatal("usage: vxpu ask [flags] PROMPT")
 	}
 
-	if err := ensurePod(*pod, *image, *accelerator); err != nil {
-		log.Fatalf("ensure executor pod: %v", err)
-	}
-	addr, stop, err := portForward(*pod)
-	if err != nil {
-		log.Fatalf("port-forward: %v", err)
+	var addr string
+	var stop func()
+	if *routerAddr != "" {
+		addr = *routerAddr
+		stop = func() {}
+	} else {
+		if err := ensurePod(*pod, *image, *executorImage, *accelerator); err != nil {
+			log.Fatalf("ensure router pod: %v", err)
+		}
+		var err error
+		addr, stop, err = portForward(*pod)
+		if err != nil {
+			log.Fatalf("port-forward: %v", err)
+		}
 	}
 	defer stop()
 
@@ -161,7 +172,7 @@ func cmdAsk(args []string) {
 
 func cmdDown(args []string) {
 	flags := flag.NewFlagSet("down", flag.ExitOnError)
-	pod := flags.String("pod", "vxpu-executor", "executor pod name")
+	pod := flags.String("pod", "vxpu-router", "router pod name")
 	_ = flags.Parse(args)
 	out, err := exec.Command("kubectl", "delete", "pod", *pod,
 		"--ignore-not-found").CombinedOutput()
@@ -171,23 +182,24 @@ func cmdDown(args []string) {
 	}
 }
 
-// ensurePod creates the executor pod if absent and waits until Ready.
-func ensurePod(pod, image, accelerator string) error {
+// ensurePod creates the router pod if absent and waits until Ready.
+func ensurePod(pod, image, executorImage, accelerator string) error {
 	if exec.Command("kubectl", "get", "pod", pod).Run() == nil {
 		return waitReady(pod)
 	}
 	if image == "" {
 		return fmt.Errorf(
-			"pod %q not found and no --image/VXPU_EXECUTOR_IMAGE set",
+			"pod %q not found and no --image/VXPU_ROUTER_IMAGE set",
 			pod)
 	}
-	fmt.Printf("creating executor pod %s (image %s, accelerator %s)\n",
-		pod, image, accelerator)
+	fmt.Printf("creating router pod %s (image %s, executor-image %s, accelerator %s)\n",
+		pod, image, executorImage, accelerator)
 	manifest := strings.NewReplacer(
 		`"NAME"`, fmt.Sprintf("%q", pod),
 		`"IMAGE"`, fmt.Sprintf("%q", image),
+		`"EXECUTOR_IMAGE"`, fmt.Sprintf("%q", executorImage),
 		`"ACCELERATOR"`, fmt.Sprintf("%q", accelerator),
-	).Replace(executorManifest)
+	).Replace(routerManifest)
 	apply := exec.Command("kubectl", "apply", "-f", "-")
 	apply.Stdin = strings.NewReader(manifest)
 	apply.Stdout, apply.Stderr = os.Stdout, os.Stderr
@@ -201,7 +213,15 @@ func waitReady(pod string) error {
 	wait := exec.Command("kubectl", "wait", "--for=condition=Ready",
 		"pod/"+pod, "--timeout=900s")
 	wait.Stdout, wait.Stderr = os.Stdout, os.Stderr
-	return wait.Run()
+	err := wait.Run()
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "pod %s failed to become ready. Printing pod details and logs:\n", pod)
+		out, _ := exec.Command("kubectl", "get", "pod", pod, "-o", "yaml").CombinedOutput()
+		fmt.Fprintf(os.Stderr, "Pod YAML:\n%s\n", string(out))
+		logs, _ := exec.Command("kubectl", "logs", pod, "--all-containers", "--tail=50").CombinedOutput()
+		fmt.Fprintf(os.Stderr, "Pod Logs:\n%s\n", string(logs))
+	}
+	return err
 }
 
 // portForward tunnels an ephemeral local port to the executor.
