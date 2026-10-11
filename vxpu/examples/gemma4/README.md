@@ -54,6 +54,42 @@ The first load downloads 62.6 GB into the router's cache and again into
 the executor's RAM; expect 10–20 minutes. Later loads of the same
 artifact are a digest match and take seconds.
 
+## What you should see
+
+The committed notebook has no outputs (they are environment-specific
+and change with every run); this is the shape of a run against the
+31B on the CPU executor, lightly abridged.
+
+Loading, after a one-minute export on first use:
+
+```
+executor placed and artifact delivered (515s); rehydrating weights...
+model ready in 727s
+VxpuModelForCausalLM('google/gemma-4-31B-it', router='127.0.0.1:57298', session='…:s0')
+```
+
+The docs' function-calling example, decoded with `skip_special_tokens=False`:
+
+```
+<|tool_call>call:get_n_day_weather_forecast{format:<|"|>fahrenheit<|"|>,location:<|"|>San Francisco, CA<|"|>,num_days:3}<tool_call|><|tool_response>
+```
+
+and after the tool response is appended and the template re-rendered,
+only the new tokens are prefilled (157 of 320) before the model answers
+from the tool data:
+
+```
+The weather forecast for San Francisco, CA over the next 3 days is:
+*   **Day 1:** High of 68°F, low of 54°F, and sunny.
+*   **Day 2:** High of 65°F, low of 53°F, with fog in the morning.
+*   **Day 3:** High of 62°F, low of 52°F, with light rain.
+
+GenerateStats(finish_reason='eos', prompt_tokens=320, prefilled_tokens=157, generated=106, prefill_ms=5652, ms_per_token=1483.5)
+```
+
+Streaming multi-turn chat behaves the same way: the follow-up turn
+prefills 99 of 119 prompt tokens and answers at ~1.4 s/token.
+
 ## What is and is not covered
 
 - Causal LM, function calling (processor-rendered template with tools,
