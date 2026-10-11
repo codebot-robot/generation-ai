@@ -28,7 +28,7 @@ cadence. The result is:
                             12-minute model load becomes seconds) and a
                             scrubber
 
-    dev/tasks/record-notebook-run examples/gemma4/gemma4-on-vxpu.ipynb --out /tmp/demo
+    .venv/bin/python dev/tasks/record-notebook-run examples/gemma4/gemma4-on-vxpu.ipynb
 
 A few kilobytes of text per run, so recordings can be diffed and
 hosted anywhere a static file can. Requires nbclient, nbformat,
@@ -48,13 +48,17 @@ import time
 import mistune
 import nbformat
 from nbclient import NotebookClient
+from nbclient.exceptions import CellExecutionError, CellTimeoutError, DeadKernelError
 from pygments import highlight
 from pygments.formatters import HtmlFormatter
 from pygments.lexers import PythonLexer
 
-ANSI = re.compile(r"\x1b\[[0-9;?]*[A-Za-z]")
+# CSI sequences and OSC strings; \r and \b are kept for the player, which
+# applies them the way a notebook output area does.
+ANSI = re.compile(r"\x1b\[[0-9;?]*[A-Za-z]|\x1b\][^\x07\x1b]*(?:\x07|\x1b\\)")
 MARKDOWN = mistune.create_markdown(plugins=["table", "strikethrough"])
 FORMATTER = HtmlFormatter(nowrap=True)
+DEFAULT_OUT = os.path.join(os.path.expanduser("~"), ".cache", "vxpu", "recordings")
 
 
 def strip_ansi(text):
@@ -91,14 +95,20 @@ class RecordingClient(NotebookClient):
         elif kind == "stream":
             event = {"type": "stream", "name": content["name"],
                      "text": strip_ansi(content["text"])}
-        elif kind in ("execute_result", "display_data"):
-            event = {"type": "display", **render_mime(content.get("data", {}))}
+        elif kind in ("execute_result", "display_data", "update_display_data"):
+            event = {"type": "update" if kind == "update_display_data" else "display",
+                     **render_mime(content.get("data", {}))}
+            display_id = (content.get("transient") or {}).get("display_id")
+            if display_id:
+                event["display_id"] = display_id
         elif kind == "error":
             event = {"type": "error", "text": strip_ansi(
                 "\n".join(content.get("traceback", [])) or
                 f"{content.get('ename')}: {content.get('evalue')}")}
         elif kind == "clear_output":
-            event = {"type": "clear"}
+            # wait=True clears only when the next output arrives (the
+            # flicker-free refresh idiom); the player honours it.
+            event = {"type": "clear", "wait": bool(content.get("wait"))}
         elif kind == "status":
             event = {"type": "status", "state": content["execution_state"]}
         if event is not None:
@@ -117,7 +127,17 @@ def record(path, timeout, kernel_name, allow_errors):
         allow_errors=allow_errors,
         resources={"metadata": {"path": os.path.dirname(os.path.abspath(path)) or "."}})
     started = datetime.datetime.now(datetime.timezone.utc)
-    client.execute()
+    aborted = None
+    try:
+        client.execute()
+    except (CellExecutionError, CellTimeoutError, DeadKernelError,
+            KeyboardInterrupt) as e:
+        # Keep what was recorded: a late failure in a long run is
+        # exactly when the recording is most useful.
+        detail = strip_ansi(str(e)).strip().splitlines()
+        aborted = f"{type(e).__name__}: {detail[-1] if detail else ''}"
+        print(f"run aborted ({aborted}); writing the partial recording",
+              file=sys.stderr)
     cells = []
     for i, cell in enumerate(nb.cells):
         source = "".join(cell.source)
@@ -136,6 +156,7 @@ def record(path, timeout, kernel_name, allow_errors):
         "recorded": started.isoformat(timespec="seconds"),
         "duration": duration,
         "errors": errors,
+        "aborted": aborted,
         "cells": cells,
         "events": events,
     }
@@ -172,7 +193,9 @@ pre { margin:0; font:13px/1.45 ui-monospace, SFMono-Regular, Menlo, monospace; w
 .outputs .display { }
 code { font-family: ui-monospace, SFMono-Regular, Menlo, monospace; font-size: 0.92em; }
 .cell.markdown code, .outputs code { background:var(--input); padding:1px 4px; border-radius:4px; }
-__PYGMENTS__
+__PYGMENTS_LIGHT__
+@media (prefers-color-scheme: dark) { __PYGMENTS_DARK__ }
+.cell .input pre.highlight { background: transparent; }
 </style>
 <header>
   <h1>__TITLE__</h1>
@@ -182,7 +205,7 @@ __PYGMENTS__
   <input type="range" id="seek" min="0" max="1000" value="0">
   <span class="meta" id="time"></span>
   <label><input type="checkbox" id="follow" checked> follow</label>
-  <span class="meta">recorded __RECORDED__ · real duration __DURATION__</span>
+  <span class="meta">recorded __RECORDED__ · real duration __DURATION__</span>__ABORTED__
 </header>
 <main id="main"></main>
 <script id="recording" type="application/json">__RECORDING__</script>
@@ -207,10 +230,25 @@ function buildTimeline() {
   eff = []; let acc = 0, prev = 0;
   for (const e of rec.events) { acc += Math.min(Math.max(e.t - prev, 0), cap); prev = e.t; eff.push(acc); }
 }
+// Apply a stream chunk the way a notebook output area does: \r returns
+// to the start of the current line, \b deletes one character.
+function appendStream(pre, chunk) {
+  let text = pre.textContent;
+  for (const ch of chunk) {
+    if (ch === '\r') { const nl = text.lastIndexOf('\n'); text = text.slice(0, nl + 1); }
+    else if (ch === '\b') { text = text.slice(0, -1); }
+    else { text += ch; }
+  }
+  pre.textContent = text;
+}
 function fmt(s) { s = Math.max(0, Math.round(s)); return String(Math.floor(s / 60)).padStart(2, '0') + ':' + String(s % 60).padStart(2, '0'); }
-const counts = {};
+const counts = {}; let pendingClear = {};
 function reset() {
+  pendingClear = {};
   for (const el of cells) { el.classList.remove('running'); const o = el.querySelector('.outputs'); if (o) o.innerHTML = ''; const p = el.querySelector('.prompt'); if (p && el.classList.contains('code')) p.textContent = '[ ]:'; }
+}
+function beforeOutput(cellIndex, out) {
+  if (pendingClear[cellIndex]) { out.innerHTML = ''; pendingClear[cellIndex] = false; }
 }
 function apply(e) {
   const el = cells[e.cell]; if (!el) return;
@@ -218,13 +256,18 @@ function apply(e) {
   if (e.type === 'input') { el.classList.add('running'); prompt.textContent = '[*]:'; counts[e.cell] = e.count; }
   else if (e.type === 'status' && e.state === 'idle') { el.classList.remove('running'); if (counts[e.cell] != null) prompt.textContent = '[' + counts[e.cell] + ']:'; }
   else if (e.type === 'stream') {
+    beforeOutput(e.cell, out);
     let pre = out.lastElementChild;
     if (!pre || !pre.classList.contains('stream') || !pre.classList.contains(e.name)) { pre = document.createElement('pre'); pre.className = 'stream ' + e.name; out.appendChild(pre); }
-    pre.textContent += e.text;
+    appendStream(pre, e.text);
   }
-  else if (e.type === 'display') { const d = document.createElement('div'); d.className = 'display'; d.innerHTML = e.html; out.appendChild(d); }
-  else if (e.type === 'error') { const pre = document.createElement('pre'); pre.className = 'error'; pre.textContent = e.text; out.appendChild(pre); }
-  else if (e.type === 'clear') { out.innerHTML = ''; }
+  else if (e.type === 'display' || e.type === 'update') {
+    const existing = e.display_id ? main.querySelector('.display[data-display-id="' + CSS.escape(e.display_id) + '"]') : null;
+    if (e.type === 'update') { if (existing) existing.innerHTML = e.html; }
+    else { beforeOutput(e.cell, out); const d = document.createElement('div'); d.className = 'display'; if (e.display_id) d.dataset.displayId = e.display_id; d.innerHTML = e.html; out.appendChild(d); }
+  }
+  else if (e.type === 'error') { beforeOutput(e.cell, out); const pre = document.createElement('pre'); pre.className = 'error'; pre.textContent = e.text; out.appendChild(pre); }
+  else if (e.type === 'clear') { if (e.wait) pendingClear[e.cell] = true; else { out.innerHTML = ''; pendingClear[e.cell] = false; } }
   if (document.getElementById('follow').checked && e.type !== 'status') el.scrollIntoView({ block: 'center', behavior: 'smooth' });
 }
 let pos = 0, clock = 0, playing = false, last = null, raf = null;
@@ -256,38 +299,54 @@ buildTimeline(); render();
 """
 
 
+def pygments_css(style):
+    """Token colours only: no background box, no unprefixed `pre` rule."""
+    defs = HtmlFormatter(style=style, nobackground=True).get_style_defs(".highlight")
+    return "\n".join(line for line in defs.splitlines()
+                     if line.startswith(".highlight ."))
+
+
 def write_player(recording, path):
+    aborted = recording.get("aborted")
     page = (PLAYER
             .replace("__TITLE__", html.escape(recording["notebook"]))
             .replace("__RECORDED__", html.escape(recording["recorded"]))
             .replace("__DURATION__", f"{int(recording['duration'] // 60)}m{int(recording['duration'] % 60):02d}s")
-            .replace("__PYGMENTS__", HtmlFormatter().get_style_defs(".highlight"))
-            .replace("__RECORDING__", json.dumps(recording).replace("</", "<\\/")))
-    with open(path, "w") as f:
+            .replace("__ABORTED__", f' <span class="meta" style="color:#b3261e">· aborted: {html.escape(aborted)}</span>' if aborted else "")
+            .replace("__PYGMENTS_LIGHT__", pygments_css("default"))
+            .replace("__PYGMENTS_DARK__", pygments_css("monokai"))
+            # \u003c keeps "</script>" and "<!--" in recorded content from
+            # ending or escaping the data element.
+            .replace("__RECORDING__", json.dumps(recording).replace("<", "\\u003c")))
+    with open(path, "w", encoding="utf-8") as f:
         f.write(page)
 
 
 def main():
     parser = argparse.ArgumentParser(description=__doc__.split("\n\n")[0])
     parser.add_argument("notebook")
-    parser.add_argument("--out", default="/tmp/vxpu-demo")
+    parser.add_argument("--out", default=DEFAULT_OUT,
+                        help="output directory (default: a per-user cache dir)")
     parser.add_argument("--timeout", type=int, default=3600, help="per-cell timeout")
     parser.add_argument("--kernel", default=None, help="kernel name (default: the notebook's)")
     parser.add_argument("--stop-on-error", action="store_true",
-                        help="abort at the first failing cell instead of recording it")
+                        help="stop at the first failing cell (the recording up to "
+                             "and including it is still written)")
     args = parser.parse_args()
 
-    recording = record(args.notebook, args.timeout, args.kernel,
-                       allow_errors=not args.stop_on_error)
+    # Fail on an unusable output directory before the (possibly long) run.
     os.makedirs(args.out, exist_ok=True)
     stem = os.path.join(args.out, os.path.splitext(os.path.basename(args.notebook))[0])
-    with open(stem + ".recording.json", "w") as f:
+    recording = record(args.notebook, args.timeout, args.kernel,
+                       allow_errors=not args.stop_on_error)
+    with open(stem + ".recording.json", "w", encoding="utf-8") as f:
         json.dump(recording, f)
     write_player(recording, stem + ".html")
     print(f"recording: {stem}.recording.json ({len(recording['events'])} events, "
-          f"{recording['duration']:.0f}s real time, {recording['errors']} errors)")
+          f"{recording['duration']:.0f}s real time, {recording['errors']} errors"
+          f"{', aborted' if recording['aborted'] else ''})")
     print(f"player:    {stem}.html")
-    return 1 if recording["errors"] else 0
+    return 1 if recording["errors"] or recording["aborted"] else 0
 
 
 if __name__ == "__main__":

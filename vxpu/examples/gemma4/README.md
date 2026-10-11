@@ -64,7 +64,7 @@ ten-minute model load takes seconds to watch. A few kilobytes of text
 per run, so it can be hosted anywhere a static file can (#195).
 
 ```sh
-dev/tasks/record-notebook-run examples/gemma4/gemma4-on-vxpu.ipynb --out /tmp/demo
+.venv/bin/python dev/tasks/record-notebook-run examples/gemma4/gemma4-on-vxpu.ipynb --out /tmp/demo
 open /tmp/demo/gemma4-on-vxpu.html
 ```
 
