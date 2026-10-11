@@ -1,0 +1,294 @@
+#!/usr/bin/env python3
+# Copyright 2026 Google LLC
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
+"""Record a notebook run as a replayable HTML page (no browser, no video).
+
+Executes the notebook with nbclient (what `jupyter nbconvert --execute`
+uses) and logs every kernel message — execute_input, stream chunks,
+results, errors, busy/idle — with the time it arrived. Streamed output
+such as a TextStreamer printing one token at a time keeps its real
+cadence. The result is:
+
+    <name>.recording.json   the stripped cells plus the timestamped events
+    <name>.html             a self-contained player: cells rendered like a
+                            notebook, outputs appear on schedule, with
+                            play/pause, speed, idle-gap capping (a
+                            12-minute model load becomes seconds) and a
+                            scrubber
+
+    dev/tasks/record-notebook-run examples/gemma4/gemma4-on-vxpu.ipynb --out /tmp/demo
+
+A few kilobytes of text per run, so recordings can be diffed and
+hosted anywhere a static file can. Requires nbclient, nbformat,
+mistune and pygments (all dependencies of jupyter/nbconvert); the
+notebook's own requirements apply as usual.
+"""
+
+import argparse
+import datetime
+import html
+import json
+import os
+import re
+import sys
+import time
+
+import mistune
+import nbformat
+from nbclient import NotebookClient
+from pygments import highlight
+from pygments.formatters import HtmlFormatter
+from pygments.lexers import PythonLexer
+
+ANSI = re.compile(r"\x1b\[[0-9;?]*[A-Za-z]")
+MARKDOWN = mistune.create_markdown(plugins=["table", "strikethrough"])
+FORMATTER = HtmlFormatter(nowrap=True)
+
+
+def strip_ansi(text):
+    return ANSI.sub("", text)
+
+
+def render_mime(data):
+    """Pick the richest representation the player can show."""
+    if "text/html" in data:
+        return {"html": "".join(data["text/html"])}
+    if "text/markdown" in data:
+        return {"html": MARKDOWN("".join(data["text/markdown"]))}
+    if "image/png" in data:
+        return {"html": f'<img src="data:image/png;base64,{data["image/png"]}">'}
+    if "text/plain" in data:
+        return {"html": f"<pre>{html.escape(strip_ansi(''.join(data['text/plain'])))}</pre>"}
+    return {"html": f"<pre>{html.escape(', '.join(sorted(data)))}</pre>"}
+
+
+class RecordingClient(NotebookClient):
+    """nbclient that logs every kernel message with a timestamp."""
+
+    def __init__(self, nb, events, **kwargs):
+        super().__init__(nb, **kwargs)
+        self._events = events
+        self._t0 = time.monotonic()
+
+    def process_message(self, msg, cell, cell_index):
+        content = msg["content"]
+        kind = msg["msg_type"]
+        event = None
+        if kind == "execute_input":
+            event = {"type": "input", "count": content.get("execution_count")}
+        elif kind == "stream":
+            event = {"type": "stream", "name": content["name"],
+                     "text": strip_ansi(content["text"])}
+        elif kind in ("execute_result", "display_data"):
+            event = {"type": "display", **render_mime(content.get("data", {}))}
+        elif kind == "error":
+            event = {"type": "error", "text": strip_ansi(
+                "\n".join(content.get("traceback", [])) or
+                f"{content.get('ename')}: {content.get('evalue')}")}
+        elif kind == "clear_output":
+            event = {"type": "clear"}
+        elif kind == "status":
+            event = {"type": "status", "state": content["execution_state"]}
+        if event is not None:
+            event["t"] = round(time.monotonic() - self._t0, 3)
+            event["cell"] = cell_index
+            self._events.append(event)
+        return super().process_message(msg, cell, cell_index)
+
+
+def record(path, timeout, kernel_name, allow_errors):
+    nb = nbformat.read(path, as_version=4)
+    events = []
+    kernel = kernel_name or nb.metadata.get("kernelspec", {}).get("name", "python3")
+    client = RecordingClient(
+        nb, events, timeout=timeout, kernel_name=kernel,
+        allow_errors=allow_errors,
+        resources={"metadata": {"path": os.path.dirname(os.path.abspath(path)) or "."}})
+    started = datetime.datetime.now(datetime.timezone.utc)
+    client.execute()
+    cells = []
+    for i, cell in enumerate(nb.cells):
+        source = "".join(cell.source)
+        if cell.cell_type == "markdown":
+            cells.append({"type": "markdown", "html": MARKDOWN(source)})
+        elif cell.cell_type == "code":
+            cells.append({"type": "code", "source": source,
+                          "html": highlight(source, PythonLexer(), FORMATTER)})
+        else:
+            cells.append({"type": "raw", "html": f"<pre>{html.escape(source)}</pre>"})
+    duration = events[-1]["t"] if events else 0.0
+    errors = sum(1 for e in events if e["type"] == "error")
+    return {
+        "format": "vxpu-notebook-recording/v1",
+        "notebook": os.path.basename(path),
+        "recorded": started.isoformat(timespec="seconds"),
+        "duration": duration,
+        "errors": errors,
+        "cells": cells,
+        "events": events,
+    }
+
+
+PLAYER = r"""<!DOCTYPE html>
+<meta charset="utf-8">
+<title>__TITLE__</title>
+<style>
+:root { --bg:#fff; --fg:#1f1f1f; --muted:#6b6b6b; --input:#f5f5f5; --border:#e0e0e0; --accent:#1a73e8; --run:#f9ab00; }
+@media (prefers-color-scheme: dark) { :root { --bg:#111; --fg:#e6e6e6; --muted:#9a9a9a; --input:#1b1b1b; --border:#333; } }
+body { margin:0; background:var(--bg); color:var(--fg); font:15px/1.5 -apple-system, Segoe UI, Roboto, sans-serif; }
+header { position:sticky; top:0; z-index:2; background:var(--bg); border-bottom:1px solid var(--border); padding:10px 24px; display:flex; gap:14px; align-items:center; flex-wrap:wrap; }
+header h1 { font-size:15px; margin:0 12px 0 0; font-weight:600; }
+header .meta { color:var(--muted); font-size:13px; }
+button, select { font:inherit; font-size:13px; padding:4px 10px; border:1px solid var(--border); border-radius:6px; background:var(--input); color:var(--fg); cursor:pointer; }
+button.primary { background:var(--accent); color:#fff; border-color:var(--accent); min-width:72px; }
+input[type=range] { flex:1; min-width:160px; }
+label { color:var(--muted); font-size:13px; display:flex; gap:6px; align-items:center; }
+main { max-width: 980px; margin: 0 auto; padding: 16px 24px 60vh; }
+.cell { display:grid; grid-template-columns: 64px 1fr; gap: 0 8px; margin: 10px 0; }
+.cell .prompt { color:var(--muted); font:13px/1.5 ui-monospace, SFMono-Regular, Menlo, monospace; text-align:right; padding-top:6px; white-space:pre; }
+.cell.running .prompt { color:var(--run); }
+.cell.running .input { border-left: 3px solid var(--run); }
+.cell .input { background:var(--input); border:1px solid var(--border); border-radius:6px; padding:6px 10px; }
+.cell.markdown .body { padding: 0 10px; }
+.cell.markdown .body h1 { font-size:26px; } .cell.markdown .body h2 { font-size:21px; } .cell.markdown .body h3 { font-size:17px; }
+pre { margin:0; font:13px/1.45 ui-monospace, SFMono-Regular, Menlo, monospace; white-space:pre-wrap; word-break:break-word; }
+.cell.markdown pre, .outputs pre.display { background:var(--input); padding:8px 10px; border-radius:6px; }
+.outputs { grid-column: 2; margin-top: 4px; }
+.outputs > * { padding: 4px 10px; }
+.outputs pre.stderr { background: #fff3f0; color:#8a1c0c; } @media (prefers-color-scheme: dark) { .outputs pre.stderr { background:#3a1b16; color:#ffb4a4; } }
+.outputs pre.error { background: #fdecea; color:#b3261e; } @media (prefers-color-scheme: dark) { .outputs pre.error { background:#3a1b16; color:#ffb4a4; } }
+.outputs .display { }
+code { font-family: ui-monospace, SFMono-Regular, Menlo, monospace; font-size: 0.92em; }
+.cell.markdown code, .outputs code { background:var(--input); padding:1px 4px; border-radius:4px; }
+__PYGMENTS__
+</style>
+<header>
+  <h1>__TITLE__</h1>
+  <button class="primary" id="play">Play</button>
+  <label>speed <select id="speed"><option>1</option><option>2</option><option selected>4</option><option>8</option><option>16</option></select>×</label>
+  <label>cap gaps at <select id="gap"><option value="0.5">0.5 s</option><option value="2" selected>2 s</option><option value="5">5 s</option><option value="1e9">no cap</option></select></label>
+  <input type="range" id="seek" min="0" max="1000" value="0">
+  <span class="meta" id="time"></span>
+  <label><input type="checkbox" id="follow" checked> follow</label>
+  <span class="meta">recorded __RECORDED__ · real duration __DURATION__</span>
+</header>
+<main id="main"></main>
+<script id="recording" type="application/json">__RECORDING__</script>
+<script>
+const rec = JSON.parse(document.getElementById('recording').textContent);
+const main = document.getElementById('main');
+const cells = rec.cells.map((c, i) => {
+  const el = document.createElement('div');
+  el.className = 'cell ' + c.type; el.id = 'cell-' + i;
+  if (c.type === 'code') {
+    el.innerHTML = '<div class="prompt">[ ]:</div><div class="input"><pre class="highlight">' + c.html + '</pre></div><div class="outputs"></div>';
+  } else {
+    el.innerHTML = '<div class="prompt"></div><div class="body">' + c.html + '</div>';
+  }
+  main.appendChild(el);
+  return el;
+});
+// Effective timeline: real gaps between events, each capped.
+let eff = [];
+function buildTimeline() {
+  const cap = parseFloat(document.getElementById('gap').value);
+  eff = []; let acc = 0, prev = 0;
+  for (const e of rec.events) { acc += Math.min(Math.max(e.t - prev, 0), cap); prev = e.t; eff.push(acc); }
+}
+function fmt(s) { s = Math.max(0, Math.round(s)); return String(Math.floor(s / 60)).padStart(2, '0') + ':' + String(s % 60).padStart(2, '0'); }
+const counts = {};
+function reset() {
+  for (const el of cells) { el.classList.remove('running'); const o = el.querySelector('.outputs'); if (o) o.innerHTML = ''; const p = el.querySelector('.prompt'); if (p && el.classList.contains('code')) p.textContent = '[ ]:'; }
+}
+function apply(e) {
+  const el = cells[e.cell]; if (!el) return;
+  const out = el.querySelector('.outputs'); const prompt = el.querySelector('.prompt');
+  if (e.type === 'input') { el.classList.add('running'); prompt.textContent = '[*]:'; counts[e.cell] = e.count; }
+  else if (e.type === 'status' && e.state === 'idle') { el.classList.remove('running'); if (counts[e.cell] != null) prompt.textContent = '[' + counts[e.cell] + ']:'; }
+  else if (e.type === 'stream') {
+    let pre = out.lastElementChild;
+    if (!pre || !pre.classList.contains('stream') || !pre.classList.contains(e.name)) { pre = document.createElement('pre'); pre.className = 'stream ' + e.name; out.appendChild(pre); }
+    pre.textContent += e.text;
+  }
+  else if (e.type === 'display') { const d = document.createElement('div'); d.className = 'display'; d.innerHTML = e.html; out.appendChild(d); }
+  else if (e.type === 'error') { const pre = document.createElement('pre'); pre.className = 'error'; pre.textContent = e.text; out.appendChild(pre); }
+  else if (e.type === 'clear') { out.innerHTML = ''; }
+  if (document.getElementById('follow').checked && e.type !== 'status') el.scrollIntoView({ block: 'center', behavior: 'smooth' });
+}
+let pos = 0, clock = 0, playing = false, last = null, raf = null;
+const seek = document.getElementById('seek'), timeEl = document.getElementById('time'), playBtn = document.getElementById('play');
+function total() { return eff.length ? eff[eff.length - 1] : 0; }
+function render() {
+  while (pos < rec.events.length && eff[pos] <= clock) apply(rec.events[pos++]);
+  seek.value = total() ? Math.round(1000 * clock / total()) : 0;
+  const real = pos ? rec.events[pos - 1].t : 0;
+  timeEl.textContent = fmt(clock) + ' / ' + fmt(total()) + ' (real ' + fmt(real) + ')';
+  if (pos >= rec.events.length && playing) { playing = false; playBtn.textContent = 'Replay'; }
+}
+function tick(now) {
+  if (!playing) return;
+  if (last != null) clock += (now - last) / 1000 * parseFloat(document.getElementById('speed').value);
+  last = now; render(); raf = requestAnimationFrame(tick);
+}
+function seekTo(t) { reset(); pos = 0; clock = t; render(); }
+playBtn.onclick = () => {
+  if (pos >= rec.events.length) { seekTo(0); }
+  playing = !playing; playBtn.textContent = playing ? 'Pause' : 'Play'; last = null;
+  if (playing) raf = requestAnimationFrame(tick);
+};
+seek.oninput = () => { seekTo(total() * seek.value / 1000); };
+document.getElementById('gap').onchange = () => { const frac = total() ? clock / total() : 0; buildTimeline(); seekTo(total() * frac); };
+document.addEventListener('keydown', (ev) => { if (ev.code === 'Space' && ev.target.tagName !== 'SELECT') { ev.preventDefault(); playBtn.click(); } });
+buildTimeline(); render();
+</script>
+"""
+
+
+def write_player(recording, path):
+    page = (PLAYER
+            .replace("__TITLE__", html.escape(recording["notebook"]))
+            .replace("__RECORDED__", html.escape(recording["recorded"]))
+            .replace("__DURATION__", f"{int(recording['duration'] // 60)}m{int(recording['duration'] % 60):02d}s")
+            .replace("__PYGMENTS__", HtmlFormatter().get_style_defs(".highlight"))
+            .replace("__RECORDING__", json.dumps(recording).replace("</", "<\\/")))
+    with open(path, "w") as f:
+        f.write(page)
+
+
+def main():
+    parser = argparse.ArgumentParser(description=__doc__.split("\n\n")[0])
+    parser.add_argument("notebook")
+    parser.add_argument("--out", default="/tmp/vxpu-demo")
+    parser.add_argument("--timeout", type=int, default=3600, help="per-cell timeout")
+    parser.add_argument("--kernel", default=None, help="kernel name (default: the notebook's)")
+    parser.add_argument("--stop-on-error", action="store_true",
+                        help="abort at the first failing cell instead of recording it")
+    args = parser.parse_args()
+
+    recording = record(args.notebook, args.timeout, args.kernel,
+                       allow_errors=not args.stop_on_error)
+    os.makedirs(args.out, exist_ok=True)
+    stem = os.path.join(args.out, os.path.splitext(os.path.basename(args.notebook))[0])
+    with open(stem + ".recording.json", "w") as f:
+        json.dump(recording, f)
+    write_player(recording, stem + ".html")
+    print(f"recording: {stem}.recording.json ({len(recording['events'])} events, "
+          f"{recording['duration']:.0f}s real time, {recording['errors']} errors)")
+    print(f"player:    {stem}.html")
+    return 1 if recording["errors"] else 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())
