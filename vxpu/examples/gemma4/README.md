@@ -54,6 +54,20 @@ The first load downloads 62.6 GB into the router's cache and again into
 the executor's RAM; expect 10–20 minutes. Later loads of the same
 artifact are a digest match and take seconds.
 
+## Record a run
+
+`dev/tasks/record-notebook-run` executes the notebook with nbclient and
+writes a replayable, self-contained HTML page (plus the raw timestamped
+events as JSON): cells rendered like a notebook, outputs appearing on
+their real schedule, with speed control and capping of idle gaps so a
+ten-minute model load takes seconds to watch. A few kilobytes of text
+per run, so it can be hosted anywhere a static file can (#195).
+
+```sh
+.venv/bin/python dev/tasks/record-notebook-run examples/gemma4/gemma4-on-vxpu.ipynb --out /tmp/demo
+open /tmp/demo/gemma4-on-vxpu.html
+```
+
 ## What you should see
 
 The committed notebook has no outputs (they are environment-specific
