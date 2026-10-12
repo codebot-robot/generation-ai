@@ -172,6 +172,8 @@ def cpu_compat(exported):
 
     histc(int) has no CPU kernel; for integer inputs counted over
     [0, bins) it is exactly bincount (sliced to bins, cast back).
+    Graphs from the forked transformers count in float off the GPU and
+    need no rewrite; this remains for artifacts exported before that.
     """
     graph = exported.graph_module.graph
     replaced = 0
@@ -179,6 +181,9 @@ def cpu_compat(exported):
         if (node.op == "call_function"
                 and str(node.target) == "aten.histc.default"):
             x, bins = node.args[0], node.args[1]
+            val = x.meta.get("val") if hasattr(x, "meta") else None
+            if val is not None and val.is_floating_point():
+                continue  # float histc has a CPU kernel; leave the graph alone
             with graph.inserting_before(node):
                 flat = graph.call_function(
                     torch.ops.aten.reshape.default, (x, [-1]))
@@ -225,6 +230,15 @@ def load_program(graph_path, tensors, device):
     exported = torch.export.load(graph_path)
 
     def place(fqn, tensor):
+        # The checkpoint's dtype may differ from the graph's parameter
+        # dtype (Qwen stores fp8 block scales as bf16; transformers'
+        # fp8 modules declare float32). Cast as from_pretrained would.
+        expected = exported.state_dict.get(fqn, exported.constants.get(fqn))
+        if (isinstance(expected, torch.Tensor)
+                and expected.dtype != tensor.dtype
+                and expected.is_floating_point()
+                and tensor.is_floating_point()):
+            tensor = tensor.to(expected.dtype)
         if fqn in exported.state_dict:
             exported.state_dict[fqn] = torch.nn.Parameter(
                 tensor, requires_grad=False)

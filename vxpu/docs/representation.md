@@ -82,6 +82,26 @@ does, and it keeps the tree.
 - **Version coupling.** A .pt2 pins the exporting torch version (the
   format promises newer-loads-older; same-version is what we test).
 
+## Fixing libraries instead of working around them
+
+Whether a blocker is "a pt2 limitation" or "a transformers limitation"
+is academic except for one thing: where the fix goes. The format is hard
+to change; a library is not. So when a library stands between a model
+and a faithful export, we carry a small, upstreamable patch in a fork
+under `third_party/` (a git submodule branched from the pinned release)
+rather than reimplement the module in vXPU.
+
+The first case: transformers' fp8 modules (`FP8Linear`, `FP8Experts`)
+had no computation at all off the GPU, only dispatch to CUDA kernels, so
+on a GPU-less machine there was no fp8 graph to capture and the first
+vXPU artifact used fp8 modules of our own. The fork adds a plain-aten
+reference path (dequantize the block, matmul; grouped and batched
+variants for the experts), after which transformers' own modules export
+weightlessly, match the dequantized reference exactly, and run an fp8
+checkpoint on a CPU without `dequantize=True`. vXPU's fp8 modules were
+deleted. The exported graph is now transformers' computation, with its
+own routing (`grouped_mm` for prefill, `batched_mm` for decode).
+
 ## Where we deviated, and the correction
 
 The first MoE fp8 artifact ran prefill *densely* (every expert on every
@@ -97,9 +117,11 @@ one grouped matmul per projection. Compute is proportional to tokens
 times top-k, and the result matches transformers' eager MoE exactly on
 a small model.
 
-The remaining executor-side rewrite (`histc` to `bincount` on CPU) is
-the kind of convenience requirement 2 says we should not rely on; it
-stays only because it is exact and cheap, and it is documented as such.
+The executor-side rewrite of integer `histc` to `bincount` on the CPU
+is the kind of convenience requirement 2 says we should not rely on. The
+fork fixes its cause (the grouped experts now count in float off the
+GPU, meta included), so new artifacts do not need it and the rewrite
+no longer touches them; it stays for artifacts exported before that.
 
 ## Decision
 

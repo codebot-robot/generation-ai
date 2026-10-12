@@ -1,0 +1,5 @@
+[submodule "vxpu/third_party/transformers"]
+	path = vxpu/third_party/transformers
+	url = https://github.com/justinsb/transformers.git
+	branch = vxpu/v5.14.1
+	shallow = true

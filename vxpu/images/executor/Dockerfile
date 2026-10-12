@@ -26,9 +26,12 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
 # ExportedPrograms promise newer-loads-older, but same-version is the
 # tested configuration. The default Linux wheels include CUDA, so one
 # image serves CPU and GPU nodes.
+# transformers comes from the fork under third_party/ (a submodule), so the
+# executor runs the same code the exporter traced; see docs/representation.md.
+COPY third_party/transformers/ /src/transformers/
 RUN pip install --no-cache-dir \
     torch==2.13.0 \
-    transformers==5.14.1 \
+    /src/transformers \
     grpcio \
     "protobuf>=6.30" \
     requests \

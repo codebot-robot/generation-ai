@@ -12,158 +12,30 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""Block-scaled FP8 checkpoints (``quant_method: fp8``) as aten-only graphs.
+"""Model-maker fp8 checkpoints (``quant_method: fp8``) in the exported graph.
 
-Model makers ship checkpoints whose linear weights are ``float8_e4m3fn``
-with one scale per ``block_size`` (typically 128x128) block
-(``<name>.weight`` + ``<name>.weight_scale_inv``; the scales are float32
-or, in Qwen's releases, bf16 — they are bound as stored). transformers runs them
-through GPU-only kernels; here the same tensors are consumed by plain
-aten ops so the graph exports on the meta device and runs wherever
-torch runs: the weight is dequantized block-wise *during* the matmul,
-never materialized in full up front.
+transformers already has the modules for these checkpoints (``FP8Linear``,
+``FP8Experts`` in ``integrations/finegrained_fp8.py``), and its loader
+installs them in ``from_pretrained``. Two things stood between them and a
+weightless export on a GPU-less machine, and both are fixed in the
+transformers fork under ``third_party/transformers`` rather than here:
 
-Two module replacements, applied on the meta model before export:
+* their forward dispatched only to CUDA kernels (DeepGEMM, a Triton
+  kernel from the Hub), so off the GPU there was no computation to
+  trace; the fork adds a plain-aten reference path (dequantize the
+  block, matmul) used on CPU, MPS and the meta device;
+* the grouped experts counted tokens with an integer ``histc`` off the
+  CPU, which has no CPU kernel; the fork counts in float off the GPU.
 
-* ``FP8Linear`` — ``nn.Linear`` whose parameters are the checkpoint's
-  ``weight`` (fp8) and ``weight_scale_inv``; forward dequantizes and
-  calls ``F.linear``.
-* ``FP8Experts`` — a mixture-of-experts expert bank whose stacked
-  parameters hold every expert's fp8 weights and scales. The checkpoint
-  stores experts one by one (``experts.<i>.gate_proj.weight`` ...); the
-  binding's ``stacked`` category tells the executor how to assemble
-  them. Decode gathers only the selected experts' blocks and
-  dequantizes those; prefill dequantizes the layer's experts once and
-  runs a grouped matmul over the routed (token, expert) pairs — the
-  routing is the same sparse computation transformers performs.
+What remains in vxpu is bookkeeping: install the modules on the meta
+model the way the loader would (``apply_fp8``), choose the experts
+implementation per graph (``grouped_mm`` for prefill, ``batched_mm`` for
+decode: both static-shape and the same routing computation transformers
+runs), and tell the executor how to assemble a stacked expert parameter
+from the checkpoint's per-expert tensors (``stacked_sources``).
 """
 
 import re
-
-import torch
-import torch.nn as nn
-import torch.nn.functional as F
-
-FP8 = torch.float8_e4m3fn
-
-
-def dequantize_block(weight, scale_inv, block_size, dtype=torch.bfloat16):
-    """fp8 [.., N, K] with scales [.., N/bn, K/bk] -> dtype [.., N, K]."""
-    bn, bk = block_size
-    *lead, n, k = weight.shape
-    w = weight.to(dtype).reshape(*lead, n // bn, bn, k // bk, bk)
-    s = scale_inv.to(dtype).reshape(*lead, n // bn, 1, k // bk, 1)
-    return (w * s).reshape(*lead, n, k)
-
-
-class FP8Linear(nn.Module):
-    """``F.linear`` over a block-scaled fp8 weight (checkpoint names)."""
-
-    def __init__(self, in_features, out_features, block_size, bias=False,
-                 scale_dtype=torch.float32):
-        super().__init__()
-        bn, bk = block_size
-        self.in_features, self.out_features = in_features, out_features
-        self.block_size = tuple(block_size)
-        self.weight = nn.Parameter(
-            torch.empty(out_features, in_features, dtype=FP8), requires_grad=False)
-        self.weight_scale_inv = nn.Parameter(
-            torch.empty((out_features + bn - 1) // bn, (in_features + bk - 1) // bk,
-                        dtype=scale_dtype), requires_grad=False)
-        self.bias = nn.Parameter(torch.empty(out_features), requires_grad=False) if bias else None
-
-    def forward(self, x):
-        w = dequantize_block(self.weight, self.weight_scale_inv, self.block_size, x.dtype)
-        return F.linear(x, w, self.bias)
-
-
-class FP8Experts(nn.Module):
-    """Expert bank for gated MLP experts (gate/up/down), fp8 block-scaled.
-
-    Parameters (stacked over experts, assembled by the executor):
-      gate_up_proj            fp8  [E, 2*I, H]   rows: gate then up
-      gate_up_proj_scale_inv  f32|bf16 [E, 2*I/bn, H/bk]
-      down_proj               fp8  [E, H, I]
-      down_proj_scale_inv     f32|bf16 [E, H/bn, I/bk]
-
-    ``mode`` is fixed at export time: "decode" gathers the selected
-    experts' blocks per token (few pairs, few experts touched); "prefill"
-    dequantizes each expert once and runs a grouped matmul over the
-    routed (token, expert) pairs, so compute stays proportional to
-    tokens * top_k whatever the prompt length.
-    """
-
-    def __init__(self, num_experts, hidden_dim, intermediate_dim, block_size, act_fn,
-                 scale_dtype=torch.float32):
-        super().__init__()
-        bn, bk = block_size
-        self.num_experts, self.hidden_dim, self.intermediate_dim = num_experts, hidden_dim, intermediate_dim
-        self.block_size = tuple(block_size)
-        self.act_fn = act_fn
-        self.mode = "decode"
-        e, h, i = num_experts, hidden_dim, intermediate_dim
-        self.gate_up_proj = nn.Parameter(torch.empty(e, 2 * i, h, dtype=FP8), requires_grad=False)
-        self.gate_up_proj_scale_inv = nn.Parameter(
-            torch.empty(e, (2 * i + bn - 1) // bn, (h + bk - 1) // bk, dtype=scale_dtype), requires_grad=False)
-        self.down_proj = nn.Parameter(torch.empty(e, h, i, dtype=FP8), requires_grad=False)
-        self.down_proj_scale_inv = nn.Parameter(
-            torch.empty(e, (h + bn - 1) // bn, (i + bk - 1) // bk, dtype=scale_dtype), requires_grad=False)
-
-    def forward(self, hidden_states, top_k_index, top_k_weights):
-        if self.mode == "prefill":
-            return self._grouped(hidden_states, top_k_index, top_k_weights)
-        return self._gather(hidden_states, top_k_index, top_k_weights)
-
-    def _gather(self, x, top_k_index, top_k_weights):
-        """Selected experts only: S = tokens * top_k (expert, token) pairs."""
-        t, k = top_k_index.shape
-        idx = top_k_index.reshape(-1)                                   # [S]
-        xs = x.repeat_interleave(k, dim=0)                              # [S, H]
-        w1 = dequantize_block(self.gate_up_proj[idx], self.gate_up_proj_scale_inv[idx],
-                              self.block_size, x.dtype)                 # [S, 2I, H]
-        gate, up = torch.bmm(w1, xs.unsqueeze(-1)).squeeze(-1).chunk(2, dim=-1)
-        h = self.act_fn(gate) * up                                      # [S, I]
-        w2 = dequantize_block(self.down_proj[idx], self.down_proj_scale_inv[idx],
-                              self.block_size, x.dtype)                 # [S, H, I]
-        out = torch.bmm(w2, h.unsqueeze(-1)).squeeze(-1)                # [S, H]
-        out = out * top_k_weights.reshape(-1, 1).to(out.dtype)
-        return out.reshape(t, k, -1).sum(dim=1)
-
-    def _grouped(self, x, top_k_index, top_k_weights):
-        """Routed pairs sorted by expert; one grouped matmul per projection.
-
-        The same formulation transformers uses for its grouped_mm experts:
-        S = tokens * top_k pairs are sorted by expert, a cumulative count
-        per expert gives the group boundaries, and ``grouped_mm`` runs
-        each expert on exactly its tokens. Shapes are static (S, E); the
-        variable group sizes live inside the op. Each expert's weight is
-        dequantized once per call, so prefill reads the bank once.
-        """
-        t, k = top_k_index.shape
-        e = self.num_experts
-        expert_ids = top_k_index.reshape(-1)                            # [S]
-        expert_ids_g, perm = torch.sort(expert_ids)
-        xs = x[perm // k]                                               # [S, H]
-        weights_g = top_k_weights.reshape(-1)[perm].unsqueeze(-1)       # [S, 1]
-        counts = torch.zeros(e, dtype=torch.int64, device=x.device).scatter_add(
-            0, expert_ids_g, torch.ones_like(expert_ids_g))
-        offs = counts.cumsum(0, dtype=torch.int32)                      # [E]
-        w1 = dequantize_block(self.gate_up_proj, self.gate_up_proj_scale_inv,
-                              self.block_size, x.dtype)                 # [E, 2I, H]
-        gate, up = _grouped_mm(xs, w1.transpose(-2, -1), offs).chunk(2, dim=-1)
-        h = self.act_fn(gate) * up                                      # [S, I]
-        w2 = dequantize_block(self.down_proj, self.down_proj_scale_inv,
-                              self.block_size, x.dtype)                 # [E, H, I]
-        out = _grouped_mm(h, w2.transpose(-2, -1), offs) * weights_g.to(x.dtype)
-        return torch.zeros(t, x.shape[-1], dtype=x.dtype, device=x.device).index_add(
-            0, perm // k, out)
-
-
-def _grouped_mm(a, b, offs):
-    """(S, K) @ (E, K, N) with rows grouped by ``offs`` -> (S, N)."""
-    if hasattr(F, "grouped_mm"):
-        return F.grouped_mm(a, b, offs=offs)
-    return torch._grouped_mm(a, b, offs=offs)
 
 
 def fp8_config(config):
@@ -178,54 +50,39 @@ def fp8_config(config):
             "modules_to_not_convert": set(qc.get("modules_to_not_convert") or [])}
 
 
-def apply_fp8(model, config, scale_dtype=torch.float32):
-    """Swap Linear/expert modules of a meta model for their fp8 forms.
+def apply_fp8(model, config):
+    """Install transformers' fp8 modules on a (meta) model, as its loader does.
 
-    Mirrors transformers' replacement rules: every ``nn.Linear`` not in
-    ``modules_to_not_convert`` (nor ``lm_head``) becomes ``FP8Linear``;
-    an expert bank (a module with stacked ``gate_up_proj``/``down_proj``
-    parameters) becomes ``FP8Experts``. ``scale_dtype`` is the dtype the
-    checkpoint stores ``weight_scale_inv`` in (bf16 in Qwen's exports,
-    float32 in others); the graph binds those tensors as they are.
-    Returns the count of swaps.
+    Returns the number of modules replaced (0 for a non-fp8 checkpoint).
     """
+    from transformers import FineGrainedFP8Config
+    from transformers.integrations import finegrained_fp8
+    from transformers.integrations.finegrained_fp8 import (
+        FP8Experts, FP8Linear, replace_with_fp8_linear)
+
     settings = fp8_config(config)
     if settings is None:
         return 0
-    block, skip = settings["block_size"], settings["modules_to_not_convert"]
-    swapped = 0
-    for name, module in list(model.named_modules()):
-        for child_name, child in list(module.named_children()):
-            fqn = f"{name}.{child_name}" if name else child_name
-            if fqn in skip or any(fqn.endswith("." + s) or fqn == s for s in skip) or child_name == "lm_head":
-                continue
-            if isinstance(child, nn.Linear):
-                new = FP8Linear(child.in_features, child.out_features, block,
-                                bias=child.bias is not None, scale_dtype=scale_dtype)
-            elif (hasattr(child, "gate_up_proj") and hasattr(child, "down_proj")
-                  and isinstance(getattr(child, "gate_up_proj"), nn.Parameter)):
-                e, two_i, h = child.gate_up_proj.shape
-                new = FP8Experts(e, h, two_i // 2, block, child.act_fn, scale_dtype=scale_dtype)
-            else:
-                continue
-            setattr(module, child_name, new)
-            swapped += 1
-    return swapped
+    if not hasattr(finegrained_fp8, "_reference_fp8_linear"):
+        raise RuntimeError(
+            "this transformers has no off-GPU fp8 path, so an fp8 checkpoint "
+            "cannot be exported on the meta device; install the fork: "
+            "pip install -e third_party/transformers (see docs/representation.md)")
+    qc = config.quantization_config
+    qc = FineGrainedFP8Config.from_dict(qc) if isinstance(qc, dict) else qc
+    before = sum(isinstance(m, (FP8Linear, FP8Experts)) for m in model.modules())
+    replace_with_fp8_linear(
+        model, modules_to_not_convert=sorted(settings["modules_to_not_convert"]),
+        quantization_config=qc)
+    return sum(isinstance(m, (FP8Linear, FP8Experts)) for m in model.modules()) - before
 
 
-def scale_dtype_of(manifest_tensors):
-    """The dtype the checkpoint stores its fp8 block scales in."""
-    for name, ref in manifest_tensors.items():
-        if name.endswith("_scale_inv"):
-            return {"F32": torch.float32, "BF16": torch.bfloat16,
-                    "F16": torch.float16}[ref["dtype"]]
-    return torch.float32
-
-
-def set_experts_mode(model, mode):
-    for m in model.modules():
-        if isinstance(m, FP8Experts):
-            m.mode = mode
+def set_experts_implementation(model, name):
+    """Select transformers' experts implementation for the next export."""
+    config = model.config
+    config._experts_implementation = name
+    text = config.get_text_config() if hasattr(config, "get_text_config") else config
+    text._experts_implementation = name
 
 
 EXPERTS_PARAM = re.compile(r"^(?P<prefix>.*\.experts)\.(?P<which>gate_up_proj|down_proj)(?P<scale>_scale_inv)?$")

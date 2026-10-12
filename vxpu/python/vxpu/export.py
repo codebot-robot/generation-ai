@@ -49,7 +49,7 @@ from transformers.integrations.executorch import (
     TorchExportableModuleForDecoderOnlyLM,
 )
 
-from .fp8 import (apply_fp8, fp8_config, scale_dtype_of, set_experts_mode,
+from .fp8 import (apply_fp8, fp8_config, set_experts_implementation,
                   stacked_sources)
 from .manifest import build_manifest
 
@@ -146,22 +146,26 @@ def export_artifact(repo_id, out_dir, max_cache_len=1024, revision="main"):
     quantization = fp8_config(config)
     with torch.device("meta"):
         model = AutoModelForCausalLM.from_config(config).eval()
-        # A model-maker fp8 checkpoint: the graph consumes its fp8
-        # weights and block scales directly (see fp8.py).
-        swapped = (apply_fp8(model, config, scale_dtype_of(manifest["tensors"]))
-                   if quantization else 0)
+        # A model-maker fp8 checkpoint: transformers' own fp8 modules,
+        # whose graph consumes the fp8 weights and block scales directly
+        # (see fp8.py and third_party/transformers).
+        swapped = apply_fp8(model, config) if quantization else 0
         model.generation_config.cache_implementation = "static"
         exportable = TorchExportableModuleForDecoderOnlyLM(
             model, batch_size=1, max_cache_len=max_cache_len)
 
         seq = torch.export.Dim("seq", min=1, max=max_cache_len)
-        set_experts_mode(model, "prefill")
+        # Experts: grouped_mm for prefill (routed pairs sorted by expert,
+        # one grouped matmul per projection), batched_mm for decode (one
+        # gathered block per pair). Both are static-shape; both are the
+        # sparse routing transformers runs eagerly.
+        set_experts_implementation(model, "grouped_mm")
         prefill = exportable.export(
             input_ids=torch.zeros(1, 8, dtype=torch.long),
             cache_position=torch.arange(8),
             dynamic_shapes={"input_ids": {1: seq},
                             "cache_position": {0: seq}})
-        set_experts_mode(model, "decode")
+        set_experts_implementation(model, "batched_mm")
         decode = exportable.export(
             input_ids=torch.zeros(1, 1, dtype=torch.long),
             cache_position=torch.zeros(1, dtype=torch.long))
