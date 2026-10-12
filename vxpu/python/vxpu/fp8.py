@@ -34,7 +34,8 @@ Two module replacements, applied on the meta model before export:
   binding's ``stacked`` category tells the executor how to assemble
   them. Decode gathers only the selected experts' blocks and
   dequantizes those; prefill dequantizes the layer's experts once and
-  runs them densely, so its cost is bounded whatever the prompt length.
+  runs a grouped matmul over the routed (token, expert) pairs — the
+  routing is the same sparse computation transformers performs.
 """
 
 import re
@@ -86,8 +87,10 @@ class FP8Experts(nn.Module):
       down_proj_scale_inv     f32|bf16 [E, H/bn, I/bk]
 
     ``mode`` is fixed at export time: "decode" gathers the selected
-    experts per token; "prefill" dequantizes all experts once and
-    evaluates every expert for every token, masking by routing weight.
+    experts' blocks per token (few pairs, few experts touched); "prefill"
+    dequantizes each expert once and runs a grouped matmul over the
+    routed (token, expert) pairs, so compute stays proportional to
+    tokens * top_k whatever the prompt length.
     """
 
     def __init__(self, num_experts, hidden_dim, intermediate_dim, block_size, act_fn,
@@ -108,7 +111,7 @@ class FP8Experts(nn.Module):
 
     def forward(self, hidden_states, top_k_index, top_k_weights):
         if self.mode == "prefill":
-            return self._dense(hidden_states, top_k_index, top_k_weights)
+            return self._grouped(hidden_states, top_k_index, top_k_weights)
         return self._gather(hidden_states, top_k_index, top_k_weights)
 
     def _gather(self, x, top_k_index, top_k_weights):
@@ -126,18 +129,41 @@ class FP8Experts(nn.Module):
         out = out * top_k_weights.reshape(-1, 1).to(out.dtype)
         return out.reshape(t, k, -1).sum(dim=1)
 
-    def _dense(self, x, top_k_index, top_k_weights):
-        """Every expert for every token; routing weights as a dense mask."""
-        t = x.shape[0]
-        w1 = dequantize_block(self.gate_up_proj, self.gate_up_proj_scale_inv, self.block_size, x.dtype)
-        gu = torch.matmul(w1, x.t())                                    # [E, 2I, T]
-        gate, up = gu.chunk(2, dim=1)
-        h = self.act_fn(gate) * up                                      # [E, I, T]
-        w2 = dequantize_block(self.down_proj, self.down_proj_scale_inv, self.block_size, x.dtype)
-        y = torch.matmul(w2, h)                                         # [E, H, T]
-        dense = torch.zeros(t, self.num_experts, dtype=x.dtype, device=x.device)
-        dense = dense.scatter_add(1, top_k_index, top_k_weights.to(x.dtype))  # [T, E]
-        return torch.einsum("eht,te->th", y, dense)
+    def _grouped(self, x, top_k_index, top_k_weights):
+        """Routed pairs sorted by expert; one grouped matmul per projection.
+
+        The same formulation transformers uses for its grouped_mm experts:
+        S = tokens * top_k pairs are sorted by expert, a cumulative count
+        per expert gives the group boundaries, and ``grouped_mm`` runs
+        each expert on exactly its tokens. Shapes are static (S, E); the
+        variable group sizes live inside the op. Each expert's weight is
+        dequantized once per call, so prefill reads the bank once.
+        """
+        t, k = top_k_index.shape
+        e = self.num_experts
+        expert_ids = top_k_index.reshape(-1)                            # [S]
+        expert_ids_g, perm = torch.sort(expert_ids)
+        xs = x[perm // k]                                               # [S, H]
+        weights_g = top_k_weights.reshape(-1)[perm].unsqueeze(-1)       # [S, 1]
+        counts = torch.zeros(e, dtype=torch.int64, device=x.device).scatter_add(
+            0, expert_ids_g, torch.ones_like(expert_ids_g))
+        offs = counts.cumsum(0, dtype=torch.int32)                      # [E]
+        w1 = dequantize_block(self.gate_up_proj, self.gate_up_proj_scale_inv,
+                              self.block_size, x.dtype)                 # [E, 2I, H]
+        gate, up = _grouped_mm(xs, w1.transpose(-2, -1), offs).chunk(2, dim=-1)
+        h = self.act_fn(gate) * up                                      # [S, I]
+        w2 = dequantize_block(self.down_proj, self.down_proj_scale_inv,
+                              self.block_size, x.dtype)                 # [E, H, I]
+        out = _grouped_mm(h, w2.transpose(-2, -1), offs) * weights_g.to(x.dtype)
+        return torch.zeros(t, x.shape[-1], dtype=x.dtype, device=x.device).index_add(
+            0, perm // k, out)
+
+
+def _grouped_mm(a, b, offs):
+    """(S, K) @ (E, K, N) with rows grouped by ``offs`` -> (S, N)."""
+    if hasattr(F, "grouped_mm"):
+        return F.grouped_mm(a, b, offs=offs)
+    return torch._grouped_mm(a, b, offs=offs)
 
 
 def fp8_config(config):

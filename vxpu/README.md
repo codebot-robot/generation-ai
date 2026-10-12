@@ -90,8 +90,9 @@ plus one scale per 128x128 block, bf16 activations) exports to a graph
 that consumes those tensors directly: every quantized `nn.Linear` becomes
 an aten-only block-dequantize-then-matmul, and a mixture-of-experts bank
 becomes a `stacked` binding assembled on the executor from the
-checkpoint's per-expert tensors (decode gathers only the routed experts;
-prefill runs all experts densely). Weights stay fp8 in memory and are
+checkpoint's per-expert tensors (decode gathers only the routed experts'
+blocks; prefill is the same grouped-matmul routing transformers uses,
+so compute stays proportional to tokens × top-k). Weights stay fp8 in memory and are
 dequantized during compute, so the executor needs the checkpoint's size,
 not the bf16 size, and the same artifact runs on a CPU node or a GPU.
 Nothing is re-quantized: the user's `from_pretrained(repo)` is the
@@ -237,9 +238,13 @@ clients.
   through `vxpu.AutoModelForCausalLM` is token-for-token identical to
   transformers loading the same checkpoint with
   `FineGrainedFP8Config(dequantize=True)` on the same node class. Speed
-  on the CPU is dominated by the fp8→bf16 cast (~3 GB/s): ~20 s prefill
-  (dense experts) and ~1.85 s/token decode, against ~170 ms/token for
-  the dequantized-up-front bf16 reference, which needs twice the memory.
+  on the CPU is dominated by the fp8→bf16 cast: prefill dequantizes
+  every expert once (~21 s for 13 tokens, ~24 s for 474, grouped
+  matmul over the routed pairs; the earlier dense formulation took
+  41 s at 474) and decode is ~1.7–1.9 s/token, against ~170 ms/token
+  for the dequantized-up-front bf16 reference, which needs twice the
+  memory. See [docs/representation.md](docs/representation.md) for why
+  the graph must carry the sparse routing rather than a dense stand-in.
 
 ## Status and roadmap
 
