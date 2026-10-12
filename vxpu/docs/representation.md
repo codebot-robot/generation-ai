@@ -63,7 +63,14 @@ does, and it keeps the tree.
   This is the "recognize known layers, run unknown ones as a graph"
   hybrid, already present in the format.
 - **A compiler input.** The exported graph is what inductor consumes,
-  so engine-side fusion is `torch.compile` of the loaded program.
+  so engine-side fusion is `torch.compile` of the loaded program. This
+  is what makes reference semantics affordable: the fp8 linear in the
+  graph is cast, scale, matmul, which read alone is 2x slower than bf16
+  on an L4; with inductor's prologue fusion the executor folds the
+  dequantization into the GEMM's operand load and the same graph runs
+  at the fp8 bandwidth floor, faster than bf16 and 3x faster than
+  transformers' own fp8 kernel path on that GPU. The artifact never
+  changed; the executor's compiler settings did.
 - **Training.** The unflattened module is an ordinary module of aten ops
   and runs under autograd; export also has a training IR. Plausible,
   not yet exercised here.

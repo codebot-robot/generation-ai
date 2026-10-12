@@ -50,15 +50,30 @@ def fp8_config(config):
             "modules_to_not_convert": set(qc.get("modules_to_not_convert") or [])}
 
 
-def apply_fp8(model, config):
+def _lookup(manifest_tensors, fqn):
+    """Find a checkpoint tensor for a module path, peeling wrapper prefixes."""
+    parts = fqn.split(".")
+    for i in range(len(parts)):
+        if ".".join(parts[i:]) in manifest_tensors:
+            return True
+    return False
+
+
+def apply_fp8(model, config, manifest_tensors=None):
     """Install transformers' fp8 modules on a (meta) model, as its loader does.
 
+    Runs the same HfQuantizer preprocessing ``from_pretrained`` runs. The
+    loader additionally lets the *checkpoint* decide: a linear whose
+    weight has no ``weight_scale_inv`` beside it (Qwen's bf16 lm_head,
+    with an empty ``modules_to_not_convert``) stays a plain linear. Given
+    the manifest, the same rule is applied here before the swap.
     Returns the number of modules replaced (0 for a non-fp8 checkpoint).
     """
+    import torch.nn as nn
     from transformers import FineGrainedFP8Config
     from transformers.integrations import finegrained_fp8
-    from transformers.integrations.finegrained_fp8 import (
-        FP8Experts, FP8Linear, replace_with_fp8_linear)
+    from transformers.integrations.finegrained_fp8 import FP8Experts, FP8Linear
+    from transformers.quantizers import AutoHfQuantizer
 
     settings = fp8_config(config)
     if settings is None:
@@ -70,10 +85,22 @@ def apply_fp8(model, config):
             "pip install -e third_party/transformers (see docs/representation.md)")
     qc = config.quantization_config
     qc = FineGrainedFP8Config.from_dict(qc) if isinstance(qc, dict) else qc
+    skip = list(qc.modules_to_not_convert or [])
+    if manifest_tensors:
+        for fqn, mod in model.named_modules():
+            if isinstance(mod, nn.Linear):
+                probe = fqn
+            elif isinstance(getattr(mod, "gate_up_proj", None), nn.Parameter):
+                probe = f"{fqn}.0.gate_proj"  # the checkpoint stores experts one by one
+            else:
+                continue
+            if (_lookup(manifest_tensors, probe + ".weight")
+                    and not _lookup(manifest_tensors, probe + ".weight_scale_inv")):
+                skip.append(fqn)
+    qc.modules_to_not_convert = sorted(set(skip))
     before = sum(isinstance(m, (FP8Linear, FP8Experts)) for m in model.modules())
-    replace_with_fp8_linear(
-        model, modules_to_not_convert=sorted(settings["modules_to_not_convert"]),
-        quantization_config=qc)
+    quantizer = AutoHfQuantizer.from_config(qc, pre_quantized=True)
+    quantizer.preprocess_model(model, config=config)
     return sum(isinstance(m, (FP8Linear, FP8Experts)) for m in model.modules()) - before
 
 

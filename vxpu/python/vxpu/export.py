@@ -149,7 +149,8 @@ def export_artifact(repo_id, out_dir, max_cache_len=1024, revision="main"):
         # A model-maker fp8 checkpoint: transformers' own fp8 modules,
         # whose graph consumes the fp8 weights and block scales directly
         # (see fp8.py and third_party/transformers).
-        swapped = apply_fp8(model, config) if quantization else 0
+        swapped = (apply_fp8(model, config, manifest["tensors"])
+                   if quantization else 0)
         model.generation_config.cache_implementation = "static"
         exportable = TorchExportableModuleForDecoderOnlyLM(
             model, batch_size=1, max_cache_len=max_cache_len)
@@ -166,6 +167,11 @@ def export_artifact(repo_id, out_dir, max_cache_len=1024, revision="main"):
             dynamic_shapes={"input_ids": {1: seq},
                             "cache_position": {0: seq}})
         set_experts_implementation(model, "batched_mm")
+        # Linear-attention / conv states branch in Python on whether a
+        # previous state exists; the decode graph is the "yes" branch.
+        set_state_flag = getattr(exportable.model, "set_has_previous_state", None)
+        if set_state_flag is not None:
+            set_state_flag(True)
         decode = exportable.export(
             input_ids=torch.zeros(1, 1, dtype=torch.long),
             cache_position=torch.zeros(1, dtype=torch.long))

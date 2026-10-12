@@ -45,6 +45,27 @@ from .rehydrate import (derived_tensor, fetch_stacked, fetch_tensor,
                         load_program, share_state, strip_asserts)
 
 
+def compile_options(device):
+    """How the executor compiles the decode graph on this device.
+
+    The artifact carries reference semantics (an fp8 linear is cast,
+    scale, matmul); the engine's job is to make that fast here. On CUDA,
+    inductor's prologue fusion folds the dequantization into the GEMM's
+    operand load, so fp8 weights are read once at fp8 width instead of
+    being materialized in bf16 every step: measured on an L4, that takes
+    an 8192x8192 fp8 linear from 2.6x slower than bf16 to 1.9x faster,
+    at the fp8 bandwidth floor. max-autotune is what enables the GEMM
+    templates that fusion needs; it costs compile time once per shape.
+    VXPU_COMPILE_MODE overrides the mode ("default" to skip autotuning).
+    """
+    if not str(device).startswith("cuda"):
+        return {}
+    import torch._inductor.config as inductor_config
+    inductor_config.prologue_fusion = True
+    return {"mode": os.environ.get("VXPU_COMPILE_MODE",
+                                   "max-autotune-no-cudagraphs")}
+
+
 class Engine:
     def __init__(self, artifact_dir, device="cpu", compile_decode=False,
                  cas_dir=None):
@@ -173,7 +194,7 @@ class Engine:
         self._decode_run = self._decode
         if self.compile_decode:
             strip_asserts(self._decode)
-            self._decode_run = torch.compile(self._decode)
+            self._decode_run = torch.compile(self._decode, **compile_options(self.device))
 
     def _bind(self, state):
         """Point both graphs' state buffers at this session's tensors.

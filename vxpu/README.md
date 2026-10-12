@@ -270,6 +270,16 @@ clients.
   experts dequantize the whole bank per step; the decode graph uses the
   `batched_mm` routing, which touches only the routed experts. See
   [docs/representation.md](docs/representation.md).
+- The same fp8 graph on a GPU runs at full speed without a device-specific
+  artifact. Qwen3-8B-FP8 (dense, 9.4 GB) on an L4: the bf16 checkpoint
+  decodes at 67 ms/token in eager transformers and transformers' own fp8
+  kernel path (Hub Triton kernel) at 136 ms/token; the exported graph,
+  compiled plainly, at 132 ms/token; with inductor's prologue fusion
+  enabled by the executor on CUDA (`engine.compile_options`), at
+  **46 ms/token**, the fp8 bandwidth floor. The dequantization is folded
+  into the GEMM's operand load, so fp8 weights are read once at fp8
+  width. The cost is a one-time autotune of about two minutes on first
+  load (`VXPU_COMPILE_MODE=default` skips it).
 
 ## Status and roadmap
 
