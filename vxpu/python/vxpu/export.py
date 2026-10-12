@@ -49,6 +49,8 @@ from transformers.integrations.executorch import (
     TorchExportableModuleForDecoderOnlyLM,
 )
 
+from .fp8 import (apply_fp8, fp8_config, scale_dtype_of, set_experts_mode,
+                  stacked_sources)
 from .manifest import build_manifest
 
 # Buffers computed from config at init time, never stored in
@@ -85,8 +87,13 @@ _upstream_head_shapes = hf_executorch.get_head_shapes
 hf_executorch.get_head_shapes = _head_shapes
 
 
-def classify(exported, manifest):
-    """Classify every tensor the exported program references."""
+def classify(exported, manifest, num_experts=0):
+    """Classify every tensor the exported program references.
+
+    Returns (bound, derived, state, stacked, unbound). ``stacked`` maps a
+    stacked expert parameter to the checkpoint tensors it is assembled
+    from (see fp8.stacked_sources).
+    """
     sig = exported.graph_signature
     # Tied weights collapse to one placeholder in the signature but the
     # state dict keeps both names — classify over the union.
@@ -110,20 +117,24 @@ def classify(exported, manifest):
         (ref for name, ref in manifest["tensors"].items()
          if name.endswith("embed_tokens.weight")), None)
 
-    bound, derived, state, unbound = {}, [], [], []
+    bound, derived, state, stacked, unbound = {}, [], [], {}, []
     for fqn in fqns:
         ref = lookup(fqn)
         if ref is None and fqn.endswith("lm_head.weight"):
             ref = tied_ref  # weight tying: an alias, not a second copy
+        parts = (stacked_sources(fqn, manifest["tensors"], num_experts)
+                 if ref is None and num_experts else None)
         if ref is not None:
             bound[fqn] = ref
+        elif parts is not None:
+            stacked[fqn] = {"parts": parts, "cat_dim": 0}
         elif any(marker in fqn for marker in DERIVED_MARKERS):
             derived.append(fqn)
         elif fqn not in param_fqns:
             state.append(fqn)
         else:
             unbound.append(fqn)
-    return bound, derived, state, unbound
+    return bound, derived, state, stacked, unbound
 
 
 def export_artifact(repo_id, out_dir, max_cache_len=1024, revision="main"):
@@ -132,18 +143,25 @@ def export_artifact(repo_id, out_dir, max_cache_len=1024, revision="main"):
     manifest = build_manifest(repo_id, revision)
     config = AutoConfig.from_pretrained(repo_id, revision=revision)
 
+    quantization = fp8_config(config)
     with torch.device("meta"):
         model = AutoModelForCausalLM.from_config(config).eval()
+        # A model-maker fp8 checkpoint: the graph consumes its fp8
+        # weights and block scales directly (see fp8.py).
+        swapped = (apply_fp8(model, config, scale_dtype_of(manifest["tensors"]))
+                   if quantization else 0)
         model.generation_config.cache_implementation = "static"
         exportable = TorchExportableModuleForDecoderOnlyLM(
             model, batch_size=1, max_cache_len=max_cache_len)
 
         seq = torch.export.Dim("seq", min=1, max=max_cache_len)
+        set_experts_mode(model, "prefill")
         prefill = exportable.export(
             input_ids=torch.zeros(1, 8, dtype=torch.long),
             cache_position=torch.arange(8),
             dynamic_shapes={"input_ids": {1: seq},
                             "cache_position": {0: seq}})
+        set_experts_mode(model, "decode")
         decode = exportable.export(
             input_ids=torch.zeros(1, 1, dtype=torch.long),
             cache_position=torch.zeros(1, dtype=torch.long))
@@ -151,12 +169,21 @@ def export_artifact(repo_id, out_dir, max_cache_len=1024, revision="main"):
     torch.export.save(prefill, os.path.join(out_dir, "prefill.pt2"))
     torch.export.save(decode, os.path.join(out_dir, "decode.pt2"))
 
-    bound, derived, state, unbound = classify(decode, manifest)
+    text_config = (config.get_text_config()
+                   if hasattr(config, "get_text_config") else config)
+    num_experts = getattr(text_config, "num_experts", 0) or 0
+    bound, derived, state, stacked, unbound = classify(
+        decode, manifest, num_experts)
     if unbound:
         raise RuntimeError(
             f"unbound tensors (artifact would be incomplete): {unbound}")
     binding = {"bound": bound, "derived": derived, "state": state,
-               "max_cache_len": max_cache_len}
+               "stacked": stacked, "max_cache_len": max_cache_len}
+    if quantization:
+        binding["quantization"] = {
+            "quant_method": "fp8",
+            "block_size": list(quantization["block_size"]),
+            "fp8_modules": swapped}
 
     with open(os.path.join(out_dir, "manifest.json"), "w") as f:
         json.dump(manifest, f, indent=1, sort_keys=True)
@@ -184,7 +211,10 @@ def main():
           f"{total / 1e9:.2f} GB of weights referenced, not included)")
     print(f"  binding: {len(binding['bound'])} bound, "
           f"{len(binding['derived'])} derived, "
-          f"{len(binding['state'])} state")
+          f"{len(binding['state'])} state, "
+          f"{len(binding['stacked'])} stacked"
+          + (f" (fp8, {binding['quantization']['fp8_modules']} modules)"
+             if binding.get("quantization") else ""))
     return 0
 
 

@@ -41,8 +41,8 @@ import time
 
 import torch
 
-from .rehydrate import (derived_tensor, fetch_tensor, load_program,
-                        share_state, strip_asserts)
+from .rehydrate import (derived_tensor, fetch_stacked, fetch_tensor,
+                        load_program, share_state, strip_asserts)
 
 
 class Engine:
@@ -95,6 +95,13 @@ class Engine:
         for fqn, ref in self.binding["bound"].items():
             tensor, downloaded = fetch_tensor(
                 ref, self.manifest["files"], cas_dir)
+            self.shared[fqn] = tensor.to(device)
+            self.bytes_fetched += downloaded
+        # Stacked parameters (mixture-of-experts banks) are assembled
+        # from the checkpoint's per-expert tensors.
+        for fqn, spec in self.binding.get("stacked", {}).items():
+            tensor, downloaded = fetch_stacked(
+                spec, self.manifest["tensors"], self.manifest["files"], cas_dir)
             self.shared[fqn] = tensor.to(device)
             self.bytes_fetched += downloaded
         for fqn in self.binding["derived"]:

@@ -72,15 +72,30 @@ Three ideas carry the design:
    loads download nothing, and the sha256 of the manifest is the
    model's identity — `LoadModel` with a matching digest is a no-op.
 
-3. **A three-way tensor classification.** Every tensor the graphs
-   reference is `bound` (a weight reference), `derived` (computed from
-   config at load time: RoPE tables via transformers' own formula
-   registry, embedding scales — never stored in checkpoints), or
-   `state` (per-session KV cache, zero-initialized, mutated in place
-   by the graphs). The classification is also the serving
+3. **A tensor classification.** Every tensor the graphs
+   reference is `bound` (a weight reference), `stacked` (a bank of
+   weight references concatenated on the executor, e.g. one MoE
+   expert parameter from 128 per-expert checkpoint tensors), `derived`
+   (computed from config at load time: RoPE tables via transformers'
+   own formula registry, embedding scales — never stored in
+   checkpoints), or `state` (per-session KV cache, zero-initialized,
+   mutated in place by the graphs). The classification is also the serving
    architecture: bound/derived are shared read-only across sessions;
    a session *is* its state tensors. Multi-turn chat prefills only the
    new suffix tokens against the session's existing cache.
+
+**Pre-quantized checkpoints run as published.** A model-maker fp8
+checkpoint (`quant_method: fp8`, e.g. Qwen's `-FP8` releases: fp8 weights
+plus one scale per 128x128 block, bf16 activations) exports to a graph
+that consumes those tensors directly: every quantized `nn.Linear` becomes
+an aten-only block-dequantize-then-matmul, and a mixture-of-experts bank
+becomes a `stacked` binding assembled on the executor from the
+checkpoint's per-expert tensors (decode gathers only the routed experts;
+prefill runs all experts densely). Weights stay fp8 in memory and are
+dequantized during compute, so the executor needs the checkpoint's size,
+not the bf16 size, and the same artifact runs on a CPU node or a GPU.
+Nothing is re-quantized: the user's `from_pretrained(repo)` is the
+model-maker's checkpoint, bit for bit.
 
 **Placement is the router's decision.** The artifact is hardware-
 agnostic, so the router reads the manifest's weight sizes and places
@@ -214,6 +229,18 @@ clients.
   calling, streaming multi-turn) run unchanged from a GPU-less notebook
   against it through `vxpu.AutoModelForCausalLM` (see `examples/gemma4`).
 
+- Qwen3-30B-A3B-Instruct-2507-FP8 (MoE, 128 experts top-8, model-maker
+  fp8 checkpoint, 31.2 GB) exports weightless in about a minute to a
+  65 MB artifact; the router places it as a 40 GB / 15-CPU pod on the
+  c3d node, rehydration takes 163 s (37k tensors, expert banks assembled
+  concurrently), and the executor holds 31.9 GB resident. Greedy output
+  through `vxpu.AutoModelForCausalLM` is token-for-token identical to
+  transformers loading the same checkpoint with
+  `FineGrainedFP8Config(dequantize=True)` on the same node class. Speed
+  on the CPU is dominated by the fp8→bf16 cast (~3 GB/s): ~20 s prefill
+  (dense experts) and ~1.85 s/token decode, against ~170 ms/token for
+  the dequantized-up-front bf16 reference, which needs twice the memory.
+
 ## Status and roadmap
 
 vXPU is an early extraction of the `experiments/model-manifest`
@@ -224,9 +251,10 @@ Known simplifications / tasks for the immediate roadmap are:
   in it; executors currently fetch them from the source repo.
 - Artifacts travel inside the LoadModel RPC; OCI registries
   (per-tensor layers, signed manifests) are the intended distribution.
-- One model per executor; engine-backed executors (vLLM behind the
-  same proto) for architectures whose graphs are not natively
-  runnable (quantized fused-MoE) are planned.
+- One model per executor.
+- fp8 checkpoints are dequantized per block on every use; an executor
+  that dequantizes at load when memory allows, or uses the device's fp8
+  kernels, would be a placement choice, not an artifact change.
 - `.pt2` graphs pin the exporting torch version (the serialization
   format promises newer-loads-older; same-version is what we test).
 - A shared paged KV pool is designed (see the experiment's

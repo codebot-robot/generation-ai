@@ -30,6 +30,7 @@ is exactly bincount).
 import hashlib
 import math
 import os
+from concurrent.futures import ThreadPoolExecutor
 
 import requests
 import torch
@@ -85,6 +86,26 @@ def fetch_tensor(ref, files, cas_dir=None):
     tensor = torch.frombuffer(
         data, dtype=DTYPES[ref["dtype"]]).view(ref["shape"])
     return tensor, downloaded
+
+
+def fetch_stacked(spec, manifest_tensors, files, cas_dir=None, workers=16):
+    """Assemble a stacked parameter from per-expert checkpoint tensors.
+
+    ``spec["parts"]`` is a list over the stacked dimension of lists of
+    manifest tensor names concatenated along ``spec["cat_dim"]`` (a
+    gated MLP expert's gate and up projections become one block).
+    Parts are fetched concurrently: a 128-expert layer is 384 range
+    reads, and a model has dozens of layers.
+
+    Returns (tensor, bytes_downloaded).
+    """
+    names = [n for row in spec["parts"] for n in row]
+    with ThreadPoolExecutor(max_workers=workers) as pool:
+        fetched = dict(zip(names, pool.map(
+            lambda n: fetch_tensor(manifest_tensors[n], files, cas_dir), names)))
+    rows = [torch.cat([fetched[n][0] for n in row], dim=spec["cat_dim"])
+            for row in spec["parts"]]
+    return torch.stack(rows), sum(d for _, d in fetched.values())
 
 
 def derived_tensor(fqn, meta, config):
