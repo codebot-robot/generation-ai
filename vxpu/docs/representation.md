@@ -130,6 +130,41 @@ fork fixes its cause (the grouped experts now count in float off the
 GPU, meta included), so new artifacts do not need it and the rewrite
 no longer touches them; it stays for artifacts exported before that.
 
+## What Qwen3.8-Flash-Next taught us
+
+The hybrid model was the test of the format, and pt2 passed it, with
+every fix landing in the library rather than the artifact:
+
+- **Data-dependent loops.** The chunked delta rule runs a recurrence
+  over a number of chunks that depends on the prompt length. A Python
+  loop specializes the length; the `scan` and `while_loop` higher-order
+  ops export, serialize and reload with a symbolic trip count. The
+  fork uses `while_loop` with per-chunk `index_select`, because strided
+  chunk views of a symbolic-length tensor make the shape reasoner
+  case-split on "could this be one chunk?".
+- **Python control flow on data.** The indexer picked tokens with a
+  `nonzero` loop per query. With a static cache the visible set is a
+  known function of the position, so the same selection is a masked
+  top-k over all blocks; equal to the loop to float32 rounding.
+- **Growing Python state.** Full position tables lived on the cache
+  object and grew by concatenation; with a static cache they are the
+  table for every slot, indexed by `cache_position`.
+- **0/1 specialization.** Branches on the length (`if seq < kernel`),
+  `-1` in reshapes next to the length, and contiguity requests on
+  transposed activations all pin the length to the example's range.
+  Non-strict export plus `backed_size_oblivious` reasoning, and
+  removing those patterns in the fork, leave one guard we accept: the
+  prefill graph starts at two tokens, and a one-token prefill is the
+  decode graph.
+- **Two names for one tensor.** Non-strict export lifts a cache tensor
+  reached through the cache object as a constant even when it is also
+  a wrapper buffer. The binding records the alias; the executor binds
+  both names to one tensor. Separate tensors would not be a cache.
+- **Checkpoint layout is the loader's business.** Key renaming and the
+  recipes that merge per-expert projections into a bank or 128 shards
+  into a table come from transformers' conversion mapping, replayed on
+  the manifest; nothing in vXPU knows a model's naming.
+
 ## Decision
 
 pt2 is the representation. Our own module-tree format would reinvent

@@ -281,6 +281,25 @@ clients.
   width. The cost is a one-time autotune of about two minutes on first
   load (`VXPU_COMPILE_MODE=default` skips it).
 
+- Qwen3.8-Flash-Next-FP8 (hybrid: 36 Gated DeltaNet linear-attention
+  layers, 12 indexed-attention layers, 512 experts top-10, a per-layer
+  n-gram embedding stored as 128 fp8 shards; 186 GB) exports weightless
+  on a laptop with transformers 5.18 from the fork: a 38 MB prefill
+  graph (36 `while_loop` chunk recurrences with a symbolic trip count,
+  96 `grouped_mm`, 72 triangular solves, 12 `scaled_dot_product_attention`
+  with a static indexer selection) and a 29 MB decode graph; 1071 bound,
+  2 derived, 134 state and 193 merged tensors (expert banks and the
+  sharded table, assembled on the executor from transformers' own
+  conversion recipes). In the cluster: the router cached the 131 shards
+  in ~9 min, the executor (a 217 GiB / 30-CPU pod on the c3d node)
+  rehydrated 182 GB in 12 min and holds 177 GB resident with the fp8
+  tensors kept as fp8; the first prompt answered at ~2.3 s/token after
+  a ~75 s prefill (every expert bank is dequantized once per prefill).
+  Correctness of the static-cache path and of the pt2 round trip is
+  verified against eager transformers on a small random Qwen4 model
+  (float32 rounding); a same-node reference run of the 186 GB model is
+  still to do.
+
 ## Status and roadmap
 
 vXPU is an early extraction of the `experiments/model-manifest`
