@@ -43,7 +43,7 @@ way a vLLM or llama.cpp backend will work), but it is not a
 representation of the graph. The second is what `torch.export` already
 does, and it keeps the tree.
 
-## What pt2 gives us (checked against torch 2.13)
+## What pt2 gives us (checked against torch 2.13 and 2.14)
 
 - **Aten-level graph, no Python.** The executor runs ops, not model
   code. The .pt2 archive is a declarative graph plus tensor metadata

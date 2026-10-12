@@ -89,23 +89,62 @@ def fetch_tensor(ref, files, cas_dir=None):
 
 
 def fetch_stacked(spec, manifest_tensors, files, cas_dir=None, workers=16):
-    """Assemble a stacked parameter from per-expert checkpoint tensors.
+    """Assemble a parameter from several checkpoint tensors.
 
-    ``spec["parts"]`` is a list over the stacked dimension of lists of
-    manifest tensor names concatenated along ``spec["cat_dim"]`` (a
-    gated MLP expert's gate and up projections become one block).
-    Parts are fetched concurrently: a 128-expert layer is 384 range
-    reads, and a model has dozens of layers.
+    ``spec["parts"]`` is a list of rows; each row is a list of manifest
+    tensor names concatenated along ``spec["cat_dim"]`` (a gated MLP
+    expert's gate and up projections become one block). With
+    ``spec["stack"]`` (the default) the rows are stacked along a new
+    leading dimension (an expert bank); otherwise there is one row (a
+    table stored in shards). The result is allocated once and filled
+    part by part, so assembling a 50 GB table costs 50 GB, not twice
+    that. Parts are fetched concurrently: a 128-expert layer is 384
+    range reads, and a model has dozens of layers.
 
     Returns (tensor, bytes_downloaded).
     """
-    names = [n for row in spec["parts"] for n in row]
+    rows, cat_dim, stack = spec["parts"], spec["cat_dim"], spec.get("stack", True)
+    # Shapes and dtype come from the manifest, so the result can be
+    # allocated before anything is fetched.
+    first = manifest_tensors[rows[0][0]]
+    row_shape = list(first["shape"])
+    row_shape[cat_dim] = sum(manifest_tensors[n]["shape"][cat_dim] for n in rows[0])
+    out_shape = ([len(rows)] if stack else []) + row_shape
+    out = torch.empty(out_shape, dtype=DTYPES[first["dtype"]])
+
+    # (row, offset, name) in assembly order; fetched through a bounded
+    # window so at most `workers` parts are in flight (a sharded 50 GB
+    # table must not be held twice).
+    slots = []
+    for r, row in enumerate(rows):
+        offset = 0
+        for n in row:
+            slots.append((r, offset, n))
+            offset += manifest_tensors[n]["shape"][cat_dim]
+    downloaded = 0
     with ThreadPoolExecutor(max_workers=workers) as pool:
-        fetched = dict(zip(names, pool.map(
-            lambda n: fetch_tensor(manifest_tensors[n], files, cas_dir), names)))
-    rows = [torch.cat([fetched[n][0] for n in row], dim=spec["cat_dim"])
-            for row in spec["parts"]]
-    return torch.stack(rows), sum(d for _, d in fetched.values())
+        pending = {}
+        for i, (r, offset, n) in enumerate(slots):
+            pending[i] = pool.submit(fetch_tensor, manifest_tensors[n], files, cas_dir)
+            if len(pending) >= 2 * workers:
+                j = min(pending)
+                _place_part(out, slots[j], pending.pop(j).result(), cat_dim, stack)
+                downloaded += _last_bytes
+        for j in sorted(pending):
+            _place_part(out, slots[j], pending.pop(j).result(), cat_dim, stack)
+            downloaded += _last_bytes
+    return out, downloaded
+
+
+_last_bytes = 0
+
+
+def _place_part(out, slot, fetched, cat_dim, stack):
+    global _last_bytes
+    r, offset, _ = slot
+    part, _last_bytes = fetched
+    target = out[r] if stack else out
+    target.narrow(cat_dim, offset, part.shape[cat_dim]).copy_(part)
 
 
 def derived_tensor(fqn, meta, config):

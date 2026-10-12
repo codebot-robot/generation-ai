@@ -76,7 +76,7 @@ spec:
   volumes:
     - name: cache-volume
       emptyDir:
-        sizeLimit: 80Gi
+        sizeLimit: 600Gi
   containers:
     - name: router
       image: "IMAGE"

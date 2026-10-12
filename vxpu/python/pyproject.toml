@@ -18,8 +18,8 @@ version = "0.1.0"
 description = "Run PyTorch models on remote accelerators via portable artifacts"
 requires-python = ">=3.12"
 dependencies = [
-    "torch>=2.13.0",
-    "transformers>=5.14.1",
+    "torch>=2.14.1",
+    "transformers>=5.18.0",
     "grpcio",
     "protobuf>=6.30",
     "requests",

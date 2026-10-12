@@ -131,6 +131,11 @@ class Engine:
         self.state_specs = {
             fqn: (probe_meta[fqn].shape, probe_meta[fqn].dtype)
             for fqn in self.binding["state"]}
+        # Names the graphs use for a tensor that is also known under a
+        # canonical name (a cache tensor lifted both as a wrapper buffer
+        # and as a constant); bound to the same tensor as the canonical.
+        self.aliases = self.binding.get("aliases", {})
+        self.min_prefill_len = self.binding.get("min_prefill_len", 1)
 
         self.sessions = {}
         self._next_id = 0
@@ -182,6 +187,12 @@ class Engine:
             fqn: torch.zeros(shape, dtype=dtype, device=self.device)
             for fqn, (shape, dtype) in self.state_specs.items()}
         tensors = {**self.shared, **scratch}
+        # Aliases must be placed too (an unplaced constant stays on the
+        # meta device); _bind below re-points them at the canonical
+        # tensors once the programs are on the device.
+        tensors.update({alias: tensors[canonical]
+                        for alias, canonical in self.aliases.items()
+                        if canonical in tensors})
         self._prefill = load_program(
             os.path.join(self.artifact_dir, "prefill.pt2"),
             tensors, self.device).module()
@@ -191,6 +202,7 @@ class Engine:
         shared = share_state(self._prefill, self._decode,
                              self.binding["state"])
         assert shared > 0, "prefill/decode share no cache state"
+        self._bind(scratch)  # aliases -> the canonical tensors, both graphs
         self._decode_run = self._decode
         if self.compile_decode:
             strip_asserts(self._decode)
@@ -202,6 +214,9 @@ class Engine:
         A reference swap, O(number of buffers); the compiled decode
         re-reads its buffers on each call, so this triggers no recompile.
         """
+        state = {**state, **{alias: state[canonical]
+                             for alias, canonical in self.aliases.items()
+                             if canonical in state}}
         for module in (self._prefill, self._decode):
             for fqn, tensor in state.items():
                 parent, name = (fqn.rsplit(".", 1) if "." in fqn
@@ -346,10 +361,18 @@ class Engine:
         # it has finished only the shared prefix is known to be there.
         session["cached_ids"] = cached[:start]
         prefill_started = time.perf_counter()
-        logits = self._prefill(
-            input_ids=new_ids,
-            cache_position=torch.arange(start, total_len,
-                                        device=self.device))
+        if new_ids.shape[1] < self.min_prefill_len:
+            # The prefill graph's length starts at min_prefill_len; a
+            # single new token (a re-asked prompt, a one-token turn) is
+            # exactly what the decode graph computes.
+            logits = self._decode_run(
+                input_ids=new_ids,
+                cache_position=torch.tensor([start], device=self.device))
+        else:
+            logits = self._prefill(
+                input_ids=new_ids,
+                cache_position=torch.arange(start, total_len,
+                                            device=self.device))
         prefill_s = time.perf_counter() - prefill_started
         cached = session["cached_ids"] = list(ids)
 

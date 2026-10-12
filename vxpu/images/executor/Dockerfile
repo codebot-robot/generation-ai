@@ -16,7 +16,7 @@ FROM python:3.13-slim
 
 WORKDIR /app
 
-# torch 2.13 JIT-compiles some eager CUDA ops via Triton at runtime,
+# torch JIT-compiles some eager CUDA ops via Triton at runtime,
 # which needs a C compiler even without torch.compile.
 RUN apt-get update && apt-get install -y --no-install-recommends \
     gcc libc6-dev \
@@ -30,7 +30,7 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
 # executor runs the same code the exporter traced; see docs/representation.md.
 COPY third_party/transformers/ /src/transformers/
 RUN pip install --no-cache-dir \
-    torch==2.13.0 \
+    torch==2.14.1 \
     /src/transformers \
     grpcio \
     "protobuf>=6.30" \

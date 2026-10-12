@@ -28,14 +28,14 @@ transformers fork under ``third_party/transformers`` rather than here:
   CPU, which has no CPU kernel; the fork counts in float off the GPU.
 
 What remains in vxpu is bookkeeping: install the modules on the meta
-model the way the loader would (``apply_fp8``), choose the experts
+model the way the loader would (``apply_fp8``) and choose the experts
 implementation per graph (``grouped_mm`` for prefill, ``batched_mm`` for
 decode: both static-shape and the same routing computation transformers
-runs), and tell the executor how to assemble a stacked expert parameter
-from the checkpoint's per-expert tensors (``stacked_sources``).
+runs). How a merged parameter (an expert bank, a sharded table) is
+assembled from checkpoint tensors comes from transformers' own
+conversion mapping (export.checkpoint_view).
 """
 
-import re
 
 
 def fp8_config(config):
@@ -50,23 +50,26 @@ def fp8_config(config):
             "modules_to_not_convert": set(qc.get("modules_to_not_convert") or [])}
 
 
-def _lookup(manifest_tensors, fqn):
-    """Find a checkpoint tensor for a module path, peeling wrapper prefixes."""
+def _resolve(fqn, table):
+    """Find a model key in ``table`` for a module path, peeling wrapper prefixes."""
     parts = fqn.split(".")
     for i in range(len(parts)):
-        if ".".join(parts[i:]) in manifest_tensors:
-            return True
-    return False
+        value = table.get(".".join(parts[i:]))
+        if value is not None:
+            return value
+    return None
 
 
-def apply_fp8(model, config, manifest_tensors=None):
+def apply_fp8(model, config, view, manifest_tensors):
     """Install transformers' fp8 modules on a (meta) model, as its loader does.
 
     Runs the same HfQuantizer preprocessing ``from_pretrained`` runs. The
     loader additionally lets the *checkpoint* decide: a linear whose
     weight has no ``weight_scale_inv`` beside it (Qwen's bf16 lm_head,
-    with an empty ``modules_to_not_convert``) stays a plain linear. Given
-    the manifest, the same rule is applied here before the swap.
+    with an empty ``modules_to_not_convert``) stays a plain linear, and
+    an embedding table stored as fp8 with a per-tensor ``weight_scale``
+    (Qwen3.8's n-gram table) becomes an ``FP8Embedding``. ``view`` is the
+    checkpoint as the model's parameters see it (export.checkpoint_view).
     Returns the number of modules replaced (0 for a non-fp8 checkpoint).
     """
     import torch.nn as nn
@@ -83,25 +86,59 @@ def apply_fp8(model, config, manifest_tensors=None):
             "this transformers has no off-GPU fp8 path, so an fp8 checkpoint "
             "cannot be exported on the meta device; install the fork: "
             "pip install -e third_party/transformers (see docs/representation.md)")
+    direct, merged = view
+
+    def has(key):
+        return _resolve(key, direct) is not None or _resolve(key, merged) is not None
+
+    def dtype_of(key):
+        name = _resolve(key, direct)
+        if name is None:
+            spec = _resolve(key, merged)
+            name = spec["parts"][0][0] if spec else None
+        return manifest_tensors[name]["dtype"] if name else None
+
     qc = config.quantization_config
     qc = FineGrainedFP8Config.from_dict(qc) if isinstance(qc, dict) else qc
     skip = list(qc.modules_to_not_convert or [])
-    if manifest_tensors:
-        for fqn, mod in model.named_modules():
-            if isinstance(mod, nn.Linear):
-                probe = fqn
-            elif isinstance(getattr(mod, "gate_up_proj", None), nn.Parameter):
-                probe = f"{fqn}.0.gate_proj"  # the checkpoint stores experts one by one
-            else:
-                continue
-            if (_lookup(manifest_tensors, probe + ".weight")
-                    and not _lookup(manifest_tensors, probe + ".weight_scale_inv")):
+    embeddings = []
+    for fqn, mod in model.named_modules():
+        if isinstance(mod, nn.Linear):
+            probe = fqn
+        elif isinstance(getattr(mod, "gate_up_proj", None), nn.Parameter):
+            probe = fqn  # merged bank: experts.gate_up_proj[_scale_inv]
+            probe_name = f"{fqn}.gate_up_proj"
+            if has(probe_name) and not has(probe_name + "_scale_inv"):
                 skip.append(fqn)
+            continue
+        elif isinstance(mod, nn.Embedding):
+            if (dtype_of(f"{fqn}.weight") == "F8_E4M3"
+                    and has(f"{fqn}.weight_scale")):
+                embeddings.append((fqn, mod))
+            continue
+        else:
+            continue
+        if has(probe + ".weight") and not has(probe + ".weight_scale_inv"):
+            skip.append(fqn)
     qc.modules_to_not_convert = sorted(set(skip))
     before = sum(isinstance(m, (FP8Linear, FP8Experts)) for m in model.modules())
     quantizer = AutoHfQuantizer.from_config(qc, pre_quantized=True)
     quantizer.preprocess_model(model, config=config)
-    return sum(isinstance(m, (FP8Linear, FP8Experts)) for m in model.modules()) - before
+    swapped = sum(isinstance(m, (FP8Linear, FP8Experts)) for m in model.modules()) - before
+
+    if embeddings:
+        FP8Embedding = getattr(finegrained_fp8, "FP8Embedding", None)
+        if FP8Embedding is None:
+            raise RuntimeError(
+                "the checkpoint stores an embedding table as fp8 with a "
+                "per-tensor scale, which needs FP8Embedding from the fork")
+        for fqn, mod in embeddings:
+            parent_name, _, child = fqn.rpartition(".")
+            parent = model.get_submodule(parent_name) if parent_name else model
+            setattr(parent, child, FP8Embedding(mod.num_embeddings, mod.embedding_dim,
+                                                padding_idx=mod.padding_idx))
+            swapped += 1
+    return swapped
 
 
 def set_experts_implementation(model, name):
@@ -110,27 +147,3 @@ def set_experts_implementation(model, name):
     config._experts_implementation = name
     text = config.get_text_config() if hasattr(config, "get_text_config") else config
     text._experts_implementation = name
-
-
-EXPERTS_PARAM = re.compile(r"^(?P<prefix>.*\.experts)\.(?P<which>gate_up_proj|down_proj)(?P<scale>_scale_inv)?$")
-
-
-def stacked_sources(fqn, manifest_tensors, num_experts):
-    """For a stacked expert parameter, the checkpoint tensors it is
-    assembled from: a list (over experts) of lists (concatenated along
-    dim 0) of manifest tensor names. None if ``fqn`` is not one.
-
-    Matching peels wrapper prefixes the way the exporter does elsewhere.
-    """
-    m = EXPERTS_PARAM.match(fqn)
-    if not m:
-        return None
-    suffix = ".weight" + (m.group("scale") or "")
-    projs = ["gate_proj", "up_proj"] if m.group("which") == "gate_up_proj" else ["down_proj"]
-    parts = m.group("prefix").split(".")
-    for start in range(len(parts)):
-        prefix = ".".join(parts[start:])
-        names = [[f"{prefix}.{i}.{p}{suffix}" for p in projs] for i in range(num_experts)]
-        if all(n in manifest_tensors for row in names for n in row):
-            return names
-    return None

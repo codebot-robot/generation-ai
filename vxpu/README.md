@@ -176,7 +176,7 @@ git submodules, branched from the pinned release:
 
 | submodule | branch | patch |
 |---|---|---|
-| `third_party/transformers` | `vxpu/v5.14.1` (from `v5.14.1`) | plain-torch path for `FP8Linear`/`FP8Experts` off the GPU (CPU, MPS, meta), so fp8 checkpoints load on a CPU without `dequantize=True` and export weightlessly; float `histc` off the GPU in the grouped experts so the exported graph runs on a CPU |
+| `third_party/transformers` | `vxpu/v5.18.0` (from `v5.18.0`; `vxpu/v5.14.1` carries the fp8 patches on the older release) | plain-torch path for `FP8Linear`/`FP8Experts` off the GPU (CPU, MPS, meta), so fp8 checkpoints load on a CPU without `dequantize=True` and export weightlessly; `FP8Embedding` for tables stored as fp8 with a per-tensor scale; float `histc` off the GPU in the grouped experts; the export wrapper sizes and registers linear-attention/conv states and passes `cache_position`; `qwen4_exp` exports with a symbolic prefill length (static indexer selection, `while_loop` chunk recurrence, no Python branches on the length); `sdpa` evaluates `is_causal` without guarding the length |
 
 ```sh
 git submodule update --init
