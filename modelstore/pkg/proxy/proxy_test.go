@@ -16,190 +16,264 @@ package proxy
 
 import (
 	"bytes"
+	"crypto/sha256"
+	"encoding/hex"
 	"encoding/json"
+	"fmt"
 	"io"
 	"net/http"
 	"net/http/httptest"
-	"os"
-	"path/filepath"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/gke-labs/generation-ai/modelstore/apis/v1alpha1"
+	"github.com/gke-labs/generation-ai/modelstore/pkg/blobstore"
+	"github.com/gke-labs/generation-ai/modelstore/pkg/importer"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/runtime"
+	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/client/fake"
 )
 
-func TestLocalFileServing(t *testing.T) {
-	// Create a temporary cache directory
-	cacheDir, err := os.MkdirTemp("", "modelstore-test-*")
+func newTestProxy(t *testing.T, hfEndpoint string) (*Proxy, client.Client) {
+	t.Helper()
+	store, err := blobstore.NewLocal(t.TempDir())
 	if err != nil {
-		t.Fatalf("Failed to create temp dir: %v", err)
+		t.Fatal(err)
 	}
-	defer os.RemoveAll(cacheDir)
-
-	// Pre-populate a file in the cache
-	content := "local content"
-	err = os.WriteFile(filepath.Join(cacheDir, "test-file"), []byte(content), 0644)
-	if err != nil {
-		t.Fatalf("Failed to write test file: %v", err)
+	scheme := runtime.NewScheme()
+	if err := v1alpha1.AddToScheme(scheme); err != nil {
+		t.Fatal(err)
 	}
+	kube := fake.NewClientBuilder().WithScheme(scheme).WithStatusSubresource(&v1alpha1.Model{}).Build()
+	return NewProxy(store, importer.New(store, hfEndpoint), kube), kube
+}
 
-	p, err := NewProxy("", cacheDir, nil)
-	if err != nil {
-		t.Fatalf("Failed to create proxy: %v", err)
+func shaOf(b []byte) string {
+	h := sha256.Sum256(b)
+	return hex.EncodeToString(h[:])
+}
+
+func do(p *Proxy, method, path string, body io.Reader, headers ...string) *httptest.ResponseRecorder {
+	req := httptest.NewRequest(method, path, body)
+	for i := 0; i+1 < len(headers); i += 2 {
+		req.Header.Set(headers[i], headers[i+1])
 	}
-
-	req := httptest.NewRequest(http.MethodGet, "/test-file", nil)
 	w := httptest.NewRecorder()
 	p.ServeHTTP(w, req)
+	return w
+}
 
-	resp := w.Result()
-	if resp.StatusCode != http.StatusOK {
-		t.Errorf("Expected status 200, got %d", resp.StatusCode)
-	}
-	body, _ := io.ReadAll(resp.Body)
-	if string(body) != content {
-		t.Errorf("Expected '%s', got '%s'", content, string(body))
-	}
-
-	// Test non-existent file returns 404
-	req = httptest.NewRequest(http.MethodGet, "/non-existent-file", nil)
-	w = httptest.NewRecorder()
-	p.ServeHTTP(w, req)
-	resp = w.Result()
-	if resp.StatusCode != http.StatusNotFound {
-		t.Errorf("Expected status 404, got %d", resp.StatusCode)
+func TestModelName(t *testing.T) {
+	for in, want := range map[string]string{
+		"Qwen/Qwen3-8B-FP8":                   "qwen-qwen3-8b-fp8",
+		"google/gemma-4-E4B-it":               "google-gemma-4-e4b-it",
+		"trl-internal-testing/tiny_random.v2": "trl-internal-testing-tiny-random.v2",
+		"user/repo":                           "user-repo",
+	} {
+		if got := modelName(in); got != want {
+			t.Errorf("modelName(%q) = %q, want %q", in, got, want)
+		}
 	}
 }
 
-func TestBlobAndModelAPI(t *testing.T) {
-	cacheDir, err := os.MkdirTemp("", "modelstore-blob-test-*")
-	if err != nil {
-		t.Fatalf("Failed to create temp dir: %v", err)
+func TestBlobPutGetAndRanges(t *testing.T) {
+	p, _ := newTestProxy(t, "")
+	content := []byte("0123456789abcdef")
+	sha := shaOf(content)
+
+	if w := do(p, http.MethodPut, "/blobs/"+sha, bytes.NewReader(content)); w.Code != http.StatusCreated {
+		t.Fatalf("PUT: got %d: %s", w.Code, w.Body.String())
 	}
-	defer os.RemoveAll(cacheDir)
-
-	scheme := runtime.NewScheme()
-	_ = v1alpha1.AddToScheme(scheme)
-	kube := fake.NewClientBuilder().WithScheme(scheme).Build()
-
-	p, err := NewProxy("", cacheDir, kube)
-	if err != nil {
-		t.Fatalf("Failed to create proxy: %v", err)
+	if w := do(p, http.MethodPut, "/blobs/"+strings.Repeat("0", 64), bytes.NewReader(content)); w.Code != http.StatusBadRequest {
+		t.Errorf("PUT with wrong sha: got %d, want 400", w.Code)
 	}
-
-	// 1. Upload a blob
-	content := "blob content"
-	sha := "7b24cf3d897fd680e0258c1c7c23db50a5428581ed1785c08de505c381b4c4b5"
-	req := httptest.NewRequest(http.MethodPut, "/blobs/"+sha, strings.NewReader(content))
-	w := httptest.NewRecorder()
-	p.ServeHTTP(w, req)
-
-	if w.Code != http.StatusCreated {
-		t.Errorf("Expected blob PUT status 201, got %d", w.Code)
+	if w := do(p, http.MethodPut, "/blobs/not-a-sha", bytes.NewReader(content)); w.Code != http.StatusBadRequest {
+		t.Errorf("PUT with malformed name: got %d, want 400", w.Code)
 	}
 
-	// Verify HEAD request for blob
-	req = httptest.NewRequest(http.MethodHead, "/blobs/"+sha, nil)
-	w = httptest.NewRecorder()
-	p.ServeHTTP(w, req)
-	if w.Code != http.StatusOK {
-		t.Errorf("Expected blob HEAD status 200, got %d", w.Code)
+	w := do(p, http.MethodHead, "/blobs/"+sha, nil)
+	if w.Code != http.StatusOK || w.Header().Get("Content-Length") != "16" || w.Header().Get("Accept-Ranges") != "bytes" {
+		t.Errorf("HEAD: got %d %v", w.Code, w.Header())
+	}
+	if w := do(p, http.MethodGet, "/blobs/"+sha, nil); w.Code != http.StatusOK || w.Body.String() != string(content) {
+		t.Errorf("GET: got %d %q", w.Code, w.Body.String())
+	}
+	if w := do(p, http.MethodGet, "/blobs/"+strings.Repeat("1", 64), nil); w.Code != http.StatusNotFound {
+		t.Errorf("GET missing: got %d, want 404", w.Code)
 	}
 
-	// 2. Create a model
-	model := v1alpha1.Model{
-		ObjectMeta: metav1.ObjectMeta{
-			Name: "test-model",
-		},
-		Spec: v1alpha1.ModelSpec{
-			Files: []v1alpha1.File{
-				{Path: "weights.bin", SHA256: sha},
-			},
-		},
+	for _, tc := range []struct {
+		rng, want, contentRange string
+	}{
+		{"bytes=4-7", "4567", "bytes 4-7/16"},
+		{"bytes=12-", "cdef", "bytes 12-15/16"},
+		{"bytes=-3", "def", "bytes 13-15/16"},
+		{"bytes=10-99", "abcdef", "bytes 10-15/16"},
+	} {
+		w := do(p, http.MethodGet, "/blobs/"+sha, nil, "Range", tc.rng)
+		if w.Code != http.StatusPartialContent || w.Body.String() != tc.want ||
+			w.Header().Get("Content-Range") != tc.contentRange ||
+			w.Header().Get("Content-Length") != fmt.Sprint(len(tc.want)) {
+			t.Errorf("Range %s: got %d %q %q", tc.rng, w.Code, w.Body.String(), w.Header().Get("Content-Range"))
+		}
 	}
-	modelJSON, _ := json.Marshal(model)
-	req = httptest.NewRequest(http.MethodPost, "/models", bytes.NewReader(modelJSON))
-	w = httptest.NewRecorder()
-	p.ServeHTTP(w, req)
+	if w := do(p, http.MethodGet, "/blobs/"+sha, nil, "Range", "bytes=16-20"); w.Code != http.StatusRequestedRangeNotSatisfiable {
+		t.Errorf("unsatisfiable range: got %d, want 416", w.Code)
+	}
+	if w := do(p, http.MethodGet, "/blobs/"+sha, nil, "Range", "bytes=0-1,4-5"); w.Code != http.StatusRequestedRangeNotSatisfiable {
+		t.Errorf("multi range: got %d, want 416", w.Code)
+	}
+}
 
-	if w.Code != http.StatusCreated {
-		t.Errorf("Expected model POST status 201, got %d: %s", w.Code, w.Body.String())
+func TestModelCreateAndHubReads(t *testing.T) {
+	p, _ := newTestProxy(t, "")
+	content := []byte("blob content")
+	sha := shaOf(content)
+	do(p, http.MethodPut, "/blobs/"+sha, bytes.NewReader(content))
+
+	missing := strings.Repeat("2", 64)
+	bad, _ := json.Marshal(v1alpha1.Model{ObjectMeta: metav1.ObjectMeta{Name: "bad"},
+		Spec: v1alpha1.ModelSpec{Files: []v1alpha1.File{{Path: "x", SHA256: missing}}}})
+	if w := do(p, http.MethodPost, "/models", bytes.NewReader(bad)); w.Code != http.StatusBadRequest {
+		t.Errorf("model with missing blob: got %d, want 400", w.Code)
 	}
 
-	// 3. List models
-	req = httptest.NewRequest(http.MethodGet, "/models", nil)
-	w = httptest.NewRecorder()
-	p.ServeHTTP(w, req)
-
-	if w.Code != http.StatusOK {
-		t.Errorf("Expected model GET status 200, got %d", w.Code)
+	model, _ := json.Marshal(v1alpha1.Model{ObjectMeta: metav1.ObjectMeta{Name: "user-repo"},
+		Spec: v1alpha1.ModelSpec{Files: []v1alpha1.File{{Path: "config.json", SHA256: sha, Size: int64(len(content))}}}})
+	if w := do(p, http.MethodPost, "/models", bytes.NewReader(model)); w.Code != http.StatusCreated {
+		t.Fatalf("POST model: got %d: %s", w.Code, w.Body.String())
 	}
-
+	w := do(p, http.MethodGet, "/models/user-repo", nil)
+	var got v1alpha1.Model
+	if err := json.NewDecoder(w.Body).Decode(&got); err != nil || got.Status.Phase != v1alpha1.PhaseReady {
+		t.Errorf("GET model: %v phase=%q", err, got.Status.Phase)
+	}
+	w = do(p, http.MethodGet, "/models", nil)
 	var list v1alpha1.ModelList
-	if err := json.NewDecoder(w.Body).Decode(&list); err != nil {
-		t.Fatalf("Failed to decode model list: %v", err)
+	if err := json.NewDecoder(w.Body).Decode(&list); err != nil || len(list.Items) != 1 {
+		t.Errorf("list: %v %d items", err, len(list.Items))
 	}
 
-	if len(list.Items) != 1 {
-		t.Errorf("Expected 1 model, got %d", len(list.Items))
+	// Hub-compatible reads, with and without a revision in the path.
+	for _, path := range []string{"/api/models/user/repo", "/api/models/user/repo/revision/main"} {
+		w := do(p, http.MethodGet, path, nil)
+		var meta map[string]any
+		if err := json.NewDecoder(w.Body).Decode(&meta); w.Code != 200 || err != nil || meta["modelId"] != "user/repo" {
+			t.Errorf("%s: %d %v %v", path, w.Code, err, meta)
+		}
 	}
-	if list.Items[0].Name != "test-model" {
-		t.Errorf("Expected model name 'test-model', got '%s'", list.Items[0].Name)
+	w = do(p, http.MethodGet, "/user/repo/resolve/main/config.json", nil)
+	if w.Code != http.StatusOK || w.Body.String() != string(content) || w.Header().Get("ETag") != `"`+sha+`"` {
+		t.Errorf("resolve: %d %q etag=%s", w.Code, w.Body.String(), w.Header().Get("ETag"))
 	}
+	w = do(p, http.MethodGet, "/user/repo/resolve/main/config.json", nil, "Range", "bytes=0-3")
+	if w.Code != http.StatusPartialContent || w.Body.String() != "blob" {
+		t.Errorf("resolve range: %d %q", w.Code, w.Body.String())
+	}
+	if w := do(p, http.MethodGet, "/user/repo/resolve/main/missing.bin", nil); w.Code != http.StatusNotFound {
+		t.Errorf("resolve missing file: %d", w.Code)
+	}
+	if w := do(p, http.MethodGet, "/api/models/nobody/nothing", nil); w.Code != http.StatusNotFound {
+		t.Errorf("metadata of unknown model: %d", w.Code)
+	}
+}
 
-	// 4. Test HF Metadata API
-	req = httptest.NewRequest(http.MethodGet, "/api/models/test-model", nil)
-	w = httptest.NewRecorder()
-	p.ServeHTTP(w, req)
-	if w.Code != http.StatusOK {
-		t.Errorf("Expected HF metadata status 200, got %d", w.Code)
-	}
-	var metadata map[string]any
-	json.NewDecoder(w.Body).Decode(&metadata)
-	if metadata["modelId"] != "test-model" {
-		t.Errorf("Expected modelId 'test-model', got '%v'", metadata["modelId"])
-	}
-
-	// 5. Test HF Download API
-	req = httptest.NewRequest(http.MethodGet, "/test-model/resolve/main/weights.bin", nil)
-	w = httptest.NewRecorder()
-	p.ServeHTTP(w, req)
-	if w.Code != http.StatusOK {
-		t.Errorf("Expected HF download status 200, got %d", w.Code)
-	}
-	if w.Body.String() != content {
-		t.Errorf("Expected '%s', got '%s'", content, w.Body.String())
-	}
-
-	// 6. Test HF API with slashes
-	slashModel := v1alpha1.Model{
-		ObjectMeta: metav1.ObjectMeta{
-			Name: "user-repo",
-		},
-		Spec: v1alpha1.ModelSpec{
-			Files: []v1alpha1.File{
-				{Path: "config.json", SHA256: sha},
+// fakeHub serves a one-repo Hugging Face Hub: a listing with one LFS
+// file (sha256 published) and one small file (no sha256).
+func fakeHub(t *testing.T, weights, config []byte) *httptest.Server {
+	t.Helper()
+	mux := http.NewServeMux()
+	mux.HandleFunc("/api/models/org/name/revision/main", func(w http.ResponseWriter, r *http.Request) {
+		_ = json.NewEncoder(w).Encode(map[string]any{
+			"sha": "abc123",
+			"siblings": []map[string]any{
+				{"rfilename": "model.safetensors", "size": len(weights),
+					"lfs": map[string]any{"sha256": shaOf(weights), "size": len(weights)}},
+				{"rfilename": "config.json", "size": len(config)},
 			},
-		},
-	}
-	modelJSON, _ = json.Marshal(slashModel)
-	req = httptest.NewRequest(http.MethodPost, "/models", bytes.NewReader(modelJSON))
-	p.ServeHTTP(httptest.NewRecorder(), req)
+		})
+	})
+	mux.HandleFunc("/org/name/resolve/abc123/model.safetensors", func(w http.ResponseWriter, r *http.Request) { _, _ = w.Write(weights) })
+	mux.HandleFunc("/org/name/resolve/abc123/config.json", func(w http.ResponseWriter, r *http.Request) { _, _ = w.Write(config) })
+	return httptest.NewServer(mux)
+}
 
-	req = httptest.NewRequest(http.MethodGet, "/api/models/user/repo", nil)
-	w = httptest.NewRecorder()
-	p.ServeHTTP(w, req)
-	if w.Code != http.StatusOK {
-		t.Errorf("Expected HF metadata status 200 for user/repo, got %d", w.Code)
-	}
+func TestBlobImport(t *testing.T) {
+	weights := bytes.Repeat([]byte("w"), 1000)
+	hub := fakeHub(t, weights, []byte("{}"))
+	defer hub.Close()
+	p, _ := newTestProxy(t, hub.URL)
+	sha := shaOf(weights)
+	body := fmt.Sprintf(`{"url": %q}`, hub.URL+"/org/name/resolve/abc123/model.safetensors")
 
-	req = httptest.NewRequest(http.MethodGet, "/user/repo/resolve/main/config.json", nil)
-	w = httptest.NewRecorder()
-	p.ServeHTTP(w, req)
-	if w.Code != http.StatusOK {
-		t.Errorf("Expected HF download status 200 for user/repo, got %d", w.Code)
+	w := do(p, http.MethodPost, "/blobs/"+sha+"/import?wait=true", strings.NewReader(body))
+	if w.Code != http.StatusCreated {
+		t.Fatalf("import: got %d: %s", w.Code, w.Body.String())
+	}
+	if w := do(p, http.MethodGet, "/blobs/"+sha, nil, "Range", "bytes=0-9"); w.Code != 206 || w.Body.String() != "wwwwwwwwww" {
+		t.Errorf("after import: %d %q", w.Code, w.Body.String())
+	}
+	// Importing again is a no-op that reports the blob present.
+	if w := do(p, http.MethodPost, "/blobs/"+sha+"/import", strings.NewReader(body)); w.Code != http.StatusCreated {
+		t.Errorf("re-import: got %d, want 201", w.Code)
+	}
+	// A URL whose bytes do not match the sha leaves no blob.
+	wrong := strings.Repeat("3", 64)
+	w = do(p, http.MethodPost, "/blobs/"+wrong+"/import?wait=true", strings.NewReader(body))
+	if w.Code != http.StatusInternalServerError || !strings.Contains(w.Body.String(), "sha256 mismatch") {
+		t.Errorf("mismatched import: %d %s", w.Code, w.Body.String())
+	}
+	if w := do(p, http.MethodHead, "/blobs/"+wrong, nil); w.Code != http.StatusNotFound {
+		t.Errorf("mismatched blob should not exist: %d", w.Code)
+	}
+}
+
+func TestModelImport(t *testing.T) {
+	weights := bytes.Repeat([]byte("x"), 4096)
+	config := []byte(`{"model_type": "test"}`)
+	hub := fakeHub(t, weights, config)
+	defer hub.Close()
+	p, kube := newTestProxy(t, hub.URL)
+
+	w := do(p, http.MethodPost, "/models/import", strings.NewReader(`{"repo": "org/name", "revision": "main"}`))
+	if w.Code != http.StatusAccepted {
+		t.Fatalf("import: got %d: %s", w.Code, w.Body.String())
+	}
+	var model v1alpha1.Model
+	deadline := time.Now().Add(10 * time.Second)
+	for {
+		if err := kube.Get(t.Context(), client.ObjectKey{Name: "org-name"}, &model); err != nil {
+			t.Fatal(err)
+		}
+		if model.Status.Phase != v1alpha1.PhaseImporting || time.Now().After(deadline) {
+			break
+		}
+		time.Sleep(20 * time.Millisecond)
+	}
+	if model.Status.Phase != v1alpha1.PhaseReady {
+		t.Fatalf("phase %q (%s)", model.Status.Phase, model.Status.Message)
+	}
+	if model.Spec.Source == nil || model.Spec.Source.CommitSHA != "abc123" || len(model.Spec.Files) != 2 {
+		t.Fatalf("spec: %+v", model.Spec)
+	}
+	if model.Status.FilesImported != 2 || model.Status.BytesImported != int64(len(weights)+len(config)) {
+		t.Errorf("status: %+v", model.Status)
+	}
+	// The small file was hashed on the way in; the Hub reads now serve both.
+	w = do(p, http.MethodGet, "/org/name/resolve/main/config.json", nil)
+	if w.Code != 200 || w.Body.String() != string(config) || w.Header().Get("X-Repo-Commit") != "abc123" {
+		t.Errorf("config via resolve: %d %q commit=%s", w.Code, w.Body.String(), w.Header().Get("X-Repo-Commit"))
+	}
+	w = do(p, http.MethodHead, "/org/name/resolve/main/model.safetensors", nil)
+	if w.Code != 200 || w.Header().Get("Content-Length") != "4096" {
+		t.Errorf("weights HEAD: %d %s", w.Code, w.Header().Get("Content-Length"))
+	}
+	w = do(p, http.MethodGet, "/api/models/org/name", nil)
+	var meta map[string]any
+	_ = json.NewDecoder(w.Body).Decode(&meta)
+	if meta["sha"] != "abc123" {
+		t.Errorf("metadata sha: %v", meta["sha"])
 	}
 }

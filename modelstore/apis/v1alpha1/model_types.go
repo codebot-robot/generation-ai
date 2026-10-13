@@ -22,6 +22,9 @@ import (
 type ModelSpec struct {
 	// Files is a list of files that make up the model.
 	Files []File `json:"files,omitempty"`
+	// Source records where the files were imported from, when they
+	// were imported rather than uploaded.
+	Source *ModelSource `json:"source,omitempty"`
 }
 
 type File struct {
@@ -29,15 +32,47 @@ type File struct {
 	Path string `json:"path"`
 	// SHA256 is the SHA256 hash of the file content.
 	SHA256 string `json:"sha256"`
+	// Size is the file size in bytes, when known.
+	Size int64 `json:"size,omitempty"`
 }
+
+// ModelSource is a Hugging Face Hub repository at a revision.
+type ModelSource struct {
+	// Repo is the Hub repository id, e.g. Qwen/Qwen3-8B-FP8.
+	Repo string `json:"repo"`
+	// Revision is the revision that was asked for (a branch, tag or commit).
+	Revision string `json:"revision,omitempty"`
+	// CommitSHA is the commit the revision resolved to at import time.
+	CommitSHA string `json:"commitSha,omitempty"`
+}
+
+// Model phases.
+const (
+	PhaseImporting = "Importing"
+	PhaseReady     = "Ready"
+	PhaseFailed    = "Failed"
+)
 
 // ModelStatus defines the observed state of Model
 type ModelStatus struct {
+	// Phase is Importing, Ready or Failed.
+	Phase string `json:"phase,omitempty"`
+	// FilesTotal and FilesImported count the files of an import.
+	FilesTotal    int `json:"filesTotal,omitempty"`
+	FilesImported int `json:"filesImported,omitempty"`
+	// BytesImported counts the bytes written to the store by this import.
+	BytesImported int64 `json:"bytesImported,omitempty"`
+	// Message explains a Failed phase.
+	Message string `json:"message,omitempty"`
 }
 
 // +kubebuilder:object:root=true
 // +kubebuilder:subresource:status
 // +kubebuilder:resource:scope=Cluster
+// +kubebuilder:printcolumn:name="Phase",type=string,JSONPath=`.status.phase`
+// +kubebuilder:printcolumn:name="Files",type=integer,JSONPath=`.status.filesImported`
+// +kubebuilder:printcolumn:name="Bytes",type=integer,JSONPath=`.status.bytesImported`
+// +kubebuilder:printcolumn:name="Source",type=string,JSONPath=`.spec.source.repo`
 
 // Model is the Schema for the models API
 type Model struct {

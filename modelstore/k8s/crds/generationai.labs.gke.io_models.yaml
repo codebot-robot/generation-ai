@@ -14,7 +14,20 @@ spec:
     singular: model
   scope: Cluster
   versions:
-  - name: v1alpha1
+  - additionalPrinterColumns:
+    - jsonPath: .status.phase
+      name: Phase
+      type: string
+    - jsonPath: .status.filesImported
+      name: Files
+      type: integer
+    - jsonPath: .status.bytesImported
+      name: Bytes
+      type: integer
+    - jsonPath: .spec.source.repo
+      name: Source
+      type: string
+    name: v1alpha1
     schema:
       openAPIV3Schema:
         description: Model is the Schema for the models API
@@ -50,14 +63,54 @@ spec:
                     sha256:
                       description: SHA256 is the SHA256 hash of the file content.
                       type: string
+                    size:
+                      description: Size is the file size in bytes, when known.
+                      format: int64
+                      type: integer
                   required:
                   - path
                   - sha256
                   type: object
                 type: array
+              source:
+                description: |-
+                  Source records where the files were imported from, when they
+                  were imported rather than uploaded.
+                properties:
+                  commitSha:
+                    description: CommitSHA is the commit the revision resolved to
+                      at import time.
+                    type: string
+                  repo:
+                    description: Repo is the Hub repository id, e.g. Qwen/Qwen3-8B-FP8.
+                    type: string
+                  revision:
+                    description: Revision is the revision that was asked for (a branch,
+                      tag or commit).
+                    type: string
+                required:
+                - repo
+                type: object
             type: object
           status:
             description: ModelStatus defines the observed state of Model
+            properties:
+              bytesImported:
+                description: BytesImported counts the bytes written to the store by
+                  this import.
+                format: int64
+                type: integer
+              filesImported:
+                type: integer
+              filesTotal:
+                description: FilesTotal and FilesImported count the files of an import.
+                type: integer
+              message:
+                description: Message explains a Failed phase.
+                type: string
+              phase:
+                description: Phase is Importing, Ready or Failed.
+                type: string
             type: object
         type: object
     served: true

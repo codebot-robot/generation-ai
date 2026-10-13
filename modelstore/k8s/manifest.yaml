@@ -58,13 +58,15 @@ spec:
       port: 80
       targetPort: 8080
 ---
+# The server. Blobs live in a GCS bucket (--blob-store), so the pod has
+# no volume and can be replaced freely; the bucket is granted to the
+# modelstore ServiceAccount through workload identity (see README).
 apiVersion: apps/v1
-kind: StatefulSet
+kind: Deployment
 metadata:
   name: modelstore
   namespace: modelstore
 spec:
-  serviceName: "modelstore"
   replicas: 1
   selector:
     matchLabels:
@@ -78,16 +80,19 @@ spec:
       containers:
         - name: modelstore
           image: modelstore:latest
+          args:
+            - serve
+            - --port=8080
+            - --blob-store=$(MODELSTORE_BLOB_STORE)
+          env:
+            - name: MODELSTORE_BLOB_STORE
+              value: gs://vxpu-justinsb-knotai-dev-us-central1
+            # Optional: a Hub token for gated repositories.
+            # - name: HF_TOKEN
+            #   valueFrom:
+            #     secretKeyRef: {name: hf-token, key: token}
           ports:
             - containerPort: 8080
-          volumeMounts:
-            - name: cache
-              mountPath: /cache
-  volumeClaimTemplates:
-    - metadata:
-        name: cache
-      spec:
-        accessModes: [ "ReadWriteOnce" ]
-        resources:
-          requests:
-            storage: 10Gi
+          resources:
+            requests: {cpu: "2", memory: 2Gi}
+            limits: {memory: 4Gi}
