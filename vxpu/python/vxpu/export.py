@@ -315,7 +315,7 @@ def constant_aliases(exportable, *programs):
 MIN_PREFILL_LEN = 2
 
 
-def classify(exported, manifest, view, aliases=None):
+def classify(exported, manifest, view, aliases=None, also_mutated=()):
     """Classify every tensor the exported program references.
 
     Returns (bound, derived, state, stacked, unbound, unused, constant).
@@ -375,7 +375,9 @@ def classify(exported, manifest, view, aliases=None):
         (ref for name, ref in manifest["tensors"].items()
          if name.endswith("embed_tokens.weight")), None)
 
-    mutated = {aliases.get(f, f) for f in mutated_fqns(exported)}
+    # State is whatever either graph writes: a linear-attention state
+    # written by prefill and only read by decode is state all the same.
+    mutated = {aliases.get(f, f) for f in mutated_fqns(exported) | set(also_mutated)}
     bound, derived, state, stacked, unbound, unused, constant = {}, [], [], {}, [], [], []
     for fqn in fqns:
         if fqn in skip:
@@ -479,7 +481,8 @@ def export_artifact(repo_id, out_dir, max_cache_len=1024, revision="main"):
     torch.export.save(decode, os.path.join(out_dir, "decode.pt2"))
 
     bound, derived, state, stacked, unbound, unused, constant = classify(
-        decode, manifest, view, aliases=aliases)
+        decode, manifest, view, aliases=aliases,
+        also_mutated=mutated_fqns(prefill))
     if unbound:
         raise RuntimeError(
             f"unbound tensors (artifact would be incomplete): {unbound}")

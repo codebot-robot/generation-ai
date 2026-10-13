@@ -100,11 +100,13 @@ def _encode(tokenizer, prompt):
     return tokenizer(prompt["text"])["input_ids"]  # base model: plain text
 
 
-def _tokenizer(model, revision):
+def _tokenizer(model, revision, prompts="auto"):
+    if prompts == "ids":
+        return None
     from transformers import AutoTokenizer
     try:
         return AutoTokenizer.from_pretrained(model, revision=revision)
-    except (OSError, ValueError):
+    except Exception:  # no tokenizer files, or a backend missing: ids prompts
         return None
 
 
@@ -127,7 +129,7 @@ def record_transformers(model, revision, prompts, settings, device="cpu", dtype=
     """
     import torch
     from transformers import AutoModelForCausalLM
-    tok = _tokenizer(model, revision)
+    tok = _tokenizer(model, revision, prompts)
     torch_dtype = "auto" if dtype == "auto" else getattr(torch, dtype)
     kwargs = {"dtype": torch_dtype, "revision": revision}
     if dequantize:
@@ -166,7 +168,7 @@ def record_vxpu_engine(model, revision, prompts, settings, artifact, device="cpu
     """Candidate: the executor's engine in this process (no cluster)."""
     import torch
     from .engine import Engine, SamplingParams
-    tok = _tokenizer(model, revision)
+    tok = _tokenizer(model, revision, prompts)
     engine = Engine(artifact, device=device, compile_decode=compile_decode)
     out = []
     for prompt in _prompt_set(tok, prompts):
@@ -204,7 +206,7 @@ def record_vxpu_router(model, revision, prompts, settings, artifact, router=None
     """Candidate: an executor reached through a router (tokens only;
     the wire carries no logits)."""
     from .modeling import VxpuModelForCausalLM
-    tok = _tokenizer(model, revision)
+    tok = _tokenizer(model, revision, prompts)
     lm = VxpuModelForCausalLM.from_pretrained(
         model, router=router, artifact_dir=artifact, revision=revision,
         progress=lambda *a: None)
@@ -346,6 +348,11 @@ def selftest(workdir, settings, keep=False):
         ("tiny-fp8-moe", tiny_fp8_moe.write(os.path.join(workdir, "tiny-fp8-moe")), "ids"),
         ("tiny-llama", "trl-internal-testing/tiny-random-LlamaForCausalLM", "auto"),
     ]
+    try:
+        from .fixtures import tiny_qwen4  # hybrid linear/indexed attention, needs transformers >= 5.18
+        models.append(("tiny-qwen4", tiny_qwen4.write(os.path.join(workdir, "tiny-qwen4")), "ids"))
+    except ImportError as e:
+        print(f"tiny-qwen4 fixture skipped: {e}")
     failed = []
     for name, model, prompts in models:
         artifact = os.path.join(workdir, name + "-artifact")

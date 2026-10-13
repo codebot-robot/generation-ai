@@ -88,11 +88,17 @@ class Engine:
         ].from_dict(self.manifest["config"])
         self.max_cache_len = int(self.binding.get("max_cache_len", 1024))
         # Tokenizer/processor files are not yet part of the manifest.
-        self.tokenizer = AutoTokenizer.from_pretrained(
-            self.manifest["source"]["repo"])
+        # Generate (ids in, ids out) needs none; Chat does, and says so.
+        try:
+            self.tokenizer = AutoTokenizer.from_pretrained(
+                self.manifest["source"]["repo"])
+        except Exception as e:  # no tokenizer files, or no backend for them
+            print(f"[vxpu] no tokenizer for {self.manifest['source']['repo']}: "
+                  f"{type(e).__name__}; Chat is unavailable, Generate works")
+            self.tokenizer = None
         self.generation_config = self._generation_config()
         self.eos_ids = self._eos_ids()
-        if getattr(self.tokenizer, "chat_template", None) is None:
+        if self.tokenizer is not None and getattr(self.tokenizer, "chat_template", None) is None:
             self.tokenizer.chat_template = (
                 "{% for message in messages %}"
                 "{{ message['role'] | capitalize }}: {{ message['content'] }}\\n"
@@ -182,7 +188,7 @@ class Engine:
                 ids.add(eos)
             elif isinstance(eos, (list, tuple)):
                 ids.update(int(i) for i in eos)
-        if self.tokenizer.eos_token_id is not None:
+        if self.tokenizer is not None and self.tokenizer.eos_token_id is not None:
             ids.add(int(self.tokenizer.eos_token_id))
         return ids
 
@@ -231,6 +237,11 @@ class Engine:
                           else module)
                 if name in target._buffers:
                     target._buffers[name] = tensor
+                elif isinstance(target.__dict__.get(name), torch.Tensor):
+                    # A lifted constant (a cache tensor the model reaches
+                    # through its cache object) is a plain attribute of
+                    # the unlifted module, not a registered buffer.
+                    setattr(target, name, tensor)
 
     def new_session(self):
         with self._lock:
@@ -265,6 +276,8 @@ class Engine:
         with tools); it is tokenized verbatim, adding BOS only if the
         rendered text does not already start with it.
         """
+        if self.tokenizer is None:
+            raise ValueError("this model has no tokenizer; use Generate with token ids")
         if raw_prompt:
             bos = self.tokenizer.bos_token or ""
             add_special = not (bos and text.startswith(bos))
