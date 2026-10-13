@@ -20,6 +20,7 @@ import (
 	"crypto/sha256"
 	"encoding/hex"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"net/http"
@@ -59,8 +60,12 @@ func BuildUploadCommand() *cobra.Command {
 	cmd.Flags().StringVar(&opt.ModelName, "model-name", "", "Name of the model")
 	cmd.Flags().StringVar(&opt.ModelDir, "model-dir", "", "Directory containing the model files")
 
-	cmd.MarkFlagRequired("model-name")
-	cmd.MarkFlagRequired("model-dir")
+	if err := cmd.MarkFlagRequired("model-name"); err != nil {
+		panic(err)
+	}
+	if err := cmd.MarkFlagRequired("model-dir"); err != nil {
+		panic(err)
+	}
 
 	return cmd
 }
@@ -88,7 +93,11 @@ func RunUpload(ctx context.Context, opt *UploadOptions) error {
 		if err != nil {
 			return err
 		}
-		defer f.Close()
+		defer func() {
+			if err := f.Close(); err != nil && !errors.Is(err, os.ErrClosed) {
+				log.Error(err, "closing file", "path", path)
+			}
+		}()
 
 		h := sha256.New()
 		if _, err := io.Copy(h, f); err != nil {
@@ -125,10 +134,17 @@ func RunUpload(ctx context.Context, opt *UploadOptions) error {
 		if err != nil {
 			return err
 		}
-		defer resp.Body.Close()
+		defer func() {
+			if err := resp.Body.Close(); err != nil {
+				log.Error(err, "closing response body", "url", blobURL)
+			}
+		}()
 
 		if resp.StatusCode != http.StatusCreated && resp.StatusCode != http.StatusOK {
-			body, _ := io.ReadAll(resp.Body)
+			body, err := io.ReadAll(resp.Body)
+			if err != nil {
+				return fmt.Errorf("failed to upload blob %s (status %s): reading body: %w", sha, resp.Status, err)
+			}
 			return fmt.Errorf("failed to upload blob %s: %s %s", sha, resp.Status, string(body))
 		}
 
@@ -166,10 +182,17 @@ func RunUpload(ctx context.Context, opt *UploadOptions) error {
 	if err != nil {
 		return err
 	}
-	defer resp.Body.Close()
+	defer func() {
+		if err := resp.Body.Close(); err != nil {
+			log.Error(err, "closing response body", "url", modelURL)
+		}
+	}()
 
 	if resp.StatusCode != http.StatusCreated && resp.StatusCode != http.StatusOK {
-		body, _ := io.ReadAll(resp.Body)
+		body, err := io.ReadAll(resp.Body)
+		if err != nil {
+			return fmt.Errorf("failed to create model %s (status %s): reading body: %w", opt.ModelName, resp.Status, err)
+		}
 		return fmt.Errorf("failed to create model %s: %s %s", opt.ModelName, resp.Status, string(body))
 	}
 

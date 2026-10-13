@@ -63,6 +63,15 @@ func TestLocalFileServing(t *testing.T) {
 	if string(body) != content {
 		t.Errorf("Expected '%s', got '%s'", content, string(body))
 	}
+
+	// Test non-existent file returns 404
+	req = httptest.NewRequest(http.MethodGet, "/non-existent-file", nil)
+	w = httptest.NewRecorder()
+	p.ServeHTTP(w, req)
+	resp = w.Result()
+	if resp.StatusCode != http.StatusNotFound {
+		t.Errorf("Expected status 404, got %d", resp.StatusCode)
+	}
 }
 
 func TestBlobAndModelAPI(t *testing.T) {
