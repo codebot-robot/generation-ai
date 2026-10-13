@@ -305,8 +305,10 @@ clients.
   compile settings: Qwen3-30B-A3B-Instruct-2507-FP8 decodes at
   11.7–12.2 ms/token (~85 tok/s) with the same tokens as before, against
   25.4–26.9 ms/token for eager transformers running the checkpoint
-  dequantized to bf16 (61 GB) on the same card; Qwen3-8B-FP8 at
-  12.2 ms/token. The first load pays ~1–2 min of autotuning. That the
+  dequantized to bf16 (61 GB) and 46–62 ms/token for eager transformers
+  running it as fp8 with its own kernels (`FP8Linear`/`FP8Experts`, the
+  Hub Triton kernel; DeepGEMM needs a datacenter part) on the same card;
+  Qwen3-8B-FP8 at 12.2 ms/token. The first load pays ~1–2 min of autotuning. That the
   8B and the 30B take the same time per token says the step is bound by
   kernel launches, not bandwidth, on this card (CUDA graphs are the next
   lever; see the issue tracker).
