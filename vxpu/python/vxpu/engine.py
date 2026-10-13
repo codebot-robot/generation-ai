@@ -66,6 +66,18 @@ def compile_options(device):
                                    "max-autotune-no-cudagraphs")}
 
 
+
+TOKENIZER_FILES = ("tokenizer.json", "tokenizer_config.json",
+                   "tokenizer.model", "vocab.json", "spiece.model")
+
+
+def _has_tokenizer_files(repo):
+    """False only for a local checkpoint directory with none of the
+    usual tokenizer files; a Hub repo is always attempted."""
+    if not os.path.isdir(repo):
+        return True
+    return any(os.path.exists(os.path.join(repo, f)) for f in TOKENIZER_FILES)
+
 class Engine:
     def __init__(self, artifact_dir, device="cpu", compile_decode=False,
                  cas_dir=None):
@@ -88,13 +100,17 @@ class Engine:
         ].from_dict(self.manifest["config"])
         self.max_cache_len = int(self.binding.get("max_cache_len", 1024))
         # Tokenizer/processor files are not yet part of the manifest.
-        # Generate (ids in, ids out) needs none; Chat does, and says so.
-        try:
-            self.tokenizer = AutoTokenizer.from_pretrained(
-                self.manifest["source"]["repo"])
-        except Exception as e:  # no tokenizer files, or no backend for them
-            print(f"[vxpu] no tokenizer for {self.manifest['source']['repo']}: "
-                  f"{type(e).__name__}; Chat is unavailable, Generate works")
+        # Generate (ids in, ids out) needs none; Chat does. A local
+        # checkpoint without tokenizer files (the test fixtures) loads
+        # without one; for a Hub repo a failed fetch fails the load, so
+        # a transient Hub error is reported as one rather than as a
+        # model with no tokenizer.
+        repo = self.manifest["source"]["repo"]
+        if _has_tokenizer_files(repo):
+            self.tokenizer = AutoTokenizer.from_pretrained(repo)
+        else:
+            print(f"[vxpu] {repo} has no tokenizer files; "
+                  "Chat is unavailable, Generate works", flush=True)
             self.tokenizer = None
         self.generation_config = self._generation_config()
         self.eos_ids = self._eos_ids()

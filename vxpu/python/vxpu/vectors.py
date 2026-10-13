@@ -249,6 +249,13 @@ def compare(reference, candidate, logit_tolerance=0.025):
     computations of the same model legitimately differ by a few units
     in the last place of that scale (a logit of 30 carries 0.25 per ulp
     in bf16). 2.5% covers that; a real divergence is tens of percent.
+
+    The two top-k sets need not hold the same ids. An id in one set and
+    not the other still has a known bound on the other side: its logit
+    there is no larger than that side's k-th value, so the diff is at
+    least the gap down to it. That gap is what is charged, in both
+    directions; a diff of exactly the k-th-largest cut is the smallest
+    the truth could be, never an acquittal.
     """
     rows, ok = [], True
     ref = {p["name"]: p for p in reference["prompts"]}
@@ -264,12 +271,18 @@ def compare(reference, candidate, logit_tolerance=0.025):
         if r.get("top_logits") and p.get("top_logits"):
             diffs, rels = [], []
             for a, b in zip(r["top_logits"], p["top_logits"]):
-                bv = dict(zip(b["ids"], b["values"]))
+                av, bv = dict(zip(a["ids"], a["values"])), dict(zip(b["ids"], b["values"]))
+                a_floor, b_floor = min(a["values"]), min(b["values"])
                 scale = max(1.0, max(abs(v) for v in a["values"]))
-                for i, v in zip(a["ids"], a["values"]):
-                    if i in bv:
-                        diffs.append(abs(v - bv[i]))
-                        rels.append(abs(v - bv[i]) / scale)
+                for i, v in av.items():
+                    d = abs(v - bv[i]) if i in bv else max(0.0, v - b_floor)
+                    diffs.append(d)
+                    rels.append(d / scale)
+                for i, v in bv.items():
+                    if i not in av:
+                        d = max(0.0, v - a_floor)
+                        diffs.append(d)
+                        rels.append(d / scale)
             max_diff = max(diffs) if diffs else None
             max_rel = max(rels) if rels else None
         row_ok = same_prompt and tokens_equal and (max_rel is None or max_rel <= logit_tolerance)
@@ -339,7 +352,7 @@ def cmd_compare(args):
         raise SystemExit("vectors differ")
 
 
-def selftest(workdir, settings, keep=False):
+def selftest(workdir, settings):
     """The CI tier: tiny models through export, the in-process engine,
     and a transformers reference, token-exact. No cluster."""
     from .export import export_artifact

@@ -29,6 +29,7 @@ import (
 	"bufio"
 	"context"
 	_ "embed"
+	"encoding/json"
 	"errors"
 	"flag"
 	"fmt"
@@ -144,6 +145,9 @@ func cmdAsk(ctx context.Context, args []string) error {
 			return fmt.Errorf("reading artifact: %w", err)
 		}
 		files[name] = data
+	}
+	if err := checkShippable(files["manifest.json"]); err != nil {
+		return err
 	}
 	fmt.Printf("shipping artifact %s (%d MB graphs; weights stay remote)\n",
 		*artifact, (len(files["prefill.pt2"])+len(files["decode.pt2"]))/(1024*1024))
@@ -361,4 +365,26 @@ func portForward(ctx context.Context, pod string) (string, func(), error) {
 	}
 	stop()
 	return "", nil, fmt.Errorf("port-forward to %s never became ready", pod)
+}
+
+// checkShippable refuses an artifact exported from a local checkpoint
+// directory: its manifest binds weights to file:// paths on the
+// exporting machine, which an executor elsewhere cannot read. Catching
+// it here is better than on the executor, which would already have
+// evicted the model it was serving to make room.
+func checkShippable(manifestJSON []byte) error {
+	var manifest struct {
+		Files map[string]struct {
+			Source string `json:"source"`
+		} `json:"files"`
+	}
+	if err := json.Unmarshal(manifestJSON, &manifest); err != nil {
+		return fmt.Errorf("parsing manifest.json: %w", err)
+	}
+	for _, f := range manifest.Files {
+		if strings.HasPrefix(f.Source, "file://") {
+			return fmt.Errorf("artifact binds weights to local files, which the executor cannot read (%s); export from a Hub repo id to ship it, or run it in-process", f.Source)
+		}
+	}
+	return nil
 }

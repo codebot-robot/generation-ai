@@ -53,12 +53,6 @@ from transformers.integrations.executorch import (
 from .fp8 import apply_fp8, fp8_config, set_experts_implementation
 from .manifest import build_manifest
 
-# Buffers computed from config at init time, never stored in
-# checkpoints. Executors recompute them (see rehydrate.derived_tensor).
-DERIVED_MARKERS = ("rotary_emb", "inv_freq", "embed_scale", "softcap",
-                   "inv_timescales")
-
-
 def _head_shapes(config):
     """Per-layer (num_kv_heads, head_dim) for the static cache.
 
