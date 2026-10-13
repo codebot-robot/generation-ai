@@ -195,9 +195,12 @@ run one transformers. Each patch is written to be upstreamable.
 
 `vxpu.vectors` records what a model says and compares two recordings.
 Eager transformers writes the reference; the vXPU engine (in-process,
-or through a router) and vLLM write candidates. Greedy tokens must
-agree exactly, and where both sides carry logits the top-k values of
-the first generated positions must agree within a tolerance. The file format (`vxpu-vectors/1`) is the
+or through a router) and vLLM write candidates. Where the candidate's
+greedy tokens leave the reference's, the reference's own logits at
+that position decide whether the flip was a tie (within the tolerance
+of its top choice: a coin toss two correct engines can call
+differently) or a divergence; and the top-k logits of every generated
+position, up to the first flip, must agree within the tolerance. The file format (`vxpu-vectors/1`) is the
 interchange point between engines.
 
 ```sh
@@ -263,29 +266,35 @@ vXPU engine on the same card (the artifact, compiled):
 |---|---|---|---|---|---|
 | L4 | Marlin, weight-only (fp8 weights, bf16 activations) | vLLM | 3 of 3 prompts equal | 0.75 (2.0%) | 34–39 |
 | L4 | (the graph: fp8 weights, bf16 activations) | vXPU | 3 of 3 equal; also 3 of 3 equal to vLLM | 0.75 (1.8%) | 40 |
-| RTX PRO 6000 | DeepGEMM, fp8 weights *and* activations | vLLM | 1 of 3 equal (31/32, 20/32) | 2.75 (6.5%) | 7.6–8.0 |
-| RTX PRO 6000 | (the graph: fp8 weights, bf16 activations) | vXPU | 3 of 3 equal; vs vLLM 1 of 3 (the same two flips) | 0.625 (1.7%) | 10.3 |
+| RTX PRO 6000 | DeepGEMM, fp8 weights *and* activations | vLLM | 1 of 3 equal; two tie flips (gaps 0.0 and 0.75) | 2.75 (6.5%), fails | 7.6–8.0 |
+| RTX PRO 6000 | (the graph: fp8 weights, bf16 activations) | vXPU | 3 of 3 equal; vs vLLM the same two tie flips | 0.625 (1.7%) | 10.3 |
 
 Reading the table: on the L4, where Ada has no fp8 compute and vLLM
 dequantizes the weights and multiplies in bf16, vLLM computes the same
 function as transformers and the vXPU graph, and its logits sit within
 bf16 rounding of them. On the RTX, vLLM takes its DeepGEMM path, which
 quantizes the activations to fp8 per 128-group as well, and its logits
-move by up to 6.5% of the top logit; the two token divergences are an
-exact tie (the transformers reference has both candidates at 40.5 at
-that position) and a 0.75 gap that the activation quantization inverts.
+move by up to 6.5% of the top logit; the two token flips are an exact
+tie (the transformers reference has both candidates at 40.5 at that
+position) and a 0.75 gap at a top logit of 31.5, which is 2.4% and so
+inside the tie tolerance too. The rows fail on the logits, not on the
+tokens: the tokens were coin tosses, the distribution is what moved.
 Transformers' own fp8 kernel path on the same card (`FP8Linear` with
 the Hub kernel, also fp8 activations) lands 3% from its bf16 path and
 6–7% from vLLM, so vLLM's path differs in more than the GEMM.
 
-Two rules the vLLM column taught the harness. The reference must be
-recorded on the same device class as the candidate: eager transformers
-on the CPU and on an L4 already disagree on one token of the kubernetes
-prompt, a near-tie 0.25 apart in logits of magnitude 40, one bf16 ulp.
-And logits are compared only up to the first token where the two
-streams diverge; after that each side's logits answer a different
+Three rules the vLLM column taught the harness. A token flip is judged
+by the reference's logits at that position (its *tie set*: every token
+within the tolerance of its top choice), not by equality: eager
+transformers on the CPU and on an L4 already disagree on one token of
+the kubernetes prompt, a near-tie 0.25 apart in logits of magnitude 40,
+one bf16 ulp, and that is a tie, not a bug. For the same reason the
+reference must be recorded on the same device class as the candidate,
+and logits are recorded for every generated position, since a flip at
+a position without them cannot be judged. And logits are compared only
+up to the first flip; after that each side's logits answer a different
 question, and the first version of `compare` reported 130% diffs that
-meant nothing.
+meant nothing (teacher forcing, #243, will lift that limit).
 
 The equivalence bar for the vXPU graph is unchanged: it must match the
 computation transformers runs for the checkpoint, and it does on both
