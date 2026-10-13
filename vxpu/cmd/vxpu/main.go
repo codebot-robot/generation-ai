@@ -211,6 +211,24 @@ func cmdUp(ctx context.Context, args []string) error {
 	if err := flags.Parse(args); err != nil {
 		return err
 	}
+	// A running router keeps the settings it was started with unless
+	// a flag names a new value: `vxpu up` on its own means "make sure
+	// it is running", not "reset it to the defaults".
+	set := map[string]bool{}
+	flags.Visit(func(f *flag.Flag) { set[f.Name] = true })
+	if current, err := podSettings(ctx, *pod); err != nil {
+		return err
+	} else if current != nil {
+		if !set["image"] && current.image != "" {
+			*image = current.image
+		}
+		if !set["executor-image"] && current.executorImage != "" {
+			*executorImage = current.executorImage
+		}
+		if !set["accelerator"] && current.accelerator != "" {
+			*accelerator = current.accelerator
+		}
+	}
 	if err := ensurePod(ctx, *pod, *image, *executorImage, *accelerator, true); err != nil {
 		return fmt.Errorf("ensuring router pod: %w", err)
 	}
@@ -246,6 +264,31 @@ func cmdDown(ctx context.Context, args []string) error {
 // podPhase returns the router pod's phase, or "" if there is no such
 // pod. --ignore-not-found makes absence a success with empty output,
 // so any error from kubectl is a real one.
+// routerSettings are the values a running router was created with.
+type routerSettings struct {
+	image, executorImage, accelerator string
+}
+
+// podSettings reads a running router's image, executor image and
+// accelerator; nil if the pod does not exist.
+func podSettings(ctx context.Context, pod string) (*routerSettings, error) {
+	out, err := exec.CommandContext(ctx, "kubectl", "get", "pod", pod,
+		"--ignore-not-found", "-o",
+		`jsonpath={.spec.containers[0].image}{"\t"}`+
+			`{.spec.containers[0].env[?(@.name=="VXPU_EXECUTOR_IMAGE")].value}{"\t"}`+
+			`{.spec.containers[0].env[?(@.name=="VXPU_ACCELERATOR")].value}`).CombinedOutput()
+	if err != nil {
+		return nil, fmt.Errorf("kubectl get pod %s: %w: %s", pod, err,
+			strings.TrimSpace(string(out)))
+	}
+	fields := strings.Split(strings.TrimSpace(string(out)), "\t")
+	if len(fields) < 3 || fields[0] == "" {
+		return nil, nil
+	}
+	return &routerSettings{image: fields[0], executorImage: fields[1],
+		accelerator: fields[2]}, nil
+}
+
 func podPhase(ctx context.Context, pod string) (string, error) {
 	out, err := exec.CommandContext(ctx, "kubectl", "get", "pod", pod,
 		"--ignore-not-found", "-o", "jsonpath={.status.phase}").CombinedOutput()
