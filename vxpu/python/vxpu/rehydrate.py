@@ -30,6 +30,7 @@ is exactly bincount).
 import hashlib
 import math
 import os
+import threading
 from concurrent.futures import ThreadPoolExecutor
 
 import requests
@@ -41,6 +42,24 @@ DTYPES = {
     "BF16": torch.bfloat16, "I64": torch.int64, "I32": torch.int32,
     "F8_E4M3": torch.float8_e4m3fn, "F8_E5M2": torch.float8_e5m2,
 }
+
+
+_local = threading.local()
+
+
+def _session():
+    """One keep-alive HTTP session per thread.
+
+    A model is tens of thousands of range reads; a new connection per
+    read exhausts the ephemeral ports (errno 99) on a fast node.
+    """
+    session = getattr(_local, "session", None)
+    if session is None:
+        session = _local.session = requests.Session()
+        adapter = requests.adapters.HTTPAdapter(pool_connections=4, pool_maxsize=4, max_retries=3)
+        session.mount("http://", adapter)
+        session.mount("https://", adapter)
+    return session
 
 
 def fetch_tensor(ref, files, cas_dir=None):
@@ -56,7 +75,7 @@ def fetch_tensor(ref, files, cas_dir=None):
     def download():
         url = files[ref["file_sha256"]]["source"]
         end = ref["offset"] + ref["length"] - 1
-        resp = requests.get(
+        resp = _session().get(
             url, headers={"Range": f"bytes={ref['offset']}-{end}"})
         resp.raise_for_status()
         if resp.status_code != 206:
