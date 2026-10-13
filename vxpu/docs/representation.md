@@ -165,6 +165,26 @@ every fix landing in the library rather than the artifact:
   into a table come from transformers' conversion mapping, replayed on
   the manifest; nothing in vXPU knows a model's naming.
 
+## Which computation is the reference
+
+The bar is "the computation transformers runs for the checkpoint", and
+for a model-maker fp8 checkpoint that phrase has two readings. Loaded
+with `dequantize=True`, or through the fork's plain-torch path,
+transformers dequantizes each weight block and multiplies in bf16
+(fp8 weights, bf16 activations). Its CUDA kernel path, like vLLM's
+DeepGEMM path on Hopper and Blackwell, also quantizes the activations
+to fp8 per 128-group before the GEMM (fp8 weights and activations).
+The test vectors for Qwen3-8B-FP8 put numbers on the gap: the two
+transformers paths differ by 3% of the top logit on the same card,
+vLLM's path by 6%, and a token flips wherever the top two were within
+that. The exported graph is the first reading, and matches it to bf16
+rounding on a CPU, an L4 and an RTX PRO 6000. Substituting a vendor
+kernel that computes the second reading (#217) is therefore not a
+transparent optimization: it changes the function by an amount the
+harness can see, and it should be a placement choice reported in the
+same table, with the model maker's intent for the checkpoint deciding
+the default.
+
 ## Decision
 
 pt2 is the representation. Our own module-tree format would reinvent

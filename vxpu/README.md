@@ -194,11 +194,10 @@ run one transformers. Each patch is written to be upstreamable.
 ## Verifying a model: test vectors
 
 `vxpu.vectors` records what a model says and compares two recordings.
-Eager transformers writes the reference; the vXPU engine writes a
-candidate (in-process, or through a router); a future vLLM backend
-would write one too. Greedy tokens must agree exactly, and where both
-sides carry logits the top-k values of the first generated positions
-must agree within a tolerance. The file format (`vxpu-vectors/1`) is the
+Eager transformers writes the reference; the vXPU engine (in-process,
+or through a router) and vLLM write candidates. Greedy tokens must
+agree exactly, and where both sides carry logits the top-k values of
+the first generated positions must agree within a tolerance. The file format (`vxpu-vectors/1`) is the
 interchange point between engines.
 
 ```sh
@@ -209,6 +208,8 @@ python -m vxpu.export Qwen/Qwen3-8B-FP8 -o qwen8b/
 python -m vxpu.vectors record --producer vxpu-engine --model Qwen/Qwen3-8B-FP8 --artifact qwen8b/ -o got.json
 # ... or through the router in the cluster (tokens only; no logits on the wire)
 python -m vxpu.vectors record --producer vxpu-router --model Qwen/Qwen3-8B-FP8 --artifact qwen8b/ -o got.json
+# ... or vLLM, from a vLLM image (needs only vllm; copy vectors.py in)
+python -m vxpu.vectors record --producer vllm --model Qwen/Qwen3-8B-FP8 --device cuda -o vllm.json
 python -m vxpu.vectors compare ref.json got.json
 ```
 
@@ -240,6 +241,57 @@ because the engine only re-bound registered buffers, not the cache
 tensors export had lifted as constants. The fp8 numbers on the CPU also
 say plainly that dequantizing per step costs 20x against bf16 weights
 there; the GPU is where fp8 pays.
+
+### A second engine: vLLM
+
+`--producer vllm` records what vLLM serves for the same repo and
+revision: the prompt as the same token ids (the chat template is
+applied by the harness, not by vLLM), greedy, and the top-k *raw
+logits* of each generated position (`logprobs_mode="raw_logits"`, the
+pre-softmax values before any processor), so a vLLM recording compares
+with the others at the logit level. The producer needs only the `vllm`
+package: copy `vectors.py` into a vLLM image and run it directly.
+
+Qwen3-8B-FP8 through vLLM 0.31 on two cards, against eager transformers
+on the same card (the checkpoint dequantized to bf16) and against the
+vXPU engine on the same card (the artifact, compiled):
+
+| card | vLLM's fp8 path | engine | greedy tokens vs transformers | top-k logits, max diff | ms/token |
+|---|---|---|---|---|---|
+| L4 | Marlin, weight-only (fp8 weights, bf16 activations) | vLLM | 3 of 3 prompts equal | 0.75 (2.0%) | 34–39 |
+| L4 | (the graph: fp8 weights, bf16 activations) | vXPU | 3 of 3 equal; also 3 of 3 equal to vLLM | 0.75 (1.8%) | 40 |
+| RTX PRO 6000 | DeepGEMM, fp8 weights *and* activations | vLLM | 1 of 3 equal (31/32, 20/32) | 2.75 (6.5%) | 7.6–8.0 |
+| RTX PRO 6000 | (the graph: fp8 weights, bf16 activations) | vXPU | 3 of 3 equal; vs vLLM 1 of 3 (the same two flips) | 0.625 (1.7%) | 10.3 |
+
+Reading the table: on the L4, where Ada has no fp8 compute and vLLM
+dequantizes the weights and multiplies in bf16, vLLM computes the same
+function as transformers and the vXPU graph, and its logits sit within
+bf16 rounding of them. On the RTX, vLLM takes its DeepGEMM path, which
+quantizes the activations to fp8 per 128-group as well, and its logits
+move by up to 6.5% of the top logit; the two token divergences are an
+exact tie (the transformers reference has both candidates at 40.5 at
+that position) and a 0.75 gap that the activation quantization inverts.
+Transformers' own fp8 kernel path on the same card (`FP8Linear` with
+the Hub kernel, also fp8 activations) lands 3% from its bf16 path and
+6–7% from vLLM, so vLLM's path differs in more than the GEMM.
+
+Two rules the vLLM column taught the harness. The reference must be
+recorded on the same device class as the candidate: eager transformers
+on the CPU and on an L4 already disagree on one token of the kubernetes
+prompt, a near-tie 0.25 apart in logits of magnitude 40, one bf16 ulp.
+And logits are compared only up to the first token where the two
+streams diverge; after that each side's logits answer a different
+question, and the first version of `compare` reported 130% diffs that
+meant nothing.
+
+The equivalence bar for the vXPU graph is unchanged: it must match the
+computation transformers runs for the checkpoint, and it does on both
+cards. vLLM's path with fp8 activations (W8A8, in the usual shorthand;
+the graph is W8A16) is a different computation of the same weights,
+and the question of which one the model maker's fp8 recipe intends is
+the question #217 and #218 ask of DeepGEMM substitution: a kernel that
+changes the logits by 6% is a placement choice the user should see in
+this table, not an invisible rewrite.
 
 ## Layout
 
