@@ -16,14 +16,14 @@
 
 A vectors file is the interchange format between engines. Eager
 transformers records the reference; the vXPU engine (in-process, or
-through a router) records a candidate; a vLLM backend would record one
-too. ``compare`` diffs two files: greedy tokens must agree exactly, and
+through a router) and vLLM record candidates. ``compare`` diffs two files: greedy tokens must agree exactly, and
 where both sides carry logits the top-k values must agree within a
 tolerance.
 
     python -m vxpu.vectors record --producer transformers --model REPO -o ref.json
     python -m vxpu.vectors record --producer vxpu-engine --model REPO --artifact DIR -o got.json
     python -m vxpu.vectors record --producer vxpu-router --model REPO --artifact DIR [--router host:port] -o got.json
+    python -m vxpu.vectors record --producer vllm --model REPO -o vllm.json  # or: python vectors.py ...
     python -m vxpu.vectors compare ref.json got.json
     python -m vxpu.vectors selftest  # the CI tier: tiny models, in-process
 
@@ -31,7 +31,7 @@ Format (vxpu-vectors/1):
 
     {"format": "vxpu-vectors/1",
      "model": {"repo": ..., "revision": ..., "commit_sha": ...},
-     "producer": {"kind": "transformers" | "vxpu-engine" | "vxpu-router",
+     "producer": {"kind": "transformers" | "vxpu-engine" | "vxpu-router" | "vllm",
                   "torch": ..., "transformers": ..., "device": ..., ...},
      "settings": {"new_tokens": 32, "top_k": 32, "logit_positions": 4,
                   "greedy": true},
@@ -74,8 +74,12 @@ FORMAT = "vxpu-vectors/1"
 def _versions(device):
     import torch
     import transformers
-    return {"torch": torch.__version__, "transformers": transformers.__version__,
-            "device": str(device)}
+    out = {"torch": torch.__version__, "transformers": transformers.__version__,
+           "device": str(device)}
+    if str(device).startswith("cuda") and torch.cuda.is_available():
+        # The kernel path follows from the card, so name the one used.
+        out["gpu"] = torch.cuda.get_device_name(torch.device(str(device)))
+    return out
 
 
 def _r(value):
@@ -233,6 +237,75 @@ def record_vxpu_router(model, revision, prompts, settings, artifact, router=None
     return _document(model, revision, lm.config, producer, settings, out)
 
 
+def record_vllm(model, revision, prompts, settings, dtype="auto",
+                max_model_len=None, enforce_eager=False):
+    """Candidate: vLLM serving the same repo/revision, greedy, raw logits.
+
+    vLLM is given the prompt as the same token ids the other producers
+    use (the chat template is applied here, not by vLLM), and asked for
+    the top-k *raw logits* of each generated position (``logprobs_mode=
+    "raw_logits"``: the pre-softmax values before any processor), so the
+    recording compares with the others at the logit level. Sampling
+    defaults come from vLLM, not the model's generation_config, and
+    everything that matters is set explicitly: temperature 0, no
+    penalties. Expect larger logit differences than between two
+    transformers runs: vLLM's fp8 path quantizes activations to fp8
+    too (W8A8), where transformers and the vXPU graph dequantize the
+    weights and multiply in bf16 (W8A16); the greedy tokens are the
+    test, the logits say how close the two engines' views are.
+
+    vLLM places the model itself (there is no device argument); the
+    recording is labelled with the device and card it ran on.
+
+    Runs with the ``vllm`` package only (plus transformers for the
+    tokenizer): copy this file into a vLLM image and run it directly,
+    ``python vectors.py record --producer vllm ...``.
+    """
+    import torch
+    import vllm
+    from vllm import LLM, SamplingParams
+    from vllm.inputs import TokensPrompt
+    tok = _tokenizer(model, revision, prompts)
+    kwargs = {"model": model, "revision": revision, "dtype": dtype,
+              "logprobs_mode": "raw_logits", "max_logprobs": settings["top_k"],
+              "generation_config": "vllm", "enforce_eager": enforce_eager, "seed": 0}
+    if max_model_len:
+        kwargs["max_model_len"] = max_model_len
+    llm = LLM(**kwargs)
+    config = llm.llm_engine.model_config.hf_config
+    params = SamplingParams(temperature=0.0, top_p=1.0, top_k=0, repetition_penalty=1.0,
+                            max_tokens=settings["new_tokens"],
+                            logprobs=settings["top_k"], skip_special_tokens=False)
+    out = []
+    for prompt in _prompt_set(tok, prompts):
+        ids = _encode(tok, prompt)
+        t0 = time.perf_counter()
+        result = llm.generate([TokensPrompt(prompt_token_ids=ids)], params, use_tqdm=False)[0]
+        elapsed = time.perf_counter() - t0
+        completion = result.outputs[0]
+        new = list(completion.token_ids)
+        top = []
+        for step in (completion.logprobs or [])[:settings["logit_positions"]]:
+            # {token_id: Logprob(logprob=<raw logit here>, rank, ...)}; the
+            # sampled token is included even when outside the top-k, so
+            # keep the k best by value, like torch.topk does.
+            pairs = sorted(((lp.logprob, i) for i, lp in step.items()), reverse=True)
+            pairs = pairs[:settings["top_k"]]
+            top.append({"ids": [i for _, i in pairs],
+                        "values": [round(float(v), 5) for v, _ in pairs]})
+        out.append({**prompt, "input_ids": ids, "generated_ids": new,
+                    "finish": {"stop": "eos", "length": "length"}.get(
+                        completion.finish_reason, completion.finish_reason),
+                    "top_logits": top,
+                    "ms_per_token": round(1000 * elapsed / max(1, len(new)), 1)})
+    mc = llm.llm_engine.model_config
+    device = "cuda" if torch.cuda.is_available() else "cpu"
+    producer = {"kind": "vllm", "vllm": vllm.__version__, **_versions(device),
+                "dtype": str(mc.dtype), "quantization": mc.quantization,
+                "enforce_eager": enforce_eager, "logprobs_mode": "raw_logits"}
+    return _document(model, revision, config, producer, settings, out)
+
+
 def _document(model, revision, config, producer, settings, prompts):
     return {"format": FORMAT,
             "model": {"repo": model, "revision": revision,
@@ -256,6 +329,11 @@ def compare(reference, candidate, logit_tolerance=0.025):
     least the gap down to it. That gap is what is charged, in both
     directions; a diff of exactly the k-th-largest cut is the smallest
     the truth could be, never an acquittal.
+
+    Logits are compared only up to and including the first position
+    where the generated tokens differ: a later position is conditioned
+    on a different prefix on each side, and its logits are two
+    different questions, not two answers to one.
     """
     rows, ok = [], True
     ref = {p["name"]: p for p in reference["prompts"]}
@@ -268,9 +346,12 @@ def compare(reference, candidate, logit_tolerance=0.025):
         tokens_equal = r["generated_ids"] == p["generated_ids"]
         agree = sum(a == b for a, b in zip(r["generated_ids"], p["generated_ids"]))
         max_diff, max_rel = None, None
+        diverge = next((i for i, (x, y) in enumerate(zip(r["generated_ids"], p["generated_ids"]))
+                        if x != y), None)
+        comparable = len(r["generated_ids"]) if diverge is None else diverge + 1
         if r.get("top_logits") and p.get("top_logits"):
             diffs, rels = [], []
-            for a, b in zip(r["top_logits"], p["top_logits"]):
+            for a, b in list(zip(r["top_logits"], p["top_logits"]))[:comparable]:
                 av, bv = dict(zip(a["ids"], a["values"])), dict(zip(b["ids"], b["values"]))
                 a_floor, b_floor = min(a["values"]), min(b["values"])
                 scale = max(1.0, max(abs(v) for v in a["values"]))
@@ -336,6 +417,11 @@ def cmd_record(args):
         doc = record_vxpu_engine(args.model, args.revision, args.prompts, settings,
                                  args.artifact, device=args.device,
                                  compile_decode=args.compile)
+    elif args.producer == "vllm":
+        doc = record_vllm(args.model, args.revision, args.prompts, settings,
+                          dtype=args.dtype,
+                          max_model_len=args.max_model_len,
+                          enforce_eager=args.enforce_eager)
     else:
         doc = record_vxpu_router(args.model, args.revision, args.prompts, settings,
                                  args.artifact, router=args.router)
@@ -394,18 +480,21 @@ def main(argv=None):
         p.add_argument("--logit-positions", type=int, default=DEFAULTS["logit_positions"])
 
     rec = sub.add_parser("record", help="record vectors with a producer")
-    rec.add_argument("--producer", choices=["transformers", "vxpu-engine", "vxpu-router"], required=True)
+    rec.add_argument("--producer", choices=["transformers", "vxpu-engine", "vxpu-router", "vllm"], required=True)
     rec.add_argument("--model", required=True, help="Hub repo id or local checkpoint directory")
     rec.add_argument("--revision", default="main")
     rec.add_argument("--prompts", choices=["auto", "text", "ids"], default="auto",
                      help="text prompts through the chat template, or fixed ids (auto: ids if no tokenizer)")
     rec.add_argument("--artifact", help="vxpu artifact directory (vxpu-* producers)")
     rec.add_argument("--router", help="router host:port (vxpu-router; default: port-forward)")
-    rec.add_argument("--device", default="cpu")
-    rec.add_argument("--dtype", default="auto", help="transformers producer dtype (auto: the config's)")
+    rec.add_argument("--device", default="cpu", help="transformers / vxpu-engine producers (vllm places itself)")
+    rec.add_argument("--dtype", default="auto", help="transformers / vllm model dtype (auto: the config's)")
     rec.add_argument("--compile", action="store_true", help="vxpu-engine: torch.compile the decode graph")
     rec.add_argument("--dequantize", action="store_true",
                      help="transformers producer: expand an fp8 checkpoint to bf16 at load")
+    rec.add_argument("--max-model-len", type=int, default=None, help="vllm: context length to allocate for")
+    rec.add_argument("--enforce-eager", action="store_true",
+                     help="vllm: no CUDA graphs / torch.compile")
     rec.add_argument("-o", "--out", required=True)
     common(rec)
     rec.set_defaults(func=cmd_record)
