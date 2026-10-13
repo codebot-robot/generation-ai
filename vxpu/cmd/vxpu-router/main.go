@@ -33,6 +33,7 @@ import (
 
 	pb "github.com/gke-labs/generation-ai/vxpu/pkg/api/v1alpha1"
 	"github.com/gke-labs/generation-ai/vxpu/pkg/router"
+	"github.com/gke-labs/generation-ai/vxpu/pkg/weightstore"
 )
 
 func main() {
@@ -43,6 +44,8 @@ func main() {
 	imageFlag := flag.String("image", "", "The executor image to run")
 	nsFlag := flag.String("namespace", "", "The Kubernetes namespace to use")
 	acceleratorFlag := flag.String("accelerator", "", "GKE accelerator label for the executor pod (e.g., nvidia-l4)")
+	modelstoreFlag := flag.String("modelstore", "",
+		"modelstore URL to keep weights in (default: VXPU_MODELSTORE_URL, else http://modelstore.modelstore if it resolves, else the router caches weights itself)")
 	flag.Parse()
 
 	ctx := context.Background()
@@ -57,6 +60,10 @@ func main() {
 	accelerator := *acceleratorFlag
 	if accelerator == "" {
 		accelerator = os.Getenv("VXPU_ACCELERATOR")
+	}
+	modelstoreURL := *modelstoreFlag
+	if modelstoreURL == "" {
+		modelstoreURL = os.Getenv("VXPU_MODELSTORE_URL")
 	}
 
 	// Load Kubeconfig
@@ -115,6 +122,7 @@ func main() {
 	)
 
 	srv := router.NewServer(clientset, namespace, imageName, accelerator)
+	srv.UseWeightStore(weightstore.Discover(ctx, modelstoreURL))
 	pb.RegisterExecutorServer(s, srv)
 
 	log.Info("Starting vxpu-router gRPC server", "port", *portFlag, "namespace", namespace, "image", imageName, "accelerator", accelerator)

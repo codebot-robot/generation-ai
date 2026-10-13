@@ -16,7 +16,7 @@
 # router pod itself, and a Service so in-cluster clients (e.g. a
 # notebook pod) can reach it at vxpu-router:50051. Every object carries
 # app.kubernetes.io/part-of: vxpu-router so `vxpu down` can remove them.
-# Placeholders (IMAGE, NAME, EXECUTOR_IMAGE, ACCELERATOR) are substituted at apply time.
+# Placeholders (IMAGE, NAME, EXECUTOR_IMAGE, ACCELERATOR, MODELSTORE) are substituted at apply time.
 apiVersion: v1
 kind: ServiceAccount
 metadata:
@@ -105,6 +105,8 @@ spec:
           value: "EXECUTOR_IMAGE"
         - name: VXPU_ACCELERATOR
           value: "ACCELERATOR"
+        - name: VXPU_MODELSTORE_URL
+          value: "MODELSTORE"
         - name: POD_IP
           valueFrom:
             fieldRef:

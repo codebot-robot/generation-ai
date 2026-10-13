@@ -47,6 +47,7 @@ import (
 	"k8s.io/klog/v2"
 
 	pb "github.com/gke-labs/generation-ai/vxpu/pkg/api/v1alpha1"
+	"github.com/gke-labs/generation-ai/vxpu/pkg/weightstore"
 )
 
 //go:embed router.yaml
@@ -59,7 +60,7 @@ func main() {
 	log := klog.FromContext(ctx)
 	if len(os.Args) < 2 {
 		fmt.Fprintln(os.Stderr,
-			"usage: vxpu ask [flags] PROMPT | vxpu up [flags] | vxpu down [flags]")
+			"usage: vxpu ask [flags] PROMPT | vxpu up [flags] | vxpu down [flags] | vxpu mirror REPO[@REVISION]")
 		os.Exit(2)
 	}
 	var err error
@@ -70,6 +71,8 @@ func main() {
 		err = cmdUp(ctx, os.Args[2:])
 	case "down":
 		err = cmdDown(ctx, os.Args[2:])
+	case "mirror":
+		err = cmdMirror(ctx, os.Args[2:])
 	default:
 		fmt.Fprintf(os.Stderr, "unknown command %q\n", os.Args[1])
 		os.Exit(2)
@@ -92,6 +95,8 @@ func cmdAsk(ctx context.Context, args []string) error {
 		os.Getenv("VXPU_EXECUTOR_IMAGE"), "executor image (used only if the router has to be created)")
 	accelerator := flags.String("accelerator", "nvidia-l4",
 		"GKE accelerator label for the executor pod (used only if the router has to be created; 'vxpu up' changes a running router)")
+	modelstore := flags.String("modelstore", os.Getenv("VXPU_MODELSTORE_URL"),
+		"modelstore URL for weights (used only if the router has to be created; empty: the router finds modelstore.modelstore or caches weights itself)")
 	routerAddr := flags.String("router", "", "vxpu-router address (e.g. localhost:50051); if set, skips direct pod creation")
 	maxNewTokens := flags.Int("max-new-tokens", 96, "tokens per reply")
 	timeout := flags.Duration("timeout", 20*time.Minute,
@@ -113,7 +118,7 @@ func cmdAsk(ctx context.Context, args []string) error {
 		// A running router is used as it is: its image, executor image
 		// and accelerator were decided by `vxpu up`; the flags here only
 		// apply when the router has to be created.
-		if err := ensurePod(ctx, *pod, *image, *executorImage, *accelerator, false); err != nil {
+		if err := ensurePod(ctx, *pod, routerSettings{*image, *executorImage, *accelerator, *modelstore}, false); err != nil {
 			return fmt.Errorf("ensuring router pod: %w", err)
 		}
 		var err error
@@ -212,6 +217,8 @@ func cmdUp(ctx context.Context, args []string) error {
 		os.Getenv("VXPU_EXECUTOR_IMAGE"), "executor image")
 	accelerator := flags.String("accelerator", "nvidia-l4",
 		"GKE accelerator label for the executor pod")
+	modelstore := flags.String("modelstore", os.Getenv("VXPU_MODELSTORE_URL"),
+		"modelstore URL to keep weights in (empty: the router finds modelstore.modelstore if deployed, else caches weights itself)")
 	if err := flags.Parse(args); err != nil {
 		return err
 	}
@@ -232,8 +239,11 @@ func cmdUp(ctx context.Context, args []string) error {
 		if !set["accelerator"] && current.accelerator != "" {
 			*accelerator = current.accelerator
 		}
+		if !set["modelstore"] {
+			*modelstore = current.modelstore
+		}
 	}
-	if err := ensurePod(ctx, *pod, *image, *executorImage, *accelerator, true); err != nil {
+	if err := ensurePod(ctx, *pod, routerSettings{*image, *executorImage, *accelerator, *modelstore}, true); err != nil {
 		return fmt.Errorf("ensuring router pod: %w", err)
 	}
 	fmt.Printf("router %s is ready\n", *pod)
@@ -270,7 +280,7 @@ func cmdDown(ctx context.Context, args []string) error {
 // so any error from kubectl is a real one.
 // routerSettings are the values a running router was created with.
 type routerSettings struct {
-	image, executorImage, accelerator string
+	image, executorImage, accelerator, modelstore string
 }
 
 // podSettings reads a running router's image, executor image and
@@ -280,7 +290,8 @@ func podSettings(ctx context.Context, pod string) (*routerSettings, error) {
 		"--ignore-not-found", "-o",
 		`jsonpath={.spec.containers[0].image}{"\t"}`+
 			`{.spec.containers[0].env[?(@.name=="VXPU_EXECUTOR_IMAGE")].value}{"\t"}`+
-			`{.spec.containers[0].env[?(@.name=="VXPU_ACCELERATOR")].value}`).CombinedOutput()
+			`{.spec.containers[0].env[?(@.name=="VXPU_ACCELERATOR")].value}{"\t"}`+
+			`{.spec.containers[0].env[?(@.name=="VXPU_MODELSTORE_URL")].value}`).CombinedOutput()
 	if err != nil {
 		return nil, fmt.Errorf("kubectl get pod %s: %w: %s", pod, err,
 			strings.TrimSpace(string(out)))
@@ -289,8 +300,11 @@ func podSettings(ctx context.Context, pod string) (*routerSettings, error) {
 	if len(fields) < 3 || fields[0] == "" {
 		return nil, nil
 	}
-	return &routerSettings{image: fields[0], executorImage: fields[1],
-		accelerator: fields[2]}, nil
+	settings := &routerSettings{image: fields[0], executorImage: fields[1], accelerator: fields[2]}
+	if len(fields) > 3 {
+		settings.modelstore = fields[3]
+	}
+	return settings, nil
 }
 
 func podPhase(ctx context.Context, pod string) (string, error) {
@@ -313,7 +327,8 @@ func podPhase(ctx context.Context, pod string) (string, error) {
 // recreated; without it (`vxpu ask`) a live router is used as it is,
 // because replacing it would reset the accelerator chosen with `up` and
 // drop its weight cache (issue #221).
-func ensurePod(ctx context.Context, pod, image, executorImage, accelerator string, reconfigure bool) error {
+func ensurePod(ctx context.Context, pod string, want routerSettings, reconfigure bool) error {
+	image, executorImage, accelerator := want.image, want.executorImage, want.accelerator
 	phase, err := podPhase(ctx, pod)
 	if err != nil {
 		return err
@@ -337,13 +352,14 @@ func ensurePod(ctx context.Context, pod, image, executorImage, accelerator strin
 		fmt.Printf("using router %s as it is (run `vxpu up` to change its image or accelerator)\n", pod)
 		return waitReady(ctx, pod)
 	}
-	fmt.Printf("applying router %s (image %s, executor-image %s, accelerator %s)\n",
-		pod, image, executorImage, accelerator)
+	fmt.Printf("applying router %s (image %s, executor-image %s, accelerator %s, modelstore %q)\n",
+		pod, image, executorImage, accelerator, want.modelstore)
 	manifest := strings.NewReplacer(
 		`"NAME"`, fmt.Sprintf("%q", pod),
 		`"IMAGE"`, fmt.Sprintf("%q", image),
 		`"EXECUTOR_IMAGE"`, fmt.Sprintf("%q", executorImage),
 		`"ACCELERATOR"`, fmt.Sprintf("%q", accelerator),
+		`"MODELSTORE"`, fmt.Sprintf("%q", want.modelstore),
 	).Replace(routerManifest)
 	if err := kubectlApply(ctx, manifest); err != nil {
 		// Pods are immutable apart from a few fields; recreate.
@@ -443,4 +459,87 @@ func checkShippable(manifestJSON []byte) error {
 		}
 	}
 	return nil
+}
+
+// cmdMirror asks modelstore (the cluster's weight store) to import a
+// Hugging Face repository, so that its weights are pulled from the Hub
+// once and every executor, reference run and vLLM pod reads them from
+// the bucket. It returns when the import is done; the Model object
+// (`kubectl get models`) shows progress meanwhile.
+func cmdMirror(ctx context.Context, args []string) error {
+	flags := flag.NewFlagSet("mirror", flag.ContinueOnError)
+	namespace := flags.String("namespace", "modelstore", "namespace of the modelstore Service")
+	service := flags.String("service", "modelstore", "name of the modelstore Service")
+	if err := flags.Parse(args); err != nil {
+		return err
+	}
+	if flags.NArg() != 1 {
+		return errors.New("usage: vxpu mirror [flags] REPO[@REVISION]")
+	}
+	repo, revision, _ := strings.Cut(flags.Arg(0), "@")
+	if revision == "" {
+		revision = "main"
+	}
+	addr, stop, err := portForwardService(ctx, *namespace, *service, 80)
+	if err != nil {
+		return fmt.Errorf("port-forward to modelstore: %w", err)
+	}
+	defer stop()
+	store := weightstore.New("http://" + addr)
+	name, err := store.ImportRepo(ctx, repo, revision)
+	if err != nil {
+		return err
+	}
+	fmt.Printf("importing %s@%s into modelstore as Model %s (kubectl get models -w)\n", repo, revision, name)
+	last := weightstore.ModelStatus{}
+	for {
+		st, err := store.GetModelStatus(ctx, name)
+		if err != nil {
+			return err
+		}
+		if st != last {
+			fmt.Printf("  %s: %d/%d files, %.1f GB\n", st.Phase, st.FilesImported, st.FilesTotal, float64(st.BytesImported)/1e9)
+			last = st
+		}
+		switch st.Phase {
+		case "Ready":
+			fmt.Printf("%s@%s is in the weight store\n", repo, revision)
+			return nil
+		case "Failed":
+			return fmt.Errorf("import failed: %s", st.Message)
+		}
+		select {
+		case <-ctx.Done():
+			return ctx.Err()
+		case <-time.After(5 * time.Second):
+		}
+	}
+}
+
+// portForwardService tunnels an ephemeral local port to a Service port.
+func portForwardService(ctx context.Context, namespace, service string, port int) (string, func(), error) {
+	log := klog.FromContext(ctx)
+	cmd := exec.CommandContext(ctx, "kubectl", "-n", namespace, "port-forward", "svc/"+service, fmt.Sprintf(":%d", port))
+	stdout, err := cmd.StdoutPipe()
+	if err != nil {
+		return "", nil, err
+	}
+	cmd.Stderr = os.Stderr
+	if err := cmd.Start(); err != nil {
+		return "", nil, err
+	}
+	stop := func() {
+		if err := cmd.Process.Kill(); err != nil && !errors.Is(err, os.ErrProcessDone) {
+			log.Error(err, "stopping port-forward", "service", service)
+		}
+	}
+	re := regexp.MustCompile(`Forwarding from (?:127\.0\.0\.1|\[::1\]):(\d+)`)
+	scanner := bufio.NewScanner(stdout)
+	for scanner.Scan() {
+		if m := re.FindStringSubmatch(scanner.Text()); m != nil {
+			return "127.0.0.1:" + m[1], stop, nil
+		}
+	}
+	stop()
+	return "", nil, fmt.Errorf("port-forward to %s/%s never became ready", namespace, service)
 }

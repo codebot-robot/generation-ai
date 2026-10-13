@@ -18,6 +18,7 @@ import (
 	"context"
 	"crypto/sha256"
 	"encoding/hex"
+	"encoding/json"
 	stderrors "errors"
 	"fmt"
 	"io"
@@ -44,6 +45,7 @@ import (
 
 	pb "github.com/gke-labs/generation-ai/vxpu/pkg/api/v1alpha1"
 	"github.com/gke-labs/generation-ai/vxpu/pkg/blobserver"
+	"github.com/gke-labs/generation-ai/vxpu/pkg/weightstore"
 )
 
 type Server struct {
@@ -53,6 +55,10 @@ type Server struct {
 	imageName   string
 	accelerator string
 	blobServer  *blobserver.Server
+	// weightStore, when set, holds the weights (modelstore in a
+	// bucket) and executors read it directly; otherwise the router
+	// caches weights itself and serves them through blobServer.
+	weightStore *weightstore.Client
 	// executorPort is the executor pods' gRPC port (overridable for tests).
 	executorPort int
 
@@ -88,6 +94,64 @@ func NewServer(clientset kubernetes.Interface, namespace, imageName, accelerator
 		executorPort: 50051,
 	}
 	return s
+}
+
+// UseWeightStore makes the router keep weights in modelstore instead of
+// its own cache; nil keeps the router's cache.
+func (s *Server) UseWeightStore(ws *weightstore.Client) {
+	s.weightStore = ws
+}
+
+// rewriteViaWeightStore makes every file of the manifest present in
+// modelstore (which fetches what it lacks from the manifest's sources)
+// and points the sources at modelstore's blob URLs. Files are handled concurrently;
+// modelstore de-duplicates and serializes the actual downloads.
+func (s *Server) rewriteViaWeightStore(ctx context.Context, manifestJSON string) (string, error) {
+	var manifest manifestFiles
+	if err := json.Unmarshal([]byte(manifestJSON), &manifest.raw); err != nil {
+		return "", fmt.Errorf("parsing manifest: %w", err)
+	}
+	files, ok := manifest.raw["files"].(map[string]any)
+	if !ok {
+		return "", fmt.Errorf("manifest has no files")
+	}
+	type result struct {
+		sha, url string
+		err      error
+	}
+	results := make(chan result, len(files))
+	for sha, f := range files {
+		file, _ := f.(map[string]any)
+		src, _ := file["source"].(string)
+		go func(sha, src string) {
+			url, err := s.weightStore.Ensure(ctx, sha, src)
+			results <- result{sha, url, err}
+		}(sha, src)
+	}
+	var errs []string
+	for range files {
+		r := <-results
+		if r.err != nil {
+			errs = append(errs, r.err.Error())
+			continue
+		}
+		files[r.sha].(map[string]any)["source"] = r.url
+	}
+	if len(errs) > 0 {
+		return "", fmt.Errorf("weight store: %s", strings.Join(errs, "; "))
+	}
+	out, err := json.Marshal(manifest.raw)
+	if err != nil {
+		return "", fmt.Errorf("serializing manifest: %w", err)
+	}
+	return string(out), nil
+}
+
+// manifestFiles keeps the manifest as generic JSON so that rewriting
+// one field round-trips every other field untouched (numbers included:
+// the exporter writes floats the typed decoder would reformat).
+type manifestFiles struct {
+	raw map[string]any
 }
 
 // executorClient dials the executor already serving modelKey; it does
@@ -372,14 +436,22 @@ func (s *Server) LoadModel(ctx context.Context, req *pb.LoadModelRequest) (*pb.L
 		return nil, status.Errorf(codes.Internal, "blobserver is not initialized")
 	}
 
-	routerIP := getRouterIP()
 	// Caching tens of GB outlives impatient clients: a dropped
 	// connection must not abort a download that the retry would only
 	// restart from zero.
-	rewrittenManifestJSON, err := s.blobServer.CacheAndRewriteManifest(
-		context.WithoutCancel(ctx), req.ManifestJson, routerIP)
-	if err != nil {
-		return nil, status.Errorf(codes.Internal, "failed to cache and rewrite manifest: %v", err)
+	var rewrittenManifestJSON string
+	var err error
+	if s.weightStore != nil {
+		rewrittenManifestJSON, err = s.rewriteViaWeightStore(context.WithoutCancel(ctx), req.ManifestJson)
+		if err != nil {
+			return nil, status.Errorf(codes.Internal, "weight store: %v", err)
+		}
+	} else {
+		rewrittenManifestJSON, err = s.blobServer.CacheAndRewriteManifest(
+			context.WithoutCancel(ctx), req.ManifestJson, getRouterIP())
+		if err != nil {
+			return nil, status.Errorf(codes.Internal, "failed to cache and rewrite manifest: %v", err)
+		}
 	}
 
 	// Prepare rewritten request

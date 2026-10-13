@@ -122,6 +122,35 @@ integer inputs — to its exact `bincount` equivalent), so one artifact
 serves heterogeneous executors: the graph carries reference semantics;
 each engine adapts it to its hardware.
 
+## Weights: the store
+
+Weights are pulled from the Hub once and kept in the cluster's weight
+store, [modelstore](../modelstore/): a content-addressed bucket
+(`gs://…/_blobs/<sha256>`) with a `Model` object per repository
+revision and a Hugging Face compatible read API. When modelstore is
+deployed (`modelstore.modelstore` resolves; or pass `vxpu up
+--modelstore URL`), the router no longer caches weights itself: on
+`LoadModel` it asks modelstore to make sure every file in the manifest
+is present (modelstore streams what it lacks from the manifest's Hub
+sources, verifying each sha256) and rewrites the sources to
+modelstore's blob URLs. Executors range-read those, one tensor per
+request as before, so a second load of the same checkpoint on any node
+touches the Hub not at all. modelstore is the only endpoint executors
+know: it carries the bucket credentials, and whether it proxies the
+bucket or redirects a read to a signed object URL is its decision, not
+the executor's. Without a modelstore (kind, the e2e) the router's own
+cache is used as before.
+
+```sh
+vxpu mirror Qwen/Qwen3-8B-FP8        # import once, ahead of time (optional)
+kubectl get models                   # phase, files, bytes
+```
+
+Reference and vLLM pods load from the same store with one variable,
+`HF_ENDPOINT=http://modelstore.modelstore`, which transformers, vLLM and
+`huggingface_hub` honour unchanged. The one-time bucket and
+workload-identity setup is in modelstore's README.
+
 ## Security & Trust Assumptions
 
 The vXPU executor **runs the artifact it is given**. There is currently no verification or sandboxing in the executor, and verifying the graph's structure is not a viable security control (a check strong enough to guarantee safety would mean we could have regenerated the graph ourselves).
@@ -318,8 +347,9 @@ python/vxpu/  export (thin client), client (thin client, no torch),
 cmd/vxpu/     Go CLI: no Python/torch — ships artifacts, creates the
               router pod on demand, port-forwards, chats
               (`vxpu up` brings up just the router for other clients)
-cmd/vxpu-router/  in-cluster router: caches weights, places and
-              creates executor pods, proxies the Executor API
+cmd/vxpu-router/  in-cluster router: keeps weights in modelstore (or
+              caches them itself), places and creates executor pods,
+              proxies the Executor API
 images/       executor and router container images
 examples/     notebooks (Gemma 4 on vXPU)
 third_party/  forked dependencies as submodules (transformers)
@@ -447,7 +477,8 @@ work — the experiment retains the full research trail.
 
 Known simplifications / tasks for the immediate roadmap are:
 - Tokenizer/processor files ride alongside the manifest rather than
-  in it; executors currently fetch them from the source repo.
+  in it; executors currently fetch them from the source repo (with a
+  modelstore deployed, `HF_ENDPOINT` can point them at the store).
 - Artifacts travel inside the LoadModel RPC; OCI registries
   (per-tensor layers, signed manifests) are the intended distribution.
 - One model per executor.
