@@ -23,7 +23,7 @@ tolerance.
     python -m vxpu.vectors record --producer transformers --model REPO -o ref.json
     python -m vxpu.vectors record --producer vxpu-engine --model REPO --artifact DIR -o got.json
     python -m vxpu.vectors record --producer vxpu-router --model REPO --artifact DIR [--router host:port] -o got.json
-    python -m vxpu.vectors record --producer vllm --model REPO --device cuda -o vllm.json
+    python -m vxpu.vectors record --producer vllm --model REPO -o vllm.json  # or: python vectors.py ...
     python -m vxpu.vectors compare ref.json got.json
     python -m vxpu.vectors selftest  # the CI tier: tiny models, in-process
 
@@ -77,7 +77,8 @@ def _versions(device):
     out = {"torch": torch.__version__, "transformers": transformers.__version__,
            "device": str(device)}
     if str(device).startswith("cuda") and torch.cuda.is_available():
-        out["gpu"] = torch.cuda.get_device_name(0)  # the kernel path depends on it
+        # The kernel path follows from the card, so name the one used.
+        out["gpu"] = torch.cuda.get_device_name(torch.device(str(device)))
     return out
 
 
@@ -236,8 +237,8 @@ def record_vxpu_router(model, revision, prompts, settings, artifact, router=None
     return _document(model, revision, lm.config, producer, settings, out)
 
 
-def record_vllm(model, revision, prompts, settings, device="cuda", dtype="auto",
-                max_model_len=None, enforce_eager=False, gpu_memory_utilization=0.9):
+def record_vllm(model, revision, prompts, settings, dtype="auto",
+                max_model_len=None, enforce_eager=False):
     """Candidate: vLLM serving the same repo/revision, greedy, raw logits.
 
     vLLM is given the prompt as the same token ids the other producers
@@ -253,17 +254,21 @@ def record_vllm(model, revision, prompts, settings, device="cuda", dtype="auto",
     weights and multiply in bf16 (W8A16); the greedy tokens are the
     test, the logits say how close the two engines' views are.
 
+    vLLM places the model itself (there is no device argument); the
+    recording is labelled with the device and card it ran on.
+
     Runs with the ``vllm`` package only (plus transformers for the
-    tokenizer): copy this file into a vLLM image and run it directly.
+    tokenizer): copy this file into a vLLM image and run it directly,
+    ``python vectors.py record --producer vllm ...``.
     """
+    import torch
     import vllm
     from vllm import LLM, SamplingParams
     from vllm.inputs import TokensPrompt
     tok = _tokenizer(model, revision, prompts)
     kwargs = {"model": model, "revision": revision, "dtype": dtype,
               "logprobs_mode": "raw_logits", "max_logprobs": settings["top_k"],
-              "generation_config": "vllm", "enforce_eager": enforce_eager,
-              "gpu_memory_utilization": gpu_memory_utilization, "seed": 0}
+              "generation_config": "vllm", "enforce_eager": enforce_eager, "seed": 0}
     if max_model_len:
         kwargs["max_model_len"] = max_model_len
     llm = LLM(**kwargs)
@@ -294,6 +299,7 @@ def record_vllm(model, revision, prompts, settings, device="cuda", dtype="auto",
                     "top_logits": top,
                     "ms_per_token": round(1000 * elapsed / max(1, len(new)), 1)})
     mc = llm.llm_engine.model_config
+    device = "cuda" if torch.cuda.is_available() else "cpu"
     producer = {"kind": "vllm", "vllm": vllm.__version__, **_versions(device),
                 "dtype": str(mc.dtype), "quantization": mc.quantization,
                 "enforce_eager": enforce_eager, "logprobs_mode": "raw_logits"}
@@ -413,7 +419,7 @@ def cmd_record(args):
                                  compile_decode=args.compile)
     elif args.producer == "vllm":
         doc = record_vllm(args.model, args.revision, args.prompts, settings,
-                          device=args.device, dtype=args.dtype,
+                          dtype=args.dtype,
                           max_model_len=args.max_model_len,
                           enforce_eager=args.enforce_eager)
     else:
@@ -481,8 +487,8 @@ def main(argv=None):
                      help="text prompts through the chat template, or fixed ids (auto: ids if no tokenizer)")
     rec.add_argument("--artifact", help="vxpu artifact directory (vxpu-* producers)")
     rec.add_argument("--router", help="router host:port (vxpu-router; default: port-forward)")
-    rec.add_argument("--device", default="cpu")
-    rec.add_argument("--dtype", default="auto", help="transformers producer dtype (auto: the config's)")
+    rec.add_argument("--device", default="cpu", help="transformers / vxpu-engine producers (vllm places itself)")
+    rec.add_argument("--dtype", default="auto", help="transformers / vllm model dtype (auto: the config's)")
     rec.add_argument("--compile", action="store_true", help="vxpu-engine: torch.compile the decode graph")
     rec.add_argument("--dequantize", action="store_true",
                      help="transformers producer: expand an fp8 checkpoint to bf16 at load")

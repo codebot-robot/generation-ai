@@ -208,8 +208,9 @@ python -m vxpu.export Qwen/Qwen3-8B-FP8 -o qwen8b/
 python -m vxpu.vectors record --producer vxpu-engine --model Qwen/Qwen3-8B-FP8 --artifact qwen8b/ -o got.json
 # ... or through the router in the cluster (tokens only; no logits on the wire)
 python -m vxpu.vectors record --producer vxpu-router --model Qwen/Qwen3-8B-FP8 --artifact qwen8b/ -o got.json
-# ... or vLLM, from a vLLM image (needs only vllm; copy vectors.py in)
-python -m vxpu.vectors record --producer vllm --model Qwen/Qwen3-8B-FP8 --device cuda -o vllm.json
+# ... or vLLM; in a vLLM image with no vxpu installed, copy vectors.py in and
+# run it as a file: python vectors.py record --producer vllm ...
+python -m vxpu.vectors record --producer vllm --model Qwen/Qwen3-8B-FP8 -o vllm.json
 python -m vxpu.vectors compare ref.json got.json
 ```
 
@@ -249,8 +250,10 @@ revision: the prompt as the same token ids (the chat template is
 applied by the harness, not by vLLM), greedy, and the top-k *raw
 logits* of each generated position (`logprobs_mode="raw_logits"`, the
 pre-softmax values before any processor), so a vLLM recording compares
-with the others at the logit level. The producer needs only the `vllm`
-package: copy `vectors.py` into a vLLM image and run it directly.
+with the others at the logit level. vLLM places the model itself, and
+the recording is labelled with the card it used. The producer needs
+only the `vllm` package: copy `vectors.py` into a vLLM image and run
+it as a file.
 
 Qwen3-8B-FP8 through vLLM 0.31 on two cards, against eager transformers
 on the same card (the checkpoint dequantized to bf16) and against the
