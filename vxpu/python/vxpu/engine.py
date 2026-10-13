@@ -41,8 +41,29 @@ import time
 
 import torch
 
-from .rehydrate import (derived_tensor, fetch_tensor, load_program,
-                        share_state, strip_asserts)
+from .rehydrate import (derived_tensor, fetch_stacked, fetch_tensor,
+                        load_program, share_state, strip_asserts)
+
+
+def compile_options(device):
+    """How the executor compiles the decode graph on this device.
+
+    The artifact carries reference semantics (an fp8 linear is cast,
+    scale, matmul); the engine's job is to make that fast here. On CUDA,
+    inductor's prologue fusion folds the dequantization into the GEMM's
+    operand load, so fp8 weights are read once at fp8 width instead of
+    being materialized in bf16 every step: measured on an L4, that takes
+    an 8192x8192 fp8 linear from 2.6x slower than bf16 to 1.9x faster,
+    at the fp8 bandwidth floor. max-autotune is what enables the GEMM
+    templates that fusion needs; it costs compile time once per shape.
+    VXPU_COMPILE_MODE overrides the mode ("default" to skip autotuning).
+    """
+    if not str(device).startswith("cuda"):
+        return {}
+    import torch._inductor.config as inductor_config
+    inductor_config.prologue_fusion = True
+    return {"mode": os.environ.get("VXPU_COMPILE_MODE",
+                                   "max-autotune-no-cudagraphs")}
 
 
 class Engine:
@@ -97,12 +118,24 @@ class Engine:
                 ref, self.manifest["files"], cas_dir)
             self.shared[fqn] = tensor.to(device)
             self.bytes_fetched += downloaded
+        # Stacked parameters (mixture-of-experts banks) are assembled
+        # from the checkpoint's per-expert tensors.
+        for fqn, spec in self.binding.get("stacked", {}).items():
+            tensor, downloaded = fetch_stacked(
+                spec, self.manifest["tensors"], self.manifest["files"], cas_dir)
+            self.shared[fqn] = tensor.to(device)
+            self.bytes_fetched += downloaded
         for fqn in self.binding["derived"]:
             self.shared[fqn] = derived_tensor(
                 fqn, probe_meta[fqn], self.config).to(device)
         self.state_specs = {
             fqn: (probe_meta[fqn].shape, probe_meta[fqn].dtype)
             for fqn in self.binding["state"]}
+        # Names the graphs use for a tensor that is also known under a
+        # canonical name (a cache tensor lifted both as a wrapper buffer
+        # and as a constant); bound to the same tensor as the canonical.
+        self.aliases = self.binding.get("aliases", {})
+        self.min_prefill_len = self.binding.get("min_prefill_len", 1)
 
         self.sessions = {}
         self._next_id = 0
@@ -154,6 +187,12 @@ class Engine:
             fqn: torch.zeros(shape, dtype=dtype, device=self.device)
             for fqn, (shape, dtype) in self.state_specs.items()}
         tensors = {**self.shared, **scratch}
+        # Aliases must be placed too (an unplaced constant stays on the
+        # meta device); _bind below re-points them at the canonical
+        # tensors once the programs are on the device.
+        tensors.update({alias: tensors[canonical]
+                        for alias, canonical in self.aliases.items()
+                        if canonical in tensors})
         self._prefill = load_program(
             os.path.join(self.artifact_dir, "prefill.pt2"),
             tensors, self.device).module()
@@ -163,10 +202,11 @@ class Engine:
         shared = share_state(self._prefill, self._decode,
                              self.binding["state"])
         assert shared > 0, "prefill/decode share no cache state"
+        self._bind(scratch)  # aliases -> the canonical tensors, both graphs
         self._decode_run = self._decode
         if self.compile_decode:
             strip_asserts(self._decode)
-            self._decode_run = torch.compile(self._decode)
+            self._decode_run = torch.compile(self._decode, **compile_options(self.device))
 
     def _bind(self, state):
         """Point both graphs' state buffers at this session's tensors.
@@ -174,6 +214,9 @@ class Engine:
         A reference swap, O(number of buffers); the compiled decode
         re-reads its buffers on each call, so this triggers no recompile.
         """
+        state = {**state, **{alias: state[canonical]
+                             for alias, canonical in self.aliases.items()
+                             if canonical in state}}
         for module in (self._prefill, self._decode):
             for fqn, tensor in state.items():
                 parent, name = (fqn.rsplit(".", 1) if "." in fqn
@@ -318,10 +361,18 @@ class Engine:
         # it has finished only the shared prefix is known to be there.
         session["cached_ids"] = cached[:start]
         prefill_started = time.perf_counter()
-        logits = self._prefill(
-            input_ids=new_ids,
-            cache_position=torch.arange(start, total_len,
-                                        device=self.device))
+        if new_ids.shape[1] < self.min_prefill_len:
+            # The prefill graph's length starts at min_prefill_len; a
+            # single new token (a re-asked prompt, a one-token turn) is
+            # exactly what the decode graph computes.
+            logits = self._decode_run(
+                input_ids=new_ids,
+                cache_position=torch.tensor([start], device=self.device))
+        else:
+            logits = self._prefill(
+                input_ids=new_ids,
+                cache_position=torch.arange(start, total_len,
+                                            device=self.device))
         prefill_s = time.perf_counter() - prefill_started
         cached = session["cached_ids"] = list(ids)
 

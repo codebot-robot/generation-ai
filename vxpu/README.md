@@ -72,15 +72,34 @@ Three ideas carry the design:
    loads download nothing, and the sha256 of the manifest is the
    model's identity — `LoadModel` with a matching digest is a no-op.
 
-3. **A three-way tensor classification.** Every tensor the graphs
-   reference is `bound` (a weight reference), `derived` (computed from
-   config at load time: RoPE tables via transformers' own formula
-   registry, embedding scales — never stored in checkpoints), or
-   `state` (per-session KV cache, zero-initialized, mutated in place
-   by the graphs). The classification is also the serving
+3. **A tensor classification.** Every tensor the graphs
+   reference is `bound` (a weight reference), `stacked` (a bank of
+   weight references concatenated on the executor, e.g. one MoE
+   expert parameter from 128 per-expert checkpoint tensors), `derived`
+   (computed from config at load time: RoPE tables via transformers'
+   own formula registry, embedding scales — never stored in
+   checkpoints), or `state` (per-session KV cache, zero-initialized,
+   mutated in place by the graphs). The classification is also the serving
    architecture: bound/derived are shared read-only across sessions;
    a session *is* its state tensors. Multi-turn chat prefills only the
    new suffix tokens against the session's existing cache.
+
+**Pre-quantized checkpoints run as published.** A model-maker fp8
+checkpoint (`quant_method: fp8`, e.g. Qwen's `-FP8` releases: fp8 weights
+plus one scale per 128x128 block, bf16 activations) exports with
+transformers' own `FP8Linear`/`FP8Experts` modules, installed on the meta
+model exactly as `from_pretrained` would. The graph consumes the fp8
+tensors directly: block-dequantize-then-matmul in plain aten, with a
+mixture-of-experts bank bound as a `stacked` parameter the executor
+assembles from the checkpoint's per-expert tensors (prefill is
+transformers' `grouped_mm` routing, decode its `batched_mm` routing; both
+static-shape, both the sparse computation it runs eagerly). Weights stay
+fp8 in memory and are dequantized during compute, so the executor needs
+the checkpoint's size, not the bf16 size, and the same artifact runs on
+a CPU node or a GPU. Nothing is re-quantized: the user's
+`from_pretrained(repo)` is the model-maker's checkpoint, bit for bit.
+Upstream transformers has no fp8 path off the GPU (its forward is CUDA
+kernels only), which is why this needs the fork in `third_party/`.
 
 **Placement is the router's decision.** The artifact is hardware-
 agnostic, so the router reads the manifest's weight sizes and places
@@ -149,6 +168,24 @@ templated replies are plain text. Generation stops on any of
 the model's end-of-turn ids (`config.eos_token_id`, e.g. Gemma's
 `<end_of_turn>`), not just the tokenizer's `eos`.
 
+## Forked dependencies (`third_party/`)
+
+When a library stands between a model and a faithful export, we carry a
+small patch in a fork rather than build around it in vXPU. The forks are
+git submodules, branched from the pinned release:
+
+| submodule | branch | patch |
+|---|---|---|
+| `third_party/transformers` | `vxpu/v5.18.0` (from `v5.18.0`; `vxpu/v5.14.1` carries the fp8 patches on the older release) | plain-torch path for `FP8Linear`/`FP8Experts` off the GPU (CPU, MPS, meta), so fp8 checkpoints load on a CPU without `dequantize=True` and export weightlessly; `FP8Embedding` for tables stored as fp8 with a per-tensor scale; float `histc` off the GPU in the grouped experts; the export wrapper sizes and registers linear-attention/conv states and passes `cache_position`; `qwen4_exp` exports with a symbolic prefill length (static indexer selection, `while_loop` chunk recurrence, no Python branches on the length); `sdpa` evaluates `is_causal` without guarding the length |
+
+```sh
+git submodule update --init
+uv pip install -e third_party/transformers -e python/
+```
+
+The executor image installs the same fork, so exporter and executor
+run one transformers. Each patch is written to be upstreamable.
+
 ## Layout
 
 ```
@@ -163,6 +200,8 @@ cmd/vxpu-router/  in-cluster router: caches weights, places and
               creates executor pods, proxies the Executor API
 images/       executor and router container images
 examples/     notebooks (Gemma 4 on vXPU)
+third_party/  forked dependencies as submodules (transformers)
+docs/         design notes (representation.md: why the artifact is pt2)
 ```
 
 ## Building
@@ -214,6 +253,69 @@ clients.
   calling, streaming multi-turn) run unchanged from a GPU-less notebook
   against it through `vxpu.AutoModelForCausalLM` (see `examples/gemma4`).
 
+- Qwen3-30B-A3B-Instruct-2507-FP8 (MoE, 128 experts top-8, model-maker
+  fp8 checkpoint, 31.2 GB) exports weightless in about a minute to a
+  77 MB artifact using transformers' own fp8 modules (from the fork in
+  `third_party/`); the router places it as a 40 GB / 15-CPU pod on the
+  c3d node and the executor holds ~32 GB resident. Greedy output through
+  `vxpu.AutoModelForCausalLM` is token-for-token identical to
+  transformers loading the same checkpoint on the same node class, both
+  with `FineGrainedFP8Config(dequantize=True)` (bf16, ~61 GB) and, with
+  the fork, as fp8 on the CPU. Speed on the CPU is bound by the fp8→bf16
+  cast: prefill dequantizes every expert once (22 s at 13 tokens, 26 s
+  at 474; `grouped_mm` routing keeps the growth to ~8 ms/token) and
+  decode is ~2.3–2.9 s/token, against ~170 ms/token for the bf16
+  reference at twice the memory. Eager transformers on the CPU with fp8
+  weights is far slower per token (~20 s) because its `grouped_mm`
+  experts dequantize the whole bank per step; the decode graph uses the
+  `batched_mm` routing, which touches only the routed experts. See
+  [docs/representation.md](docs/representation.md).
+- The same fp8 graph on a GPU runs at full speed without a device-specific
+  artifact. Qwen3-8B-FP8 (dense, 9.4 GB) on an L4: the bf16 checkpoint
+  decodes at 67 ms/token in eager transformers and transformers' own fp8
+  kernel path (Hub Triton kernel) at 136 ms/token; the exported graph,
+  compiled plainly, at 132 ms/token; with inductor's prologue fusion
+  enabled by the executor on CUDA (`engine.compile_options`), at
+  **46 ms/token**, the fp8 bandwidth floor. The dequantization is folded
+  into the GEMM's operand load, so fp8 weights are read once at fp8
+  width. The cost is a one-time autotune of about two minutes on first
+  load (`VXPU_COMPILE_MODE=default` skips it).
+
+- Qwen3.8-Flash-Next-FP8 (hybrid: 36 Gated DeltaNet linear-attention
+  layers, 12 indexed-attention layers, 512 experts top-10, a per-layer
+  n-gram embedding stored as 128 fp8 shards; 186 GB) exports weightless
+  on a laptop with transformers 5.18 from the fork: a 38 MB prefill
+  graph (36 `while_loop` chunk recurrences with a symbolic trip count,
+  96 `grouped_mm`, 72 triangular solves, 12 `scaled_dot_product_attention`
+  with a static indexer selection) and a 29 MB decode graph; 1071 bound,
+  2 derived, 134 state and 193 merged tensors (expert banks and the
+  sharded table, assembled on the executor from transformers' own
+  conversion recipes). In the cluster: the router cached the 131 shards
+  in ~9 min, the executor (a 217 GiB / 30-CPU pod on the c3d node)
+  rehydrated 182 GB in 12 min and holds 177 GB resident with the fp8
+  tensors kept as fp8; the first prompt answered at ~2.3 s/token after
+  a ~75 s prefill (every expert bank is dequantized once per prefill).
+  Correctness of the static-cache path and of the pt2 round trip is
+  verified against eager transformers on a small random Qwen4 model
+  (float32 rounding); a same-node reference run of the 186 GB model is
+  still to do.
+
+- On an RTX PRO 6000 (Blackwell Server Edition, 96 GB, Spot node) the
+  same two fp8 artifacts, unchanged, with the executor's default CUDA
+  compile settings: Qwen3-30B-A3B-Instruct-2507-FP8 decodes at
+  11.7–12.2 ms/token (~85 tok/s) with the same tokens as before, against
+  25.4–26.9 ms/token for eager transformers running the checkpoint
+  dequantized to bf16 (61 GB) and 46–62 ms/token for eager transformers
+  running it as fp8 with its own kernels (`FP8Linear`/`FP8Experts`, the
+  Hub Triton kernel; DeepGEMM needs a datacenter part) on the same card;
+  Qwen3-8B-FP8 at 12.2 ms/token. Prefill of a 474-token prompt takes 0.4 s (24 s on the CPU
+  node). Gemma-4-31B-it (dense bf16, 62.6 GB) rehydrates onto the card
+  in 104 s and decodes at 50–53 ms/token (1.2–1.4 s/token on the CPU
+  node), the same text. The first load pays ~1–2 min of autotuning. That the
+  8B and the 30B take the same time per token says the step is bound by
+  kernel launches, not bandwidth, on this card (CUDA graphs are the next
+  lever; see the issue tracker).
+
 ## Status and roadmap
 
 vXPU is an early extraction of the `experiments/model-manifest`
@@ -224,9 +326,10 @@ Known simplifications / tasks for the immediate roadmap are:
   in it; executors currently fetch them from the source repo.
 - Artifacts travel inside the LoadModel RPC; OCI registries
   (per-tensor layers, signed manifests) are the intended distribution.
-- One model per executor; engine-backed executors (vLLM behind the
-  same proto) for architectures whose graphs are not natively
-  runnable (quantized fused-MoE) are planned.
+- One model per executor.
+- fp8 checkpoints are dequantized per block on every use; an executor
+  that dequantizes at load when memory allows, or uses the device's fp8
+  kernels, would be a placement choice, not an artifact change.
 - `.pt2` graphs pin the exporting torch version (the serialization
   format promises newer-loads-older; same-version is what we test).
 - A shared paged KV pool is designed (see the experiment's

@@ -30,6 +30,8 @@ is exactly bincount).
 import hashlib
 import math
 import os
+import threading
+from concurrent.futures import ThreadPoolExecutor
 
 import requests
 import torch
@@ -40,6 +42,24 @@ DTYPES = {
     "BF16": torch.bfloat16, "I64": torch.int64, "I32": torch.int32,
     "F8_E4M3": torch.float8_e4m3fn, "F8_E5M2": torch.float8_e5m2,
 }
+
+
+_local = threading.local()
+
+
+def _session():
+    """One keep-alive HTTP session per thread.
+
+    A model is tens of thousands of range reads; a new connection per
+    read exhausts the ephemeral ports (errno 99) on a fast node.
+    """
+    session = getattr(_local, "session", None)
+    if session is None:
+        session = _local.session = requests.Session()
+        adapter = requests.adapters.HTTPAdapter(pool_connections=4, pool_maxsize=4, max_retries=3)
+        session.mount("http://", adapter)
+        session.mount("https://", adapter)
+    return session
 
 
 def fetch_tensor(ref, files, cas_dir=None):
@@ -55,7 +75,7 @@ def fetch_tensor(ref, files, cas_dir=None):
     def download():
         url = files[ref["file_sha256"]]["source"]
         end = ref["offset"] + ref["length"] - 1
-        resp = requests.get(
+        resp = _session().get(
             url, headers={"Range": f"bytes={ref['offset']}-{end}"})
         resp.raise_for_status()
         if resp.status_code != 206:
@@ -85,6 +105,65 @@ def fetch_tensor(ref, files, cas_dir=None):
     tensor = torch.frombuffer(
         data, dtype=DTYPES[ref["dtype"]]).view(ref["shape"])
     return tensor, downloaded
+
+
+def fetch_stacked(spec, manifest_tensors, files, cas_dir=None, workers=16):
+    """Assemble a parameter from several checkpoint tensors.
+
+    ``spec["parts"]`` is a list of rows; each row is a list of manifest
+    tensor names concatenated along ``spec["cat_dim"]`` (a gated MLP
+    expert's gate and up projections become one block). With
+    ``spec["stack"]`` (the default) the rows are stacked along a new
+    leading dimension (an expert bank); otherwise there is one row (a
+    table stored in shards). The result is allocated once and filled
+    part by part, so assembling a 50 GB table costs 50 GB, not twice
+    that. Parts are fetched concurrently: a 128-expert layer is 384
+    range reads, and a model has dozens of layers.
+
+    Returns (tensor, bytes_downloaded).
+    """
+    rows, cat_dim, stack = spec["parts"], spec["cat_dim"], spec.get("stack", True)
+    # Shapes and dtype come from the manifest, so the result can be
+    # allocated before anything is fetched.
+    first = manifest_tensors[rows[0][0]]
+    row_shape = list(first["shape"])
+    row_shape[cat_dim] = sum(manifest_tensors[n]["shape"][cat_dim] for n in rows[0])
+    out_shape = ([len(rows)] if stack else []) + row_shape
+    out = torch.empty(out_shape, dtype=DTYPES[first["dtype"]])
+
+    # (row, offset, name) in assembly order; fetched through a bounded
+    # window so at most `workers` parts are in flight (a sharded 50 GB
+    # table must not be held twice).
+    slots = []
+    for r, row in enumerate(rows):
+        offset = 0
+        for n in row:
+            slots.append((r, offset, n))
+            offset += manifest_tensors[n]["shape"][cat_dim]
+    downloaded = 0
+    with ThreadPoolExecutor(max_workers=workers) as pool:
+        pending = {}
+        for i, (r, offset, n) in enumerate(slots):
+            pending[i] = pool.submit(fetch_tensor, manifest_tensors[n], files, cas_dir)
+            if len(pending) >= 2 * workers:
+                j = min(pending)
+                _place_part(out, slots[j], pending.pop(j).result(), cat_dim, stack)
+                downloaded += _last_bytes
+        for j in sorted(pending):
+            _place_part(out, slots[j], pending.pop(j).result(), cat_dim, stack)
+            downloaded += _last_bytes
+    return out, downloaded
+
+
+_last_bytes = 0
+
+
+def _place_part(out, slot, fetched, cat_dim, stack):
+    global _last_bytes
+    r, offset, _ = slot
+    part, _last_bytes = fetched
+    target = out[r] if stack else out
+    target.narrow(cat_dim, offset, part.shape[cat_dim]).copy_(part)
 
 
 def derived_tensor(fqn, meta, config):
@@ -151,6 +230,8 @@ def cpu_compat(exported):
 
     histc(int) has no CPU kernel; for integer inputs counted over
     [0, bins) it is exactly bincount (sliced to bins, cast back).
+    Graphs from the forked transformers count in float off the GPU and
+    need no rewrite; this remains for artifacts exported before that.
     """
     graph = exported.graph_module.graph
     replaced = 0
@@ -158,6 +239,9 @@ def cpu_compat(exported):
         if (node.op == "call_function"
                 and str(node.target) == "aten.histc.default"):
             x, bins = node.args[0], node.args[1]
+            val = x.meta.get("val") if hasattr(x, "meta") else None
+            if val is not None and val.is_floating_point():
+                continue  # float histc has a CPU kernel; leave the graph alone
             with graph.inserting_before(node):
                 flat = graph.call_function(
                     torch.ops.aten.reshape.default, (x, [-1]))
@@ -204,6 +288,15 @@ def load_program(graph_path, tensors, device):
     exported = torch.export.load(graph_path)
 
     def place(fqn, tensor):
+        # The checkpoint's dtype may differ from the graph's parameter
+        # dtype (Qwen stores fp8 block scales as bf16; transformers'
+        # fp8 modules declare float32). Cast as from_pretrained would.
+        expected = exported.state_dict.get(fqn, exported.constants.get(fqn))
+        if (isinstance(expected, torch.Tensor)
+                and expected.dtype != tensor.dtype
+                and expected.is_floating_point()
+                and tensor.is_floating_point()):
+            tensor = tensor.to(expected.dtype)
         if fqn in exported.state_dict:
             exported.state_dict[fqn] = torch.nn.Parameter(
                 tensor, requires_grad=False)
