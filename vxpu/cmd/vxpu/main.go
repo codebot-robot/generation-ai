@@ -86,11 +86,11 @@ func cmdAsk(ctx context.Context, args []string) error {
 		"artifact directory (manifest.json, binding.json, *.pt2)")
 	pod := flags.String("pod", "vxpu-router", "router pod name")
 	image := flags.String("image",
-		os.Getenv("VXPU_ROUTER_IMAGE"), "router image")
+		os.Getenv("VXPU_ROUTER_IMAGE"), "router image (used only if the router has to be created)")
 	executorImage := flags.String("executor-image",
-		os.Getenv("VXPU_EXECUTOR_IMAGE"), "executor image")
+		os.Getenv("VXPU_EXECUTOR_IMAGE"), "executor image (used only if the router has to be created)")
 	accelerator := flags.String("accelerator", "nvidia-l4",
-		"GKE accelerator label for the executor pod")
+		"GKE accelerator label for the executor pod (used only if the router has to be created; `vxpu up` changes a running router)")
 	routerAddr := flags.String("router", "", "vxpu-router address (e.g. localhost:50051); if set, skips direct pod creation")
 	maxNewTokens := flags.Int("max-new-tokens", 96, "tokens per reply")
 	timeout := flags.Duration("timeout", 20*time.Minute,
@@ -109,7 +109,10 @@ func cmdAsk(ctx context.Context, args []string) error {
 		addr = *routerAddr
 		stop = func() {}
 	} else {
-		if err := ensurePod(ctx, *pod, *image, *executorImage, *accelerator); err != nil {
+		// A running router is used as it is: its image, executor image
+		// and accelerator were decided by `vxpu up`; the flags here only
+		// apply when the router has to be created.
+		if err := ensurePod(ctx, *pod, *image, *executorImage, *accelerator, false); err != nil {
 			return fmt.Errorf("ensuring router pod: %w", err)
 		}
 		var err error
@@ -208,7 +211,7 @@ func cmdUp(ctx context.Context, args []string) error {
 	if err := flags.Parse(args); err != nil {
 		return err
 	}
-	if err := ensurePod(ctx, *pod, *image, *executorImage, *accelerator); err != nil {
+	if err := ensurePod(ctx, *pod, *image, *executorImage, *accelerator, true); err != nil {
 		return fmt.Errorf("ensuring router pod: %w", err)
 	}
 	fmt.Printf("router %s is ready\n", *pod)
@@ -258,7 +261,12 @@ func podPhase(ctx context.Context, pod string) (string, error) {
 // every time keeps an existing router's Service/RBAC current; if the
 // pod itself cannot be updated in place (an immutable field changed, or
 // it has exited), it is recreated.
-func ensurePod(ctx context.Context, pod, image, executorImage, accelerator string) error {
+// ensurePod makes sure the router pod is running. With reconfigure set
+// (`vxpu up`) the manifest is applied, and a pod whose settings differ is
+// recreated; without it (`vxpu ask`) a live router is used as it is,
+// because replacing it would reset the accelerator chosen with `up` and
+// drop its weight cache (issue #221).
+func ensurePod(ctx context.Context, pod, image, executorImage, accelerator string, reconfigure bool) error {
 	phase, err := podPhase(ctx, pod)
 	if err != nil {
 		return err
@@ -276,6 +284,11 @@ func ensurePod(ctx context.Context, pod, image, executorImage, accelerator strin
 		if err := deletePod(ctx, pod); err != nil {
 			return err
 		}
+		phase = ""
+	}
+	if phase != "" && !reconfigure {
+		fmt.Printf("using router %s as it is (run `vxpu up` to change its image or accelerator)\n", pod)
+		return waitReady(ctx, pod)
 	}
 	fmt.Printf("applying router %s (image %s, executor-image %s, accelerator %s)\n",
 		pod, image, executorImage, accelerator)
