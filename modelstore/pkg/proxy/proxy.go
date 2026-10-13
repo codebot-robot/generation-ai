@@ -18,6 +18,7 @@ import (
 	"crypto/sha256"
 	"encoding/hex"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"net/http"
@@ -99,6 +100,8 @@ func (p *Proxy) serve(w http.ResponseWriter, r *http.Request) error {
 		if _, err := os.Stat(cachePath); err == nil {
 			http.ServeFile(w, r, cachePath)
 			return nil
+		} else if !os.IsNotExist(err) {
+			return fmt.Errorf("failed to stat cached file %s: %w", cachePath, err)
 		}
 	}
 
@@ -214,7 +217,9 @@ func (p *Proxy) handleBlobPut(w http.ResponseWriter, r *http.Request) error {
 	tmpPath := tmpFile.Name()
 	moved := false
 	defer func() {
-		tmpFile.Close()
+		if err := tmpFile.Close(); err != nil && !errors.Is(err, os.ErrClosed) {
+			log.Error(err, "closing temp file", "path", tmpPath)
+		}
 		if !moved {
 			if err := os.Remove(tmpPath); err != nil && !os.IsNotExist(err) {
 				log.Error(err, "failed to remove temp file", "path", tmpPath)
