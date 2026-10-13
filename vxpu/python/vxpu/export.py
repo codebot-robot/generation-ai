@@ -38,6 +38,7 @@ Usage:
 """
 
 import argparse
+import contextlib
 import json
 import os
 import sys
@@ -51,12 +52,6 @@ from transformers.integrations.executorch import (
 
 from .fp8 import apply_fp8, fp8_config, set_experts_implementation
 from .manifest import build_manifest
-
-# Buffers computed from config at init time, never stored in
-# checkpoints. Executors recompute them (see rehydrate.derived_tensor).
-DERIVED_MARKERS = ("rotary_emb", "inv_freq", "embed_scale", "softcap",
-                   "inv_timescales")
-
 
 def _head_shapes(config):
     """Per-layer (num_kv_heads, head_dim) for the static cache.
@@ -150,6 +145,143 @@ def checkpoint_view(model, manifest_tensors):
     return direct, merged
 
 
+@contextlib.contextmanager
+def meta_parameters():
+    """Construct a model with parameters on the meta device and buffers real.
+
+    Used once, to harvest buffer values (buffer_values): buffers are
+    what the model computes from its config at construction (rotary
+    tables, embedding scales, softcaps), and the artifact must carry
+    exactly those values rather than have the executor re-derive them.
+    (The re-derived p-RoPE table of Gemma 4 was wrong past its first
+    entries and long prompts diverged; see issue #228.) Export itself
+    still runs on an all-meta model; the values are put back into the
+    exported programs afterwards.
+
+    Parameters are allocated on the CPU untouched (virtual memory only;
+    transformers' no_init_weights keeps initializers from writing) and
+    moved to meta as they are registered.
+    """
+    import torch.nn as nn
+    try:
+        from transformers.initialization import no_init_weights  # >= 5.x
+    except ImportError:
+        from transformers.modeling_utils import no_init_weights
+
+    original = nn.Module.register_parameter
+
+    def register_parameter(module, name, param):
+        if param is not None and param.device.type != "meta":
+            param = nn.Parameter(param.detach().to("meta"),
+                                 requires_grad=param.requires_grad)
+        original(module, name, param)
+
+    nn.Module.register_parameter = register_parameter
+    try:
+        with no_init_weights():
+            yield
+    finally:
+        nn.Module.register_parameter = original
+
+
+def buffer_values(config, dtype):
+    """{buffer name: tensor} for every buffer the model computes at
+    construction, from a throwaway model with meta parameters."""
+    with meta_parameters():
+        probe = AutoModelForCausalLM.from_config(config, dtype=dtype)
+    values = {name: tensor.detach().clone()
+              for name, tensor in probe.named_buffers()
+              if tensor.device.type != "meta"}
+    del probe
+    return values
+
+
+def inject_buffer_values(exported, values, param_fqns, mutated):
+    """Give the exported program's meta buffers their real values.
+
+    Matches by peeling wrapper prefixes from the exported name (the
+    wrapper holds the model as ``model``). Parameters and state are
+    left alone. Returns the fqns that received values.
+    """
+    given = []
+    for table in (exported.state_dict, exported.constants):
+        for fqn in list(table):
+            tensor = table[fqn]
+            if (fqn in param_fqns or fqn in mutated
+                    or not isinstance(tensor, torch.Tensor) or not tensor.is_meta):
+                continue
+            parts = fqn.split(".")
+            for i in range(len(parts)):
+                value = values.get(".".join(parts[i:]))
+                if value is not None:
+                    if tuple(value.shape) != tuple(tensor.shape):
+                        raise RuntimeError(
+                            f"buffer {fqn}: model computes shape {tuple(value.shape)}, "
+                            f"graph expects {tuple(tensor.shape)}")
+                    table[fqn] = value.to(tensor.dtype)
+                    given.append(fqn)
+                    break
+    return given
+
+
+VIEW_OPS = ("aten.slice.", "aten.select.", "aten.view.", "aten.reshape.",
+            "aten.alias.", "aten.as_strided.", "aten.squeeze.", "aten.unsqueeze.",
+            "aten.transpose.", "aten.permute.", "aten.expand.", "aten.narrow.",
+            "aten._unsafe_view.", "aten.detach.")
+
+
+def mutated_fqns(exported):
+    """Names of tensors the graph writes in place: the model's state.
+
+    Two forms: a functionalized program reports mutations in its
+    signature; the export wrapper's cache updates survive as in-place
+    aten ops (index_copy_, copy_) on a placeholder or a view of one, so
+    those are traced back through view ops to their placeholder.
+    """
+    from torch.export.graph_signature import OutputKind
+    sig = exported.graph_signature
+    kinds = {OutputKind.BUFFER_MUTATION, OutputKind.USER_INPUT_MUTATION}
+    mutated = {spec.target for spec in sig.output_specs
+               if spec.kind in kinds and spec.target}
+
+    placeholder_fqn = {}
+    for mapping in (sig.inputs_to_parameters, sig.inputs_to_buffers,
+                    sig.inputs_to_lifted_tensor_constants):
+        placeholder_fqn.update(mapping)
+
+    def root(node):
+        seen = 0
+        while node is not None and node.op == "call_function" and seen < 64:
+            if not any(str(node.target).startswith(v) for v in VIEW_OPS):
+                return None
+            node = node.args[0] if node.args and hasattr(node.args[0], "op") else None
+            seen += 1
+        return node
+
+    for node in exported.graph.nodes:
+        if node.op != "call_function":
+            continue
+        parts = str(node.target).split(".")  # aten.index_copy_.default
+        if len(parts) < 2 or not parts[1].endswith("_"):
+            continue
+        target = root(node.args[0]) if node.args and hasattr(node.args[0], "op") else None
+        if target is not None and target.op == "placeholder":
+            fqn = placeholder_fqn.get(target.target)
+            if fqn is not None:
+                mutated.add(fqn)
+    return mutated
+
+
+def strip_state_values(exported, state_fqns):
+    """Replace state tensors' (zero) values with meta tensors before
+    saving: a session's cache belongs to the executor, not the artifact."""
+    for table in (exported.state_dict, exported.constants):
+        for fqn in list(table):
+            tensor = table[fqn]
+            if fqn in state_fqns and isinstance(tensor, torch.Tensor) and not tensor.is_meta:
+                table[fqn] = torch.empty(tensor.shape, dtype=tensor.dtype, device="meta")
+
+
 def constant_aliases(exportable, *programs):
     """Lifted constants that are the same tensor as a wrapper buffer.
 
@@ -177,16 +309,40 @@ def constant_aliases(exportable, *programs):
 MIN_PREFILL_LEN = 2
 
 
-def classify(exported, manifest, view, skip=()):
+def classify(exported, manifest, view, aliases=None, also_mutated=()):
     """Classify every tensor the exported program references.
 
-    Returns (bound, derived, state, stacked, unbound). ``view`` is the
+    Returns (bound, derived, state, stacked, unbound, unused, constant).
+    ``state`` is what the graph mutates (caches); ``constant`` is a
+    buffer whose values the artifact carries (rotary tables, scales);
+    ``derived`` is a buffer without values, recomputed by the executor
+    (artifacts from before real buffers were captured). ``view`` is the
     checkpoint as the model's parameters see it (checkpoint_view);
-    ``stacked`` maps a merged parameter to its assembly spec. ``skip``
-    names are aliases of other tensors and are not classified.
+    ``stacked`` maps a merged parameter to its assembly spec. ``aliases``
+    maps a lifted name to the tensor it is (constant_aliases); aliases
+    are not classified themselves.
     """
     direct, merged = view
+    aliases = dict(aliases or {})
+    skip = set(aliases)
     sig = exported.graph_signature
+    # Non-strict export lifts every buffer and constant of the module
+    # tree, used or not (a text decode graph still names the vision and
+    # audio towers' rotary tables and softcaps). Those placeholders have
+    # no users; they get a placeholder tensor on the executor, nothing
+    # is fetched or derived for them.
+    # A tensor counts as used if any of its names is (a cache tensor is
+    # read through its lifted-constant alias and written through its
+    # buffer name, or the other way round).
+    used_placeholders = {
+        node.target for node in exported.graph.nodes
+        if node.op == "placeholder" and node.users}
+    used_fqns = set()
+    for mapping in (sig.inputs_to_parameters, sig.inputs_to_buffers,
+                    sig.inputs_to_lifted_tensor_constants):
+        for placeholder, fqn in mapping.items():
+            if placeholder in used_placeholders:
+                used_fqns.add(aliases.get(fqn, fqn))
     # Tied weights collapse to one placeholder in the signature but the
     # state dict keeps both names — classify over the union.
     param_fqns = set(sig.inputs_to_parameters.values()) | set(
@@ -213,9 +369,15 @@ def classify(exported, manifest, view, skip=()):
         (ref for name, ref in manifest["tensors"].items()
          if name.endswith("embed_tokens.weight")), None)
 
-    bound, derived, state, stacked, unbound = {}, [], [], {}, []
+    # State is whatever either graph writes: a linear-attention state
+    # written by prefill and only read by decode is state all the same.
+    mutated = {aliases.get(f, f) for f in mutated_fqns(exported) | set(also_mutated)}
+    bound, derived, state, stacked, unbound, unused, constant = {}, [], [], {}, [], [], []
     for fqn in fqns:
         if fqn in skip:
+            continue
+        if aliases.get(fqn, fqn) not in used_fqns:
+            unused.append(fqn)
             continue
         ref = lookup(fqn)
         if ref is None and fqn.endswith("lm_head.weight"):
@@ -225,13 +387,17 @@ def classify(exported, manifest, view, skip=()):
             bound[fqn] = ref
         elif spec is not None:
             stacked[fqn] = spec
-        elif any(marker in fqn for marker in DERIVED_MARKERS):
-            derived.append(fqn)
-        elif fqn not in param_fqns:
+        elif fqn in param_fqns:
+            unbound.append(fqn)
+        elif aliases.get(fqn, fqn) in mutated:
             state.append(fqn)
         else:
-            unbound.append(fqn)
-    return bound, derived, state, stacked, unbound
+            value = exported.state_dict.get(fqn, exported.constants.get(fqn))
+            if isinstance(value, torch.Tensor) and not value.is_meta:
+                constant.append(fqn)
+            else:
+                derived.append(fqn)  # pre-real-buffer artifacts
+    return bound, derived, state, stacked, unbound, unused, constant
 
 
 def export_artifact(repo_id, out_dir, max_cache_len=1024, revision="main"):
@@ -254,6 +420,7 @@ def export_artifact(repo_id, out_dir, max_cache_len=1024, revision="main"):
                    if hasattr(config, "get_text_config") else config)
     dtype = (getattr(config, "dtype", None)
              or getattr(text_config, "dtype", None) or torch.bfloat16)
+    buffers = buffer_values(config, dtype)
     with torch.device("meta"):
         model = AutoModelForCausalLM.from_config(config, dtype=dtype).eval()
         # A model-maker fp8 checkpoint: transformers' own fp8 modules,
@@ -296,17 +463,26 @@ def export_artifact(repo_id, out_dir, max_cache_len=1024, revision="main"):
             cache_position=torch.zeros(1, dtype=torch.long),
             strict=False)
 
+    aliases = constant_aliases(exportable, prefill, decode)
+    for program in (prefill, decode):
+        state_fqns = {f for f in mutated_fqns(program)}
+        state_fqns |= {a for a, c in aliases.items() if c in state_fqns}
+        state_fqns |= {c for a, c in aliases.items() if a in state_fqns}
+        strip_state_values(program, state_fqns)
+        params = set(program.graph_signature.inputs_to_parameters.values())
+        inject_buffer_values(program, buffers, params, state_fqns)
     torch.export.save(prefill, os.path.join(out_dir, "prefill.pt2"))
     torch.export.save(decode, os.path.join(out_dir, "decode.pt2"))
-    aliases = constant_aliases(exportable, prefill, decode)
 
-    bound, derived, state, stacked, unbound = classify(
-        decode, manifest, view, skip=set(aliases))
+    bound, derived, state, stacked, unbound, unused, constant = classify(
+        decode, manifest, view, aliases=aliases,
+        also_mutated=mutated_fqns(prefill))
     if unbound:
         raise RuntimeError(
             f"unbound tensors (artifact would be incomplete): {unbound}")
     binding = {"bound": bound, "derived": derived, "state": state,
-               "stacked": stacked, "aliases": aliases,
+               "stacked": stacked, "aliases": aliases, "unused": unused,
+               "constant": constant,
                "max_cache_len": max_cache_len,
                "min_prefill_len": MIN_PREFILL_LEN}
     if quantization:
@@ -343,7 +519,9 @@ def main():
           f"{len(binding['derived'])} derived, "
           f"{len(binding['state'])} state, "
           f"{len(binding['stacked'])} stacked, "
-          f"{len(binding['aliases'])} aliases"
+          f"{len(binding['aliases'])} aliases, "
+          f"{len(binding['unused'])} unused, "
+          f"{len(binding['constant'])} constant"
           + (f" (fp8, {binding['quantization']['fp8_modules']} modules)"
              if binding.get("quantization") else ""))
     return 0

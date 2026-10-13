@@ -24,6 +24,7 @@ chats with the model wherever the router placed it. Mirrors the Go CLI
     print(session.chat("Is the sky blue?").text)
 """
 
+import json
 import os
 import re
 import subprocess
@@ -173,6 +174,22 @@ class GenerateStats:
                 f"ms_per_token={self.ms_per_token:.1f})")
 
 
+
+def check_shippable(manifest):
+    """An artifact exported from a local checkpoint directory binds its
+    weights to file:// paths on the exporting machine; an executor
+    elsewhere cannot read them. Such artifacts run in-process
+    (``vxpu.engine.Engine``) and are refused here before anything is
+    sent, rather than failing on the executor after it has evicted the
+    model it was serving."""
+    local = sorted({f["source"] for f in manifest.get("files", {}).values()
+                    if f.get("source", "").startswith("file://")})
+    if local:
+        raise ValueError(
+            "artifact binds weights to local files, which the executor "
+            f"cannot read ({local[0]}{', ...' if len(local) > 1 else ''}); "
+            "export from a Hub repo id to ship it, or run it in-process")
+
 class Client:
     def __init__(self, address="localhost:50051", timeout=1800):
         self.address = address
@@ -200,6 +217,7 @@ class Client:
         for name in ARTIFACT_FILES:
             with open(os.path.join(artifact_dir, name), "rb") as f:
                 files[name] = f.read()
+        check_shippable(json.loads(files["manifest.json"]))
         graph_mb = (len(files["prefill.pt2"]) + len(files["decode.pt2"])) / 1e6
         progress(f"shipping artifact {artifact_dir} ({graph_mb:.0f} MB of "
                  "graphs; weights stay remote)")

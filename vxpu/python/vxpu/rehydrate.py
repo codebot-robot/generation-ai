@@ -75,6 +75,14 @@ def fetch_tensor(ref, files, cas_dir=None):
     def download():
         url = files[ref["file_sha256"]]["source"]
         end = ref["offset"] + ref["length"] - 1
+        if url.startswith("file://"):  # a local checkpoint directory
+            with open(url[len("file://"):], "rb") as f:
+                f.seek(ref["offset"])
+                content = f.read(ref["length"])
+            if len(content) != ref["length"]:
+                raise RuntimeError(
+                    f"expected {ref['length']} bytes, got {len(content)} bytes")
+            return content
         resp = _session().get(
             url, headers={"Range": f"bytes={ref['offset']}-{end}"})
         resp.raise_for_status()

@@ -74,12 +74,17 @@ Three ideas carry the design:
 
 3. **A tensor classification.** Every tensor the graphs
    reference is `bound` (a weight reference), `stacked` (a bank of
-   weight references concatenated on the executor, e.g. one MoE
-   expert parameter from 128 per-expert checkpoint tensors), `derived`
-   (computed from config at load time: RoPE tables via transformers'
-   own formula registry, embedding scales — never stored in
-   checkpoints), or `state` (per-session KV cache, zero-initialized,
-   mutated in place by the graphs). The classification is also the serving
+   weight references assembled on the executor, e.g. one MoE expert
+   parameter from 128 per-expert checkpoint tensors, following
+   transformers' own conversion recipes), `constant` (a buffer the
+   model computes from its config, RoPE tables and embedding scales,
+   captured with its real values at export and carried in the
+   artifact), `state` (what the graphs write in place: the per-session
+   KV cache, zero-initialized on the executor), or `unused` (lifted by
+   export but read by no op, e.g. another tower's tables). Older
+   artifacts carry `derived` tensors the executor recomputes from the
+   config; the harness showed that recomputation wrong for Gemma 4's
+   p-RoPE table, which is why constants are captured now. The classification is also the serving
    architecture: bound/derived are shared read-only across sessions;
    a session *is* its state tensors. Multi-turn chat prefills only the
    new suffix tokens against the session's existing cache.
@@ -186,12 +191,63 @@ uv pip install -e third_party/transformers -e python/
 The executor image installs the same fork, so exporter and executor
 run one transformers. Each patch is written to be upstreamable.
 
+## Verifying a model: test vectors
+
+`vxpu.vectors` records what a model says and compares two recordings.
+Eager transformers writes the reference; the vXPU engine writes a
+candidate (in-process, or through a router); a future vLLM backend
+would write one too. Greedy tokens must agree exactly, and where both
+sides carry logits the top-k values of the first generated positions
+must agree within a tolerance. The file format (`vxpu-vectors/1`) is the
+interchange point between engines.
+
+```sh
+# reference, from the same transformers the exporter uses
+python -m vxpu.vectors record --producer transformers --model Qwen/Qwen3-8B-FP8 -o ref.json
+# candidate: the exported artifact on this machine's CPU ...
+python -m vxpu.export Qwen/Qwen3-8B-FP8 -o qwen8b/
+python -m vxpu.vectors record --producer vxpu-engine --model Qwen/Qwen3-8B-FP8 --artifact qwen8b/ -o got.json
+# ... or through the router in the cluster (tokens only; no logits on the wire)
+python -m vxpu.vectors record --producer vxpu-router --model Qwen/Qwen3-8B-FP8 --artifact qwen8b/ -o got.json
+python -m vxpu.vectors compare ref.json got.json
+```
+
+Two tiers. The CI tier, `python -m vxpu.vectors selftest`, runs in the
+e2e presubmit on three tiny models built in-process or fetched from the
+Hub: a random fp8 Qwen3-MoE (`vxpu.fixtures.tiny_fp8_moe`: block
+scales, per-expert tensors, an unquantized lm_head), the tiny random
+Llama, and a random Qwen4 hybrid (`vxpu.fixtures.tiny_qwen4`: Gated
+DeltaNet linear attention, indexed attention, n-gram embedding, MoE),
+each exported, run on the in-process engine, and required to be
+token-exact against transformers. The cluster tier is the same commands
+against the real models on the c3d CPU node (the 30B through the router
+on the RTX PRO 6000, tokens only). Latest run:
+
+| model | reference | prompts | greedy tokens | top-k logits, max diff | ms/token, reference → vXPU |
+|---|---|---|---|---|---|
+| google/gemma-4-E4B-it | transformers bf16 eager | 3 | all equal | 0.44 (1.7%) | 160–290 → 220 |
+| google/gemma-4-31B-it | transformers bf16 eager | 3 | all equal | 0.59 (2.4%) | 790–1330 → 1070–1110 |
+| Qwen/Qwen3-8B-FP8 | transformers, fp8 dequantized to bf16 | 3 | all equal | 0.50 (1.2%) | 270–350 → 5700–6300 |
+| Qwen/Qwen3-30B-A3B-Instruct-2507-FP8 | transformers, fp8 dequantized to bf16 | 3 | all equal | n/a (router) | 190–330 → 11.7 (RTX PRO 6000) |
+| Qwen/Qwen3.8-Flash-Next-FP8 | none yet (186 GB; a reference needs a larger node) | | export + run only | | |
+
+Two things this table found on its first run, both fixed in the same
+change: Gemma 4's long prompts diverged because the executor
+recomputed the p-RoPE table from the config and got it wrong past the
+first entries (the artifact now carries the model's own buffers), and
+sessions after the first ran linear-attention models on stale state
+because the engine only re-bound registered buffers, not the cache
+tensors export had lifted as constants. The fp8 numbers on the CPU also
+say plainly that dequantizing per step costs 20x against bf16 weights
+there; the GPU is where fp8 pays.
+
 ## Layout
 
 ```
 proto/        Executor gRPC API (LoadModel / NewSession / Chat)
 python/vxpu/  export (thin client), client (thin client, no torch),
               modeling (transformers-shaped from_pretrained/generate),
+              vectors (test vectors: record with any producer, compare),
               server (executor): manifest, export, rehydrate, engine
 cmd/vxpu/     Go CLI: no Python/torch — ships artifacts, creates the
               router pod on demand, port-forwards, chats
@@ -295,6 +351,8 @@ clients.
   rehydrated 182 GB in 12 min and holds 177 GB resident with the fp8
   tensors kept as fp8; the first prompt answered at ~2.3 s/token after
   a ~75 s prefill (every expert bank is dequantized once per prefill).
+  (That run predates the session-state fix above: only its first
+  session had correct linear-attention state.)
   Correctness of the static-cache path and of the pt2 round trip is
   verified against eager transformers on a small random Qwen4 model
   (float32 rounding); a same-node reference run of the 186 GB model is

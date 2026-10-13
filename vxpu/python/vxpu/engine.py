@@ -66,6 +66,18 @@ def compile_options(device):
                                    "max-autotune-no-cudagraphs")}
 
 
+
+TOKENIZER_FILES = ("tokenizer.json", "tokenizer_config.json",
+                   "tokenizer.model", "vocab.json", "spiece.model")
+
+
+def _has_tokenizer_files(repo):
+    """False only for a local checkpoint directory with none of the
+    usual tokenizer files; a Hub repo is always attempted."""
+    if not os.path.isdir(repo):
+        return True
+    return any(os.path.exists(os.path.join(repo, f)) for f in TOKENIZER_FILES)
+
 class Engine:
     def __init__(self, artifact_dir, device="cpu", compile_decode=False,
                  cas_dir=None):
@@ -88,11 +100,21 @@ class Engine:
         ].from_dict(self.manifest["config"])
         self.max_cache_len = int(self.binding.get("max_cache_len", 1024))
         # Tokenizer/processor files are not yet part of the manifest.
-        self.tokenizer = AutoTokenizer.from_pretrained(
-            self.manifest["source"]["repo"])
+        # Generate (ids in, ids out) needs none; Chat does. A local
+        # checkpoint without tokenizer files (the test fixtures) loads
+        # without one; for a Hub repo a failed fetch fails the load, so
+        # a transient Hub error is reported as one rather than as a
+        # model with no tokenizer.
+        repo = self.manifest["source"]["repo"]
+        if _has_tokenizer_files(repo):
+            self.tokenizer = AutoTokenizer.from_pretrained(repo)
+        else:
+            print(f"[vxpu] {repo} has no tokenizer files; "
+                  "Chat is unavailable, Generate works", flush=True)
+            self.tokenizer = None
         self.generation_config = self._generation_config()
         self.eos_ids = self._eos_ids()
-        if getattr(self.tokenizer, "chat_template", None) is None:
+        if self.tokenizer is not None and getattr(self.tokenizer, "chat_template", None) is None:
             self.tokenizer.chat_template = (
                 "{% for message in messages %}"
                 "{{ message['role'] | capitalize }}: {{ message['content'] }}\\n"
@@ -128,6 +150,12 @@ class Engine:
         for fqn in self.binding["derived"]:
             self.shared[fqn] = derived_tensor(
                 fqn, probe_meta[fqn], self.config).to(device)
+        # Lifted but unused by the graph (other towers' tables): any
+        # tensor of the right shape and dtype; nothing is fetched.
+        for fqn in self.binding.get("unused", []):
+            meta = probe_meta[fqn]
+            self.shared[fqn] = torch.zeros(meta.shape, dtype=meta.dtype,
+                                           device=device)
         self.state_specs = {
             fqn: (probe_meta[fqn].shape, probe_meta[fqn].dtype)
             for fqn in self.binding["state"]}
@@ -176,7 +204,7 @@ class Engine:
                 ids.add(eos)
             elif isinstance(eos, (list, tuple)):
                 ids.update(int(i) for i in eos)
-        if self.tokenizer.eos_token_id is not None:
+        if self.tokenizer is not None and self.tokenizer.eos_token_id is not None:
             ids.add(int(self.tokenizer.eos_token_id))
         return ids
 
@@ -225,6 +253,11 @@ class Engine:
                           else module)
                 if name in target._buffers:
                     target._buffers[name] = tensor
+                elif isinstance(target.__dict__.get(name), torch.Tensor):
+                    # A lifted constant (a cache tensor the model reaches
+                    # through its cache object) is a plain attribute of
+                    # the unlifted module, not a registered buffer.
+                    setattr(target, name, tensor)
 
     def new_session(self):
         with self._lock:
@@ -259,6 +292,8 @@ class Engine:
         with tools); it is tokenized verbatim, adding BOS only if the
         rendered text does not already start with it.
         """
+        if self.tokenizer is None:
+            raise ValueError("this model has no tokenizer; use Generate with token ids")
         if raw_prompt:
             bos = self.tokenizer.bos_token or ""
             add_special = not (bos and text.startswith(bos))
@@ -303,19 +338,22 @@ class Engine:
         }
 
     def generate(self, session_id, input_ids, max_new_tokens, params,
-                 extra_eos_ids=()):
+                 extra_eos_ids=(), logits_sink=None):
         """transformers' generate() loop, streamed.
 
         Yields dicts {"token_ids": [...], "done": bool, ...}; the last
         one has done=True and the statistics. The generation lock is
         held for the whole stream (one accelerator serves turns
-        serially anyway).
+        serially anyway). ``logits_sink(position, logits)``, if given,
+        sees the next-token logits (a 1-D tensor) before each pick,
+        position 0 being the first generated token; used to record
+        test vectors.
         """
         with self._lock:
             session = self._session(session_id)
             yield from self._generate_locked(
                 session, list(input_ids), max_new_tokens, params,
-                extra_eos_ids)
+                extra_eos_ids, logits_sink)
 
     def _session(self, session_id):
         if session_id not in self.sessions:
@@ -323,7 +361,7 @@ class Engine:
         return self.sessions[session_id]
 
     def _generate_locked(self, session, ids, max_new_tokens, params,
-                         extra_eos_ids=()):
+                         extra_eos_ids=(), logits_sink=None):
         self._bind(session["state"])
         total_len = len(ids)
         if total_len == 0:
@@ -382,9 +420,11 @@ class Engine:
         # part of the cache.
         token_ids = []
         finish_reason = "length"
+        if logits_sink is not None:
+            logits_sink(0, logits[0, -1])
         next_id = sampler.pick(logits[0, -1], ids)
         loop_started = time.perf_counter()
-        for _ in range(max_tokens_to_generate):
+        for step in range(max_tokens_to_generate):
             token_ids.append(next_id)
             yield {"token_ids": [next_id], "done": False}
             if next_id in eos_ids:
@@ -397,6 +437,8 @@ class Engine:
                 cache_position=torch.tensor([len(cached)],
                                             device=self.device))
             cached.append(next_id)
+            if logits_sink is not None:
+                logits_sink(step + 1, logits[0, -1])
             next_id = sampler.pick(logits[0, -1], cached)
         loop_s = time.perf_counter() - loop_started
 
