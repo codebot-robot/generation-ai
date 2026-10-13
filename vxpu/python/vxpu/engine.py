@@ -128,6 +128,12 @@ class Engine:
         for fqn in self.binding["derived"]:
             self.shared[fqn] = derived_tensor(
                 fqn, probe_meta[fqn], self.config).to(device)
+        # Lifted but unused by the graph (other towers' tables): any
+        # tensor of the right shape and dtype; nothing is fetched.
+        for fqn in self.binding.get("unused", []):
+            meta = probe_meta[fqn]
+            self.shared[fqn] = torch.zeros(meta.shape, dtype=meta.dtype,
+                                           device=device)
         self.state_specs = {
             fqn: (probe_meta[fqn].shape, probe_meta[fqn].dtype)
             for fqn in self.binding["state"]}

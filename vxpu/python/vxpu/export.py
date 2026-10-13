@@ -177,16 +177,36 @@ def constant_aliases(exportable, *programs):
 MIN_PREFILL_LEN = 2
 
 
-def classify(exported, manifest, view, skip=()):
+def classify(exported, manifest, view, aliases=None):
     """Classify every tensor the exported program references.
 
-    Returns (bound, derived, state, stacked, unbound). ``view`` is the
+    Returns (bound, derived, state, stacked, unbound, unused). ``view`` is the
     checkpoint as the model's parameters see it (checkpoint_view);
-    ``stacked`` maps a merged parameter to its assembly spec. ``skip``
-    names are aliases of other tensors and are not classified.
+    ``stacked`` maps a merged parameter to its assembly spec. ``aliases``
+    maps a lifted name to the tensor it is (constant_aliases); aliases
+    are not classified themselves.
     """
     direct, merged = view
+    aliases = dict(aliases or {})
+    skip = set(aliases)
     sig = exported.graph_signature
+    # Non-strict export lifts every buffer and constant of the module
+    # tree, used or not (a text decode graph still names the vision and
+    # audio towers' rotary tables and softcaps). Those placeholders have
+    # no users; they get a placeholder tensor on the executor, nothing
+    # is fetched or derived for them.
+    # A tensor counts as used if any of its names is (a cache tensor is
+    # read through its lifted-constant alias and written through its
+    # buffer name, or the other way round).
+    used_placeholders = {
+        node.target for node in exported.graph.nodes
+        if node.op == "placeholder" and node.users}
+    used_fqns = set()
+    for mapping in (sig.inputs_to_parameters, sig.inputs_to_buffers,
+                    sig.inputs_to_lifted_tensor_constants):
+        for placeholder, fqn in mapping.items():
+            if placeholder in used_placeholders:
+                used_fqns.add(aliases.get(fqn, fqn))
     # Tied weights collapse to one placeholder in the signature but the
     # state dict keeps both names — classify over the union.
     param_fqns = set(sig.inputs_to_parameters.values()) | set(
@@ -213,9 +233,12 @@ def classify(exported, manifest, view, skip=()):
         (ref for name, ref in manifest["tensors"].items()
          if name.endswith("embed_tokens.weight")), None)
 
-    bound, derived, state, stacked, unbound = {}, [], [], {}, []
+    bound, derived, state, stacked, unbound, unused = {}, [], [], {}, [], []
     for fqn in fqns:
         if fqn in skip:
+            continue
+        if aliases.get(fqn, fqn) not in used_fqns:
+            unused.append(fqn)
             continue
         ref = lookup(fqn)
         if ref is None and fqn.endswith("lm_head.weight"):
@@ -231,7 +254,7 @@ def classify(exported, manifest, view, skip=()):
             state.append(fqn)
         else:
             unbound.append(fqn)
-    return bound, derived, state, stacked, unbound
+    return bound, derived, state, stacked, unbound, unused
 
 
 def export_artifact(repo_id, out_dir, max_cache_len=1024, revision="main"):
@@ -300,13 +323,13 @@ def export_artifact(repo_id, out_dir, max_cache_len=1024, revision="main"):
     torch.export.save(decode, os.path.join(out_dir, "decode.pt2"))
     aliases = constant_aliases(exportable, prefill, decode)
 
-    bound, derived, state, stacked, unbound = classify(
-        decode, manifest, view, skip=set(aliases))
+    bound, derived, state, stacked, unbound, unused = classify(
+        decode, manifest, view, aliases=aliases)
     if unbound:
         raise RuntimeError(
             f"unbound tensors (artifact would be incomplete): {unbound}")
     binding = {"bound": bound, "derived": derived, "state": state,
-               "stacked": stacked, "aliases": aliases,
+               "stacked": stacked, "aliases": aliases, "unused": unused,
                "max_cache_len": max_cache_len,
                "min_prefill_len": MIN_PREFILL_LEN}
     if quantization:
@@ -343,7 +366,8 @@ def main():
           f"{len(binding['derived'])} derived, "
           f"{len(binding['state'])} state, "
           f"{len(binding['stacked'])} stacked, "
-          f"{len(binding['aliases'])} aliases"
+          f"{len(binding['aliases'])} aliases, "
+          f"{len(binding['unused'])} unused"
           + (f" (fp8, {binding['quantization']['fp8_modules']} modules)"
              if binding.get("quantization") else ""))
     return 0

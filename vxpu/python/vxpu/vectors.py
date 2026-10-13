@@ -78,6 +78,10 @@ def _versions(device):
             "device": str(device)}
 
 
+def _r(value):
+    return None if value is None else round(float(value), 1)
+
+
 def _top(logits, k):
     import torch
     values, ids = torch.topk(logits.detach().float().cpu(), k)
@@ -185,7 +189,7 @@ def record_vxpu_engine(model, revision, prompts, settings, artifact, device="cpu
                     "finish": stats.get("finish_reason") if stats else None,
                     "top_logits": top,
                     "prefill_ms": stats.get("prefill_ms") if stats else None,
-                    "ms_per_token": stats.get("ms_per_token") if stats else None})
+                    "ms_per_token": _r(stats.get("ms_per_token")) if stats else None})
     with open(os.path.join(artifact, "binding.json")) as f:
         binding = json.load(f)
     producer = {"kind": "vxpu-engine", **_versions(device),
@@ -219,7 +223,7 @@ def record_vxpu_router(model, revision, prompts, settings, artifact, router=None
                         "finish": getattr(stats, "finish_reason", None),
                         "top_logits": [],
                         "prefill_ms": getattr(stats, "prefill_ms", None),
-                        "ms_per_token": getattr(stats, "ms_per_token", None)})
+                        "ms_per_token": _r(getattr(stats, "ms_per_token", None))})
     finally:
         lm.close()
     producer = {"kind": "vxpu-router", **_versions("remote"),
@@ -234,8 +238,14 @@ def _document(model, revision, config, producer, settings, prompts):
             "producer": producer, "settings": settings, "prompts": prompts}
 
 
-def compare(reference, candidate, logit_tolerance=0.05):
-    """Per prompt: tokens equal?, max top-k logit diff. Returns (rows, ok)."""
+def compare(reference, candidate, logit_tolerance=0.025):
+    """Per prompt: tokens equal?, max top-k logit diff. Returns (rows, ok).
+
+    ``logit_tolerance`` is relative to the logit's magnitude (at least
+    1.0): two bf16 computations of the same model legitimately differ by
+    a few units in the last place, and a logit of 30 carries 0.25 per
+    ulp in bf16. 2.5% covers that; a real divergence is tens of percent.
+    """
     rows, ok = [], True
     ref = {p["name"]: p for p in reference["prompts"]}
     for p in candidate["prompts"]:
@@ -246,19 +256,24 @@ def compare(reference, candidate, logit_tolerance=0.05):
         same_prompt = r["input_ids"] == p["input_ids"]
         tokens_equal = r["generated_ids"] == p["generated_ids"]
         agree = sum(a == b for a, b in zip(r["generated_ids"], p["generated_ids"]))
-        max_diff = None
+        max_diff, max_rel = None, None
         if r.get("top_logits") and p.get("top_logits"):
-            diffs = []
+            diffs, rels = [], []
             for a, b in zip(r["top_logits"], p["top_logits"]):
                 bv = dict(zip(b["ids"], b["values"]))
-                diffs += [abs(v - bv[i]) for i, v in zip(a["ids"], a["values"]) if i in bv]
+                for i, v in zip(a["ids"], a["values"]):
+                    if i in bv:
+                        diffs.append(abs(v - bv[i]))
+                        rels.append(abs(v - bv[i]) / max(1.0, abs(v)))
             max_diff = max(diffs) if diffs else None
-        row_ok = same_prompt and tokens_equal and (max_diff is None or max_diff <= logit_tolerance)
+            max_rel = max(rels) if rels else None
+        row_ok = same_prompt and tokens_equal and (max_rel is None or max_rel <= logit_tolerance)
         ok &= row_ok
         rows.append({"prompt": p["name"], "status": "ok" if row_ok else "DIFF",
                      "same_prompt": same_prompt, "tokens_equal": tokens_equal,
                      "agree": f"{agree}/{max(len(r['generated_ids']), len(p['generated_ids']))}",
                      "max_logit_diff": None if max_diff is None else round(max_diff, 4),
+                     "max_logit_rel": None if max_rel is None else round(max_rel, 4),
                      "ref_ms_per_token": r.get("ms_per_token"),
                      "ms_per_token": p.get("ms_per_token")})
     return rows, ok
@@ -267,15 +282,16 @@ def compare(reference, candidate, logit_tolerance=0.05):
 def table(reference, candidate, rows):
     head = (f"{candidate['model']['repo']} @ {candidate['model']['revision']}: "
             f"{reference['producer']['kind']} vs {candidate['producer']['kind']}")
-    lines = [head, "| prompt | tokens | top-k logits max diff | ms/token (ref -> candidate) |",
+    lines = [head, "| prompt | tokens | top-k logits max diff (abs / rel) | ms/token (ref -> candidate) |",
              "|---|---|---|---|"]
     for r in rows:
         if r["status"] == "no reference":
             lines.append(f"| {r['prompt']} | no reference | | |")
             continue
+        logit = ("n/a" if r["max_logit_diff"] is None
+                 else f"{r['max_logit_diff']} / {100 * r['max_logit_rel']:.1f}%")
         lines.append(f"| {r['prompt']} | {'equal' if r['tokens_equal'] else 'DIFFER'} ({r['agree']}) | "
-                     f"{'n/a' if r['max_logit_diff'] is None else r['max_logit_diff']} | "
-                     f"{r['ref_ms_per_token']} -> {r['ms_per_token']} |")
+                     f"{logit} | {r['ref_ms_per_token']} -> {r['ms_per_token']} |")
     return "\n".join(lines)
 
 
@@ -374,7 +390,8 @@ def main(argv=None):
     cmp_ = sub.add_parser("compare", help="compare two vectors files")
     cmp_.add_argument("reference")
     cmp_.add_argument("candidate")
-    cmp_.add_argument("--logit-tolerance", type=float, default=0.05)
+    cmp_.add_argument("--logit-tolerance", type=float, default=0.025,
+                      help="relative to the logit magnitude (bf16 rounding is ~1%%)")
     cmp_.set_defaults(func=cmd_compare)
 
     st = sub.add_parser("selftest", help="CI tier: tiny models, in-process, token-exact")
