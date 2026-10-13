@@ -90,7 +90,7 @@ func cmdAsk(ctx context.Context, args []string) error {
 	executorImage := flags.String("executor-image",
 		os.Getenv("VXPU_EXECUTOR_IMAGE"), "executor image (used only if the router has to be created)")
 	accelerator := flags.String("accelerator", "nvidia-l4",
-		"GKE accelerator label for the executor pod (used only if the router has to be created; `vxpu up` changes a running router)")
+		"GKE accelerator label for the executor pod (used only if the router has to be created; 'vxpu up' changes a running router)")
 	routerAddr := flags.String("router", "", "vxpu-router address (e.g. localhost:50051); if set, skips direct pod creation")
 	maxNewTokens := flags.Int("max-new-tokens", 96, "tokens per reply")
 	timeout := flags.Duration("timeout", 20*time.Minute,
