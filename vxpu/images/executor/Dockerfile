@@ -47,7 +47,8 @@ RUN if [ -f /src/transformers/pyproject.toml ]; then \
         grpcio \
         "protobuf>=6.30" \
         requests \
-        huggingface_hub
+        huggingface_hub \
+        accelerate
 
 COPY python/vxpu/ /app/vxpu/
 
