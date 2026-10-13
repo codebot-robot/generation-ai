@@ -135,32 +135,42 @@ func (h *Harness) WaitForStatefulSet(name, namespace string, timeout time.Durati
 
 func (h *Harness) DeleteDeployment(name, namespace string) {
 	h.t.Helper()
-	// Ignore errors if deployment doesn't exist
-	exec.Command("kubectl", "delete", "deployment", name, "-n", namespace, "--ignore-not-found").Run()
+	out, err := exec.Command("kubectl", "delete", "deployment", name, "-n", namespace, "--ignore-not-found").CombinedOutput()
+	if err != nil {
+		h.t.Logf("kubectl delete deployment %s/%s failed (ignored, best-effort cleanup): %v: %s", namespace, name, err, out)
+	}
 }
 
 func (h *Harness) DeleteStatefulSet(name, namespace string) {
 	h.t.Helper()
-	// Ignore errors if statefulset doesn't exist
-	exec.Command("kubectl", "delete", "statefulset", name, "-n", namespace, "--ignore-not-found").Run()
+	out, err := exec.Command("kubectl", "delete", "statefulset", name, "-n", namespace, "--ignore-not-found").CombinedOutput()
+	if err != nil {
+		h.t.Logf("kubectl delete statefulset %s/%s failed (ignored, best-effort cleanup): %v: %s", namespace, name, err, out)
+	}
 }
 
 func (h *Harness) DeleteService(name, namespace string) {
 	h.t.Helper()
-	// Ignore errors if service doesn't exist
-	exec.Command("kubectl", "delete", "service", name, "-n", namespace, "--ignore-not-found").Run()
+	out, err := exec.Command("kubectl", "delete", "service", name, "-n", namespace, "--ignore-not-found").CombinedOutput()
+	if err != nil {
+		h.t.Logf("kubectl delete service %s/%s failed (ignored, best-effort cleanup): %v: %s", namespace, name, err, out)
+	}
 }
 
 func (h *Harness) DeletePod(name, namespace string) {
 	h.t.Helper()
-	// Ignore errors if pod doesn't exist
-	exec.Command("kubectl", "delete", "pod", name, "-n", namespace, "--ignore-not-found").Run()
+	out, err := exec.Command("kubectl", "delete", "pod", name, "-n", namespace, "--ignore-not-found").CombinedOutput()
+	if err != nil {
+		h.t.Logf("kubectl delete pod %s/%s failed (ignored, best-effort cleanup): %v: %s", namespace, name, err, out)
+	}
 }
 
 func (h *Harness) DeleteJob(name, namespace string) {
 	h.t.Helper()
-	// Ignore errors if job doesn't exist
-	exec.Command("kubectl", "delete", "job", name, "-n", namespace, "--ignore-not-found").Run()
+	out, err := exec.Command("kubectl", "delete", "job", name, "-n", namespace, "--ignore-not-found").CombinedOutput()
+	if err != nil {
+		h.t.Logf("kubectl delete job %s/%s failed (ignored, best-effort cleanup): %v: %s", namespace, name, err, out)
+	}
 }
 
 func (h *Harness) GetPodLogs(labelSelector, namespace string) string {
