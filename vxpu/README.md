@@ -213,12 +213,33 @@ python -m vxpu.vectors compare ref.json got.json
 ```
 
 Two tiers. The CI tier, `python -m vxpu.vectors selftest`, runs in the
-e2e presubmit: a tiny random fp8 Qwen3-MoE built in-process
-(`vxpu.fixtures.tiny_fp8_moe`: block scales, per-expert tensors, an
-unquantized lm_head) and the tiny random Llama, exported from a local
-directory, run on the in-process engine, token-exact against
-transformers. The cluster tier is the same commands against the real
-models; its latest table is below.
+e2e presubmit on three tiny models built in-process or fetched from the
+Hub: a random fp8 Qwen3-MoE (`vxpu.fixtures.tiny_fp8_moe`: block
+scales, per-expert tensors, an unquantized lm_head), the tiny random
+Llama, and a random Qwen4 hybrid (`vxpu.fixtures.tiny_qwen4`: Gated
+DeltaNet linear attention, indexed attention, n-gram embedding, MoE),
+each exported, run on the in-process engine, and required to be
+token-exact against transformers. The cluster tier is the same commands
+against the real models on the c3d CPU node (the 30B through the router
+on the RTX PRO 6000, tokens only). Latest run:
+
+| model | reference | prompts | greedy tokens | top-k logits, max diff | ms/token, reference → vXPU |
+|---|---|---|---|---|---|
+| google/gemma-4-E4B-it | transformers bf16 eager | 3 | all equal | 0.44 (1.7%) | 160–290 → 220 |
+| google/gemma-4-31B-it | transformers bf16 eager | 3 | all equal | 0.59 (2.4%) | 790–1330 → 1070–1110 |
+| Qwen/Qwen3-8B-FP8 | transformers, fp8 dequantized to bf16 | 3 | all equal | 0.50 (1.2%) | 270–350 → 5700–6300 |
+| Qwen/Qwen3-30B-A3B-Instruct-2507-FP8 | transformers, fp8 dequantized to bf16 | 3 | all equal | n/a (router) | 190–330 → 11.7 (RTX PRO 6000) |
+| Qwen/Qwen3.8-Flash-Next-FP8 | none yet (186 GB; a reference needs a larger node) | | export + run only | | |
+
+Two things this table found on its first run, both fixed in the same
+change: Gemma 4's long prompts diverged because the executor
+recomputed the p-RoPE table from the config and got it wrong past the
+first entries (the artifact now carries the model's own buffers), and
+sessions after the first ran linear-attention models on stale state
+because the engine only re-bound registered buffers, not the cache
+tensors export had lifted as constants. The fp8 numbers on the CPU also
+say plainly that dequantizing per step costs 20x against bf16 weights
+there; the GPU is where fp8 pays.
 
 ## Layout
 
@@ -330,6 +351,8 @@ clients.
   rehydrated 182 GB in 12 min and holds 177 GB resident with the fp8
   tensors kept as fp8; the first prompt answered at ~2.3 s/token after
   a ~75 s prefill (every expert bank is dequantized once per prefill).
+  (That run predates the session-state fix above: only its first
+  session had correct linear-attention state.)
   Correctness of the static-cache path and of the pt2 round trip is
   verified against eager transformers on a small random Qwen4 model
   (float32 rounding); a same-node reference run of the 186 GB model is
