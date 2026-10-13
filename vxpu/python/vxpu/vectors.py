@@ -241,10 +241,12 @@ def _document(model, revision, config, producer, settings, prompts):
 def compare(reference, candidate, logit_tolerance=0.025):
     """Per prompt: tokens equal?, max top-k logit diff. Returns (rows, ok).
 
-    ``logit_tolerance`` is relative to the logit's magnitude (at least
-    1.0): two bf16 computations of the same model legitimately differ by
-    a few units in the last place, and a logit of 30 carries 0.25 per
-    ulp in bf16. 2.5% covers that; a real divergence is tens of percent.
+    ``logit_tolerance`` is relative to the largest logit at that
+    position (at least 1.0): softmax is shift-invariant, so what matters
+    is error against the scale of the distribution, and two bf16
+    computations of the same model legitimately differ by a few units
+    in the last place of that scale (a logit of 30 carries 0.25 per ulp
+    in bf16). 2.5% covers that; a real divergence is tens of percent.
     """
     rows, ok = [], True
     ref = {p["name"]: p for p in reference["prompts"]}
@@ -261,10 +263,11 @@ def compare(reference, candidate, logit_tolerance=0.025):
             diffs, rels = [], []
             for a, b in zip(r["top_logits"], p["top_logits"]):
                 bv = dict(zip(b["ids"], b["values"]))
+                scale = max(1.0, max(abs(v) for v in a["values"]))
                 for i, v in zip(a["ids"], a["values"]):
                     if i in bv:
                         diffs.append(abs(v - bv[i]))
-                        rels.append(abs(v - bv[i]) / max(1.0, abs(v)))
+                        rels.append(abs(v - bv[i]) / scale)
             max_diff = max(diffs) if diffs else None
             max_rel = max(rels) if rels else None
         row_ok = same_prompt and tokens_equal and (max_rel is None or max_rel <= logit_tolerance)
@@ -391,7 +394,7 @@ def main(argv=None):
     cmp_.add_argument("reference")
     cmp_.add_argument("candidate")
     cmp_.add_argument("--logit-tolerance", type=float, default=0.025,
-                      help="relative to the logit magnitude (bf16 rounding is ~1%%)")
+                      help="relative to the position's largest logit (bf16 rounding is ~1%%)")
     cmp_.set_defaults(func=cmd_compare)
 
     st = sub.add_parser("selftest", help="CI tier: tiny models, in-process, token-exact")

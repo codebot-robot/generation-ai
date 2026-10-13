@@ -74,12 +74,17 @@ Three ideas carry the design:
 
 3. **A tensor classification.** Every tensor the graphs
    reference is `bound` (a weight reference), `stacked` (a bank of
-   weight references concatenated on the executor, e.g. one MoE
-   expert parameter from 128 per-expert checkpoint tensors), `derived`
-   (computed from config at load time: RoPE tables via transformers'
-   own formula registry, embedding scales — never stored in
-   checkpoints), or `state` (per-session KV cache, zero-initialized,
-   mutated in place by the graphs). The classification is also the serving
+   weight references assembled on the executor, e.g. one MoE expert
+   parameter from 128 per-expert checkpoint tensors, following
+   transformers' own conversion recipes), `constant` (a buffer the
+   model computes from its config, RoPE tables and embedding scales,
+   captured with its real values at export and carried in the
+   artifact), `state` (what the graphs write in place: the per-session
+   KV cache, zero-initialized on the executor), or `unused` (lifted by
+   export but read by no op, e.g. another tower's tables). Older
+   artifacts carry `derived` tensors the executor recomputes from the
+   config; the harness showed that recomputation wrong for Gemma 4's
+   p-RoPE table, which is why constants are captured now. The classification is also the serving
    architecture: bound/derived are shared read-only across sessions;
    a session *is* its state tensors. Multi-turn chat prefills only the
    new suffix tokens against the session's existing cache.
