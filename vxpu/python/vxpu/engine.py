@@ -303,19 +303,22 @@ class Engine:
         }
 
     def generate(self, session_id, input_ids, max_new_tokens, params,
-                 extra_eos_ids=()):
+                 extra_eos_ids=(), logits_sink=None):
         """transformers' generate() loop, streamed.
 
         Yields dicts {"token_ids": [...], "done": bool, ...}; the last
         one has done=True and the statistics. The generation lock is
         held for the whole stream (one accelerator serves turns
-        serially anyway).
+        serially anyway). ``logits_sink(position, logits)``, if given,
+        sees the next-token logits (a 1-D tensor) before each pick,
+        position 0 being the first generated token; used to record
+        test vectors.
         """
         with self._lock:
             session = self._session(session_id)
             yield from self._generate_locked(
                 session, list(input_ids), max_new_tokens, params,
-                extra_eos_ids)
+                extra_eos_ids, logits_sink)
 
     def _session(self, session_id):
         if session_id not in self.sessions:
@@ -323,7 +326,7 @@ class Engine:
         return self.sessions[session_id]
 
     def _generate_locked(self, session, ids, max_new_tokens, params,
-                         extra_eos_ids=()):
+                         extra_eos_ids=(), logits_sink=None):
         self._bind(session["state"])
         total_len = len(ids)
         if total_len == 0:
@@ -382,9 +385,11 @@ class Engine:
         # part of the cache.
         token_ids = []
         finish_reason = "length"
+        if logits_sink is not None:
+            logits_sink(0, logits[0, -1])
         next_id = sampler.pick(logits[0, -1], ids)
         loop_started = time.perf_counter()
-        for _ in range(max_tokens_to_generate):
+        for step in range(max_tokens_to_generate):
             token_ids.append(next_id)
             yield {"token_ids": [next_id], "done": False}
             if next_id in eos_ids:
@@ -397,6 +402,8 @@ class Engine:
                 cache_position=torch.tensor([len(cached)],
                                             device=self.device))
             cached.append(next_id)
+            if logits_sink is not None:
+                logits_sink(step + 1, logits[0, -1])
             next_id = sampler.pick(logits[0, -1], cached)
         loop_s = time.perf_counter() - loop_started
 

@@ -186,12 +186,42 @@ uv pip install -e third_party/transformers -e python/
 The executor image installs the same fork, so exporter and executor
 run one transformers. Each patch is written to be upstreamable.
 
+## Verifying a model: test vectors
+
+`vxpu.vectors` records what a model says and compares two recordings.
+Eager transformers writes the reference; the vXPU engine writes a
+candidate (in-process, or through a router); a future vLLM backend
+would write one too. Greedy tokens must agree exactly, and where both
+sides carry logits the top-k values of the first generated positions
+must agree within a tolerance. The file format (`vxpu-vectors/1`) is the
+interchange point between engines.
+
+```sh
+# reference, from the same transformers the exporter uses
+python -m vxpu.vectors record --producer transformers --model Qwen/Qwen3-8B-FP8 -o ref.json
+# candidate: the exported artifact on this machine's CPU ...
+python -m vxpu.export Qwen/Qwen3-8B-FP8 -o qwen8b/
+python -m vxpu.vectors record --producer vxpu-engine --model Qwen/Qwen3-8B-FP8 --artifact qwen8b/ -o got.json
+# ... or through the router in the cluster (tokens only; no logits on the wire)
+python -m vxpu.vectors record --producer vxpu-router --model Qwen/Qwen3-8B-FP8 --artifact qwen8b/ -o got.json
+python -m vxpu.vectors compare ref.json got.json
+```
+
+Two tiers. The CI tier, `python -m vxpu.vectors selftest`, runs in the
+e2e presubmit: a tiny random fp8 Qwen3-MoE built in-process
+(`vxpu.fixtures.tiny_fp8_moe`: block scales, per-expert tensors, an
+unquantized lm_head) and the tiny random Llama, exported from a local
+directory, run on the in-process engine, token-exact against
+transformers. The cluster tier is the same commands against the real
+models; its latest table is below.
+
 ## Layout
 
 ```
 proto/        Executor gRPC API (LoadModel / NewSession / Chat)
 python/vxpu/  export (thin client), client (thin client, no torch),
               modeling (transformers-shaped from_pretrained/generate),
+              vectors (test vectors: record with any producer, compare),
               server (executor): manifest, export, rehydrate, engine
 cmd/vxpu/     Go CLI: no Python/torch — ships artifacts, creates the
               router pod on demand, port-forwards, chats

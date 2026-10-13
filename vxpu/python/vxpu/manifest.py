@@ -22,7 +22,9 @@ the Hub API) and range-fetched safetensors headers — never from weight
 bytes. The sha256 of the manifest is the model's digest.
 """
 
+import hashlib
 import json
+import os
 import struct
 
 import requests
@@ -32,6 +34,14 @@ MANIFEST_FORMAT = "vxpu-manifest/v1alpha1"
 
 
 def _fetch_range(url, start, length):
+    if url.startswith("file://"):
+        with open(url[len("file://"):], "rb") as f:
+            f.seek(start)
+            content = f.read(length)
+        if len(content) != length:
+            raise RuntimeError(
+                f"expected {length} bytes from {url}, got {len(content)} bytes")
+        return content
     resp = requests.get(
         url, headers={"Range": f"bytes={start}-{start + length - 1}"})
     resp.raise_for_status()
@@ -45,28 +55,53 @@ def _fetch_range(url, start, length):
     return content
 
 
-def build_manifest(repo_id, revision="main"):
-    """Build a manifest for a Hugging Face model repo.
+def _local_shards(directory):
+    """(sha256, size, name, file:// source) for each safetensors file in
+    a local checkpoint directory (a save_pretrained output)."""
+    shards = []
+    for name in sorted(os.listdir(directory)):
+        if not name.endswith(".safetensors"):
+            continue
+        path = os.path.join(directory, name)
+        digest = hashlib.sha256()
+        with open(path, "rb") as f:
+            for chunk in iter(lambda: f.read(1 << 20), b""):
+                digest.update(chunk)
+        shards.append((digest.hexdigest(), os.path.getsize(path), name,
+                       "file://" + os.path.abspath(path)))
+    return shards
 
-    Downloads no weight bytes: only file metadata and safetensors
-    headers (a few KB per shard, via HTTP range requests).
+
+def build_manifest(repo_id, revision="main"):
+    """Build a manifest for a Hugging Face model repo, or for a local
+    checkpoint directory (file:// sources; sha256 computed here).
+
+    For a Hub repo this downloads no weight bytes: only file metadata
+    and safetensors headers (a few KB per shard, via HTTP range
+    requests).
     """
-    info = HfApi().model_info(repo_id, revision=revision,
-                              files_metadata=True)
-    commit_sha = getattr(info, "sha", None) or revision
-    with open(hf_hub_download(repo_id, "config.json",
-                              revision=commit_sha)) as f:
-        config = json.load(f)
+    if os.path.isdir(repo_id):
+        directory = os.path.abspath(repo_id)
+        with open(os.path.join(directory, "config.json")) as f:
+            config = json.load(f)
+        shards = _local_shards(directory)
+        commit_sha, revision = "local", "local"
+        repo_id = directory
+    else:
+        info = HfApi().model_info(repo_id, revision=revision,
+                                  files_metadata=True)
+        commit_sha = getattr(info, "sha", None) or revision
+        with open(hf_hub_download(repo_id, "config.json",
+                                  revision=commit_sha)) as f:
+            config = json.load(f)
+        shards = [(s.lfs.sha256, s.size, s.rfilename,
+                   f"https://huggingface.co/{repo_id}/resolve/"
+                   f"{commit_sha}/{s.rfilename}")
+                  for s in info.siblings if s.rfilename.endswith(".safetensors")]
 
     files, tensors = {}, {}
-    shards = [s for s in info.siblings
-              if s.rfilename.endswith(".safetensors")]
-    for shard in shards:
-        sha = shard.lfs.sha256
-        source = (f"https://huggingface.co/{repo_id}/resolve/"
-                  f"{commit_sha}/{shard.rfilename}")
-        files[sha] = {"size": shard.size, "name": shard.rfilename,
-                      "source": source}
+    for sha, size, name, source in shards:
+        files[sha] = {"size": size, "name": name, "source": source}
         (header_len,) = struct.unpack("<Q", _fetch_range(source, 0, 8))
         header = json.loads(_fetch_range(source, 8, header_len))
         data_start = 8 + header_len
