@@ -308,7 +308,10 @@ clients.
   dequantized to bf16 (61 GB) and 46–62 ms/token for eager transformers
   running it as fp8 with its own kernels (`FP8Linear`/`FP8Experts`, the
   Hub Triton kernel; DeepGEMM needs a datacenter part) on the same card;
-  Qwen3-8B-FP8 at 12.2 ms/token. The first load pays ~1–2 min of autotuning. That the
+  Qwen3-8B-FP8 at 12.2 ms/token. Prefill of a 474-token prompt takes 0.4 s (24 s on the CPU
+  node). Gemma-4-31B-it (dense bf16, 62.6 GB) rehydrates onto the card
+  in 104 s and decodes at 50–53 ms/token (1.2–1.4 s/token on the CPU
+  node), the same text. The first load pays ~1–2 min of autotuning. That the
   8B and the 30B take the same time per token says the step is bound by
   kernel launches, not bandwidth, on this card (CUDA graphs are the next
   lever; see the issue tracker).
