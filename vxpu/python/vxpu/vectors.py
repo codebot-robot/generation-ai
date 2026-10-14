@@ -16,9 +16,11 @@
 
 A vectors file is the interchange format between engines. Eager
 transformers records the reference; the vXPU engine (in-process, or
-through a router) and vLLM record candidates. ``compare`` diffs two files: greedy tokens must agree exactly, and
-where both sides carry logits the top-k values must agree within a
-tolerance.
+through a router) and vLLM record candidates. ``compare`` diffs two
+files: where the candidate's greedy tokens leave the reference's, the
+reference's logits at that position say whether the flip was a tie or
+a divergence, and the top-k logits of every position up to there must
+agree within a tolerance.
 
     python -m vxpu.vectors record --producer transformers --model REPO -o ref.json
     python -m vxpu.vectors record --producer vxpu-engine --model REPO --artifact DIR -o got.json
@@ -34,7 +36,7 @@ Format (vxpu-vectors/1):
      "producer": {"kind": "transformers" | "vxpu-engine" | "vxpu-router" | "vllm",
                   "torch": ..., "transformers": ..., "device": ..., ...},
      "settings": {"new_tokens": 32, "top_k": 32, "logit_positions": 32,
-                  "greedy": true},
+                  "greedy": true},   # logit_positions defaults to new_tokens
      "prompts": [{"name": ..., "text": ... | "ids": [...],
                   "input_ids": [...], "generated_ids": [...],
                   "finish": "eos" | "length",
@@ -42,8 +44,8 @@ Format (vxpu-vectors/1):
                   "prefill_ms": ..., "ms_per_token": ...}]}
 
 Logits are stored as the top-k (id, value) pairs of each generated
-position (``logit_positions``; all 32 by default, a few tens of KB per
-prompt): they are what lets a token flip be judged as a tie or a
+position (``logit_positions``, every generated position unless set
+lower; a few tens of KB per prompt): they are what lets a token flip be judged as a tie or a
 divergence, and they stay useful under any later tolerance.
 """
 
@@ -68,7 +70,7 @@ ID_PROMPTS = [
     {"name": "ids-long", "ids": [(i * 37 + 11) % 500 + 3 for i in range(100)]},
 ]
 
-DEFAULTS = {"new_tokens": 32, "top_k": 32, "logit_positions": 32, "greedy": True}
+DEFAULTS = {"new_tokens": 32, "top_k": 32, "logit_positions": None, "greedy": True}
 FORMAT = "vxpu-vectors/1"
 
 
@@ -314,6 +316,14 @@ def _document(model, revision, config, producer, settings, prompts):
             "producer": producer, "settings": settings, "prompts": prompts}
 
 
+def _scale(values):
+    """The scale a relative tolerance applies to at one position: the
+    largest logit magnitude in the recorded top-k, at least 1.0. Used
+    for logit diffs and for the tie set alike, so one tolerance means
+    one thing."""
+    return max(1.0, max(abs(v) for v in values))
+
+
 def tie_set(top, logit_tolerance):
     """The ids a greedy decoder could defensibly pick at a position: every
     token whose logit is within the tolerance of the top one, on the
@@ -321,8 +331,8 @@ def tie_set(top, logit_tolerance):
     if not top or not top["values"]:
         return set()
     best = top["values"][0]
-    scale = max(1.0, abs(best))
-    return {i for i, v in zip(top["ids"], top["values"]) if best - v <= logit_tolerance * scale}
+    allowed = logit_tolerance * _scale(top["values"])
+    return {i for i, v in zip(top["ids"], top["values"]) if best - v <= allowed}
 
 
 def _first_flip(r, p, logit_tolerance):
@@ -347,8 +357,8 @@ def _first_flip(r, p, logit_tolerance):
         flip["kind"] = "length"  # one side stopped (eos) where the other went on
         return flip
     tops = r.get("top_logits") or []
-    if pos >= len(tops):
-        flip["kind"] = "unjudged"
+    if pos >= len(tops) or not tops[pos] or not tops[pos]["values"]:
+        flip["kind"] = "unjudged"  # no reference logits recorded there
         return flip
     top = tops[pos]
     values = dict(zip(top["ids"], top["values"]))
@@ -412,7 +422,7 @@ def compare(reference, candidate, logit_tolerance=0.025, strict_tokens=False):
             for a, b in list(zip(r["top_logits"], p["top_logits"]))[:comparable]:
                 av, bv = dict(zip(a["ids"], a["values"])), dict(zip(b["ids"], b["values"]))
                 a_floor, b_floor = min(a["values"]), min(b["values"])
-                scale = max(1.0, max(abs(v) for v in a["values"]))
+                scale = _scale(a["values"])
                 for i, v in av.items():
                     d = abs(v - bv[i]) if i in bv else max(0.0, v - b_floor)
                     diffs.append(d)
@@ -476,8 +486,11 @@ def _load(path):
 
 
 def _settings(args):
+    # Logits for every generated position unless asked for fewer: a flip
+    # at a position without them cannot be judged.
+    positions = args.logit_positions if args.logit_positions is not None else args.new_tokens
     return {"new_tokens": args.new_tokens, "top_k": args.top_k,
-            "logit_positions": args.logit_positions, "greedy": True}
+            "logit_positions": positions, "greedy": True}
 
 
 def cmd_record(args):
@@ -550,7 +563,8 @@ def main(argv=None):
     def common(p):
         p.add_argument("--new-tokens", type=int, default=DEFAULTS["new_tokens"])
         p.add_argument("--top-k", type=int, default=DEFAULTS["top_k"])
-        p.add_argument("--logit-positions", type=int, default=DEFAULTS["logit_positions"])
+        p.add_argument("--logit-positions", type=int, default=None,
+                       help="positions to record top-k logits for (default: all of --new-tokens)")
 
     rec = sub.add_parser("record", help="record vectors with a producer")
     rec.add_argument("--producer", choices=["transformers", "vxpu-engine", "vxpu-router", "vllm"], required=True)
