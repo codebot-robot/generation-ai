@@ -141,11 +141,24 @@ class Engine:
         # in place), so a session costs cache memory, not a weight copy.
         self.shared = {}
         self.bytes_fetched = 0
-        for fqn, ref in self.binding["bound"].items():
-            tensor, downloaded = fetch_tensor(
-                ref, self.manifest["files"], cas_dir)
-            self.shared[fqn] = tensor.to(device)
-            self.bytes_fetched += downloaded
+        # Bound tensors are fetched concurrently (a bounded window, so
+        # the memory in flight stays near the window, not the model);
+        # each lands on the device as it completes.
+        from concurrent.futures import ThreadPoolExecutor
+        bound = list(self.binding["bound"].items())
+        with ThreadPoolExecutor(max_workers=16) as pool:
+            pending = {}
+            for i, (fqn, ref) in enumerate(bound):
+                pending[i] = pool.submit(fetch_tensor, ref, self.manifest["files"], cas_dir)
+                if len(pending) >= 32:
+                    j = min(pending)
+                    tensor, downloaded = pending.pop(j).result()
+                    self.shared[bound[j][0]] = tensor.to(device)
+                    self.bytes_fetched += downloaded
+            for j in sorted(pending):
+                tensor, downloaded = pending.pop(j).result()
+                self.shared[bound[j][0]] = tensor.to(device)
+                self.bytes_fetched += downloaded
         # Stacked parameters (mixture-of-experts banks) are assembled
         # from the checkpoint's per-expert tensors.
         for fqn, spec in self.binding.get("stacked", {}).items():
