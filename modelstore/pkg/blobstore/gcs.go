@@ -20,6 +20,7 @@ import (
 	"fmt"
 	"io"
 	"path"
+	"sort"
 	"strings"
 
 	"cloud.google.com/go/storage"
@@ -130,6 +131,60 @@ func (g *GCS) Open(ctx context.Context, sha string, offset, length int64) (io.Re
 		return nil, ErrNotFound
 	}
 	return rc, err
+}
+
+func (g *GCS) ref(key string) string { return path.Join(g.prefix, "_refs", key) }
+
+func (g *GCS) PutRef(ctx context.Context, key string, value []byte) error {
+	if !ValidRefKey(key) {
+		return fmt.Errorf("invalid ref key %q", key)
+	}
+	w := g.client.Bucket(g.bucket).Object(g.ref(key)).NewWriter(ctx)
+	w.ContentType = "application/octet-stream"
+	if _, err := w.Write(value); err != nil {
+		if cerr := w.Close(); cerr != nil {
+			klog.FromContext(ctx).V(2).Info("closing failed ref write", "key", key, "error", cerr.Error())
+		}
+		return err
+	}
+	return w.Close()
+}
+
+func (g *GCS) GetRef(ctx context.Context, key string) ([]byte, error) {
+	if !ValidRefKey(key) {
+		return nil, ErrNotFound
+	}
+	rc, err := g.client.Bucket(g.bucket).Object(g.ref(key)).NewReader(ctx)
+	if errors.Is(err, storage.ErrObjectNotExist) {
+		return nil, ErrNotFound
+	}
+	if err != nil {
+		return nil, err
+	}
+	defer func() {
+		if cerr := rc.Close(); cerr != nil {
+			klog.FromContext(ctx).Error(cerr, "closing ref", "key", key)
+		}
+	}()
+	return io.ReadAll(rc)
+}
+
+func (g *GCS) ListRefs(ctx context.Context, prefix string) ([]string, error) {
+	base := g.ref("") + "/"
+	it := g.client.Bucket(g.bucket).Objects(ctx, &storage.Query{Prefix: base + prefix})
+	var keys []string
+	for {
+		attrs, err := it.Next()
+		if errors.Is(err, iterator.Done) {
+			break
+		}
+		if err != nil {
+			return nil, err
+		}
+		keys = append(keys, strings.TrimPrefix(attrs.Name, base))
+	}
+	sort.Strings(keys)
+	return keys, nil
 }
 
 func (g *GCS) DirectURL(sha string) string {

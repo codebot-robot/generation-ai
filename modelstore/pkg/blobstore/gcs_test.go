@@ -88,6 +88,28 @@ func TestGCS(t *testing.T) {
 	if !strings.HasPrefix(store.DirectURL(sha), "gs://") || !strings.HasSuffix(store.DirectURL(sha), "/_blobs/"+sha) {
 		t.Fatalf("DirectURL: %s", store.DirectURL(sha))
 	}
+	// Refs: tags and manifest records next to the blobs.
+	if err := store.PutRef(ctx, "tags/org/name/main", []byte("sha256:"+sha)); err != nil {
+		t.Fatalf("PutRef: %v", err)
+	}
+	if err := store.PutRef(ctx, "tags/org/name/v1", []byte("sha256:"+sha)); err != nil {
+		t.Fatalf("PutRef: %v", err)
+	}
+	if v, err := store.GetRef(ctx, "tags/org/name/main"); err != nil || string(v) != "sha256:"+sha {
+		t.Fatalf("GetRef: %v %q", err, v)
+	}
+	if _, err := store.GetRef(ctx, "tags/org/name/missing"); !errors.Is(err, ErrNotFound) {
+		t.Fatalf("GetRef missing: %v", err)
+	}
+	keys, err := store.ListRefs(ctx, "tags/org/name/")
+	if err != nil || strings.Join(keys, ",") != "tags/org/name/main,tags/org/name/v1" {
+		t.Fatalf("ListRefs: %v %v", err, keys)
+	}
+	for _, k := range keys {
+		if err := store.client.Bucket(store.bucket).Object(store.ref(k)).Delete(ctx); err != nil {
+			t.Logf("cleanup ref %s: %v", k, err)
+		}
+	}
 	// Clean up the test prefix.
 	for _, name := range []string{store.object(sha)} {
 		if err := store.client.Bucket(store.bucket).Object(name).Delete(ctx); err != nil {

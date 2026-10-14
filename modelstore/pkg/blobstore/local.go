@@ -21,6 +21,8 @@ import (
 	"io"
 	"os"
 	"path/filepath"
+	"sort"
+	"strings"
 
 	"k8s.io/klog/v2"
 )
@@ -117,5 +119,62 @@ type limitedFile struct {
 func (l *limitedFile) Close() error { return l.f.Close() }
 
 func (l *Local) DirectURL(sha string) string { return "" }
+
+func (l *Local) refPath(key string) string {
+	return filepath.Join(l.dir, "refs", filepath.FromSlash(key))
+}
+
+func (l *Local) PutRef(ctx context.Context, key string, value []byte) error {
+	if !ValidRefKey(key) {
+		return fmt.Errorf("invalid ref key %q", key)
+	}
+	path := l.refPath(key)
+	if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
+		return err
+	}
+	tmp := path + ".tmp"
+	if err := os.WriteFile(tmp, value, 0o644); err != nil {
+		return err
+	}
+	return os.Rename(tmp, path)
+}
+
+func (l *Local) GetRef(ctx context.Context, key string) ([]byte, error) {
+	if !ValidRefKey(key) {
+		return nil, ErrNotFound
+	}
+	b, err := os.ReadFile(l.refPath(key))
+	if errors.Is(err, os.ErrNotExist) {
+		return nil, ErrNotFound
+	}
+	return b, err
+}
+
+func (l *Local) ListRefs(ctx context.Context, prefix string) ([]string, error) {
+	root := filepath.Join(l.dir, "refs")
+	var keys []string
+	err := filepath.WalkDir(root, func(path string, d os.DirEntry, err error) error {
+		if err != nil {
+			if errors.Is(err, os.ErrNotExist) {
+				return nil
+			}
+			return err
+		}
+		if d.IsDir() || strings.HasSuffix(path, ".tmp") {
+			return nil
+		}
+		rel, err := filepath.Rel(root, path)
+		if err != nil {
+			return err
+		}
+		key := filepath.ToSlash(rel)
+		if strings.HasPrefix(key, prefix) {
+			keys = append(keys, key)
+		}
+		return nil
+	})
+	sort.Strings(keys)
+	return keys, err
+}
 
 func (l *Local) String() string { return "local:" + l.dir }

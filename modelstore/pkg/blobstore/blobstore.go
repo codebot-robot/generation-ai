@@ -54,6 +54,34 @@ type Store interface {
 	DirectURL(sha string) string
 	// String describes the backend for logs.
 	String() string
+
+	// Refs are small named values next to the blobs: registry tags and
+	// manifest records. Keys are slash-separated paths such as
+	// "tags/<name>/<tag>"; values are a few bytes to a few KB. PutRef
+	// overwrites; GetRef returns ErrNotFound for a missing key; ListRefs
+	// returns the keys under a prefix, sorted.
+	PutRef(ctx context.Context, key string, value []byte) error
+	GetRef(ctx context.Context, key string) ([]byte, error)
+	ListRefs(ctx context.Context, prefix string) ([]string, error)
+}
+
+// ValidRefKey accepts the keys Refs are stored under: path segments of
+// [A-Za-z0-9._-] plus ":" (digests), no empty or dot-only segments.
+func ValidRefKey(key string) bool {
+	if key == "" {
+		return false
+	}
+	for _, seg := range strings.Split(key, "/") {
+		if seg == "" || strings.Trim(seg, ".") == "" {
+			return false
+		}
+		for _, c := range seg {
+			if !(c >= 'a' && c <= 'z' || c >= 'A' && c <= 'Z' || c >= '0' && c <= '9' || c == '.' || c == '_' || c == '-' || c == ':') {
+				return false
+			}
+		}
+	}
+	return true
 }
 
 // Open opens a store from its location: a gs://bucket[/prefix] URL or

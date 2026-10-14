@@ -12,10 +12,12 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-// Package proxy is modelstore's HTTP API: content-addressed blobs,
-// Model objects as the index from file names to blobs, imports from
-// the Hugging Face Hub, and a Hub-compatible read API so that
-// transformers and vLLM load through it with HF_ENDPOINT set.
+// Package proxy is modelstore's HTTP front: the OCI distribution API
+// (pkg/registry) for blobs, manifests and tags; imports from the
+// Hugging Face Hub that end as OCI artifacts; a Hub-compatible read API
+// served from manifest annotations so that transformers and vLLM load
+// through it with HF_ENDPOINT set; and the plain /blobs/<sha> routes
+// the vxpu router uses today.
 package proxy
 
 import (
@@ -23,42 +25,47 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
-	"io"
 	"net/http"
-	"strconv"
 	"strings"
 	"sync"
 	"time"
 
-	"github.com/gke-labs/generation-ai/modelstore/apis/v1alpha1"
 	"github.com/gke-labs/generation-ai/modelstore/pkg/blobstore"
 	"github.com/gke-labs/generation-ai/modelstore/pkg/importer"
-	apierrors "k8s.io/apimachinery/pkg/api/errors"
-	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
-	"k8s.io/apimachinery/pkg/util/validation"
+	"github.com/gke-labs/generation-ai/modelstore/pkg/registry"
 	"k8s.io/klog/v2"
-	"sigs.k8s.io/controller-runtime/pkg/client"
 )
 
-// DirectURLHeader carries, on blob responses, a URL a client with its
-// own access to the backing store can read the blob from directly
-// (a gs:// URL for the GCS backend).
-const DirectURLHeader = "X-Modelstore-Direct-Url"
+// Import phases.
+const (
+	PhaseImporting = "Importing"
+	PhaseReady     = "Ready"
+	PhaseFailed    = "Failed"
+)
 
-type Proxy struct {
-	store    blobstore.Store
-	importer *importer.Importer
-	kube     client.Client
-
-	mu      sync.Mutex
-	imports map[string]bool // Model imports running in this process
+// ImportStatus is the progress of a repository import, kept in memory
+// for the process that runs it; the durable result is the manifest and
+// its tags in the registry.
+type ImportStatus struct {
+	Phase         string `json:"phase"`
+	FilesTotal    int    `json:"filesTotal,omitempty"`
+	FilesImported int    `json:"filesImported,omitempty"`
+	BytesImported int64  `json:"bytesImported,omitempty"`
+	Message       string `json:"message,omitempty"`
+	Digest        string `json:"digest,omitempty"`
 }
 
-// NewProxy serves blobs from store, imports through imp, and keeps
-// Model objects through kube. Call Resume to pick up imports a
-// previous process left unfinished.
-func NewProxy(store blobstore.Store, imp *importer.Importer, kube client.Client) *Proxy {
-	return &Proxy{store: store, importer: imp, kube: kube, imports: map[string]bool{}}
+type Proxy struct {
+	reg      *registry.Registry
+	importer *importer.Importer
+
+	mu      sync.Mutex
+	imports map[string]*ImportStatus // repository imports in this process, by name
+}
+
+// NewProxy serves the registry and imports through imp.
+func NewProxy(reg *registry.Registry, imp *importer.Importer) *Proxy {
+	return &Proxy{reg: reg, importer: imp, imports: map[string]*ImportStatus{}}
 }
 
 func (p *Proxy) ServeHTTP(w http.ResponseWriter, r *http.Request) {
@@ -96,6 +103,11 @@ func (w *responseWriter) Write(b []byte) (int, error) {
 }
 
 func (p *Proxy) serve(w http.ResponseWriter, r *http.Request) error {
+	if handled, err := p.reg.Handle(w, r); handled {
+		return err
+	}
+
+	// Plain blob routes: what the vxpu router rewrites sources to today.
 	if rest, ok := strings.CutPrefix(r.URL.Path, "/blobs/"); ok {
 		sha, action, _ := strings.Cut(rest, "/")
 		if !blobstore.ValidSHA(sha) {
@@ -106,7 +118,7 @@ func (p *Proxy) serve(w http.ResponseWriter, r *http.Request) error {
 		case action == "" && r.Method == http.MethodPut:
 			return p.handleBlobPut(w, r, sha)
 		case action == "" && (r.Method == http.MethodGet || r.Method == http.MethodHead):
-			return p.handleBlobGet(w, r, sha)
+			return p.reg.ServeBlob(w, r, sha)
 		case action == "import" && r.Method == http.MethodPost:
 			return p.handleBlobImport(w, r, sha)
 		}
@@ -118,13 +130,13 @@ func (p *Proxy) serve(w http.ResponseWriter, r *http.Request) error {
 		switch {
 		case r.URL.Path == "/models/import" && r.Method == http.MethodPost:
 			return p.handleModelImport(w, r)
-		case r.Method == http.MethodPost:
-			return p.handleModelCreate(w, r)
 		case r.Method == http.MethodGet && (r.URL.Path == "/models" || r.URL.Path == "/models/"):
 			return p.handleModelList(w, r)
 		case r.Method == http.MethodGet:
 			return p.handleModelGet(w, r)
 		}
+		http.NotFound(w, r)
+		return nil
 	}
 
 	// Hugging Face Hub compatible reads: metadata, then downloads.
@@ -139,71 +151,95 @@ func (p *Proxy) serve(w http.ResponseWriter, r *http.Request) error {
 	return nil
 }
 
-// modelName is the Model object name for a Hub repo id: a lowercase
-// DNS subdomain (Kubernetes object names), so "Qwen/Qwen3-8B-FP8"
-// becomes "qwen-qwen3-8b-fp8". The exact id is kept in spec.source.
-func modelName(repoID string) string {
+// RepositoryName is the registry name for a Hub repo id: lowercase,
+// with "/" kept and anything the OCI name grammar rejects collapsed to
+// "-" ("Qwen/Qwen3-8B-FP8" becomes "qwen/qwen3-8b-fp8"). The exact id
+// is kept in the manifest's annotations.
+func RepositoryName(repoID string) (string, error) {
 	var b strings.Builder
 	for _, c := range strings.ToLower(repoID) {
 		switch {
-		case c >= 'a' && c <= 'z', c >= '0' && c <= '9', c == '.':
+		case c >= 'a' && c <= 'z', c >= '0' && c <= '9', c == '.', c == '_', c == '-', c == '/':
 			b.WriteRune(c)
-		default: // '/', '_', and anything else
+		default:
 			b.WriteRune('-')
 		}
 	}
-	return strings.Trim(b.String(), "-.")
-}
-
-// validModelName returns the Model object name for a repo id, or the
-// API server's objection to it.
-func validModelName(repoID string) (string, error) {
-	name := modelName(repoID)
-	if errs := validation.IsDNS1123Subdomain(name); len(errs) > 0 {
-		return "", fmt.Errorf("repository %q gives an invalid object name %q: %s", repoID, name, strings.Join(errs, "; "))
+	name := b.String()
+	if !registry.ValidName(name) {
+		return "", fmt.Errorf("repository %q gives an invalid registry name %q", repoID, name)
 	}
 	return name, nil
 }
 
-func (p *Proxy) getModel(ctx context.Context, name string) (*v1alpha1.Model, error) {
-	var model v1alpha1.Model
-	if err := p.kube.Get(ctx, client.ObjectKey{Name: name}, &model); err != nil {
-		return nil, err
+// ---- Hub-compatible reads
+
+// artifactFiles resolves a repository reference (tag or digest) to the
+// files of its weights manifest. An index resolves to the manifest
+// whose artifactType is the weights one (or the first manifest).
+func (p *Proxy) artifactFiles(ctx context.Context, name, ref string) (*registry.Manifest, string, error) {
+	body, mediaType, digest, err := p.reg.GetManifest(ctx, name, ref)
+	if err != nil {
+		return nil, "", err
 	}
-	return &model, nil
+	if mediaType == registry.MediaTypeIndex {
+		var idx registry.Index
+		if err := json.Unmarshal(body, &idx); err != nil {
+			return nil, "", fmt.Errorf("index %s: %w", digest, err)
+		}
+		pick := ""
+		for _, d := range idx.Manifests {
+			if d.ArtifactType == registry.ArtifactWeights || pick == "" {
+				pick = d.Digest
+			}
+		}
+		if pick == "" {
+			return nil, "", blobstore.ErrNotFound
+		}
+		body, _, digest, err = p.reg.GetManifest(ctx, name, pick)
+		if err != nil {
+			return nil, "", err
+		}
+	}
+	var m registry.Manifest
+	if err := json.Unmarshal(body, &m); err != nil {
+		return nil, "", fmt.Errorf("manifest %s: %w", digest, err)
+	}
+	return &m, digest, nil
+}
+
+func revisionOf(m *registry.Manifest) string {
+	if c := m.Annotations[registry.AnnotationHubSHA]; c != "" {
+		return c
+	}
+	return "main"
 }
 
 func (p *Proxy) handleHFMetadata(w http.ResponseWriter, r *http.Request) error {
 	repoID := strings.TrimPrefix(r.URL.Path, "/api/models/")
-	// /api/models/{repo}/revision/{rev} is the same answer: we hold one revision.
+	revision := "main"
 	if i := strings.Index(repoID, "/revision/"); i >= 0 {
-		repoID = repoID[:i]
+		repoID, revision = repoID[:i], repoID[i+len("/revision/"):]
 	}
-	name, nerr := validModelName(repoID)
-	if nerr != nil {
+	name, err := RepositoryName(repoID)
+	if err != nil {
 		http.NotFound(w, r)
 		return nil
 	}
-	model, err := p.getModel(r.Context(), name)
-	if apierrors.IsNotFound(err) {
+	m, _, err := p.artifactFiles(r.Context(), name, revision)
+	if errors.Is(err, blobstore.ErrNotFound) {
 		http.NotFound(w, r)
 		return nil
 	}
 	if err != nil {
-		return fmt.Errorf("getting model %s: %w", name, err)
+		return err
 	}
-	siblings := make([]map[string]any, 0, len(model.Spec.Files))
-	for _, f := range model.Spec.Files {
-		s := map[string]any{"rfilename": f.Path}
-		if f.Size > 0 {
-			s["size"] = f.Size
-		}
+	siblings := make([]map[string]any, 0, len(m.Layers))
+	for _, l := range m.Layers {
+		s := map[string]any{"rfilename": l.Annotations[registry.AnnotationTitle], "size": l.Size}
 		siblings = append(siblings, s)
 	}
-	resp := map[string]any{"modelId": repoID, "id": repoID, "siblings": siblings}
-	if src := model.Spec.Source; src != nil && src.CommitSHA != "" {
-		resp["sha"] = src.CommitSHA
-	}
+	resp := map[string]any{"modelId": repoID, "id": repoID, "siblings": siblings, "sha": revisionOf(m)}
 	w.Header().Set("Content-Type", "application/json")
 	return json.NewEncoder(w).Encode(resp)
 }
@@ -211,47 +247,46 @@ func (p *Proxy) handleHFMetadata(w http.ResponseWriter, r *http.Request) error {
 func (p *Proxy) handleHFDownload(w http.ResponseWriter, r *http.Request) error {
 	before, revAndPath, _ := strings.Cut(r.URL.Path, "/resolve/")
 	repoID := strings.TrimPrefix(before, "/")
-	_, path, ok := strings.Cut(revAndPath, "/") // the revision is whatever was imported
+	revision, path, ok := strings.Cut(revAndPath, "/")
 	if repoID == "" || !ok || path == "" {
 		http.NotFound(w, r)
 		return nil
 	}
-	name, nerr := validModelName(repoID)
-	if nerr != nil {
+	name, err := RepositoryName(repoID)
+	if err != nil {
 		http.NotFound(w, r)
 		return nil
 	}
-	model, err := p.getModel(r.Context(), name)
-	if apierrors.IsNotFound(err) {
+	m, _, err := p.artifactFiles(r.Context(), name, revision)
+	if errors.Is(err, blobstore.ErrNotFound) {
 		http.NotFound(w, r)
 		return nil
 	}
 	if err != nil {
-		return fmt.Errorf("getting model %s: %w", name, err)
+		return err
 	}
-	for _, f := range model.Spec.Files {
-		if f.Path == path {
+	for _, l := range m.Layers {
+		if l.Annotations[registry.AnnotationTitle] == path {
+			sha, ok := registry.ParseDigest(l.Digest)
+			if !ok {
+				return fmt.Errorf("bad digest %q in manifest for %s", l.Digest, name)
+			}
 			// huggingface_hub reads these to decide on caching.
-			w.Header().Set("X-Repo-Commit", commitOf(model))
-			w.Header().Set("X-Linked-Etag", `"`+f.SHA256+`"`)
-			w.Header().Set("ETag", `"`+f.SHA256+`"`)
-			return p.serveBlob(w, r, f.SHA256)
+			w.Header().Set("X-Repo-Commit", revisionOf(m))
+			w.Header().Set("X-Linked-Etag", `"`+sha+`"`)
+			w.Header().Set("ETag", `"`+sha+`"`)
+			return p.reg.ServeBlob(w, r, sha)
 		}
 	}
 	http.NotFound(w, r)
 	return nil
 }
 
-func commitOf(model *v1alpha1.Model) string {
-	if model.Spec.Source != nil && model.Spec.Source.CommitSHA != "" {
-		return model.Spec.Source.CommitSHA
-	}
-	return "main"
-}
+// ---- plain blob routes
 
 func (p *Proxy) handleBlobPut(w http.ResponseWriter, r *http.Request, sha string) error {
 	log := klog.FromContext(r.Context())
-	_, n, err := p.store.Put(r.Context(), sha, r.Body)
+	_, n, err := p.reg.Store().Put(r.Context(), sha, r.Body)
 	if err != nil {
 		if strings.Contains(err.Error(), "sha256 mismatch") {
 			http.Error(w, err.Error(), http.StatusBadRequest)
@@ -262,97 +297,6 @@ func (p *Proxy) handleBlobPut(w http.ResponseWriter, r *http.Request, sha string
 	log.Info("stored blob", "sha", sha, "bytes", n)
 	w.WriteHeader(http.StatusCreated)
 	return nil
-}
-
-func (p *Proxy) handleBlobGet(w http.ResponseWriter, r *http.Request, sha string) error {
-	return p.serveBlob(w, r, sha)
-}
-
-// serveBlob answers GET/HEAD for one blob with Range support (a single
-// range: executors read one tensor per request).
-func (p *Proxy) serveBlob(w http.ResponseWriter, r *http.Request, sha string) error {
-	ctx := r.Context()
-	size, err := p.store.Stat(ctx, sha)
-	if errors.Is(err, blobstore.ErrNotFound) {
-		http.NotFound(w, r)
-		return nil
-	}
-	if err != nil {
-		return fmt.Errorf("stat blob %s: %w", sha, err)
-	}
-	w.Header().Set("Accept-Ranges", "bytes")
-	w.Header().Set("Content-Type", "application/octet-stream")
-	if u := p.store.DirectURL(sha); u != "" {
-		w.Header().Set(DirectURLHeader, u)
-	}
-	offset, length := int64(0), size
-	status := http.StatusOK
-	if rng := r.Header.Get("Range"); rng != "" {
-		o, l, ok := parseRange(rng, size)
-		if !ok {
-			w.Header().Set("Content-Range", fmt.Sprintf("bytes */%d", size))
-			w.WriteHeader(http.StatusRequestedRangeNotSatisfiable)
-			return nil
-		}
-		offset, length, status = o, l, http.StatusPartialContent
-		w.Header().Set("Content-Range", fmt.Sprintf("bytes %d-%d/%d", offset, offset+length-1, size))
-	}
-	w.Header().Set("Content-Length", strconv.FormatInt(length, 10))
-	if r.Method == http.MethodHead {
-		w.WriteHeader(status)
-		return nil
-	}
-	rc, err := p.store.Open(ctx, sha, offset, length)
-	if err != nil {
-		return fmt.Errorf("open blob %s: %w", sha, err)
-	}
-	defer func() {
-		if err := rc.Close(); err != nil {
-			klog.FromContext(ctx).Error(err, "closing blob", "sha", sha)
-		}
-	}()
-	w.WriteHeader(status)
-	_, err = io.CopyN(w, rc, length)
-	return err
-}
-
-// parseRange handles a single byte range: bytes=a-b, bytes=a-, bytes=-n.
-// Returns offset, length and whether the range is satisfiable.
-func parseRange(h string, size int64) (int64, int64, bool) {
-	spec, ok := strings.CutPrefix(strings.TrimSpace(h), "bytes=")
-	if !ok || strings.Contains(spec, ",") {
-		return 0, 0, false
-	}
-	first, last, ok := strings.Cut(spec, "-")
-	if !ok {
-		return 0, 0, false
-	}
-	first, last = strings.TrimSpace(first), strings.TrimSpace(last)
-	if first == "" { // suffix: last n bytes
-		n, err := strconv.ParseInt(last, 10, 64)
-		if err != nil || n <= 0 {
-			return 0, 0, false
-		}
-		if n > size {
-			n = size
-		}
-		return size - n, n, true
-	}
-	start, err := strconv.ParseInt(first, 10, 64)
-	if err != nil || start < 0 || start >= size {
-		return 0, 0, false
-	}
-	end := size - 1
-	if last != "" {
-		end, err = strconv.ParseInt(last, 10, 64)
-		if err != nil || end < start {
-			return 0, 0, false
-		}
-		if end >= size {
-			end = size - 1
-		}
-	}
-	return start, end - start + 1, true
 }
 
 // BlobImportRequest asks modelstore to fetch a blob itself.
@@ -391,237 +335,221 @@ func (p *Proxy) handleBlobImport(w http.ResponseWriter, r *http.Request, sha str
 	return nil
 }
 
+// ---- repository imports
+
 // ModelImportRequest asks modelstore to import a Hub repository.
 type ModelImportRequest struct {
 	Repo     string `json:"repo"`
 	Revision string `json:"revision,omitempty"`
 }
 
-// handleModelImport imports a Hub repository revision: creates the Model
-// in phase Importing, streams every file into the store in the
-// background, updates status as it goes, and marks it Ready. Returns
-// 202 with the Model; watch it with kubectl get models.
+// modelView is the response shape of the import routes: the registry
+// name, the status, and the tags the artifact is reachable by.
+type modelView struct {
+	Metadata struct {
+		Name string `json:"name"`
+	} `json:"metadata"`
+	Status ImportStatus `json:"status"`
+	Tags   []string     `json:"tags,omitempty"`
+}
+
+func (p *Proxy) view(ctx context.Context, name string) (modelView, error) {
+	var v modelView
+	v.Metadata.Name = name
+	tags, err := p.reg.Tags(ctx, name)
+	if err != nil {
+		return v, err
+	}
+	v.Tags = tags
+	p.mu.Lock()
+	st := p.imports[name]
+	p.mu.Unlock()
+	switch {
+	case st != nil:
+		v.Status = *st
+	case len(tags) > 0:
+		v.Status = ImportStatus{Phase: PhaseReady}
+	}
+	return v, nil
+}
+
+// handleModelImport imports a Hub repository revision as a weights
+// artifact: every file becomes a blob, the manifest lists them with
+// their names, and the tags <revision> and <commit> point at it. The
+// import runs in the background; 202 returns at once and GET
+// /models/<name> reports progress. Re-importing an existing revision
+// skips the blobs already present.
 func (p *Proxy) handleModelImport(w http.ResponseWriter, r *http.Request) error {
 	var req ModelImportRequest
 	if err := json.NewDecoder(r.Body).Decode(&req); err != nil || req.Repo == "" {
 		http.Error(w, `body must be {"repo": "org/name", "revision": "main"}`, http.StatusBadRequest)
 		return nil
 	}
-	ctx := r.Context()
-	name, err := validModelName(req.Repo)
+	if req.Revision == "" {
+		req.Revision = "main"
+	}
+	name, err := RepositoryName(req.Repo)
 	if err != nil {
 		http.Error(w, err.Error(), http.StatusBadRequest)
 		return nil
 	}
-	model, err := p.getModel(ctx, name)
-	if err != nil && !apierrors.IsNotFound(err) {
-		return fmt.Errorf("getting model %s: %w", name, err)
-	}
-	if model != nil && (model.Spec.Source == nil || model.Spec.Source.Repo != req.Repo) {
-		// Names are lossy (case folded, punctuation collapsed): never let
-		// one repository overwrite a Model that came from another source.
-		from := "an upload"
-		if model.Spec.Source != nil {
-			from = model.Spec.Source.Repo
-		}
-		http.Error(w, fmt.Sprintf("model %s already exists from %s; cannot import %s under the same name", name, from, req.Repo), http.StatusConflict)
+	// Names are lossy (case folded): never let one repository write a
+	// manifest under a name another repository already owns.
+	if owner, err := p.owner(r.Context(), name); err != nil {
+		return err
+	} else if owner != "" && owner != req.Repo {
+		http.Error(w, fmt.Sprintf("registry name %s already holds %s; cannot import %s under it", name, owner, req.Repo), http.StatusConflict)
 		return nil
 	}
-	if model != nil && model.Status.Phase == v1alpha1.PhaseImporting && p.running(name) {
-		w.WriteHeader(http.StatusAccepted)
-		return json.NewEncoder(w).Encode(model)
-	}
-	if model == nil {
-		model = &v1alpha1.Model{ObjectMeta: metav1.ObjectMeta{Name: name}}
-		model.Spec.Source = &v1alpha1.ModelSource{Repo: req.Repo, Revision: req.Revision}
-		if err := p.kube.Create(ctx, model); err != nil {
-			return fmt.Errorf("creating model %s: %w", name, err)
+	p.mu.Lock()
+	if st := p.imports[name]; st != nil && st.Phase == PhaseImporting {
+		p.mu.Unlock()
+		v, err := p.view(r.Context(), name)
+		if err != nil {
+			return err
 		}
+		w.WriteHeader(http.StatusAccepted)
+		return json.NewEncoder(w).Encode(v)
 	}
-	if err := p.setStatus(ctx, model, v1alpha1.ModelStatus{Phase: v1alpha1.PhaseImporting}); err != nil {
+	st := &ImportStatus{Phase: PhaseImporting}
+	p.imports[name] = st
+	p.mu.Unlock()
+	go p.runModelImport(name, req, st)
+	v, err := p.view(r.Context(), name)
+	if err != nil {
 		return err
 	}
-	p.start(name, req)
 	w.WriteHeader(http.StatusAccepted)
-	return json.NewEncoder(w).Encode(model)
+	return json.NewEncoder(w).Encode(v)
 }
 
-// start runs a Model import in the background unless one is running.
-func (p *Proxy) start(name string, req ModelImportRequest) {
-	p.mu.Lock()
-	defer p.mu.Unlock()
-	if p.imports[name] {
-		return
+// owner returns the Hub repo id recorded on the name's manifests, if any.
+func (p *Proxy) owner(ctx context.Context, name string) (string, error) {
+	tags, err := p.reg.Tags(ctx, name)
+	if err != nil || len(tags) == 0 {
+		return "", err
 	}
-	p.imports[name] = true
-	go func() {
-		defer func() {
-			p.mu.Lock()
-			delete(p.imports, name)
-			p.mu.Unlock()
-		}()
-		p.runModelImport(name, req)
-	}()
-}
-
-// running reports whether this process is importing the Model.
-func (p *Proxy) running(name string) bool {
-	p.mu.Lock()
-	defer p.mu.Unlock()
-	return p.imports[name]
-}
-
-// Resume restarts the imports of Models left in phase Importing by a
-// previous process (a pod replaced mid-import). Blobs already in the
-// store are skipped, so a resumed import costs only what was missing.
-func (p *Proxy) Resume(ctx context.Context) error {
-	log := klog.FromContext(ctx)
-	var list v1alpha1.ModelList
-	if err := p.kube.List(ctx, &list); err != nil {
-		return fmt.Errorf("listing models: %w", err)
+	m, _, err := p.artifactFiles(ctx, name, tags[0])
+	if errors.Is(err, blobstore.ErrNotFound) {
+		return "", nil
 	}
-	for i := range list.Items {
-		m := &list.Items[i]
-		if m.Status.Phase != v1alpha1.PhaseImporting {
-			continue
-		}
-		if m.Spec.Source == nil {
-			log.Info("model stuck in Importing with no source; marking Failed", "model", m.Name)
-			if err := p.setStatus(ctx, m, v1alpha1.ModelStatus{Phase: v1alpha1.PhaseFailed,
-				Message: "import interrupted and no source recorded"}); err != nil {
-				log.Error(err, "marking model Failed", "model", m.Name)
-			}
-			continue
-		}
-		log.Info("resuming import interrupted by a restart", "model", m.Name, "repo", m.Spec.Source.Repo)
-		p.start(m.Name, ModelImportRequest{Repo: m.Spec.Source.Repo, Revision: m.Spec.Source.Revision})
+	if err != nil {
+		return "", err
 	}
-	return nil
+	return m.Annotations[registry.AnnotationHubRepo], nil
 }
 
-func (p *Proxy) runModelImport(name string, req ModelImportRequest) {
+func (p *Proxy) runModelImport(name string, req ModelImportRequest, st *ImportStatus) {
 	ctx := context.Background()
-	log := klog.FromContext(ctx).WithValues("model", name, "repo", req.Repo, "revision", req.Revision)
+	log := klog.FromContext(ctx).WithValues("name", name, "repo", req.Repo, "revision", req.Revision)
+	set := func(f func(*ImportStatus)) {
+		p.mu.Lock()
+		f(st)
+		p.mu.Unlock()
+	}
 	report := func(prog importer.Progress) {
-		// Progress is advisory: a failed status write is logged, not fatal.
-		m, err := p.getModel(ctx, name)
-		if err == nil {
-			err = p.setStatus(ctx, m, v1alpha1.ModelStatus{Phase: v1alpha1.PhaseImporting,
-				FilesTotal: prog.FilesTotal, FilesImported: prog.FilesImported, BytesImported: prog.BytesImported})
-		}
-		if err != nil {
-			log.Error(err, "recording import progress")
-		}
+		set(func(s *ImportStatus) {
+			s.FilesTotal, s.FilesImported, s.BytesImported = prog.FilesTotal, prog.FilesImported, prog.BytesImported
+		})
 	}
+	start := time.Now()
 	commit, files, err := p.importer.ImportRepo(ctx, req.Repo, req.Revision, report)
-	// Recording the outcome retries, because leaving the Model in
-	// Importing on a transient API error would strand it until a restart.
-	record := func() error {
-		model, gerr := p.getModel(ctx, name)
-		if apierrors.IsNotFound(gerr) {
-			log.Info("model deleted during import; dropping the result")
-			return nil
+	if err == nil {
+		var digest string
+		digest, err = p.writeWeightsArtifact(ctx, name, req, commit, files)
+		if err == nil {
+			set(func(s *ImportStatus) { s.Phase, s.Digest = PhaseReady, digest })
+			log.Info("imported repository", "commit", commit, "files", len(files), "digest", digest,
+				"seconds", int(time.Since(start).Seconds()))
+			return
 		}
-		if gerr != nil {
-			return gerr
-		}
-		if err != nil {
-			return p.setStatus(ctx, model, v1alpha1.ModelStatus{Phase: v1alpha1.PhaseFailed, Message: err.Error(),
-				FilesTotal: model.Status.FilesTotal, FilesImported: model.Status.FilesImported, BytesImported: model.Status.BytesImported})
-		}
-		model.Spec.Files = files
-		model.Spec.Source = &v1alpha1.ModelSource{Repo: req.Repo, Revision: req.Revision, CommitSHA: commit}
-		if uerr := p.kube.Update(ctx, model); uerr != nil {
-			return uerr
-		}
-		var bytes int64
-		for _, f := range files {
-			bytes += f.Size
-		}
-		return p.setStatus(ctx, model, v1alpha1.ModelStatus{Phase: v1alpha1.PhaseReady,
-			FilesTotal: len(files), FilesImported: len(files), BytesImported: bytes})
 	}
-	var rerr error
-	for attempt := 0; attempt < 5; attempt++ {
-		if rerr = record(); rerr == nil {
-			break
-		}
-		log.Error(rerr, "recording import outcome; will retry", "attempt", attempt)
-		time.Sleep(time.Duration(attempt+1) * time.Second)
-	}
-	switch {
-	case rerr != nil:
-		log.Error(rerr, "giving up recording the import outcome; the Model stays Importing until a restart resumes it")
-	case err != nil:
-		log.Error(err, "import failed")
-	default:
-		log.Info("imported model", "commit", commit, "files", len(files))
-	}
+	log.Error(err, "import failed")
+	set(func(s *ImportStatus) { s.Phase, s.Message = PhaseFailed, err.Error() })
 }
 
-func (p *Proxy) setStatus(ctx context.Context, model *v1alpha1.Model, st v1alpha1.ModelStatus) error {
-	model.Status = st
-	if err := p.kube.Status().Update(ctx, model); err != nil {
-		return fmt.Errorf("updating status of %s: %w", model.Name, err)
+// writeWeightsArtifact records an imported repository as an OCI
+// artifact: one layer per file (annotated with its name), tagged with
+// the revision asked for and the commit it resolved to.
+func (p *Proxy) writeWeightsArtifact(ctx context.Context, name string, req ModelImportRequest, commit string, files []importer.File) (string, error) {
+	m := registry.Manifest{
+		SchemaVersion: 2,
+		MediaType:     registry.MediaTypeManifest,
+		ArtifactType:  registry.ArtifactWeights,
+		Config:        registry.EmptyConfig,
+		Annotations: map[string]string{
+			registry.AnnotationHubRepo: req.Repo,
+			registry.AnnotationHubRev:  req.Revision,
+			registry.AnnotationHubSHA:  commit,
+		},
 	}
-	return nil
-}
-
-func (p *Proxy) handleModelCreate(w http.ResponseWriter, r *http.Request) error {
-	ctx := r.Context()
-	log := klog.FromContext(ctx)
-	var model v1alpha1.Model
-	if err := json.NewDecoder(r.Body).Decode(&model); err != nil {
-		http.Error(w, fmt.Sprintf("decoding model: %v", err), http.StatusBadRequest)
-		return nil
+	for _, f := range files {
+		m.Layers = append(m.Layers, registry.Descriptor{
+			MediaType:   registry.MediaTypeFile,
+			Digest:      "sha256:" + f.SHA256,
+			Size:        f.Size,
+			Annotations: map[string]string{registry.AnnotationTitle: f.Path},
+		})
 	}
-	if model.Name == "" {
-		http.Error(w, "model name is required", http.StatusBadRequest)
-		return nil
+	body, err := json.Marshal(m)
+	if err != nil {
+		return "", err
 	}
-	for _, file := range model.Spec.Files {
-		if _, err := p.store.Stat(ctx, file.SHA256); err != nil {
-			if errors.Is(err, blobstore.ErrNotFound) {
-				http.Error(w, fmt.Sprintf("blob %s (path %s) not found", file.SHA256, file.Path), http.StatusBadRequest)
-				return nil
-			}
-			return fmt.Errorf("stat blob %s: %w", file.SHA256, err)
+	digest, err := p.reg.PutManifest(ctx, name, req.Revision, registry.MediaTypeManifest, body)
+	if err != nil {
+		return "", fmt.Errorf("writing manifest: %w", err)
+	}
+	if commit != "" && commit != req.Revision {
+		if _, err := p.reg.PutManifest(ctx, name, commit, registry.MediaTypeManifest, body); err != nil {
+			return "", fmt.Errorf("tagging commit: %w", err)
 		}
 	}
-	model.ResourceVersion = ""
-	model.UID = ""
-	model.CreationTimestamp = metav1.Time{}
-	if err := p.kube.Create(ctx, &model); err != nil {
-		return fmt.Errorf("creating model: %w", err)
-	}
-	if err := p.setStatus(ctx, &model, v1alpha1.ModelStatus{Phase: v1alpha1.PhaseReady,
-		FilesTotal: len(model.Spec.Files), FilesImported: len(model.Spec.Files)}); err != nil {
-		log.Error(err, "setting status", "model", model.Name)
-	}
-	log.Info("created model", "name", model.Name)
-	w.WriteHeader(http.StatusCreated)
-	return json.NewEncoder(w).Encode(model)
+	return digest, nil
 }
 
 func (p *Proxy) handleModelList(w http.ResponseWriter, r *http.Request) error {
-	var list v1alpha1.ModelList
-	if err := p.kube.List(r.Context(), &list); err != nil {
-		return fmt.Errorf("listing models: %w", err)
+	names, err := p.reg.Repositories(r.Context())
+	if err != nil {
+		return err
+	}
+	p.mu.Lock()
+	for name, st := range p.imports {
+		if st.Phase == PhaseImporting {
+			names = append(names, name)
+		}
+	}
+	p.mu.Unlock()
+	seen := map[string]bool{}
+	var items []modelView
+	for _, name := range names {
+		if seen[name] {
+			continue
+		}
+		seen[name] = true
+		v, err := p.view(r.Context(), name)
+		if err != nil {
+			return err
+		}
+		items = append(items, v)
 	}
 	w.Header().Set("Content-Type", "application/json")
-	return json.NewEncoder(w).Encode(list)
+	return json.NewEncoder(w).Encode(map[string]any{"items": items})
 }
 
 func (p *Proxy) handleModelGet(w http.ResponseWriter, r *http.Request) error {
 	name := strings.TrimPrefix(r.URL.Path, "/models/")
-	model, err := p.getModel(r.Context(), name)
-	if apierrors.IsNotFound(err) {
+	if !registry.ValidName(name) {
 		http.NotFound(w, r)
 		return nil
 	}
+	v, err := p.view(r.Context(), name)
 	if err != nil {
-		return fmt.Errorf("getting model %s: %w", name, err)
+		return err
+	}
+	if v.Status.Phase == "" {
+		http.NotFound(w, r)
+		return nil
 	}
 	w.Header().Set("Content-Type", "application/json")
-	return json.NewEncoder(w).Encode(model)
+	return json.NewEncoder(w).Encode(v)
 }

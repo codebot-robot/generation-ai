@@ -17,33 +17,14 @@ kind: Namespace
 metadata:
   name: modelstore
 ---
+# The store's identity: granted roles/storage.objectAdmin on the bucket
+# through workload identity (see README). It needs nothing from the
+# Kubernetes API.
 apiVersion: v1
 kind: ServiceAccount
 metadata:
   name: modelstore
   namespace: modelstore
----
-apiVersion: rbac.authorization.k8s.io/v1
-kind: ClusterRole
-metadata:
-  name: modelstore-manager
-rules:
-  - apiGroups: ["generationai.labs.gke.io"]
-    resources: ["models", "models/status"]
-    verbs: ["get", "list", "watch", "create", "update", "patch", "delete"]
----
-apiVersion: rbac.authorization.k8s.io/v1
-kind: ClusterRoleBinding
-metadata:
-  name: modelstore-manager-rolebinding
-subjects:
-  - kind: ServiceAccount
-    name: modelstore
-    namespace: modelstore
-roleRef:
-  kind: ClusterRole
-  name: modelstore-manager
-  apiGroup: rbac.authorization.k8s.io
 ---
 apiVersion: v1
 kind: Service
@@ -58,9 +39,8 @@ spec:
       port: 80
       targetPort: 8080
 ---
-# The server. Blobs live in a GCS bucket (--blob-store), so the pod has
-# no volume and can be replaced freely; the bucket is granted to the
-# modelstore ServiceAccount through workload identity (see README).
+# The server. Blobs, manifests and tags live in a GCS bucket
+# (--blob-store), so the pod has no volume and can be replaced freely.
 apiVersion: apps/v1
 kind: Deployment
 metadata:

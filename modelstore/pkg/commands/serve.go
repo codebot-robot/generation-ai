@@ -18,16 +18,14 @@ import (
 	"context"
 	"fmt"
 	"net/http"
+	"time"
 
-	"github.com/gke-labs/generation-ai/modelstore/apis/v1alpha1"
 	"github.com/gke-labs/generation-ai/modelstore/pkg/blobstore"
 	"github.com/gke-labs/generation-ai/modelstore/pkg/importer"
 	"github.com/gke-labs/generation-ai/modelstore/pkg/proxy"
+	"github.com/gke-labs/generation-ai/modelstore/pkg/registry"
 	"github.com/spf13/cobra"
-	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/klog/v2"
-	"sigs.k8s.io/controller-runtime/pkg/client"
-	"sigs.k8s.io/controller-runtime/pkg/client/config"
 )
 
 type ServeOptions struct {
@@ -76,33 +74,15 @@ func RunServe(ctx context.Context, opt *ServeOptions) error {
 	if err != nil {
 		return fmt.Errorf("opening blob store %s: %w", opt.BlobStore, err)
 	}
-
-	scheme := runtime.NewScheme()
-	if err := v1alpha1.AddToScheme(scheme); err != nil {
-		return fmt.Errorf("failed to add v1alpha1 to scheme: %w", err)
-	}
-
-	cfg, err := config.GetConfig()
-	if err != nil {
-		return fmt.Errorf("failed to get kubernetes config: %w", err)
-	}
-
-	kube, err := client.New(cfg, client.Options{Scheme: scheme})
-	if err != nil {
-		return fmt.Errorf("failed to create kubernetes client: %w", err)
-	}
-
-	p := proxy.NewProxy(store, importer.New(store, opt.HFEndpoint), kube)
-	if err := p.Resume(ctx); err != nil {
-		return fmt.Errorf("resuming interrupted imports: %w", err)
-	}
+	reg := registry.New(store)
+	p := proxy.NewProxy(reg, importer.New(store, opt.HFEndpoint))
 
 	log.Info("Starting modelstore", "port", opt.Port, "blobStore", store.String(), "hfEndpoint", opt.HFEndpoint)
 
 	server := &http.Server{
-		Addr:    ":" + opt.Port,
-		Handler: p,
+		Addr:              ":" + opt.Port,
+		Handler:           p,
+		ReadHeaderTimeout: 30 * time.Second,
 	}
-
 	return server.ListenAndServe()
 }

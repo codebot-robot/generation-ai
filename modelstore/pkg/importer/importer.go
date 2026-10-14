@@ -31,7 +31,6 @@ import (
 	"sync/atomic"
 	"time"
 
-	"github.com/gke-labs/generation-ai/modelstore/apis/v1alpha1"
 	"github.com/gke-labs/generation-ai/modelstore/pkg/blobstore"
 	"k8s.io/klog/v2"
 )
@@ -266,6 +265,14 @@ func (w *stallWatch) stop() {
 	w.timer.Stop()
 }
 
+// File is an imported file: its path in the repository, its sha256
+// and its size.
+type File struct {
+	Path   string
+	SHA256 string
+	Size   int64
+}
+
 // HubFile is one file of a Hub repository at a commit.
 type HubFile struct {
 	Path   string
@@ -351,33 +358,37 @@ type Progress struct {
 // are fetched by their published sha256 and verified; other files
 // (configs, tokenizers) are hashed as they stream. report, if set, is
 // called after each file.
-func (im *Importer) ImportRepo(ctx context.Context, repo, revision string, report func(Progress)) (string, []v1alpha1.File, error) {
+func (im *Importer) ImportRepo(ctx context.Context, repo, revision string, report func(Progress)) (string, []File, error) {
 	commit, files, err := im.ListRepo(ctx, repo, revision)
 	if err != nil {
 		return "", nil, err
 	}
-	var out []v1alpha1.File
+	var out []File
 	prog := Progress{FilesTotal: len(files)}
 	for _, f := range files {
 		sha := f.SHA256
+		var n int64
 		if sha != "" {
 			if _, err := im.EnsureBlob(ctx, sha, f.URL); err != nil {
 				return commit, out, err
 			}
-			n, err := im.Wait(ctx, sha)
-			if err != nil {
+			var err error
+			if n, err = im.Wait(ctx, sha); err != nil {
 				return commit, out, fmt.Errorf("%s: %w", f.Path, err)
 			}
-			prog.BytesImported += n
 		} else {
-			got, n, err := im.fetch(ctx, "", f.URL)
+			got, fetched, err := im.fetch(ctx, "", f.URL)
 			if err != nil {
 				return commit, out, fmt.Errorf("%s: %w", f.Path, err)
 			}
-			sha = got
-			prog.BytesImported += n
+			sha, n = got, fetched
 		}
-		out = append(out, v1alpha1.File{Path: f.Path, SHA256: sha, Size: f.Size})
+		prog.BytesImported += n
+		size := f.Size
+		if size == 0 {
+			size = n
+		}
+		out = append(out, File{Path: f.Path, SHA256: sha, Size: size})
 		prog.FilesImported++
 		if report != nil {
 			report(prog)
