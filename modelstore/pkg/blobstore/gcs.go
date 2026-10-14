@@ -24,6 +24,7 @@ import (
 
 	"cloud.google.com/go/storage"
 	"github.com/google/uuid"
+	"google.golang.org/api/iterator"
 	"k8s.io/klog/v2"
 )
 
@@ -51,12 +52,17 @@ func NewGCS(ctx context.Context, location string) (*GCS, error) {
 	if err != nil {
 		return nil, fmt.Errorf("creating GCS client: %w", err)
 	}
+	g := &GCS{client: client, bucket: bucket, prefix: strings.Trim(prefix, "/")}
 	// Fail at startup, not on the first Put, if the bucket is not ours
-	// to use (wrong name, missing grant).
-	if _, err := client.Bucket(bucket).Attrs(ctx); err != nil {
+	// to use (wrong name, missing grant). Listing one object needs only
+	// the object roles the README grants; bucket metadata would need
+	// more.
+	it := client.Bucket(bucket).Objects(ctx, &storage.Query{Prefix: g.object("")})
+	it.PageInfo().MaxSize = 1
+	if _, err := it.Next(); err != nil && !errors.Is(err, iterator.Done) {
 		return nil, fmt.Errorf("bucket gs://%s is not reachable with these credentials: %w", bucket, err)
 	}
-	return &GCS{client: client, bucket: bucket, prefix: strings.Trim(prefix, "/")}, nil
+	return g, nil
 }
 
 func (g *GCS) object(sha string) string { return path.Join(g.prefix, "_blobs", sha) }
