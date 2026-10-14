@@ -93,6 +93,9 @@ func RunServe(ctx context.Context, opt *ServeOptions) error {
 	}
 
 	p := proxy.NewProxy(store, importer.New(store, opt.HFEndpoint), kube)
+	if err := p.Resume(ctx); err != nil {
+		return fmt.Errorf("resuming interrupted imports: %w", err)
+	}
 
 	log.Info("Starting modelstore", "port", opt.Port, "blobStore", store.String(), "hfEndpoint", opt.HFEndpoint)
 

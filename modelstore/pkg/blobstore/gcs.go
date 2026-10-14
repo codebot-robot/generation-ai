@@ -51,6 +51,11 @@ func NewGCS(ctx context.Context, location string) (*GCS, error) {
 	if err != nil {
 		return nil, fmt.Errorf("creating GCS client: %w", err)
 	}
+	// Fail at startup, not on the first Put, if the bucket is not ours
+	// to use (wrong name, missing grant).
+	if _, err := client.Bucket(bucket).Attrs(ctx); err != nil {
+		return nil, fmt.Errorf("bucket gs://%s is not reachable with these credentials: %w", bucket, err)
+	}
 	return &GCS{client: client, bucket: bucket, prefix: strings.Trim(prefix, "/")}, nil
 }
 
@@ -81,7 +86,7 @@ func (g *GCS) Put(ctx context.Context, sha string, r io.Reader) (string, int64, 
 		}
 	}
 	dw := newDigestWriter(w)
-	if _, err := io.Copy(dw, r); err != nil {
+	if err := dw.copyFrom(r); err != nil {
 		if cerr := w.Close(); cerr != nil {
 			klog.FromContext(ctx).V(2).Info("closing failed upload", "object", tmpName, "error", cerr.Error())
 		}
@@ -105,8 +110,10 @@ func (g *GCS) Put(ctx context.Context, sha string, r io.Reader) (string, int64, 
 		discard()
 		return got, dw.n, fmt.Errorf("publishing blob: %w", err)
 	}
-	if err := tmp.Delete(ctx); err != nil && !errors.Is(err, storage.ErrObjectNotExist) {
-		return got, dw.n, fmt.Errorf("removing temporary object: %w", err)
+	// The blob is live; a failure to drop the temporary is not a failed
+	// Put. The bucket's lifecycle rule (README) collects strays.
+	if err := tmp.Delete(context.WithoutCancel(ctx)); err != nil && !errors.Is(err, storage.ErrObjectNotExist) {
+		klog.FromContext(ctx).Error(err, "removing temporary object after publish", "object", tmpName)
 	}
 	return got, dw.n, nil
 }

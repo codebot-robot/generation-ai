@@ -29,6 +29,7 @@ import (
 	"encoding/hex"
 	"errors"
 	"fmt"
+	"hash"
 	"io"
 	"strings"
 )
@@ -55,11 +56,18 @@ type Store interface {
 	String() string
 }
 
-// Open opens a store from its location: a gs://bucket/prefix URL or a
-// local directory path.
+// Open opens a store from its location: a gs://bucket[/prefix] URL or
+// an absolute local directory path. Anything else is an error at
+// startup rather than a directory created on the pod's root filesystem
+// (a misspelt scheme, or an unresolved $(VAR) from a manifest).
 func Open(ctx context.Context, location string) (Store, error) {
-	if strings.HasPrefix(location, "gs://") {
+	switch {
+	case strings.HasPrefix(location, "gs://"):
 		return NewGCS(ctx, location)
+	case strings.Contains(location, "://") || strings.Contains(location, "$("):
+		return nil, fmt.Errorf("blob store location %q: want gs://bucket[/prefix] or an absolute directory", location)
+	case !strings.HasPrefix(location, "/"):
+		return nil, fmt.Errorf("blob store directory %q must be an absolute path", location)
 	}
 	return NewLocal(location)
 }
@@ -77,39 +85,29 @@ func ValidSHA(s string) bool {
 	return true
 }
 
-// digestWriter hashes what passes through it.
+// digestWriter is w with a sha256 of everything written through it.
 type digestWriter struct {
-	w io.Writer
-	h hashWriter
+	io.Writer
+	h hash.Hash
 	n int64
 }
 
-type hashWriter interface {
-	io.Writer
-	Sum(b []byte) []byte
-}
-
 func newDigestWriter(w io.Writer) *digestWriter {
-	return &digestWriter{w: w, h: sha256.New()}
+	h := sha256.New()
+	return &digestWriter{Writer: io.MultiWriter(w, h), h: h}
 }
 
-func (d *digestWriter) Write(p []byte) (int, error) {
-	n, err := d.w.Write(p)
-	d.n += int64(n)
-	if _, herr := d.h.Write(p[:n]); herr != nil {
-		return n, herr
-	}
-	return n, err
-}
-
-func (d *digestWriter) sum() string {
-	return hex.EncodeToString(d.h.Sum(nil))
+// copyFrom streams r through d, counting the bytes.
+func (d *digestWriter) copyFrom(r io.Reader) error {
+	n, err := io.Copy(d, r)
+	d.n += n
+	return err
 }
 
 // check verifies the digest against sha; an empty sha accepts any and
 // returns the computed one.
 func (d *digestWriter) check(sha string) (string, error) {
-	got := d.sum()
+	got := hex.EncodeToString(d.h.Sum(nil))
 	if sha != "" && got != sha {
 		return got, fmt.Errorf("sha256 mismatch: expected %s, got %s", sha, got)
 	}

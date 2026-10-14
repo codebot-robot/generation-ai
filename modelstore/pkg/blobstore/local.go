@@ -70,7 +70,7 @@ func (l *Local) Put(ctx context.Context, sha string, r io.Reader) (string, int64
 		}
 	}()
 	dw := newDigestWriter(tmp)
-	if _, err := io.Copy(dw, r); err != nil {
+	if err := dw.copyFrom(r); err != nil {
 		return "", dw.n, fmt.Errorf("writing blob: %w", err)
 	}
 	if err := tmp.Close(); err != nil {

@@ -15,11 +15,18 @@ everything in the cluster that needs them:
 - **Imports** pull from the Hugging Face Hub without the bytes passing
   through a client: `POST /blobs/<sha>/import {"url": ...}` fetches one
   file and verifies its digest (`202` while in flight, `201` when
-  present, idempotent); `POST /models/import {"repo": "org/name",
+  present, idempotent; the URL must be `https` on the configured Hub
+  host, since this pod holds the bucket credentials and is not a
+  general fetcher); `POST /models/import {"repo": "org/name",
   "revision": "main"}` imports a whole repository revision in the
   background and records progress on the `Model` object
-  (`kubectl get models` shows phase, files and bytes). Set `HF_TOKEN`
-  in the pod's environment for gated repositories.
+  (`kubectl get models` shows phase, files and bytes). A download that
+  delivers nothing for five minutes is cancelled and the Model marked
+  Failed; a restart of the pod resumes any Model it finds in phase
+  Importing (blobs already present are skipped). Set `HF_TOKEN` in the
+  pod's environment for gated repositories. A repository whose
+  normalized name collides with an existing Model from another source
+  is refused with `409`.
 - **Models** (`kubectl get models`, a cluster-scoped CRD) map file names
   to blobs for one repository revision, with the source repo and the
   commit it resolved to.
@@ -44,6 +51,10 @@ POOL=projects/$NUMBER/locations/global/workloadIdentityPools/$PROJECT.svc.id.goo
 
 gcloud storage buckets create $BUCKET --project=$PROJECT --location=us-central1 \
     --uniform-bucket-level-access
+# uploads stage under _tmp/ and are removed after publish; this collects
+# any left behind by a pod replaced mid-upload
+gcloud storage buckets update $BUCKET --lifecycle-file=<(echo \
+    '{"rule":[{"action":{"type":"Delete"},"condition":{"age":1,"matchesPrefix":["_tmp/"]}}]}')
 gcloud storage buckets add-iam-policy-binding $BUCKET \
     --member="principal://iam.googleapis.com/$POOL/subject/ns/modelstore/sa/modelstore" \
     --role=roles/storage.objectAdmin
@@ -60,11 +71,25 @@ Then the image and the manifests:
 gcloud builds submit --config cloudbuild.yaml --project=$PROJECT \
     --substitutions _IMAGE=gcr.io/$PROJECT/generation-ai/modelstore:v1 .
 kubectl apply -f k8s/crds/
-sed "s#image: modelstore:latest#image: gcr.io/$PROJECT/generation-ai/modelstore:v1#" k8s/manifest.yaml | kubectl apply -f -
+sed -e "s#image: modelstore:latest#image: gcr.io/$PROJECT/generation-ai/modelstore:v1#" \
+    -e "s#gs://BUCKET#$BUCKET#" k8s/manifest.yaml | kubectl apply -f -
 ```
 
-`k8s/manifest.yaml` names the bucket in `MODELSTORE_BLOB_STORE`; change
-it for another project.
+The manifest carries placeholders for the image and the bucket; the
+server refuses to start if the bucket is not reachable with the pod's
+identity, so a wrong name fails at rollout, not on the first upload.
+
+**Upgrading from the StatefulSet version.** The earlier manifest ran
+modelstore as a StatefulSet with a PVC under the same name and Service
+selector. `kubectl apply` does not remove it, and the Service would
+balance between the old pod and the new one. Delete it first:
+
+```sh
+kubectl -n modelstore delete statefulset modelstore --ignore-not-found
+kubectl -n modelstore delete pvc -l app=modelstore --ignore-not-found
+```
+
+Blobs on the old PVC are not migrated; re-import or re-upload them.
 
 ## Usage
 

@@ -277,3 +277,133 @@ func TestModelImport(t *testing.T) {
 		t.Errorf("metadata sha: %v", meta["sha"])
 	}
 }
+
+func TestModelImportRefusesCollisionsAndBadNames(t *testing.T) {
+	weights := bytes.Repeat([]byte("y"), 100)
+	hub := fakeHub(t, weights, []byte("{}"))
+	defer hub.Close()
+	p, kube := newTestProxy(t, hub.URL)
+
+	// A hand-created Model owns its name; a repository that normalizes to it is refused.
+	sha := shaOf(weights)
+	do(p, http.MethodPut, "/blobs/"+sha, bytes.NewReader(weights))
+	owned, _ := json.Marshal(v1alpha1.Model{ObjectMeta: metav1.ObjectMeta{Name: "org-name"},
+		Spec: v1alpha1.ModelSpec{Files: []v1alpha1.File{{Path: "w", SHA256: sha}}}})
+	if w := do(p, http.MethodPost, "/models", bytes.NewReader(owned)); w.Code != http.StatusCreated {
+		t.Fatalf("create: %d %s", w.Code, w.Body.String())
+	}
+	w := do(p, http.MethodPost, "/models/import", strings.NewReader(`{"repo": "org/name"}`))
+	if w.Code != http.StatusConflict {
+		t.Errorf("import over an upload: got %d, want 409: %s", w.Code, w.Body.String())
+	}
+	// Two repositories with one normalized name: the second is refused.
+	var m v1alpha1.Model
+	_ = kube.Get(t.Context(), client.ObjectKey{Name: "org-name"}, &m)
+	m.Spec.Source = &v1alpha1.ModelSource{Repo: "Org/Name"}
+	_ = kube.Update(t.Context(), &m)
+	w = do(p, http.MethodPost, "/models/import", strings.NewReader(`{"repo": "org/name"}`))
+	if w.Code != http.StatusConflict || !strings.Contains(w.Body.String(), "Org/Name") {
+		t.Errorf("import over another repo: got %d, want 409 naming the owner: %s", w.Code, w.Body.String())
+	}
+	// Names the API server would refuse are a client error, not a 500.
+	for _, repo := range []string{"org/v1.-beta", "/", "a..b"} {
+		w := do(p, http.MethodPost, "/models/import", strings.NewReader(fmt.Sprintf(`{"repo": %q}`, repo)))
+		if w.Code != http.StatusBadRequest {
+			t.Errorf("repo %q: got %d, want 400: %s", repo, w.Code, w.Body.String())
+		}
+	}
+	if w := do(p, http.MethodGet, "/api/models/", nil); w.Code != http.StatusNotFound {
+		t.Errorf("empty repo metadata: got %d, want 404", w.Code)
+	}
+}
+
+func TestBlobImportRefusesForeignURLs(t *testing.T) {
+	hub := fakeHub(t, []byte("w"), []byte("{}"))
+	defer hub.Close()
+	p, _ := newTestProxy(t, hub.URL)
+	other := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		t.Errorf("modelstore fetched %s from a host that is not the Hub", r.URL)
+	}))
+	defer other.Close()
+	sha := strings.Repeat("a", 64)
+	for _, u := range []string{other.URL + "/x", "https://" + strings.TrimPrefix(hub.URL, "http://") + "/x", "file:///etc/passwd", "::bad"} {
+		w := do(p, http.MethodPost, "/blobs/"+sha+"/import", strings.NewReader(fmt.Sprintf(`{"url": %q}`, u)))
+		if w.Code != http.StatusBadRequest {
+			t.Errorf("url %q: got %d, want 400: %s", u, w.Code, w.Body.String())
+		}
+	}
+}
+
+func TestModelImportEscapesFileNames(t *testing.T) {
+	// A fake Hub whose small file has URL syntax in its name.
+	mux := http.NewServeMux()
+	mux.HandleFunc("/api/models/org/name/revision/main", func(w http.ResponseWriter, r *http.Request) {
+		_ = json.NewEncoder(w).Encode(map[string]any{"sha": "c1",
+			"siblings": []map[string]any{{"rfilename": "notes#1.md", "size": 5}, {"rfilename": "100%.json", "size": 2}}})
+	})
+	mux.HandleFunc("/org/name/resolve/c1/notes", func(w http.ResponseWriter, r *http.Request) { _, _ = w.Write([]byte("WRONG")) })
+	mux.HandleFunc("/org/name/resolve/c1/notes%231.md", func(w http.ResponseWriter, r *http.Request) { _, _ = w.Write([]byte("right")) })
+	mux.HandleFunc("/org/name/resolve/c1/100%25.json", func(w http.ResponseWriter, r *http.Request) { _, _ = w.Write([]byte("{}")) })
+	hub := httptest.NewServer(mux)
+	defer hub.Close()
+	p, kube := newTestProxy(t, hub.URL)
+	if w := do(p, http.MethodPost, "/models/import", strings.NewReader(`{"repo": "org/name"}`)); w.Code != http.StatusAccepted {
+		t.Fatalf("import: %d %s", w.Code, w.Body.String())
+	}
+	model := waitPhase(t, kube, "org-name")
+	if model.Status.Phase != v1alpha1.PhaseReady {
+		t.Fatalf("phase %q: %s", model.Status.Phase, model.Status.Message)
+	}
+	w := do(p, http.MethodGet, "/org/name/resolve/main/notes%231.md", nil)
+	if w.Code != 200 || w.Body.String() != "right" {
+		t.Errorf("escaped file: %d %q", w.Code, w.Body.String())
+	}
+}
+
+func TestResumeRestartsInterruptedImports(t *testing.T) {
+	weights := bytes.Repeat([]byte("z"), 300)
+	hub := fakeHub(t, weights, []byte("{}"))
+	defer hub.Close()
+	p, kube := newTestProxy(t, hub.URL)
+	// A Model a previous process left in Importing, and one with no source.
+	for _, m := range []v1alpha1.Model{
+		{ObjectMeta: metav1.ObjectMeta{Name: "org-name"}, Spec: v1alpha1.ModelSpec{Source: &v1alpha1.ModelSource{Repo: "org/name", Revision: "main"}}},
+		{ObjectMeta: metav1.ObjectMeta{Name: "orphan"}},
+	} {
+		m := m
+		if err := kube.Create(t.Context(), &m); err != nil {
+			t.Fatal(err)
+		}
+		m.Status.Phase = v1alpha1.PhaseImporting
+		if err := kube.Status().Update(t.Context(), &m); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if err := p.Resume(t.Context()); err != nil {
+		t.Fatal(err)
+	}
+	if model := waitPhase(t, kube, "org-name"); model.Status.Phase != v1alpha1.PhaseReady || len(model.Spec.Files) != 2 {
+		t.Errorf("resumed import: phase %q files %d (%s)", model.Status.Phase, len(model.Spec.Files), model.Status.Message)
+	}
+	var orphan v1alpha1.Model
+	_ = kube.Get(t.Context(), client.ObjectKey{Name: "orphan"}, &orphan)
+	if orphan.Status.Phase != v1alpha1.PhaseFailed {
+		t.Errorf("orphan: phase %q, want Failed", orphan.Status.Phase)
+	}
+}
+
+// waitPhase polls until the Model leaves Importing (or 10 s pass).
+func waitPhase(t *testing.T, kube client.Client, name string) v1alpha1.Model {
+	t.Helper()
+	var model v1alpha1.Model
+	deadline := time.Now().Add(10 * time.Second)
+	for {
+		if err := kube.Get(t.Context(), client.ObjectKey{Name: name}, &model); err != nil {
+			t.Fatal(err)
+		}
+		if model.Status.Phase != v1alpha1.PhaseImporting || time.Now().After(deadline) {
+			return model
+		}
+		time.Sleep(20 * time.Millisecond)
+	}
+}

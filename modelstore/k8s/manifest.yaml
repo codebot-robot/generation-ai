@@ -83,14 +83,14 @@ spec:
           args:
             - serve
             - --port=8080
-            - --blob-store=$(MODELSTORE_BLOB_STORE)
-          env:
-            - name: MODELSTORE_BLOB_STORE
-              value: gs://vxpu-justinsb-knotai-dev-us-central1
-            # Optional: a Hub token for gated repositories.
-            # - name: HF_TOKEN
-            #   valueFrom:
-            #     secretKeyRef: {name: hf-token, key: token}
+            # BUCKET is substituted at deploy time (see README); the server
+            # refuses to start if the bucket is not reachable.
+            - --blob-store=gs://BUCKET
+          # Optional: a Hub token for gated repositories.
+          # env:
+          #   - name: HF_TOKEN
+          #     valueFrom:
+          #       secretKeyRef: {name: hf-token, key: token}
           ports:
             - containerPort: 8080
           resources:

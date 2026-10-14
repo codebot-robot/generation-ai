@@ -28,6 +28,7 @@ import (
 	"os"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/gke-labs/generation-ai/modelstore/apis/v1alpha1"
@@ -60,13 +61,43 @@ func New(store blobstore.Store, hfEndpoint string) *Importer {
 	if hfEndpoint == "" {
 		hfEndpoint = "https://huggingface.co"
 	}
+	transport := http.DefaultTransport.(*http.Transport).Clone()
+	transport.ResponseHeaderTimeout = 60 * time.Second
 	return &Importer{
 		store:      store,
 		hfEndpoint: strings.TrimSuffix(hfEndpoint, "/"),
 		hfToken:    os.Getenv("HF_TOKEN"),
-		client:     &http.Client{Timeout: 0}, // multi-GB downloads; cancellation is by context
-		jobs:       map[string]*job{},
+		// No overall timeout (multi-GB downloads); a stalled body is
+		// caught by the per-job progress watchdog in fetch.
+		client: &http.Client{Transport: transport},
+		jobs:   map[string]*job{},
 	}
+}
+
+// StallTimeout is how long a download may go without delivering a byte
+// before its job is cancelled and reported failed.
+var StallTimeout = 5 * time.Minute
+
+// ErrBadSource marks a URL modelstore refuses to fetch (a client error).
+var ErrBadSource = errors.New("bad source")
+
+// CheckSource says whether modelstore will fetch srcURL: only https
+// URLs on the configured Hub host. The import endpoints are reachable
+// by anything in the cluster, and this pod holds the bucket
+// credentials, so it is not a general-purpose fetcher.
+func (im *Importer) CheckSource(srcURL string) error {
+	u, err := url.Parse(srcURL)
+	if err != nil {
+		return fmt.Errorf("%w: invalid url %q: %v", ErrBadSource, srcURL, err)
+	}
+	h, err := url.Parse(im.hfEndpoint)
+	if err != nil {
+		return fmt.Errorf("invalid hf endpoint %q: %w", im.hfEndpoint, err)
+	}
+	if u.Scheme != h.Scheme || u.Host != h.Host {
+		return fmt.Errorf("%w: refusing to fetch %q, imports come from %s only", ErrBadSource, srcURL, im.hfEndpoint)
+	}
+	return nil
 }
 
 // Status of a blob: Present with its size, InFlight, or Absent.
@@ -101,6 +132,9 @@ func (im *Importer) Stat(ctx context.Context, sha string) (Status, int64, error)
 func (im *Importer) EnsureBlob(ctx context.Context, sha, srcURL string) (Status, error) {
 	if !blobstore.ValidSHA(sha) {
 		return Absent, fmt.Errorf("invalid sha256 %q", sha)
+	}
+	if err := im.CheckSource(srcURL); err != nil {
+		return Absent, err
 	}
 	st, _, err := im.Stat(ctx, sha)
 	if err != nil || st != Absent {
@@ -139,6 +173,7 @@ func (im *Importer) Wait(ctx context.Context, sha string) (int64, error) {
 func (im *Importer) run(sha, srcURL string, j *job) {
 	// The import outlives the request that started it: a dropped client
 	// must not abort a 50 GB download that a retry would only restart.
+	// It is cancelled only by its own stall watchdog (see fetch).
 	ctx := context.Background()
 	log := klog.FromContext(ctx).WithValues("sha", sha, "url", srcURL)
 	start := time.Now()
@@ -155,14 +190,21 @@ func (im *Importer) run(sha, srcURL string, j *job) {
 	close(j.done)
 }
 
-// fetch streams srcURL into the store as blob sha ("" names it by content).
+// fetch streams srcURL into the store as blob sha ("" names it by
+// content). A download that delivers no byte for StallTimeout is
+// cancelled, so a silent peer cannot pin a job forever.
 func (im *Importer) fetch(ctx context.Context, sha, srcURL string) (string, int64, error) {
+	if err := im.CheckSource(srcURL); err != nil {
+		return "", 0, err
+	}
+	ctx, cancel := context.WithCancelCause(ctx)
+	defer cancel(nil)
 	req, err := http.NewRequestWithContext(ctx, http.MethodGet, srcURL, nil)
 	if err != nil {
 		return "", 0, err
 	}
-	if im.hfToken != "" && im.isHub(srcURL) {
-		req.Header.Set("Authorization", "Bearer "+im.hfToken)
+	if im.hfToken != "" {
+		req.Header.Set("Authorization", "Bearer "+im.hfToken) // CheckSource: https on the Hub host only
 	}
 	resp, err := im.client.Do(req)
 	if err != nil {
@@ -172,8 +214,15 @@ func (im *Importer) fetch(ctx context.Context, sha, srcURL string) (string, int6
 	if resp.StatusCode != http.StatusOK {
 		return "", 0, fmt.Errorf("fetching %s: %s", srcURL, resp.Status)
 	}
-	got, n, err := im.store.Put(ctx, sha, resp.Body)
+	body := newStallWatch(resp.Body, StallTimeout, func() {
+		cancel(fmt.Errorf("no data for %s", StallTimeout))
+	})
+	defer body.stop()
+	got, n, err := im.store.Put(ctx, sha, body)
 	if err != nil {
+		if cause := context.Cause(ctx); cause != nil && !errors.Is(cause, context.Canceled) {
+			err = fmt.Errorf("%w (%v)", err, cause)
+		}
 		return got, n, fmt.Errorf("storing %s: %w", srcURL, err)
 	}
 	return got, n, nil
@@ -185,13 +234,36 @@ func closeBody(ctx context.Context, resp *http.Response, url string) {
 	}
 }
 
-func (im *Importer) isHub(srcURL string) bool {
-	u, err := url.Parse(srcURL)
-	if err != nil {
-		return false
+// stallWatch is a reader that calls onStall when no Read has returned
+// data for the timeout; each Read that delivers data re-arms it.
+type stallWatch struct {
+	io.Reader
+	timer   *time.Timer
+	timeout time.Duration
+	stopped atomic.Bool
+}
+
+func newStallWatch(r io.Reader, timeout time.Duration, onStall func()) *stallWatch {
+	w := &stallWatch{Reader: r, timeout: timeout}
+	w.timer = time.AfterFunc(timeout, func() {
+		if !w.stopped.Load() {
+			onStall()
+		}
+	})
+	return w
+}
+
+func (w *stallWatch) Read(p []byte) (int, error) {
+	n, err := w.Reader.Read(p)
+	if n > 0 {
+		w.timer.Reset(w.timeout)
 	}
-	h, err := url.Parse(im.hfEndpoint)
-	return err == nil && u.Host == h.Host
+	return n, err
+}
+
+func (w *stallWatch) stop() {
+	w.stopped.Store(true)
+	w.timer.Stop()
 }
 
 // HubFile is one file of a Hub repository at a commit.
@@ -207,7 +279,7 @@ func (im *Importer) ListRepo(ctx context.Context, repo, revision string) (string
 	if revision == "" {
 		revision = "main"
 	}
-	api := fmt.Sprintf("%s/api/models/%s/revision/%s?blobs=true", im.hfEndpoint, repo, url.PathEscape(revision))
+	api := im.hfEndpoint + "/api/models/" + escapePath(repo) + "/revision/" + url.PathEscape(revision) + "?blobs=true"
 	req, err := http.NewRequestWithContext(ctx, http.MethodGet, api, nil)
 	if err != nil {
 		return "", nil, err
@@ -248,13 +320,24 @@ func (im *Importer) ListRepo(ctx context.Context, repo, revision string) (string
 	var files []HubFile
 	for _, s := range info.Siblings {
 		f := HubFile{Path: s.Rfilename, Size: s.Size,
-			URL: fmt.Sprintf("%s/%s/resolve/%s/%s", im.hfEndpoint, repo, commit, s.Rfilename)}
+			URL: im.hfEndpoint + "/" + escapePath(repo) + "/resolve/" + url.PathEscape(commit) + "/" + escapePath(s.Rfilename)}
 		if s.LFS != nil {
 			f.SHA256, f.Size = s.LFS.SHA256, s.LFS.Size
 		}
 		files = append(files, f)
 	}
 	return commit, files, nil
+}
+
+// escapePath escapes each segment of a slash-separated path (a repo id
+// or a file name), keeping the slashes: "#", "?" and "%" in a file name
+// must not be read as URL syntax.
+func escapePath(p string) string {
+	parts := strings.Split(p, "/")
+	for i, s := range parts {
+		parts[i] = url.PathEscape(s)
+	}
+	return strings.Join(parts, "/")
 }
 
 // Progress is reported by ImportRepo after each file.

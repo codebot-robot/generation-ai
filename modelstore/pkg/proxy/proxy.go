@@ -27,12 +27,15 @@ import (
 	"net/http"
 	"strconv"
 	"strings"
+	"sync"
+	"time"
 
 	"github.com/gke-labs/generation-ai/modelstore/apis/v1alpha1"
 	"github.com/gke-labs/generation-ai/modelstore/pkg/blobstore"
 	"github.com/gke-labs/generation-ai/modelstore/pkg/importer"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/apimachinery/pkg/util/validation"
 	"k8s.io/klog/v2"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 )
@@ -46,20 +49,50 @@ type Proxy struct {
 	store    blobstore.Store
 	importer *importer.Importer
 	kube     client.Client
+
+	mu      sync.Mutex
+	imports map[string]bool // Model imports running in this process
 }
 
 // NewProxy serves blobs from store, imports through imp, and keeps
-// Model objects through kube.
+// Model objects through kube. Call Resume to pick up imports a
+// previous process left unfinished.
 func NewProxy(store blobstore.Store, imp *importer.Importer, kube client.Client) *Proxy {
-	return &Proxy{store: store, importer: imp, kube: kube}
+	return &Proxy{store: store, importer: imp, kube: kube, imports: map[string]bool{}}
 }
 
 func (p *Proxy) ServeHTTP(w http.ResponseWriter, r *http.Request) {
-	if err := p.serve(w, r); err != nil {
-		log := klog.FromContext(r.Context())
-		log.Error(err, "request failed", "path", r.URL.Path, "method", r.Method)
-		http.Error(w, err.Error(), http.StatusInternalServerError)
+	rw := &responseWriter{ResponseWriter: w}
+	err := p.serve(rw, r)
+	if err == nil {
+		return
 	}
+	log := klog.FromContext(r.Context())
+	if rw.started {
+		// Headers are out: the error can only be reported by cutting the
+		// body short. Most of these are clients closing a large download
+		// early, which is not a server failure.
+		log.V(2).Info("response cut short", "path", r.URL.Path, "error", err.Error())
+		return
+	}
+	log.Error(err, "request failed", "path", r.URL.Path, "method", r.Method)
+	http.Error(w, err.Error(), http.StatusInternalServerError)
+}
+
+// responseWriter remembers whether a status line has been written.
+type responseWriter struct {
+	http.ResponseWriter
+	started bool
+}
+
+func (w *responseWriter) WriteHeader(code int) {
+	w.started = true
+	w.ResponseWriter.WriteHeader(code)
+}
+
+func (w *responseWriter) Write(b []byte) (int, error) {
+	w.started = true
+	return w.ResponseWriter.Write(b)
 }
 
 func (p *Proxy) serve(w http.ResponseWriter, r *http.Request) error {
@@ -122,6 +155,16 @@ func modelName(repoID string) string {
 	return strings.Trim(b.String(), "-.")
 }
 
+// validModelName returns the Model object name for a repo id, or the
+// API server's objection to it.
+func validModelName(repoID string) (string, error) {
+	name := modelName(repoID)
+	if errs := validation.IsDNS1123Subdomain(name); len(errs) > 0 {
+		return "", fmt.Errorf("repository %q gives an invalid object name %q: %s", repoID, name, strings.Join(errs, "; "))
+	}
+	return name, nil
+}
+
 func (p *Proxy) getModel(ctx context.Context, name string) (*v1alpha1.Model, error) {
 	var model v1alpha1.Model
 	if err := p.kube.Get(ctx, client.ObjectKey{Name: name}, &model); err != nil {
@@ -136,13 +179,18 @@ func (p *Proxy) handleHFMetadata(w http.ResponseWriter, r *http.Request) error {
 	if i := strings.Index(repoID, "/revision/"); i >= 0 {
 		repoID = repoID[:i]
 	}
-	model, err := p.getModel(r.Context(), modelName(repoID))
+	name, nerr := validModelName(repoID)
+	if nerr != nil {
+		http.NotFound(w, r)
+		return nil
+	}
+	model, err := p.getModel(r.Context(), name)
 	if apierrors.IsNotFound(err) {
 		http.NotFound(w, r)
 		return nil
 	}
 	if err != nil {
-		return fmt.Errorf("getting model %s: %w", modelName(repoID), err)
+		return fmt.Errorf("getting model %s: %w", name, err)
 	}
 	siblings := make([]map[string]any, 0, len(model.Spec.Files))
 	for _, f := range model.Spec.Files {
@@ -168,13 +216,18 @@ func (p *Proxy) handleHFDownload(w http.ResponseWriter, r *http.Request) error {
 		http.NotFound(w, r)
 		return nil
 	}
-	model, err := p.getModel(r.Context(), modelName(repoID))
+	name, nerr := validModelName(repoID)
+	if nerr != nil {
+		http.NotFound(w, r)
+		return nil
+	}
+	model, err := p.getModel(r.Context(), name)
 	if apierrors.IsNotFound(err) {
 		http.NotFound(w, r)
 		return nil
 	}
 	if err != nil {
-		return fmt.Errorf("getting model %s: %w", modelName(repoID), err)
+		return fmt.Errorf("getting model %s: %w", name, err)
 	}
 	for _, f := range model.Spec.Files {
 		if f.Path == path {
@@ -317,6 +370,10 @@ func (p *Proxy) handleBlobImport(w http.ResponseWriter, r *http.Request, sha str
 		return nil
 	}
 	st, err := p.importer.EnsureBlob(r.Context(), sha, req.URL)
+	if errors.Is(err, importer.ErrBadSource) {
+		http.Error(w, err.Error(), http.StatusBadRequest)
+		return nil
+	}
 	if err != nil {
 		return err
 	}
@@ -351,12 +408,26 @@ func (p *Proxy) handleModelImport(w http.ResponseWriter, r *http.Request) error 
 		return nil
 	}
 	ctx := r.Context()
-	name := modelName(req.Repo)
+	name, err := validModelName(req.Repo)
+	if err != nil {
+		http.Error(w, err.Error(), http.StatusBadRequest)
+		return nil
+	}
 	model, err := p.getModel(ctx, name)
 	if err != nil && !apierrors.IsNotFound(err) {
 		return fmt.Errorf("getting model %s: %w", name, err)
 	}
-	if model != nil && model.Status.Phase == v1alpha1.PhaseImporting {
+	if model != nil && (model.Spec.Source == nil || model.Spec.Source.Repo != req.Repo) {
+		// Names are lossy (case folded, punctuation collapsed): never let
+		// one repository overwrite a Model that came from another source.
+		from := "an upload"
+		if model.Spec.Source != nil {
+			from = model.Spec.Source.Repo
+		}
+		http.Error(w, fmt.Sprintf("model %s already exists from %s; cannot import %s under the same name", name, from, req.Repo), http.StatusConflict)
+		return nil
+	}
+	if model != nil && model.Status.Phase == v1alpha1.PhaseImporting && p.running(name) {
 		w.WriteHeader(http.StatusAccepted)
 		return json.NewEncoder(w).Encode(model)
 	}
@@ -370,9 +441,62 @@ func (p *Proxy) handleModelImport(w http.ResponseWriter, r *http.Request) error 
 	if err := p.setStatus(ctx, model, v1alpha1.ModelStatus{Phase: v1alpha1.PhaseImporting}); err != nil {
 		return err
 	}
-	go p.runModelImport(name, req)
+	p.start(name, req)
 	w.WriteHeader(http.StatusAccepted)
 	return json.NewEncoder(w).Encode(model)
+}
+
+// start runs a Model import in the background unless one is running.
+func (p *Proxy) start(name string, req ModelImportRequest) {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	if p.imports[name] {
+		return
+	}
+	p.imports[name] = true
+	go func() {
+		defer func() {
+			p.mu.Lock()
+			delete(p.imports, name)
+			p.mu.Unlock()
+		}()
+		p.runModelImport(name, req)
+	}()
+}
+
+// running reports whether this process is importing the Model.
+func (p *Proxy) running(name string) bool {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	return p.imports[name]
+}
+
+// Resume restarts the imports of Models left in phase Importing by a
+// previous process (a pod replaced mid-import). Blobs already in the
+// store are skipped, so a resumed import costs only what was missing.
+func (p *Proxy) Resume(ctx context.Context) error {
+	log := klog.FromContext(ctx)
+	var list v1alpha1.ModelList
+	if err := p.kube.List(ctx, &list); err != nil {
+		return fmt.Errorf("listing models: %w", err)
+	}
+	for i := range list.Items {
+		m := &list.Items[i]
+		if m.Status.Phase != v1alpha1.PhaseImporting {
+			continue
+		}
+		if m.Spec.Source == nil {
+			log.Info("model stuck in Importing with no source; marking Failed", "model", m.Name)
+			if err := p.setStatus(ctx, m, v1alpha1.ModelStatus{Phase: v1alpha1.PhaseFailed,
+				Message: "import interrupted and no source recorded"}); err != nil {
+				log.Error(err, "marking model Failed", "model", m.Name)
+			}
+			continue
+		}
+		log.Info("resuming import interrupted by a restart", "model", m.Name, "repo", m.Spec.Source.Repo)
+		p.start(m.Name, ModelImportRequest{Repo: m.Spec.Source.Repo, Revision: m.Spec.Source.Revision})
+	}
+	return nil
 }
 
 func (p *Proxy) runModelImport(name string, req ModelImportRequest) {
@@ -390,34 +514,49 @@ func (p *Proxy) runModelImport(name string, req ModelImportRequest) {
 		}
 	}
 	commit, files, err := p.importer.ImportRepo(ctx, req.Repo, req.Revision, report)
-	model, gerr := p.getModel(ctx, name)
-	if gerr != nil {
-		log.Error(gerr, "model vanished during import")
-		return
-	}
-	if err != nil {
-		log.Error(err, "import failed")
-		if serr := p.setStatus(ctx, model, v1alpha1.ModelStatus{Phase: v1alpha1.PhaseFailed, Message: err.Error(),
-			FilesTotal: model.Status.FilesTotal, FilesImported: model.Status.FilesImported, BytesImported: model.Status.BytesImported}); serr != nil {
-			log.Error(serr, "recording failed import")
+	// Recording the outcome retries, because leaving the Model in
+	// Importing on a transient API error would strand it until a restart.
+	record := func() error {
+		model, gerr := p.getModel(ctx, name)
+		if apierrors.IsNotFound(gerr) {
+			log.Info("model deleted during import; dropping the result")
+			return nil
 		}
-		return
+		if gerr != nil {
+			return gerr
+		}
+		if err != nil {
+			return p.setStatus(ctx, model, v1alpha1.ModelStatus{Phase: v1alpha1.PhaseFailed, Message: err.Error(),
+				FilesTotal: model.Status.FilesTotal, FilesImported: model.Status.FilesImported, BytesImported: model.Status.BytesImported})
+		}
+		model.Spec.Files = files
+		model.Spec.Source = &v1alpha1.ModelSource{Repo: req.Repo, Revision: req.Revision, CommitSHA: commit}
+		if uerr := p.kube.Update(ctx, model); uerr != nil {
+			return uerr
+		}
+		var bytes int64
+		for _, f := range files {
+			bytes += f.Size
+		}
+		return p.setStatus(ctx, model, v1alpha1.ModelStatus{Phase: v1alpha1.PhaseReady,
+			FilesTotal: len(files), FilesImported: len(files), BytesImported: bytes})
 	}
-	model.Spec.Files = files
-	model.Spec.Source = &v1alpha1.ModelSource{Repo: req.Repo, Revision: req.Revision, CommitSHA: commit}
-	if err := p.kube.Update(ctx, model); err != nil {
-		log.Error(err, "recording imported files")
-		return
+	var rerr error
+	for attempt := 0; attempt < 5; attempt++ {
+		if rerr = record(); rerr == nil {
+			break
+		}
+		log.Error(rerr, "recording import outcome; will retry", "attempt", attempt)
+		time.Sleep(time.Duration(attempt+1) * time.Second)
 	}
-	var bytes int64
-	for _, f := range files {
-		bytes += f.Size
+	switch {
+	case rerr != nil:
+		log.Error(rerr, "giving up recording the import outcome; the Model stays Importing until a restart resumes it")
+	case err != nil:
+		log.Error(err, "import failed")
+	default:
+		log.Info("imported model", "commit", commit, "files", len(files))
 	}
-	if err := p.setStatus(ctx, model, v1alpha1.ModelStatus{Phase: v1alpha1.PhaseReady,
-		FilesTotal: len(files), FilesImported: len(files), BytesImported: bytes}); err != nil {
-		log.Error(err, "recording import status")
-	}
-	log.Info("imported model", "commit", commit, "files", len(files), "bytes", bytes)
 }
 
 func (p *Proxy) setStatus(ctx context.Context, model *v1alpha1.Model, st v1alpha1.ModelStatus) error {
