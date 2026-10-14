@@ -170,6 +170,60 @@ def record_transformers(model, revision, prompts, settings, device="cpu", dtype=
     return _document(model, revision, lm.config, producer, settings, out)
 
 
+def record_deepseek_eager(model, revision, prompts, settings, device="cpu"):
+    """Reference for a deepseek_v41 checkpoint: the model maker's module
+    from the fork, run eagerly with the plain-aten kernels on the CPU (no
+    transformers implementation exists). Greedy; logits at every step."""
+    import torch
+    from safetensors.torch import load_file
+    from transformers import AutoTokenizer
+    from . import deepseek_v41 as ds
+    from .manifest import build_manifest
+    manifest = build_manifest(model, revision)
+    tok = _tokenizer(model, revision, prompts)
+    tokenizer = AutoTokenizer.from_pretrained(model, revision=revision)
+    fork = ds._fork()
+    args = ds.model_args(model, settings.get("max_cache_len", 1024))
+    with ds.bf16_default():
+        lm = fork.Transformer(args, tokenizer).eval()
+    # load the checkpoint files the manifest names (local directory or Hub cache)
+    state = {}
+    for ref in manifest["files"].values():
+        path = ref["source"][len("file://"):] if ref["source"].startswith("file://") else None
+        if path is None:
+            from huggingface_hub import hf_hub_download
+            path = hf_hub_download(model, ref["name"], revision=revision)
+        for k, v in load_file(path).items():
+            state[k] = v.view(torch.float4_e2m1fn_x2) if (k.endswith(".weight") and ".experts." in k and v.dtype == torch.int8) else v
+    missing, unexpected = lm.load_state_dict(state, strict=False)
+    unexpected = [u for u in unexpected if not u.startswith("mtp.")]
+    if unexpected:
+        raise RuntimeError(f"checkpoint tensors the module did not take: {unexpected[:5]}")
+    eos_ids = {tokenizer.eos_token_id} if tokenizer.eos_token_id is not None else set()
+    out = []
+    for prompt in _prompt_set(tok, prompts):
+        ids = _encode(tok, prompt)
+        t0 = time.perf_counter()
+        new, top = [], []
+        with torch.no_grad(), ds.bf16_default():
+            logits = lm(torch.tensor([ids]), 0)[1]
+            for step in range(settings["new_tokens"]):
+                if step < settings["logit_positions"]:
+                    top.append(_top(logits[0], settings["top_k"]))
+                nxt = int(logits[0].argmax())
+                new.append(nxt)
+                if nxt in eos_ids:
+                    break
+                logits = lm(torch.tensor([[nxt]]), len(ids) + step)[1]
+        elapsed = time.perf_counter() - t0
+        out.append({**prompt, "input_ids": ids, "generated_ids": new,
+                    "finish": "eos" if new and new[-1] in eos_ids else "length",
+                    "top_logits": top,
+                    "ms_per_token": round(1000 * elapsed / max(1, len(new)), 1)})
+    producer = {"kind": "deepseek-eager", **_versions(device), "kernels": "aten"}
+    return _document(model, revision, type("Config", (), {"model_type": ds.MODEL_TYPE})(), producer, settings, out)
+
+
 def record_vxpu_engine(model, revision, prompts, settings, artifact, device="cpu",
                        compile_decode=False):
     """Candidate: the executor's engine in this process (no cluster)."""
@@ -512,6 +566,9 @@ def cmd_record(args):
         doc = record_vxpu_engine(args.model, args.revision, args.prompts, settings,
                                  args.artifact, device=args.device,
                                  compile_decode=args.compile)
+    elif args.producer == "deepseek-eager":
+        doc = record_deepseek_eager(args.model, args.revision, args.prompts, settings,
+                                    device=args.device)
     elif args.producer == "vllm":
         doc = record_vllm(args.model, args.revision, args.prompts, settings,
                           dtype=args.dtype,
@@ -571,11 +628,21 @@ def selftest(workdir, settings):
         models.append(("tiny-qwen4", tiny_qwen4.write(os.path.join(workdir, "tiny-qwen4")), "ids"))
     except ImportError as e:
         print(f"tiny-qwen4 fixture skipped: {e}")
+    try:
+        # DeepSeek-V4.1 layout through the model maker's module (third_party fork):
+        # fp8 dense, fp4 experts, compressed sparse attention, engram table
+        from .fixtures import tiny_deepseek_v41
+        models.append(("tiny-deepseek-v41", tiny_deepseek_v41.write(os.path.join(workdir, "tiny-deepseek-v41")), "ids"))
+    except ImportError as e:
+        print(f"tiny-deepseek-v41 fixture skipped: {e}")
     failed = []
     for name, model, prompts in models:
         artifact = os.path.join(workdir, name + "-artifact")
         export_artifact(model, artifact, max_cache_len=1024)
-        ref = record_transformers(model, "main", prompts, settings)
+        if name == "tiny-deepseek-v41":  # no transformers model: the fork run eagerly is the reference
+            ref = record_deepseek_eager(model, "main", prompts, settings)
+        else:
+            ref = record_transformers(model, "main", prompts, settings)
         got = record_vxpu_engine(model, "main", prompts, settings, artifact)
         for label, doc in (("reference", ref), ("candidate", got)):
             with open(os.path.join(workdir, f"{name}-{label}.json"), "w") as f:
@@ -600,7 +667,7 @@ def main(argv=None):
                        help="positions to record top-k logits for (default: all of --new-tokens)")
 
     rec = sub.add_parser("record", help="record vectors with a producer")
-    rec.add_argument("--producer", choices=["transformers", "vxpu-engine", "vxpu-router", "vllm"], required=True)
+    rec.add_argument("--producer", choices=["transformers", "vxpu-engine", "vxpu-router", "vllm", "deepseek-eager"], required=True)
     rec.add_argument("--model", required=True, help="Hub repo id or local checkpoint directory")
     rec.add_argument("--revision", default="main")
     rec.add_argument("--prompts", choices=["auto", "text", "ids"], default="auto",

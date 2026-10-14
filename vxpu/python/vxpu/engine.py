@@ -95,9 +95,15 @@ class Engine:
         if cas_dir:
             os.makedirs(cas_dir, exist_ok=True)
 
-        self.config = CONFIG_MAPPING[
-            self.manifest["config"]["model_type"]
-        ].from_dict(self.manifest["config"])
+        model_type = self.manifest["config"].get("model_type")
+        if model_type in CONFIG_MAPPING:
+            self.config = CONFIG_MAPPING[model_type].from_dict(self.manifest["config"])
+        else:
+            # A model transformers does not implement (DeepSeek-V4.1 runs
+            # from the model maker's module): a plain config carries what
+            # generation needs (eos ids, vocab size).
+            from transformers import PretrainedConfig
+            self.config = PretrainedConfig.from_dict(self.manifest["config"])
         self.max_cache_len = int(self.binding.get("max_cache_len", 1024))
         # Tokenizer/processor files are not yet part of the manifest.
         # Generate (ids in, ids out) needs none; Chat does. A local
@@ -235,6 +241,11 @@ class Engine:
         if self.compile_decode:
             strip_asserts(self._decode)
             self._decode_run = torch.compile(self._decode, **compile_options(self.device))
+
+    def _reset_state(self, session):
+        """Zero a session's state tensors in place (the graphs stay bound)."""
+        for tensor in session["state"].values():
+            tensor.zero_()
 
     def _bind(self, state):
         """Point both graphs' state buffers at this session's tensors.
@@ -389,6 +400,12 @@ class Engine:
             # Everything is cached, including the last prompt token;
             # recompute its logits by re-prefilling just that token.
             start = total_len - 1
+        if self.binding.get("prefill_from_zero") and start < len(cached):
+            # This model's prefill graph starts at position 0 (its ring
+            # buffers and compressed caches are seeded by the prefill):
+            # a rewritten prefix means a fresh state and a full prefill.
+            self._reset_state(session)
+            start = 0
 
         allowed_tokens = self.max_cache_len - total_len
         max_tokens_to_generate = max(0, min(max_new_tokens, allowed_tokens))

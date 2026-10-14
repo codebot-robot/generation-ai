@@ -292,11 +292,20 @@ def constant_aliases(exportable, *programs):
     (a cache written under one name and read under the other would not
     be a cache), so map each alias to the buffer it is.
     """
-    buffers = {id(t): name for name, t in exportable.model.named_buffers()}
+    # Identities come from the programs' own tables, under the names the
+    # graphs use: a buffer is in state_dict (persistent) or constants
+    # (non-persistent) under its signature name; a lifted constant that
+    # is the same object as a buffer is an alias of it.
     aliases = {}
     for program in programs:
-        for name, tensor in program.constants.items():
-            canonical = buffers.get(id(tensor))
+        sig = program.graph_signature
+        by_id = {}
+        for name in sig.inputs_to_buffers.values():
+            tensor = program.state_dict.get(name, program.constants.get(name))
+            if isinstance(tensor, torch.Tensor):
+                by_id.setdefault(id(tensor), name)
+        for name in sig.inputs_to_lifted_tensor_constants.values():
+            canonical = by_id.get(id(program.constants.get(name)))
             if canonical is not None and canonical != name:
                 if aliases.get(name, canonical) != canonical:
                     raise RuntimeError(
@@ -404,6 +413,10 @@ def export_artifact(repo_id, out_dir, max_cache_len=1024, revision="main"):
     """Build the complete artifact directory for repo_id."""
     os.makedirs(out_dir, exist_ok=True)
     manifest = build_manifest(repo_id, revision)
+    if manifest["config"].get("model_type") == "deepseek_v41":
+        # No transformers implementation: the model maker's own module,
+        # from the fork in third_party (see deepseek_v41.py).
+        return export_deepseek_v41(repo_id, out_dir, manifest, max_cache_len, revision)
     config = AutoConfig.from_pretrained(repo_id, revision=revision)
 
     quantization = fp8_config(config)
@@ -495,6 +508,46 @@ def export_artifact(repo_id, out_dir, max_cache_len=1024, revision="main"):
         json.dump(manifest, f, indent=1, sort_keys=True)
     with open(os.path.join(out_dir, "binding.json"), "w") as f:
         json.dump(binding, f, indent=1, sort_keys=True)
+    return manifest, binding
+
+
+def export_deepseek_v41(repo_id, out_dir, manifest, max_cache_len, revision):
+    """The artifact for a DeepSeek-V4.1 checkpoint: the same steps as the
+    transformers path, over the fork's module."""
+    from transformers import AutoTokenizer
+    from . import deepseek_v41 as ds
+
+    tokenizer = AutoTokenizer.from_pretrained(repo_id, revision=revision)  # the engram token map
+    model, buffers, args = ds.build(repo_id, tokenizer, max_cache_len)
+    view = ds.checkpoint_view(model, manifest["tensors"])
+    prefill, decode = ds.export_graphs(model, max_cache_len, MIN_PREFILL_LEN)
+
+    aliases = constant_aliases(ds.Prefill(model), prefill, decode)
+    for program in (prefill, decode):
+        state_fqns = {f for f in mutated_fqns(program)}
+        state_fqns |= {a for a, c in aliases.items() if c in state_fqns}
+        state_fqns |= {c for a, c in aliases.items() if a in state_fqns}
+        strip_state_values(program, state_fqns)
+        params = set(program.graph_signature.inputs_to_parameters.values())
+        inject_buffer_values(program, buffers, params, state_fqns)
+    torch.export.save(prefill, os.path.join(out_dir, "prefill.pt2"))
+    torch.export.save(decode, os.path.join(out_dir, "decode.pt2"))
+
+    bound, derived, state, stacked, unbound, unused, constant = classify(
+        decode, manifest, view, aliases=aliases, also_mutated=mutated_fqns(prefill))
+    if unbound:
+        raise RuntimeError(f"unbound tensors (artifact would be incomplete): {unbound}")
+    binding = {"bound": bound, "derived": derived, "state": state,
+               "stacked": stacked, "aliases": aliases, "unused": unused,
+               "constant": constant, "max_cache_len": max_cache_len,
+               "min_prefill_len": MIN_PREFILL_LEN, **ds.binding_extras(args)}
+    with open(os.path.join(out_dir, "manifest.json"), "w") as f:
+        json.dump(manifest, f, indent=1, sort_keys=True)
+    with open(os.path.join(out_dir, "binding.json"), "w") as f:
+        json.dump(binding, f, indent=1, sort_keys=True)
+    print(f"  model: {repo_id} (deepseek_v41 via the fork; {len(manifest['tensors'])} tensors)")
+    print(f"  binding: {len(bound)} bound, {len(state)} state, {len(stacked)} stacked, "
+          f"{len(aliases)} aliases, {len(unused)} unused, {len(constant)} constant")
     return manifest, binding
 
 

@@ -40,7 +40,9 @@ from torch.export.passes import move_to_device_pass
 DTYPES = {
     "F64": torch.float64, "F32": torch.float32, "F16": torch.float16,
     "BF16": torch.bfloat16, "I64": torch.int64, "I32": torch.int32,
+    "I16": torch.int16, "I8": torch.int8, "U8": torch.uint8, "BOOL": torch.bool,
     "F8_E4M3": torch.float8_e4m3fn, "F8_E5M2": torch.float8_e5m2,
+    "F8_E8M0": torch.float8_e8m0fnu,
 }
 
 
@@ -300,7 +302,13 @@ def load_program(graph_path, tensors, device):
         # dtype (Qwen stores fp8 block scales as bf16; transformers'
         # fp8 modules declare float32). Cast as from_pretrained would.
         expected = exported.state_dict.get(fqn, exported.constants.get(fqn))
-        if (isinstance(expected, torch.Tensor)
+        bytes_like = (torch.int8, torch.uint8)
+        if (isinstance(expected, torch.Tensor) and expected.dtype != tensor.dtype
+                and expected.dtype in bytes_like and tensor.dtype in bytes_like):
+            # Packed fp4 weights: the checkpoint says int8, the graph
+            # keeps them as uint8 bytes. Same bytes, no cast.
+            tensor = tensor.view(expected.dtype)
+        elif (isinstance(expected, torch.Tensor)
                 and expected.dtype != tensor.dtype
                 and expected.is_floating_point()
                 and tensor.is_floating_point()):

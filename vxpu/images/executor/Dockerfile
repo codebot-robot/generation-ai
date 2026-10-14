@@ -48,7 +48,24 @@ RUN if [ -f /src/transformers/pyproject.toml ]; then \
         "protobuf>=6.30" \
         requests \
         huggingface_hub \
-        accelerate
+        accelerate \
+        sympy \
+        pillow
+
+# DeepSeek-V4.1's reference module (no transformers implementation exists)
+# comes from its fork under third_party/ the same way; the exporter and
+# the executor import it from VXPU_DEEPSEEK_V41. DEEPSEEK_V41_COMMIT must
+# equal the submodule's gitlink; TestDeepseekPinMatchesSubmodule checks.
+ARG DEEPSEEK_V41_REPO=https://github.com/justinsb/deepseek-v41-flash
+ARG DEEPSEEK_V41_COMMIT=f32928b2bae99c81291a1c4855ccc6b94759d186
+COPY third_party/deepseek_v41/ /src/deepseek_v41/
+RUN if [ ! -f /src/deepseek_v41/inference/model.py ]; then \
+        rm -rf /src/deepseek_v41 \
+        && git clone --quiet "${DEEPSEEK_V41_REPO}" /src/deepseek_v41 \
+        && git -C /src/deepseek_v41 checkout --quiet "${DEEPSEEK_V41_COMMIT}" \
+        && rm -rf /src/deepseek_v41/.git; \
+    fi
+ENV VXPU_DEEPSEEK_V41=/src/deepseek_v41/inference
 
 COPY python/vxpu/ /app/vxpu/
 
