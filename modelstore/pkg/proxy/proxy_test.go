@@ -169,6 +169,17 @@ func TestModelImportWritesAnArtifact(t *testing.T) {
 	if meta["sha"] != "abc123" || len(meta["siblings"].([]any)) != 2 {
 		t.Errorf("metadata: %v", meta)
 	}
+	// The tree and paths-info routes huggingface_hub lists with.
+	w = do(p, http.MethodGet, "/api/models/Org/Name/tree/abc123?recursive=true&expand=false", nil)
+	var tree []map[string]any
+	if err := json.Unmarshal(w.Body.Bytes(), &tree); err != nil || len(tree) != 2 || tree[0]["type"] != "file" || tree[0]["lfs"] == nil {
+		t.Errorf("tree: %d %s", w.Code, w.Body.String())
+	}
+	w = do(p, http.MethodPost, "/api/models/org/name/paths-info/main", strings.NewReader("paths=config.json&paths=missing"), "Content-Type", "application/x-www-form-urlencoded")
+	var infos []map[string]any
+	if err := json.Unmarshal(w.Body.Bytes(), &infos); err != nil || len(infos) != 1 || infos[0]["path"] != "config.json" {
+		t.Errorf("paths-info: %d %s", w.Code, w.Body.String())
+	}
 	w = do(p, http.MethodGet, "/Org/Name/resolve/main/config.json", nil)
 	if w.Code != 200 || w.Body.String() != string(config) || w.Header().Get("X-Repo-Commit") != "abc123" {
 		t.Errorf("config via resolve: %d %q commit=%s", w.Code, w.Body.String(), w.Header().Get("X-Repo-Commit"))

@@ -139,8 +139,15 @@ func (p *Proxy) serve(w http.ResponseWriter, r *http.Request) error {
 		return nil
 	}
 
-	// Hugging Face Hub compatible reads: metadata, then downloads.
+	// Hugging Face Hub compatible reads: metadata, tree, then downloads.
 	if strings.HasPrefix(r.URL.Path, "/api/models/") {
+		rest := strings.TrimPrefix(r.URL.Path, "/api/models/")
+		if i := strings.Index(rest, "/tree/"); i >= 0 {
+			return p.handleHFTree(w, r, rest[:i], rest[i+len("/tree/"):])
+		}
+		if i := strings.Index(rest, "/paths-info/"); i >= 0 {
+			return p.handleHFPathsInfo(w, r, rest[:i], rest[i+len("/paths-info/"):])
+		}
 		return p.handleHFMetadata(w, r)
 	}
 	if strings.Contains(r.URL.Path, "/resolve/") && (r.Method == http.MethodGet || r.Method == http.MethodHead) {
@@ -242,6 +249,105 @@ func (p *Proxy) handleHFMetadata(w http.ResponseWriter, r *http.Request) error {
 	resp := map[string]any{"modelId": repoID, "id": repoID, "siblings": siblings, "sha": revisionOf(m)}
 	w.Header().Set("Content-Type", "application/json")
 	return json.NewEncoder(w).Encode(resp)
+}
+
+// hfEntry is one file in the Hub's tree / paths-info responses.
+type hfEntry struct {
+	Type string `json:"type"`
+	Oid  string `json:"oid"`
+	Size int64  `json:"size"`
+	Path string `json:"path"`
+	LFS  *struct {
+		Oid         string `json:"oid"`
+		Size        int64  `json:"size"`
+		PointerSize int    `json:"pointerSize"`
+	} `json:"lfs,omitempty"`
+}
+
+func hfEntries(m *registry.Manifest) []hfEntry {
+	entries := make([]hfEntry, 0, len(m.Layers))
+	for _, l := range m.Layers {
+		sha, _ := registry.ParseDigest(l.Digest)
+		e := hfEntry{Type: "file", Oid: sha, Size: l.Size, Path: l.Annotations[registry.AnnotationTitle]}
+		e.LFS = &struct {
+			Oid         string `json:"oid"`
+			Size        int64  `json:"size"`
+			PointerSize int    `json:"pointerSize"`
+		}{Oid: sha, Size: l.Size, PointerSize: 134}
+		entries = append(entries, e)
+	}
+	return entries
+}
+
+// handleHFTree answers GET /api/models/<repo>/tree/<revision>[/<path>],
+// which huggingface_hub uses to list a repository (transformers lists
+// before it fetches sharded checkpoints). Every file is reported as an
+// LFS file whose oid is its sha256, which is what the Hub does for
+// weights and is harmless for small files.
+func (p *Proxy) handleHFTree(w http.ResponseWriter, r *http.Request, repoID, revAndPath string) error {
+	revision, sub, _ := strings.Cut(revAndPath, "/")
+	name, err := RepositoryName(repoID)
+	if err != nil {
+		http.NotFound(w, r)
+		return nil
+	}
+	m, _, err := p.artifactFiles(r.Context(), name, revision)
+	if errors.Is(err, blobstore.ErrNotFound) {
+		http.NotFound(w, r)
+		return nil
+	}
+	if err != nil {
+		return err
+	}
+	var out []hfEntry
+	for _, e := range hfEntries(m) {
+		if sub == "" || strings.HasPrefix(e.Path, strings.TrimSuffix(sub, "/")+"/") {
+			out = append(out, e)
+		}
+	}
+	if out == nil {
+		out = []hfEntry{}
+	}
+	w.Header().Set("Content-Type", "application/json")
+	return json.NewEncoder(w).Encode(out)
+}
+
+// handleHFPathsInfo answers POST /api/models/<repo>/paths-info/<revision>
+// with form field paths=...: the entries for the named files.
+func (p *Proxy) handleHFPathsInfo(w http.ResponseWriter, r *http.Request, repoID, revision string) error {
+	if r.Method != http.MethodPost {
+		http.NotFound(w, r)
+		return nil
+	}
+	name, err := RepositoryName(repoID)
+	if err != nil {
+		http.NotFound(w, r)
+		return nil
+	}
+	m, _, err := p.artifactFiles(r.Context(), name, revision)
+	if errors.Is(err, blobstore.ErrNotFound) {
+		http.NotFound(w, r)
+		return nil
+	}
+	if err != nil {
+		return err
+	}
+	if err := r.ParseForm(); err != nil {
+		http.Error(w, err.Error(), http.StatusBadRequest)
+		return nil
+	}
+	want := map[string]bool{}
+	for _, path := range r.Form["paths"] {
+		want[path] = true
+	}
+	out := []hfEntry{}
+	for _, e := range hfEntries(m) {
+		if want[e.Path] {
+			out = append(out, e)
+		}
+	}
+	w.Header().Set("Content-Type", "application/json")
+	return json.NewEncoder(w).Encode(out)
 }
 
 func (p *Proxy) handleHFDownload(w http.ResponseWriter, r *http.Request) error {
