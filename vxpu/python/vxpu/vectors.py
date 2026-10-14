@@ -186,19 +186,20 @@ def record_deepseek_eager(model, revision, prompts, settings, device="cpu"):
     args = ds.model_args(model, settings.get("max_cache_len", 1024))
     with ds.bf16_default():
         lm = fork.Transformer(args, tokenizer).eval()
-    # load the checkpoint files the manifest names (local directory or Hub cache)
-    state = {}
-    for ref in manifest["files"].values():
+    # Load shard by shard into the module (local directory or Hub cache):
+    # the checkpoint never coexists with the parameters in memory, so a
+    # 510 GB model needs ~510 GB, not twice that.
+    for ref in sorted(manifest["files"].values(), key=lambda r: r["name"]):
         path = ref["source"][len("file://"):] if ref["source"].startswith("file://") else None
         if path is None:
             from huggingface_hub import hf_hub_download
             path = hf_hub_download(model, ref["name"], revision=revision)
-        for k, v in load_file(path).items():
-            state[k] = v.view(torch.float4_e2m1fn_x2) if (k.endswith(".weight") and ".experts." in k and v.dtype == torch.int8) else v
-    missing, unexpected = lm.load_state_dict(state, strict=False)
-    unexpected = [u for u in unexpected if not u.startswith("mtp.")]
-    if unexpected:
-        raise RuntimeError(f"checkpoint tensors the module did not take: {unexpected[:5]}")
+        shard = load_file(path)
+        _, unexpected = lm.load_state_dict(shard, strict=False)
+        unexpected = [u for u in unexpected if not u.startswith(("mtp.", "vision.", "aligner.", "image_"))]
+        if unexpected:
+            raise RuntimeError(f"checkpoint tensors the module did not take: {unexpected[:5]}")
+        del shard
     eos_ids = {tokenizer.eos_token_id} if tokenizer.eos_token_id is not None else set()
     out = []
     for prompt in _prompt_set(tok, prompts):
