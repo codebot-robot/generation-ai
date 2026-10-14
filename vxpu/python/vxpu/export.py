@@ -575,7 +575,7 @@ def main():
           f"{len(binding['aliases'])} aliases, "
           f"{len(binding['unused'])} unused, "
           f"{len(binding['constant'])} constant"
-          + (f" (fp8, {binding['quantization']['fp8_modules']} modules)"
+          + (f" (fp8, {binding['quantization'].get('fp8_modules', '?')} modules)"
              if binding.get("quantization") else ""))
     return 0
 
