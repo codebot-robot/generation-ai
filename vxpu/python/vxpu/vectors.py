@@ -247,8 +247,15 @@ def record_deepseek_eager(model, revision, prompts, settings, device="cpu"):
         ids = _encode(tok, prompt)
         t0 = time.perf_counter()
         new, top = [], []
+        # The exporter sets the expert routing per graph (grouped for the
+        # prefill, batched for the decode step); the module's default is
+        # grouped, which on a decode step dequantizes every expert of
+        # every layer (384 x 40 here) for one token's six. Same math,
+        # ~40x the work: nine hours instead of fifteen minutes.
         with torch.no_grad(), ds.bf16_default():
+            ds.set_routing(lm, "grouped")
             logits = lm(torch.tensor([ids]), 0)[1]
+            ds.set_routing(lm, "batched")
             for step in range(settings["new_tokens"]):
                 if step < settings["logit_positions"]:
                     top.append(_top(logits[0], settings["top_k"]))
