@@ -52,6 +52,7 @@ divergence, and they stay useful under any later tolerance.
 import argparse
 import json
 import os
+import sys
 import tempfile
 import time
 
@@ -117,6 +118,13 @@ def _tokenizer(model, revision, prompts="auto"):
         return None
 
 
+def _progress(prompt, new, ms_per_token):
+    """One line per finished prompt on stderr, so a long run (the real
+    DeepSeek reference takes hours on a CPU) shows where it is."""
+    rate = f"{ms_per_token:.0f} ms/token" if ms_per_token else "no timing"
+    print(f"[vectors] {prompt['name']}: {len(new)} tokens, {rate}", file=sys.stderr, flush=True)
+
+
 def _prompt_set(tokenizer, prompts):
     if prompts == "ids" or (prompts == "auto" and tokenizer is None):
         return ID_PROMPTS
@@ -164,6 +172,7 @@ def record_transformers(model, revision, prompts, settings, device="cpu", dtype=
                     "finish": "eos" if new and new[-1] in eos_ids else "length",
                     "top_logits": top,
                     "ms_per_token": round(1000 * elapsed / max(1, len(new)), 1)})
+        _progress(prompt, new, 1000 * elapsed / max(1, len(new)))
     producer = {"kind": "transformers", **_versions(lm.device), "dtype": str(lm.dtype),
                 "dequantize": dequantize,
                 "experts_implementation": getattr(lm.config, "_experts_implementation", None)}
@@ -253,6 +262,7 @@ def record_deepseek_eager(model, revision, prompts, settings, device="cpu"):
                     "finish": "eos" if new and new[-1] in eos_ids else "length",
                     "top_logits": top,
                     "ms_per_token": round(1000 * elapsed / max(1, len(new)), 1)})
+        _progress(prompt, new, 1000 * elapsed / max(1, len(new)))
     producer = {"kind": "deepseek-eager", **_versions(device), "kernels": "aten"}
     return _document(model, revision, type("Config", (), {"model_type": ds.MODEL_TYPE})(), producer, settings, out)
 
@@ -286,6 +296,7 @@ def record_vxpu_engine(model, revision, prompts, settings, artifact, device="cpu
                     "top_logits": top,
                     "prefill_ms": stats.get("prefill_ms") if stats else None,
                     "ms_per_token": _r(stats.get("ms_per_token")) if stats else None})
+        _progress(prompt, new, stats.get("ms_per_token") if stats else None)
     with open(os.path.join(artifact, "binding.json")) as f:
         binding = json.load(f)
     producer = {"kind": "vxpu-engine", **_versions(device),
@@ -320,6 +331,7 @@ def record_vxpu_router(model, revision, prompts, settings, artifact, router=None
                         "top_logits": [],
                         "prefill_ms": getattr(stats, "prefill_ms", None),
                         "ms_per_token": _r(getattr(stats, "ms_per_token", None))})
+            _progress(prompt, new, getattr(stats, "ms_per_token", None))
     finally:
         lm.close()
     producer = {"kind": "vxpu-router", **_versions("remote"),
@@ -388,6 +400,7 @@ def record_vllm(model, revision, prompts, settings, dtype="auto",
                         completion.finish_reason, completion.finish_reason),
                     "top_logits": top,
                     "ms_per_token": round(1000 * elapsed / max(1, len(new)), 1)})
+        _progress(prompt, new, 1000 * elapsed / max(1, len(new)))
     mc = llm.llm_engine.model_config
     device = "cuda" if torch.cuda.is_available() else "cpu"
     producer = {"kind": "vllm", "vllm": vllm.__version__, **_versions(device),
