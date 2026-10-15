@@ -188,11 +188,19 @@ func TestModelImportWritesAnArtifact(t *testing.T) {
 	if w.Code != http.StatusPartialContent || w.Body.String() != "xxxx" {
 		t.Errorf("weights range via commit tag: %d %q", w.Code, w.Body.String())
 	}
-	if w := do(p, http.MethodGet, "/org/name/resolve/main/missing.bin", nil); w.Code != http.StatusNotFound {
-		t.Errorf("missing file: %d", w.Code)
-	}
-	if w := do(p, http.MethodGet, "/api/models/nobody/nothing", nil); w.Code != http.StatusNotFound {
-		t.Errorf("unknown repo: %d", w.Code)
+	// 404s carry the Hub's error codes: huggingface_hub turns them into
+	// EntryNotFoundError / RepositoryNotFoundError / RevisionNotFoundError,
+	// and transformers skips an optional file only on the first.
+	for _, c := range []struct{ path, code string }{
+		{"/org/name/resolve/main/missing.bin", "EntryNotFound"},
+		{"/org/name/resolve/nosuchrev/config.json", "RevisionNotFound"},
+		{"/nobody/nothing/resolve/main/config.json", "RepoNotFound"},
+		{"/api/models/nobody/nothing", "RepoNotFound"},
+		{"/api/models/org/name/tree/nosuchrev", "RevisionNotFound"},
+	} {
+		if w := do(p, http.MethodGet, c.path, nil); w.Code != http.StatusNotFound || w.Header().Get("X-Error-Code") != c.code {
+			t.Errorf("%s: %d %q, want 404 %s", c.path, w.Code, w.Header().Get("X-Error-Code"), c.code)
+		}
 	}
 	// Listing shows it; a second import of the same repo is allowed, a
 	// different repo under the same name is not.

@@ -222,6 +222,32 @@ func revisionOf(m *registry.Manifest) string {
 	return "main"
 }
 
+// hubNotFound answers 404 the way the Hub does. huggingface_hub reads
+// X-Error-Code to tell a missing repository (RepoNotFound) or revision
+// (RevisionNotFound) from a missing file (EntryNotFound); transformers
+// treats the last as an optional file that is absent, and anything
+// else as a server it could not reach.
+func hubNotFound(w http.ResponseWriter, code string) {
+	w.Header().Set("X-Error-Code", code)
+	http.Error(w, code, http.StatusNotFound)
+}
+
+// hubMissing is hubNotFound for a repository the registry does not
+// have at that revision: RevisionNotFound when the name has tags,
+// RepoNotFound when it has none.
+func (p *Proxy) hubMissing(ctx context.Context, w http.ResponseWriter, name string) error {
+	tags, err := p.reg.Tags(ctx, name)
+	if err != nil {
+		return err
+	}
+	if len(tags) > 0 {
+		hubNotFound(w, "RevisionNotFound")
+	} else {
+		hubNotFound(w, "RepoNotFound")
+	}
+	return nil
+}
+
 func (p *Proxy) handleHFMetadata(w http.ResponseWriter, r *http.Request) error {
 	repoID := strings.TrimPrefix(r.URL.Path, "/api/models/")
 	revision := "main"
@@ -230,13 +256,12 @@ func (p *Proxy) handleHFMetadata(w http.ResponseWriter, r *http.Request) error {
 	}
 	name, err := RepositoryName(repoID)
 	if err != nil {
-		http.NotFound(w, r)
+		hubNotFound(w, "RepoNotFound")
 		return nil
 	}
 	m, _, err := p.artifactFiles(r.Context(), name, revision)
 	if errors.Is(err, blobstore.ErrNotFound) {
-		http.NotFound(w, r)
-		return nil
+		return p.hubMissing(r.Context(), w, name)
 	}
 	if err != nil {
 		return err
@@ -288,13 +313,12 @@ func (p *Proxy) handleHFTree(w http.ResponseWriter, r *http.Request, repoID, rev
 	revision, sub, _ := strings.Cut(revAndPath, "/")
 	name, err := RepositoryName(repoID)
 	if err != nil {
-		http.NotFound(w, r)
+		hubNotFound(w, "RepoNotFound")
 		return nil
 	}
 	m, _, err := p.artifactFiles(r.Context(), name, revision)
 	if errors.Is(err, blobstore.ErrNotFound) {
-		http.NotFound(w, r)
-		return nil
+		return p.hubMissing(r.Context(), w, name)
 	}
 	if err != nil {
 		return err
@@ -321,13 +345,12 @@ func (p *Proxy) handleHFPathsInfo(w http.ResponseWriter, r *http.Request, repoID
 	}
 	name, err := RepositoryName(repoID)
 	if err != nil {
-		http.NotFound(w, r)
+		hubNotFound(w, "RepoNotFound")
 		return nil
 	}
 	m, _, err := p.artifactFiles(r.Context(), name, revision)
 	if errors.Is(err, blobstore.ErrNotFound) {
-		http.NotFound(w, r)
-		return nil
+		return p.hubMissing(r.Context(), w, name)
 	}
 	if err != nil {
 		return err
@@ -360,13 +383,12 @@ func (p *Proxy) handleHFDownload(w http.ResponseWriter, r *http.Request) error {
 	}
 	name, err := RepositoryName(repoID)
 	if err != nil {
-		http.NotFound(w, r)
+		hubNotFound(w, "RepoNotFound")
 		return nil
 	}
 	m, _, err := p.artifactFiles(r.Context(), name, revision)
 	if errors.Is(err, blobstore.ErrNotFound) {
-		http.NotFound(w, r)
-		return nil
+		return p.hubMissing(r.Context(), w, name)
 	}
 	if err != nil {
 		return err
@@ -384,7 +406,7 @@ func (p *Proxy) handleHFDownload(w http.ResponseWriter, r *http.Request) error {
 			return p.reg.ServeBlob(w, r, sha)
 		}
 	}
-	http.NotFound(w, r)
+	hubNotFound(w, "EntryNotFound")
 	return nil
 }
 
