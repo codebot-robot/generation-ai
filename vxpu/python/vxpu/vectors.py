@@ -16,9 +16,11 @@
 
 A vectors file is the interchange format between engines. Eager
 transformers records the reference; the vXPU engine (in-process, or
-through a router) and vLLM record candidates. ``compare`` diffs two files: greedy tokens must agree exactly, and
-where both sides carry logits the top-k values must agree within a
-tolerance.
+through a router) and vLLM record candidates. ``compare`` diffs two
+files: where the candidate's greedy tokens leave the reference's, the
+reference's logits at that position say whether the flip was a tie or
+a divergence, and the top-k logits of every position up to there must
+agree within a tolerance.
 
     python -m vxpu.vectors record --producer transformers --model REPO -o ref.json
     python -m vxpu.vectors record --producer vxpu-engine --model REPO --artifact DIR -o got.json
@@ -33,17 +35,18 @@ Format (vxpu-vectors/1):
      "model": {"repo": ..., "revision": ..., "commit_sha": ...},
      "producer": {"kind": "transformers" | "vxpu-engine" | "vxpu-router" | "vllm",
                   "torch": ..., "transformers": ..., "device": ..., ...},
-     "settings": {"new_tokens": 32, "top_k": 32, "logit_positions": 4,
-                  "greedy": true},
+     "settings": {"new_tokens": 32, "top_k": 32, "logit_positions": 32,
+                  "greedy": true},   # logit_positions defaults to new_tokens
      "prompts": [{"name": ..., "text": ... | "ids": [...],
                   "input_ids": [...], "generated_ids": [...],
                   "finish": "eos" | "length",
                   "top_logits": [{"ids": [...], "values": [...]}, ...],
                   "prefill_ms": ..., "ms_per_token": ...}]}
 
-Logits are stored as the top-k (id, value) pairs of the first few
-generated positions: enough to compare two engines' views of the same
-distribution, small enough to live next to a test.
+Logits are stored as the top-k (id, value) pairs of each generated
+position (``logit_positions``, every generated position unless set
+lower; a few tens of KB per prompt): they are what lets a token flip be judged as a tie or a
+divergence, and they stay useful under any later tolerance.
 """
 
 import argparse
@@ -67,7 +70,7 @@ ID_PROMPTS = [
     {"name": "ids-long", "ids": [(i * 37 + 11) % 500 + 3 for i in range(100)]},
 ]
 
-DEFAULTS = {"new_tokens": 32, "top_k": 32, "logit_positions": 4, "greedy": True}
+DEFAULTS = {"new_tokens": 32, "top_k": 32, "logit_positions": None, "greedy": True}
 FORMAT = "vxpu-vectors/1"
 
 
@@ -313,8 +316,76 @@ def _document(model, revision, config, producer, settings, prompts):
             "producer": producer, "settings": settings, "prompts": prompts}
 
 
-def compare(reference, candidate, logit_tolerance=0.025):
-    """Per prompt: tokens equal?, max top-k logit diff. Returns (rows, ok).
+def _scale(values):
+    """The scale a relative tolerance applies to at one position: the
+    largest logit magnitude in the recorded top-k, at least 1.0. Used
+    for logit diffs and for the tie set alike, so one tolerance means
+    one thing."""
+    return max(1.0, max(abs(v) for v in values))
+
+
+def tie_set(top, logit_tolerance):
+    """The ids a greedy decoder could defensibly pick at a position: every
+    token whose logit is within the tolerance of the top one, on the
+    same scale ``compare`` uses for logit diffs."""
+    if not top or not top["values"]:
+        return set()
+    best = top["values"][0]
+    allowed = logit_tolerance * _scale(top["values"])
+    return {i for i, v in zip(top["ids"], top["values"]) if best - v <= allowed}
+
+
+def _first_flip(r, p, logit_tolerance):
+    """Where the candidate's greedy tokens leave the reference's, and
+    whether the reference's logits there excuse it. None when the
+    streams are equal; else a dict with the position, the two tokens,
+    and a kind: ``tie`` (the candidate's token is in the reference's
+    tie set), ``outside`` (it is not: the reference had a clear winner
+    the candidate missed), ``unjudged`` (no reference logits at that
+    position to say), or ``length`` (one side stopped where the other
+    went on)."""
+    pos = next((i for i, (x, y) in enumerate(zip(r["generated_ids"], p["generated_ids"]))
+                if x != y), None)
+    if pos is None:
+        if len(r["generated_ids"]) == len(p["generated_ids"]):
+            return None
+        pos = min(len(r["generated_ids"]), len(p["generated_ids"]))  # one stopped early
+    flip = {"position": pos,
+            "ref_token": r["generated_ids"][pos] if pos < len(r["generated_ids"]) else None,
+            "token": p["generated_ids"][pos] if pos < len(p["generated_ids"]) else None}
+    if flip["token"] is None or flip["ref_token"] is None:
+        flip["kind"] = "length"  # one side stopped (eos) where the other went on
+        return flip
+    tops = r.get("top_logits") or []
+    if pos >= len(tops) or not tops[pos] or not tops[pos]["values"]:
+        flip["kind"] = "unjudged"  # no reference logits recorded there
+        return flip
+    top = tops[pos]
+    values = dict(zip(top["ids"], top["values"]))
+    best = top["values"][0]
+    flip["gap"] = round(best - values[flip["token"]], 6) if flip["token"] in values else None
+    flip["kind"] = "tie" if flip["token"] in tie_set(top, logit_tolerance) else "outside"
+    return flip
+
+
+def compare(reference, candidate, logit_tolerance=0.025, strict_tokens=False):
+    """Per prompt: do the greedy tokens hold up, and how far apart are the
+    top-k logits. Returns (rows, ok).
+
+    Greedy tokens are judged against the reference's *tie set*: at the
+    first position where the candidate's token differs, the reference's
+    own logits say whether that token was within the tolerance of its
+    top choice. A flip inside the tie set is a coin toss two correct
+    engines can call differently (eager transformers on a CPU and on an
+    L4 do, at a gap of one bf16 ulp) and passes; a flip outside it is a
+    divergence and fails; a flip at a position with no reference logits
+    cannot be judged and fails, which is the reason to record logits
+    for every generated position. ``strict_tokens=True`` (the CI
+    selftest: the same computation on two paths) also fails a flip
+    inside the tie set unless the logit error measured at that position
+    covers the gap the flip had to close: two paths that differ by
+    rounding may call an exact tie differently, but a flip across a gap
+    larger than their disagreement is a bug, not rounding.
 
     ``logit_tolerance`` is relative to the largest logit at that
     position (at least 1.0): softmax is shift-invariant, so what matters
@@ -343,34 +414,41 @@ def compare(reference, candidate, logit_tolerance=0.025):
             rows.append({"prompt": p["name"], "status": "no reference"})
             continue
         same_prompt = r["input_ids"] == p["input_ids"]
-        tokens_equal = r["generated_ids"] == p["generated_ids"]
-        agree = sum(a == b for a, b in zip(r["generated_ids"], p["generated_ids"]))
-        max_diff, max_rel = None, None
-        diverge = next((i for i, (x, y) in enumerate(zip(r["generated_ids"], p["generated_ids"]))
-                        if x != y), None)
-        comparable = len(r["generated_ids"]) if diverge is None else diverge + 1
+        flip = _first_flip(r, p, logit_tolerance)
+        tokens_equal = flip is None
+        max_diff, max_rel, at_flip = None, None, None
+        comparable = (len(r["generated_ids"]) if flip is None
+                      else min(flip["position"] + 1, len(r["generated_ids"])))
         if r.get("top_logits") and p.get("top_logits"):
             diffs, rels = [], []
-            for a, b in list(zip(r["top_logits"], p["top_logits"]))[:comparable]:
+            for pos, (a, b) in enumerate(list(zip(r["top_logits"], p["top_logits"]))[:comparable]):
                 av, bv = dict(zip(a["ids"], a["values"])), dict(zip(b["ids"], b["values"]))
                 a_floor, b_floor = min(a["values"]), min(b["values"])
-                scale = max(1.0, max(abs(v) for v in a["values"]))
+                scale = _scale(a["values"])
+                here = []
                 for i, v in av.items():
-                    d = abs(v - bv[i]) if i in bv else max(0.0, v - b_floor)
-                    diffs.append(d)
-                    rels.append(d / scale)
+                    here.append(abs(v - bv[i]) if i in bv else max(0.0, v - b_floor))
                 for i, v in bv.items():
                     if i not in av:
-                        d = max(0.0, v - a_floor)
-                        diffs.append(d)
-                        rels.append(d / scale)
+                        here.append(max(0.0, v - a_floor))
+                diffs.extend(here)
+                rels.extend(d / scale for d in here)
+                if flip is not None and pos == flip["position"] and here:
+                    at_flip = max(here)
             max_diff = max(diffs) if diffs else None
             max_rel = max(rels) if rels else None
-        row_ok = same_prompt and tokens_equal and (max_rel is None or max_rel <= logit_tolerance)
+        tokens_ok = tokens_equal or flip["kind"] == "tie"
+        if strict_tokens and not tokens_equal and tokens_ok:
+            # the measured error at that position must cover the gap
+            flip["explained"] = (flip.get("gap") is not None and at_flip is not None
+                                 and flip["gap"] <= at_flip + 1e-6)
+            tokens_ok = flip["explained"]
+        row_ok = same_prompt and tokens_ok and (max_rel is None or max_rel <= logit_tolerance)
         ok &= row_ok
         rows.append({"prompt": p["name"], "status": "ok" if row_ok else "DIFF",
                      "same_prompt": same_prompt, "tokens_equal": tokens_equal,
-                     "agree": f"{agree}/{max(len(r['generated_ids']), len(p['generated_ids']))}",
+                     "tokens_ok": tokens_ok, "flip": flip,
+                     "compared": f"{comparable}/{len(r['generated_ids'])}",
                      "max_logit_diff": None if max_diff is None else round(max_diff, 4),
                      "max_logit_rel": None if max_rel is None else round(max_rel, 4),
                      "ref_ms_per_token": r.get("ms_per_token"),
@@ -381,7 +459,7 @@ def compare(reference, candidate, logit_tolerance=0.025):
 def table(reference, candidate, rows):
     head = (f"{candidate['model']['repo']} @ {candidate['model']['revision']}: "
             f"{reference['producer']['kind']} vs {candidate['producer']['kind']}")
-    lines = [head, "| prompt | tokens | top-k logits max diff (abs / rel) | ms/token (ref -> candidate) |",
+    lines = [head, "| prompt | tokens (compared) | top-k logits max diff (abs / rel) | ms/token (ref -> candidate) |",
              "|---|---|---|---|"]
     for r in rows:
         if r["status"] == "no reference":
@@ -389,9 +467,23 @@ def table(reference, candidate, rows):
             continue
         logit = ("n/a" if r["max_logit_diff"] is None
                  else f"{r['max_logit_diff']} / {100 * r['max_logit_rel']:.1f}%")
-        lines.append(f"| {r['prompt']} | {'equal' if r['tokens_equal'] else 'DIFFER'} ({r['agree']}) | "
+        lines.append(f"| {r['prompt']} | {_describe_tokens(r)} ({r['compared']}) | "
                      f"{logit} | {r['ref_ms_per_token']} -> {r['ms_per_token']} |")
     return "\n".join(lines)
+
+
+def _describe_tokens(row):
+    f = row["flip"]
+    if f is None:
+        return "equal"
+    where = f"@{f['position']}"
+    if f["kind"] == "tie":
+        return f"tie flip {where}, gap {f['gap']}"
+    if f["kind"] == "outside":
+        return f"DIFFER {where}, gap {f['gap'] if f['gap'] is not None else 'beyond top-k'}"
+    if f["kind"] == "length":
+        return f"DIFFER {where}, {'candidate' if f['token'] is None else 'reference'} stopped"
+    return f"DIFFER {where}, no logits to judge"
 
 
 def _load(path):
@@ -403,8 +495,11 @@ def _load(path):
 
 
 def _settings(args):
+    # Logits for every generated position unless asked for fewer: a flip
+    # at a position without them cannot be judged.
+    positions = args.logit_positions if args.logit_positions is not None else args.new_tokens
     return {"new_tokens": args.new_tokens, "top_k": args.top_k,
-            "logit_positions": args.logit_positions, "greedy": True}
+            "logit_positions": positions, "greedy": True}
 
 
 def cmd_record(args):
@@ -438,9 +533,33 @@ def cmd_compare(args):
         raise SystemExit("vectors differ")
 
 
+def _check_compare():
+    """compare's rules on synthetic vectors: an exact tie the candidate
+    calls the other way passes strict mode when the measured logit
+    error covers the gap, and fails it when the gap is wider than the
+    paths' disagreement."""
+    def doc(kind, ids, tops):
+        return {"producer": {"kind": kind},
+                "prompts": [{"name": "p", "input_ids": [1, 2], "generated_ids": ids,
+                             "top_logits": [{"ids": list(t), "values": list(v)} for t, v in tops]}]}
+    ref = doc("a", [7, 3], [((7, 3, 5), (10.0, 10.0, 8.0)), ((3, 7, 5), (9.0, 8.0, 7.0))])
+    # same logits to within 0.001 at the tie, other token picked: rounding
+    got = doc("b", [3, 3], [((3, 7, 5), (10.0005, 10.0, 8.0)), ((3, 7, 5), (9.0, 8.0, 7.0))])
+    _, ok = compare(ref, got, strict_tokens=True)
+    assert ok, "a flip at an exact tie within the measured error must pass strict mode"
+    # the gap (0.2) is wider than any logit disagreement (0.001): not rounding
+    ref2 = doc("a", [7, 3], [((7, 3, 5), (10.0, 9.8, 8.0)), ((3, 7, 5), (9.0, 8.0, 7.0))])
+    got2 = doc("b", [3, 3], [((7, 3, 5), (10.001, 9.8, 8.0)), ((3, 7, 5), (9.0, 8.0, 7.0))])
+    rows, ok = compare(ref2, got2, strict_tokens=True)
+    assert not ok and rows[0]["flip"]["kind"] == "tie" and rows[0]["flip"]["explained"] is False
+    _, ok = compare(ref2, got2)  # the cluster tier: within the tie tolerance, passes
+    assert ok
+
+
 def selftest(workdir, settings):
     """The CI tier: tiny models through export, the in-process engine,
     and a transformers reference, token-exact. No cluster."""
+    _check_compare()
     from .export import export_artifact
     from .fixtures import tiny_fp8_moe
     models = [
@@ -461,7 +580,7 @@ def selftest(workdir, settings):
         for label, doc in (("reference", ref), ("candidate", got)):
             with open(os.path.join(workdir, f"{name}-{label}.json"), "w") as f:
                 json.dump(doc, f, indent=1)
-        rows, ok = compare(ref, got)
+        rows, ok = compare(ref, got, strict_tokens=True)
         print(table(ref, got, rows))
         if not ok:
             failed.append(name)
@@ -477,7 +596,8 @@ def main(argv=None):
     def common(p):
         p.add_argument("--new-tokens", type=int, default=DEFAULTS["new_tokens"])
         p.add_argument("--top-k", type=int, default=DEFAULTS["top_k"])
-        p.add_argument("--logit-positions", type=int, default=DEFAULTS["logit_positions"])
+        p.add_argument("--logit-positions", type=int, default=None,
+                       help="positions to record top-k logits for (default: all of --new-tokens)")
 
     rec = sub.add_parser("record", help="record vectors with a producer")
     rec.add_argument("--producer", choices=["transformers", "vxpu-engine", "vxpu-router", "vllm"], required=True)
