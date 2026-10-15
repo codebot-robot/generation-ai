@@ -53,6 +53,8 @@ func TestE2E(t *testing.T) {
 	}
 	msManifest := string(msb)
 	msManifest = strings.ReplaceAll(msManifest, "image: modelstore:latest", "image: modelstore:e2e\n          imagePullPolicy: Never")
+	// No GCS in kind: blobs go to a directory in the container.
+	msManifest = strings.ReplaceAll(msManifest, "--blob-store=gs://BUCKET", "--blob-store=/tmp/blobs")
 
 	// Read manifest and replace placeholders
 	manifestPath := filepath.Join(experimentRoot, "k8s/manifest.yaml")
@@ -87,7 +89,7 @@ func TestE2E(t *testing.T) {
 	h.DeleteJob("finetuning-client", "default")
 	h.DeleteDeployment("finetuning-server", "default")
 	h.DeleteService("finetuning-server", "default")
-	h.DeleteStatefulSet("modelstore", "modelstore")
+	h.DeleteDeployment("modelstore", "modelstore")
 	h.DeleteService("modelstore", "modelstore")
 
 	// Apply modelstore CRD
@@ -101,7 +103,7 @@ func TestE2E(t *testing.T) {
 	h.KubectlApplyContent("modelstore", msManifest)
 
 	// Wait for modelstore
-	if err := h.WaitForStatefulSet("modelstore", "modelstore", 2*time.Minute); err != nil {
+	if err := h.WaitForDeployment("modelstore", "modelstore", 2*time.Minute); err != nil {
 		fmt.Fprintf(os.Stderr, "Modelstore failed to start: %v\n", err)
 		fmt.Fprintf(os.Stderr, "Modelstore Pod YAML:\n%s\n", h.GetPodYaml("app=modelstore", "modelstore"))
 		fmt.Fprintf(os.Stderr, "Events:\n%s\n", h.GetEvents("modelstore"))
