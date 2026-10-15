@@ -170,6 +170,24 @@ def record_transformers(model, revision, prompts, settings, device="cpu", dtype=
     return _document(model, revision, lm.config, producer, settings, out)
 
 
+def _download(url, dest, size=None):
+    """Stream url to dest (resumes nothing; a complete file of the
+    expected size is kept). Sends the Hub token when one is configured."""
+    import requests
+    from huggingface_hub.utils import build_hf_headers
+    if size is not None and os.path.exists(dest) and os.path.getsize(dest) == size:
+        return dest
+    os.makedirs(os.path.dirname(dest), exist_ok=True)
+    part = dest + ".part"
+    with requests.get(url, headers=build_hf_headers(), stream=True, timeout=(30, 600)) as r:
+        r.raise_for_status()
+        with open(part, "wb") as f:
+            for chunk in r.iter_content(chunk_size=8 << 20):
+                f.write(chunk)
+    os.replace(part, dest)
+    return dest
+
+
 def record_deepseek_eager(model, revision, prompts, settings, device="cpu"):
     """Reference for a deepseek_v41 checkpoint: the model maker's module
     from the fork, run eagerly with the plain-aten kernels on the CPU (no
@@ -186,20 +204,34 @@ def record_deepseek_eager(model, revision, prompts, settings, device="cpu"):
     args = ds.model_args(model, settings.get("max_cache_len", 1024))
     with ds.bf16_default():
         lm = fork.Transformer(args, tokenizer).eval()
-    # Load shard by shard into the module (local directory or Hub cache):
-    # the checkpoint never coexists with the parameters in memory, so a
-    # 510 GB model needs ~510 GB, not twice that.
-    for ref in sorted(manifest["files"].values(), key=lambda r: r["name"]):
-        path = ref["source"][len("file://"):] if ref["source"].startswith("file://") else None
-        if path is None:
-            from huggingface_hub import hf_hub_download
-            path = hf_hub_download(model, ref["name"], revision=revision)
-        shard = load_file(path)
-        _, unexpected = lm.load_state_dict(shard, strict=False)
-        unexpected = [u for u in unexpected if not u.startswith(("mtp.", "vision.", "aligner.", "image_"))]
-        if unexpected:
-            raise RuntimeError(f"checkpoint tensors the module did not take: {unexpected[:5]}")
-        del shard
+    # Load shard by shard into the module: the checkpoint never coexists
+    # with the parameters in memory, so a 510 GB model needs ~510 GB, not
+    # twice that. Remote shards are streamed a few at a time ahead of the
+    # loader and deleted once loaded (hf_hub_download refuses files over
+    # 50 GB without its xet client, and the engram shards are ~100 GB).
+    from concurrent.futures import ThreadPoolExecutor
+    from huggingface_hub import hf_hub_url
+    cache = os.path.join(os.environ.get("VXPU_SHARD_CACHE", os.path.join(tempfile.gettempdir(), "vxpu-shards")),
+                         model.replace("/", "--"))
+
+    def fetch(ref):
+        if ref["source"].startswith("file://"):
+            return ref["source"][len("file://"):], False
+        return _download(hf_hub_url(model, ref["name"], revision=revision),
+                         os.path.join(cache, ref["name"]), ref.get("size")), True
+
+    with ThreadPoolExecutor(max_workers=4) as pool:
+        futures = [pool.submit(fetch, ref) for ref in sorted(manifest["files"].values(), key=lambda r: r["name"])]
+        for fut in futures:
+            path, fetched = fut.result()
+            shard = load_file(path)
+            _, unexpected = lm.load_state_dict(shard, strict=False)
+            unexpected = [u for u in unexpected if not u.startswith(("mtp.", "vision.", "aligner.", "image_"))]
+            if unexpected:
+                raise RuntimeError(f"checkpoint tensors the module did not take: {unexpected[:5]}")
+            del shard
+            if fetched:
+                os.remove(path)
     eos_ids = {tokenizer.eos_token_id} if tokenizer.eos_token_id is not None else set()
     out = []
     for prompt in _prompt_set(tok, prompts):
