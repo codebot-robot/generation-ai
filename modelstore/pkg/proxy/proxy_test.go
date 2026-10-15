@@ -298,6 +298,10 @@ func TestMainReadsLatest(t *testing.T) {
 	if w.Code != 200 || !strings.Contains(w.Body.String(), `"config.json"`) {
 		t.Errorf("tree at main: %d %s", w.Code, w.Body.String())
 	}
+	w = do(p, http.MethodGet, "/api/models/opt-125m/revision/main", nil)
+	if w.Code != 200 || !strings.Contains(w.Body.String(), `"sha256":"c30559e07871356681c6f76200d795084b1b523a6d5ed4935c94297da8f5850e"`) {
+		t.Errorf("model info carries each file's sha256: %d %s", w.Code, w.Body.String())
+	}
 	w = do(p, http.MethodGet, "/opt-125m/resolve/main/config.json", nil)
 	if w.Code != 200 || w.Body.String() != cfg {
 		t.Errorf("resolve at main: %d %q", w.Code, w.Body.String())

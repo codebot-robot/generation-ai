@@ -272,9 +272,14 @@ func (p *Proxy) handleHFMetadata(w http.ResponseWriter, r *http.Request) error {
 	if err != nil {
 		return err
 	}
+	// Every file is reported as an LFS file whose sha256 is its blob
+	// digest (what the Hub does for weights, and what model_info(
+	// files_metadata=True) callers such as vxpu's manifest builder read).
 	siblings := make([]map[string]any, 0, len(m.Layers))
 	for _, l := range m.Layers {
-		s := map[string]any{"rfilename": l.Annotations[registry.AnnotationTitle], "size": l.Size}
+		sha, _ := registry.ParseDigest(l.Digest)
+		s := map[string]any{"rfilename": l.Annotations[registry.AnnotationTitle], "size": l.Size, "blobId": sha,
+			"lfs": map[string]any{"sha256": sha, "size": l.Size, "pointerSize": 134}}
 		siblings = append(siblings, s)
 	}
 	resp := map[string]any{"modelId": repoID, "id": repoID, "siblings": siblings, "sha": revisionOf(m)}
