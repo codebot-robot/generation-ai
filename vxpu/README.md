@@ -224,7 +224,9 @@ scales, per-expert tensors, an unquantized lm_head), the tiny random
 Llama, and a random Qwen4 hybrid (`vxpu.fixtures.tiny_qwen4`: Gated
 DeltaNet linear attention, indexed attention, n-gram embedding, MoE),
 each exported, run on the in-process engine, and required to be
-token-exact against transformers. The cluster tier is the same commands
+token-exact against transformers (a flip is excused only when the logit
+error measured at that position covers its gap: an exact tie that two
+rounding paths call differently). The cluster tier is the same commands
 against the real models on the c3d CPU node (the 30B through the router
 on the RTX PRO 6000, tokens only). Latest run:
 

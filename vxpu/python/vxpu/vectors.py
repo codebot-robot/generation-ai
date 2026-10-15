@@ -363,7 +363,7 @@ def _first_flip(r, p, logit_tolerance):
     top = tops[pos]
     values = dict(zip(top["ids"], top["values"]))
     best = top["values"][0]
-    flip["gap"] = round(best - values[flip["token"]], 4) if flip["token"] in values else None
+    flip["gap"] = round(best - values[flip["token"]], 6) if flip["token"] in values else None
     flip["kind"] = "tie" if flip["token"] in tie_set(top, logit_tolerance) else "outside"
     return flip
 
@@ -380,9 +380,12 @@ def compare(reference, candidate, logit_tolerance=0.025, strict_tokens=False):
     L4 do, at a gap of one bf16 ulp) and passes; a flip outside it is a
     divergence and fails; a flip at a position with no reference logits
     cannot be judged and fails, which is the reason to record logits
-    for every generated position. ``strict_tokens=True`` fails any flip
-    (the CI selftest: same computation in-process, no ties expected to
-    fall differently).
+    for every generated position. ``strict_tokens=True`` (the CI
+    selftest: the same computation on two paths) also fails a flip
+    inside the tie set unless the logit error measured at that position
+    covers the gap the flip had to close: two paths that differ by
+    rounding may call an exact tie differently, but a flip across a gap
+    larger than their disagreement is a bug, not rounding.
 
     ``logit_tolerance`` is relative to the largest logit at that
     position (at least 1.0): softmax is shift-invariant, so what matters
@@ -413,27 +416,33 @@ def compare(reference, candidate, logit_tolerance=0.025, strict_tokens=False):
         same_prompt = r["input_ids"] == p["input_ids"]
         flip = _first_flip(r, p, logit_tolerance)
         tokens_equal = flip is None
-        tokens_ok = tokens_equal or (flip["kind"] == "tie" and not strict_tokens)
-        max_diff, max_rel = None, None
+        max_diff, max_rel, at_flip = None, None, None
         comparable = (len(r["generated_ids"]) if flip is None
                       else min(flip["position"] + 1, len(r["generated_ids"])))
         if r.get("top_logits") and p.get("top_logits"):
             diffs, rels = [], []
-            for a, b in list(zip(r["top_logits"], p["top_logits"]))[:comparable]:
+            for pos, (a, b) in enumerate(list(zip(r["top_logits"], p["top_logits"]))[:comparable]):
                 av, bv = dict(zip(a["ids"], a["values"])), dict(zip(b["ids"], b["values"]))
                 a_floor, b_floor = min(a["values"]), min(b["values"])
                 scale = _scale(a["values"])
+                here = []
                 for i, v in av.items():
-                    d = abs(v - bv[i]) if i in bv else max(0.0, v - b_floor)
-                    diffs.append(d)
-                    rels.append(d / scale)
+                    here.append(abs(v - bv[i]) if i in bv else max(0.0, v - b_floor))
                 for i, v in bv.items():
                     if i not in av:
-                        d = max(0.0, v - a_floor)
-                        diffs.append(d)
-                        rels.append(d / scale)
+                        here.append(max(0.0, v - a_floor))
+                diffs.extend(here)
+                rels.extend(d / scale for d in here)
+                if flip is not None and pos == flip["position"] and here:
+                    at_flip = max(here)
             max_diff = max(diffs) if diffs else None
             max_rel = max(rels) if rels else None
+        tokens_ok = tokens_equal or flip["kind"] == "tie"
+        if strict_tokens and not tokens_equal and tokens_ok:
+            # the measured error at that position must cover the gap
+            flip["explained"] = (flip.get("gap") is not None and at_flip is not None
+                                 and flip["gap"] <= at_flip + 1e-6)
+            tokens_ok = flip["explained"]
         row_ok = same_prompt and tokens_ok and (max_rel is None or max_rel <= logit_tolerance)
         ok &= row_ok
         rows.append({"prompt": p["name"], "status": "ok" if row_ok else "DIFF",
@@ -524,9 +533,33 @@ def cmd_compare(args):
         raise SystemExit("vectors differ")
 
 
+def _check_compare():
+    """compare's rules on synthetic vectors: an exact tie the candidate
+    calls the other way passes strict mode when the measured logit
+    error covers the gap, and fails it when the gap is wider than the
+    paths' disagreement."""
+    def doc(kind, ids, tops):
+        return {"producer": {"kind": kind},
+                "prompts": [{"name": "p", "input_ids": [1, 2], "generated_ids": ids,
+                             "top_logits": [{"ids": list(t), "values": list(v)} for t, v in tops]}]}
+    ref = doc("a", [7, 3], [((7, 3, 5), (10.0, 10.0, 8.0)), ((3, 7, 5), (9.0, 8.0, 7.0))])
+    # same logits to within 0.001 at the tie, other token picked: rounding
+    got = doc("b", [3, 3], [((3, 7, 5), (10.0005, 10.0, 8.0)), ((3, 7, 5), (9.0, 8.0, 7.0))])
+    _, ok = compare(ref, got, strict_tokens=True)
+    assert ok, "a flip at an exact tie within the measured error must pass strict mode"
+    # the gap (0.2) is wider than any logit disagreement (0.001): not rounding
+    ref2 = doc("a", [7, 3], [((7, 3, 5), (10.0, 9.8, 8.0)), ((3, 7, 5), (9.0, 8.0, 7.0))])
+    got2 = doc("b", [3, 3], [((7, 3, 5), (10.001, 9.8, 8.0)), ((3, 7, 5), (9.0, 8.0, 7.0))])
+    rows, ok = compare(ref2, got2, strict_tokens=True)
+    assert not ok and rows[0]["flip"]["kind"] == "tie" and rows[0]["flip"]["explained"] is False
+    _, ok = compare(ref2, got2)  # the cluster tier: within the tie tolerance, passes
+    assert ok
+
+
 def selftest(workdir, settings):
     """The CI tier: tiny models through export, the in-process engine,
     and a transformers reference, token-exact. No cluster."""
+    _check_compare()
     from .export import export_artifact
     from .fixtures import tiny_fp8_moe
     models = [
