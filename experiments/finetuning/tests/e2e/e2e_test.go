@@ -92,14 +92,6 @@ func TestE2E(t *testing.T) {
 	h.DeleteDeployment("modelstore", "modelstore")
 	h.DeleteService("modelstore", "modelstore")
 
-	// Apply modelstore CRD
-	crdPath := filepath.Join(modelstoreRoot, "k8s/crds/generationai.labs.gke.io_models.yaml")
-	crdb, err := os.ReadFile(crdPath)
-	if err != nil {
-		t.Fatalf("Failed to read modelstore CRD: %v", err)
-	}
-	h.KubectlApplyContent("modelstore-crd", string(crdb))
-
 	h.KubectlApplyContent("modelstore", msManifest)
 
 	// Wait for modelstore
