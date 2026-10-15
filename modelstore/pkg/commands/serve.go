@@ -18,9 +18,10 @@ import (
 	"context"
 	"fmt"
 	"net/http"
-	"os"
 
 	"github.com/gke-labs/generation-ai/modelstore/apis/v1alpha1"
+	"github.com/gke-labs/generation-ai/modelstore/pkg/blobstore"
+	"github.com/gke-labs/generation-ai/modelstore/pkg/importer"
 	"github.com/gke-labs/generation-ai/modelstore/pkg/proxy"
 	"github.com/spf13/cobra"
 	"k8s.io/apimachinery/pkg/runtime"
@@ -30,13 +31,18 @@ import (
 )
 
 type ServeOptions struct {
-	Port     string
-	CacheDir string
+	Port string
+	// BlobStore is where blobs live: a gs://bucket[/prefix] URL or a
+	// local directory.
+	BlobStore string
+	// HFEndpoint is the Hugging Face Hub to import from.
+	HFEndpoint string
 }
 
 func (o *ServeOptions) InitDefaults() {
 	o.Port = "8080"
-	o.CacheDir = "/cache"
+	o.BlobStore = "/cache"
+	o.HFEndpoint = "https://huggingface.co"
 }
 
 func BuildServeCommand() *cobra.Command {
@@ -52,15 +58,23 @@ func BuildServeCommand() *cobra.Command {
 	}
 
 	cmd.Flags().StringVar(&opt.Port, "port", opt.Port, "Port to listen on")
-	cmd.Flags().StringVar(&opt.CacheDir, "cache-dir", opt.CacheDir, "Directory to store cached models")
+	cmd.Flags().StringVar(&opt.BlobStore, "blob-store", opt.BlobStore,
+		"Where blobs are stored: a gs://bucket[/prefix] URL (application default credentials) or a local directory")
+	cmd.Flags().StringVar(&opt.BlobStore, "cache-dir", opt.BlobStore, "Deprecated alias for --blob-store")
+	cmd.Flags().StringVar(&opt.HFEndpoint, "hf-endpoint", opt.HFEndpoint,
+		"Hugging Face Hub to import from (HF_TOKEN in the environment is sent for gated repositories)")
+	if err := cmd.Flags().MarkDeprecated("cache-dir", "use --blob-store"); err != nil {
+		panic(err) // a typo in the flag name above, caught at startup
+	}
 
 	return cmd
 }
 
 func RunServe(ctx context.Context, opt *ServeOptions) error {
 	log := klog.FromContext(ctx)
-	if err := os.MkdirAll(opt.CacheDir, 0755); err != nil {
-		return fmt.Errorf("failed to create cache directory: %w", err)
+	store, err := blobstore.Open(ctx, opt.BlobStore)
+	if err != nil {
+		return fmt.Errorf("opening blob store %s: %w", opt.BlobStore, err)
 	}
 
 	scheme := runtime.NewScheme()
@@ -78,13 +92,12 @@ func RunServe(ctx context.Context, opt *ServeOptions) error {
 		return fmt.Errorf("failed to create kubernetes client: %w", err)
 	}
 
-	// For now we still use NewProxy but we will clean up its implementation
-	p, err := proxy.NewProxy("", opt.CacheDir, kube)
-	if err != nil {
-		return fmt.Errorf("failed to create proxy: %w", err)
+	p := proxy.NewProxy(store, importer.New(store, opt.HFEndpoint), kube)
+	if err := p.Resume(ctx); err != nil {
+		return fmt.Errorf("resuming interrupted imports: %w", err)
 	}
 
-	log.Info("Starting modelstore", "port", opt.Port, "cacheDir", opt.CacheDir)
+	log.Info("Starting modelstore", "port", opt.Port, "blobStore", store.String(), "hfEndpoint", opt.HFEndpoint)
 
 	server := &http.Server{
 		Addr:    ":" + opt.Port,
