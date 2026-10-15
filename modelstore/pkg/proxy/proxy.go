@@ -186,6 +186,12 @@ func RepositoryName(repoID string) (string, error) {
 // whose artifactType is the weights one (or the first manifest).
 func (p *Proxy) artifactFiles(ctx context.Context, name, ref string) (*registry.Manifest, string, error) {
 	body, mediaType, digest, err := p.reg.GetManifest(ctx, name, ref)
+	if errors.Is(err, blobstore.ErrNotFound) && ref == "main" {
+		// Hub clients ask for the default branch, "main"; registry
+		// pushes (modelstore upload, oras, docker) tag "latest" by
+		// default. A name with no "main" answers for its "latest".
+		body, mediaType, digest, err = p.reg.GetManifest(ctx, name, "latest")
+	}
 	if err != nil {
 		return nil, "", err
 	}

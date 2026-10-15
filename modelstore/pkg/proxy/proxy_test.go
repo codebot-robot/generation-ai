@@ -275,3 +275,34 @@ func TestModelImportEscapesFileNames(t *testing.T) {
 		t.Errorf("escaped file: %d %q", w.Code, w.Body.String())
 	}
 }
+
+// A model pushed the registry way (tag "latest", as modelstore upload
+// does) is readable through the Hub facade at "main", which is what
+// transformers asks for when no revision is given.
+func TestMainReadsLatest(t *testing.T) {
+	p := newTestProxy(t, "http://unused.invalid")
+	cfg := `{"model_type": "opt"}`
+	if w := do(p, http.MethodPut, "/blobs/c30559e07871356681c6f76200d795084b1b523a6d5ed4935c94297da8f5850e", strings.NewReader(cfg)); w.Code != http.StatusCreated {
+		t.Fatalf("blob put: %d %s", w.Code, w.Body.String())
+	}
+	manifest := `{"schemaVersion":2,"mediaType":"application/vnd.oci.image.manifest.v1+json",` +
+		`"artifactType":"application/vnd.gke-labs.model.weights.v1+json",` +
+		`"config":{"mediaType":"application/vnd.oci.empty.v1+json","digest":"sha256:44136fa355b3678a1146ad16f7e8649e94fb4fc21fe77e8310c060f61caaff8a","size":2},` +
+		`"layers":[{"mediaType":"application/vnd.gke-labs.model.file.v1","digest":"sha256:c30559e07871356681c6f76200d795084b1b523a6d5ed4935c94297da8f5850e","size":21,` +
+		`"annotations":{"org.opencontainers.image.title":"config.json"}}]}`
+	w := do(p, http.MethodPut, "/v2/opt-125m/manifests/latest", strings.NewReader(manifest), "Content-Type", "application/vnd.oci.image.manifest.v1+json")
+	if w.Code != http.StatusCreated {
+		t.Fatalf("manifest put: %d %s", w.Code, w.Body.String())
+	}
+	w = do(p, http.MethodGet, "/api/models/opt-125m/tree/main", nil)
+	if w.Code != 200 || !strings.Contains(w.Body.String(), `"config.json"`) {
+		t.Errorf("tree at main: %d %s", w.Code, w.Body.String())
+	}
+	w = do(p, http.MethodGet, "/opt-125m/resolve/main/config.json", nil)
+	if w.Code != 200 || w.Body.String() != cfg {
+		t.Errorf("resolve at main: %d %q", w.Code, w.Body.String())
+	}
+	if w := do(p, http.MethodGet, "/opt-125m/resolve/v2/config.json", nil); w.Code != http.StatusNotFound || w.Header().Get("X-Error-Code") != "RevisionNotFound" {
+		t.Errorf("other revisions do not fall back: %d %s", w.Code, w.Header().Get("X-Error-Code"))
+	}
+}

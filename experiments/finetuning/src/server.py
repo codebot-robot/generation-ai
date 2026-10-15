@@ -79,8 +79,9 @@ def download_from_modelstore(model_id, modelstore_url, local_dir, log_queue):
 
 def push_to_modelstore(model_dir, model_id, log_queue, modelstore_url=os.getenv("MODELSTORE_URL", "http://modelstore.modelstore")):
     """Pushes a directory to modelstore as an OCI artifact tagged
-    <model_id>:main: every file becomes a blob, the manifest lists them
-    by name (the same layout `modelstore upload` writes)."""
+    <model_id>:latest: every file becomes a blob, the manifest lists them
+    by name (the same layout and tag `modelstore upload` writes; the Hub
+    facade reads it back as revision main)."""
     log_queue.put(f"Pushing fine-tuned model to modelstore at {modelstore_url}...")
     base = modelstore_url.rstrip("/")
 
@@ -129,12 +130,12 @@ def push_to_modelstore(model_dir, model_id, log_queue, modelstore_url=os.getenv(
                        "digest": f"sha256:{empty_sha}", "size": len(EMPTY_CONFIG_JSON)},
             "layers": layers,
         }
-        resp = requests.put(f"{base}/v2/{model_id}/manifests/main", data=json.dumps(manifest),
+        resp = requests.put(f"{base}/v2/{model_id}/manifests/latest", data=json.dumps(manifest),
                             headers={"Content-Type": "application/vnd.oci.image.manifest.v1+json"}, timeout=60)
         if resp.status_code not in (200, 201):
             log_queue.put(f"Failed to register model {model_id}: {resp.status_code} {resp.reason} {resp.text[:200]}")
         else:
-            log_queue.put(f"Model {model_id} registered successfully as {model_id}:main.")
+            log_queue.put(f"Model {model_id} registered successfully as {model_id}:latest.")
     except Exception as e:
         log_queue.put(f"Error registering model {model_id}: {str(e)}")
 
