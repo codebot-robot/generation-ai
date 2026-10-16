@@ -34,6 +34,7 @@ has a dynamic sequence dimension and explicit cache positions, so a
 follow-up turn prefills only the tokens beyond the cached prefix.
 """
 
+import hashlib
 import json
 import os
 import threading
@@ -41,6 +42,7 @@ import time
 
 import torch
 
+from . import ops  # noqa: F401  (registers vxpu::* before a graph that calls them is loaded)
 from .rehydrate import (derived_tensor, fetch_stacked, fetch_tensor,
                         load_program, share_state, strip_asserts)
 
@@ -80,7 +82,7 @@ def _has_tokenizer_files(repo):
 
 class Engine:
     def __init__(self, artifact_dir, device="cpu", compile_decode=False,
-                 cas_dir=None):
+                 cas_dir=None, external_dir=None):
         from transformers import AutoTokenizer
         from transformers.models.auto.configuration_auto import (
             CONFIG_MAPPING)
@@ -88,6 +90,11 @@ class Engine:
         self.artifact_dir = artifact_dir
         self.device = device
         self.compile_decode = compile_decode
+        # Where the tensors the graphs call out for (expert banks, n-gram
+        # tables) are placed: None keeps them in host memory; a directory
+        # (local SSD) memory-maps them from files there, the page cache
+        # being the RAM tier. VXPU_EXTERNAL_DIR sets it for the executor.
+        self.external_dir = external_dir or os.environ.get("VXPU_EXTERNAL_DIR") or None
         with open(os.path.join(artifact_dir, "manifest.json")) as f:
             self.manifest = json.load(f)
         with open(os.path.join(artifact_dir, "binding.json")) as f:
@@ -166,15 +173,22 @@ class Engine:
                 spec, self.manifest["tensors"], self.manifest["files"], cas_dir)
             self.shared[fqn] = tensor.to(device)
             self.bytes_fetched += downloaded
+        # What the graphs call out for (ops.py), owned here: it is freed
+        # with the engine and seen by the ops only while this engine runs
+        # a graph (external_scope).
+        self.external = ops.External()
+        if self.binding.get("external"):
+            self._bind_external(self.binding["external"], cas_dir)
         for fqn in self.binding["derived"]:
             self.shared[fqn] = derived_tensor(
                 fqn, probe_meta[fqn], self.config).to(device)
-        # Lifted but unused by the graph (other towers' tables): any
-        # tensor of the right shape and dtype; nothing is fetched.
+        # Lifted but unused by the graph (other towers' tables, and the
+        # banks the graph calls out for instead of reading): the graph
+        # never touches them, so an empty tensor of the dtype stands in.
+        # Full-size zeros would be 272 GB for DeepSeek's expert banks.
         for fqn in self.binding.get("unused", []):
             meta = probe_meta[fqn]
-            self.shared[fqn] = torch.zeros(meta.shape, dtype=meta.dtype,
-                                           device=device)
+            self.shared[fqn] = torch.empty(0, dtype=meta.dtype, device=device)
         self.state_specs = {
             fqn: (probe_meta[fqn].shape, probe_meta[fqn].dtype)
             for fqn in self.binding["state"]}
@@ -188,6 +202,44 @@ class Engine:
         self._next_id = 0
         self._lock = threading.Lock()
         self._build()
+
+    def _bind_external(self, external, cas_dir):
+        """Tensors the graphs call out for (ops.py): the expert banks and
+        the n-gram tables. They stay on the host, assembled as the model's
+        own modules so the fork's code computes on them; the graphs, on
+        whatever device they run, reach them through the ops. A device
+        copy of 272 GB of experts is exactly what this avoids."""
+        from . import deepseek_v41 as ds
+        from . import ops
+        args = ds.model_args(self.manifest["source"]["repo"], self.max_cache_len)
+        mm = self.external_dir
+        if mm:
+            # files are keyed by the model's manifest so two artifacts of
+            # one checkpoint share them and another checkpoint cannot
+            mm = os.path.join(mm, hashlib.sha256(json.dumps(
+                self.manifest["source"], sort_keys=True).encode()).hexdigest()[:16])
+        for layer, specs in external.get("experts", {}).items():
+            banks = {}
+            for name, spec in specs.items():
+                tensor, downloaded = fetch_stacked(
+                    spec, self.manifest["tensors"], self.manifest["files"], cas_dir,
+                    mmap_path=os.path.join(mm, f"experts.{layer}.{name}") if mm else None)
+                banks[name] = tensor
+                self.bytes_fetched += downloaded
+            self.external.experts[int(layer)] = ds.host_experts(int(layer), args, banks)
+        for layer, spec in external.get("engram", {}).items():
+            weight, downloaded = fetch_tensor(self.manifest["tensors"][spec["weight"]], self.manifest["files"], cas_dir, mmap_dir=mm)
+            self.bytes_fetched += downloaded
+            scale, downloaded = fetch_tensor(self.manifest["tensors"][spec["scale"]], self.manifest["files"], cas_dir, mmap_dir=mm)
+            self.bytes_fetched += downloaded
+            self.external.engram[int(layer)] = ds.host_engram(int(layer), spec["num_embeddings"], spec["dim"], weight, scale)
+            ops.ENGRAM_DIM[int(layer)] = spec["dim"]
+
+    def external_scope(self):
+        """The context in which this engine's graphs must run: the ops
+        answer from this engine's external tensors. generate() enters it;
+        a caller invoking the programs directly (a per-layer probe) must."""
+        return ops.bound(self.external)
 
     def _generation_config(self):
         """The model's generation_config.json as a dict (may be empty).
@@ -386,6 +438,12 @@ class Engine:
 
     def _generate_locked(self, session, ids, max_new_tokens, params,
                          extra_eos_ids=(), logits_sink=None):
+        with self.external_scope():
+            yield from self._generate_scoped(session, ids, max_new_tokens, params,
+                                             extra_eos_ids, logits_sink)
+
+    def _generate_scoped(self, session, ids, max_new_tokens, params,
+                         extra_eos_ids, logits_sink):
         self._bind(session["state"])
         total_len = len(ids)
         if total_len == 0:

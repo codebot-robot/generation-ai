@@ -95,13 +95,31 @@ def _read_range(url, offset, length, into):
         raise RuntimeError(f"expected {length} bytes, got {got} bytes")
 
 
-def fetch_tensor(ref, files, cas_dir=None):
+def file_backed(path, length):
+    """A uint8 tensor of `length` bytes whose storage is the file at
+    `path`, memory-mapped shared: writes land in the page cache and reach
+    the file, reads come from the page cache or the disk. A tensor placed
+    this way costs no committed memory; the kernel keeps the hot pages
+    resident and evicts the rest, which is the RAM-over-SSD tier of
+    hierarchical placement. A complete file of the right size is reused."""
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+    fresh = not (os.path.exists(path) and os.path.getsize(path) == length)
+    if fresh:
+        with open(path, "wb") as f:
+            f.truncate(length)
+    return torch.from_file(path, shared=True, size=length, dtype=torch.uint8), fresh
+
+
+def fetch_tensor(ref, files, cas_dir=None, mmap_dir=None):
     """One tensor, read by range into a buffer allocated once.
 
     Large tensors are read as several concurrent ranges of the same
     buffer. With cas_dir set, bytes are also kept on disk under a
     content-derived key (for persistent volumes); warm reloads otherwise
-    come from the engine keep-alive (digest reuse).
+    come from the engine keep-alive (digest reuse). With mmap_dir set,
+    the buffer itself is a file there (see file_backed): the tensor is
+    memory-mapped rather than held, and a file already complete from an
+    earlier load is used without fetching.
 
     Returns (tensor, bytes_downloaded); 0 when served from the cache.
     """
@@ -109,7 +127,12 @@ def fetch_tensor(ref, files, cas_dir=None):
     length = ref["length"]
     key = hashlib.sha256(f"{ref['file_sha256']}:{ref['offset']}:{length}".encode()).hexdigest()
     path = os.path.join(cas_dir, key) if cas_dir else None
-    buf = torch.empty(length, dtype=torch.uint8)
+    if mmap_dir:
+        buf, fresh = file_backed(os.path.join(mmap_dir, key), length)
+        if not fresh:
+            return buf.view(DTYPES[ref["dtype"]]).view(ref["shape"]), 0
+    else:
+        buf = torch.empty(length, dtype=torch.uint8)
     view = memoryview(buf.numpy())
     downloaded = 0
     if path is not None and os.path.exists(path):
@@ -136,7 +159,7 @@ def fetch_tensor(ref, files, cas_dir=None):
     return tensor, downloaded
 
 
-def fetch_stacked(spec, manifest_tensors, files, cas_dir=None, workers=16):
+def fetch_stacked(spec, manifest_tensors, files, cas_dir=None, workers=16, mmap_path=None):
     """Assemble a parameter from several checkpoint tensors.
 
     ``spec["parts"]`` is a list of rows; each row is a list of manifest
@@ -158,7 +181,19 @@ def fetch_stacked(spec, manifest_tensors, files, cas_dir=None, workers=16):
     row_shape = list(first["shape"])
     row_shape[cat_dim] = sum(manifest_tensors[n]["shape"][cat_dim] for n in rows[0])
     out_shape = ([len(rows)] if stack else []) + row_shape
-    out = torch.empty(out_shape, dtype=DTYPES[first["dtype"]])
+    dtype = DTYPES[first["dtype"]]
+    if mmap_path:
+        # the bank lives in a file (see file_backed): assembled once,
+        # memory-mapped on every load after
+        nbytes = torch.empty(0, dtype=dtype).element_size()
+        for d in out_shape:
+            nbytes *= d
+        buf, fresh = file_backed(mmap_path, nbytes)
+        out = buf.view(dtype).view(out_shape)
+        if not fresh:
+            return out, 0
+    else:
+        out = torch.empty(out_shape, dtype=dtype)
 
     # (row, offset, name) in assembly order; fetched through a bounded
     # window so at most `workers` parts are in flight (a sharded 50 GB

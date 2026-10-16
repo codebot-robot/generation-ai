@@ -73,7 +73,9 @@ def write(out_dir, seed=0):
     for name, p in model.named_parameters():
         if name.endswith("_scale") and name.split(".")[-1] in ("hc_attn_scale", "hc_ffn_scale"):
             tensors[name] = torch.ones(p.shape)
-        elif p.dtype == torch.float4_e2m1fn_x2:  # a bank: per-expert int8-packed rows
+        elif p.dtype == torch.float4_e2m1fn_x2 or (p.dtype == torch.uint8 and p.dim() == 3):
+            # an expert bank (the fork keeps it as uint8 bytes; torch.export cannot serialize
+            # fp4): the checkpoint stores per-expert int8-packed fp4 rows
             e, out, half = p.shape
             vals = ka._to_fp4_rounded(rand(e, out, half * 2, scale=1.0).clamp(-6, 6))
             packed = ka.pack_fp4(vals).view(torch.int8)

@@ -139,11 +139,96 @@ def checkpoint_view(model, manifest_tensors):
     return direct, merged
 
 
+def set_external(model, on):
+    """Route the expert evaluation and the n-gram lookups of every layer
+    through the vxpu ops (see ops.py), or back to the module's own paths.
+    The exporter traces with them on, so the graphs carry calls instead of
+    the banks and tables; the engine answers the calls."""
+    from . import ops
+    for layer in model.layers:
+        layer.ffn.experts_fn = torch.ops.vxpu.moe_experts if on else None
+        if layer.engram is not None:
+            layer.engram.embed.rows_fn = torch.ops.vxpu.engram_rows if on else None
+            ops.ENGRAM_DIM[layer.layer_id] = layer.engram.embed.dim
+
+
+def external_spec(model, view, args):
+    """What the graphs call out for, from the checkpoint view: per layer,
+    the expert banks (stacked specs) and the engram table (tensor names).
+    Complete or an error: the graphs no longer reference these tensors,
+    so the classifier's unbound check does not see a checkpoint that
+    lacks them, and the failure would otherwise arrive on the executor
+    after the whole fetch."""
+    import re
+    direct, merged = view
+    experts, engram = {}, {}
+    bank = re.compile(r"^layers\.(\d+)\.ffn\.(w[123](?:_scale)?)$")
+    for key, spec in merged.items():
+        m = bank.match(key)
+        if m:
+            experts.setdefault(m.group(1), {})[m.group(2)] = spec
+    problems = []
+    for layer in model.layers:
+        want = {n for n, p in layer.ffn.named_parameters() if re.fullmatch(r"w[123](_scale)?", n)}
+        got = experts.get(str(layer.layer_id), {})
+        for name in sorted(want - set(got)):
+            problems.append(f"layers.{layer.layer_id}.ffn.{name}: no expert tensors in the checkpoint")
+        for name, spec in got.items():
+            if len(spec["parts"]) != args.n_routed_experts:
+                problems.append(f"layers.{layer.layer_id}.ffn.{name}: {len(spec['parts'])} of {args.n_routed_experts} experts")
+        if layer.engram is not None:
+            prefix = f"layers.{layer.layer_id}.engram.embed."
+            if prefix + "weight" not in direct or prefix + "scale" not in direct:
+                problems.append(f"{prefix}weight/scale: not in the checkpoint")
+                continue
+            engram[str(layer.layer_id)] = {"weight": direct[prefix + "weight"], "scale": direct[prefix + "scale"],
+                                           "num_embeddings": layer.engram.embed.num_embeddings,
+                                           "dim": layer.engram.embed.dim}
+    if problems:
+        raise RuntimeError(f"external tensors missing from the checkpoint (artifact would be incomplete): {problems[:5]}")
+    return {"experts": experts, "engram": engram}
+
+
+def host_experts(layer_id, args, banks):
+    """The fork's MoE module for `layer_id` holding `banks` ({w1, w2, w3,
+    w1_scale, ...}: tensors on the host) and nothing else real; its own
+    routings compute on them."""
+    ds = _fork()
+    with torch.device("meta"), bf16_default():
+        moe = ds.MoE(layer_id, args)
+    for name, tensor in banks.items():
+        if tensor.dtype == torch.int8:  # the checkpoint's packed fp4 bytes; the module keeps uint8
+            tensor = tensor.view(torch.uint8)
+        setattr(moe, name, torch.nn.Parameter(tensor, requires_grad=False))
+    return moe
+
+
+def host_engram(layer_id, num_embeddings, dim, weight, scale):
+    """The fork's n-gram table module for `layer_id` over host tensors."""
+    ds = _fork()
+    with torch.device("meta"), bf16_default():
+        embed = ds.ParallelEngramEmbedding(num_embeddings, dim)
+    embed.weight = torch.nn.Parameter(weight, requires_grad=False)
+    embed.scale = torch.nn.Parameter(scale, requires_grad=False)
+    embed.table_id = layer_id
+    return embed
+
+
 def export_graphs(model, max_cache_len, min_prefill_len):
-    """Prefill (symbolic length) and decode programs."""
+    """Prefill (symbolic length) and decode programs. The expert banks and
+    the n-gram tables stay out of the graphs (set_external): the executor
+    places them."""
     import torch.fx.experimental._config as fx_config
     fx_config.backed_size_oblivious = True
     seq = torch.export.Dim("seq", min=min_prefill_len, max=max_cache_len)
+    set_external(model, True)
+    try:
+        return _export_graphs(model, seq)
+    finally:
+        set_external(model, False)
+
+
+def _export_graphs(model, seq):
     with bf16_default():
         set_routing(model, "grouped")
         # keyword arguments, as the engine calls the graphs
