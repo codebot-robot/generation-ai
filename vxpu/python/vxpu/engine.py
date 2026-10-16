@@ -41,6 +41,7 @@ import time
 
 import torch
 
+from . import ops  # noqa: F401  (registers vxpu::* before a graph that calls them is loaded)
 from .rehydrate import (derived_tensor, fetch_stacked, fetch_tensor,
                         load_program, share_state, strip_asserts)
 
@@ -166,15 +167,18 @@ class Engine:
                 spec, self.manifest["tensors"], self.manifest["files"], cas_dir)
             self.shared[fqn] = tensor.to(device)
             self.bytes_fetched += downloaded
+        if self.binding.get("external"):
+            self._bind_external(self.binding["external"], cas_dir)
         for fqn in self.binding["derived"]:
             self.shared[fqn] = derived_tensor(
                 fqn, probe_meta[fqn], self.config).to(device)
-        # Lifted but unused by the graph (other towers' tables): any
-        # tensor of the right shape and dtype; nothing is fetched.
+        # Lifted but unused by the graph (other towers' tables, and the
+        # banks the graph calls out for instead of reading): the graph
+        # never touches them, so an empty tensor of the dtype stands in.
+        # Full-size zeros would be 272 GB for DeepSeek's expert banks.
         for fqn in self.binding.get("unused", []):
             meta = probe_meta[fqn]
-            self.shared[fqn] = torch.zeros(meta.shape, dtype=meta.dtype,
-                                           device=device)
+            self.shared[fqn] = torch.empty(0, dtype=meta.dtype, device=device)
         self.state_specs = {
             fqn: (probe_meta[fqn].shape, probe_meta[fqn].dtype)
             for fqn in self.binding["state"]}
@@ -188,6 +192,31 @@ class Engine:
         self._next_id = 0
         self._lock = threading.Lock()
         self._build()
+
+    def _bind_external(self, external, cas_dir):
+        """Tensors the graphs call out for (ops.py): the expert banks and
+        the n-gram tables. They stay on the host, assembled as the model's
+        own modules so the fork's code computes on them; the graphs, on
+        whatever device they run, reach them through the ops. A device
+        copy of 272 GB of experts is exactly what this avoids."""
+        from . import deepseek_v41 as ds
+        from . import ops
+        args = ds.model_args(self.manifest["source"]["repo"], self.max_cache_len)
+        for layer, specs in external.get("experts", {}).items():
+            banks = {}
+            for name, spec in specs.items():
+                tensor, downloaded = fetch_stacked(
+                    spec, self.manifest["tensors"], self.manifest["files"], cas_dir)
+                banks[name] = tensor
+                self.bytes_fetched += downloaded
+            ops.EXPERTS[int(layer)] = ds.host_experts(int(layer), args, banks)
+        for layer, spec in external.get("engram", {}).items():
+            weight, downloaded = fetch_tensor(self.manifest["tensors"][spec["weight"]], self.manifest["files"], cas_dir)
+            self.bytes_fetched += downloaded
+            scale, downloaded = fetch_tensor(self.manifest["tensors"][spec["scale"]], self.manifest["files"], cas_dir)
+            self.bytes_fetched += downloaded
+            ops.ENGRAM[int(layer)] = ds.host_engram(int(layer), spec["num_embeddings"], spec["dim"], weight, scale)
+            ops.ENGRAM_DIM[int(layer)] = spec["dim"]
 
     def _generation_config(self):
         """The model's generation_config.json as a dict (may be empty).

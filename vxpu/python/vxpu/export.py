@@ -537,9 +537,13 @@ def export_deepseek_v41(repo_id, out_dir, manifest, max_cache_len, revision):
         decode, manifest, view, aliases=aliases, also_mutated=mutated_fqns(prefill))
     if unbound:
         raise RuntimeError(f"unbound tensors (artifact would be incomplete): {unbound}")
+    # The graphs call out for the expert banks and the n-gram tables
+    # (ops.py); the engine fetches them from these specs and places them.
+    external = ds.external_spec(model, view)
     binding = {"bound": bound, "derived": derived, "state": state,
                "stacked": stacked, "aliases": aliases, "unused": unused,
-               "constant": constant, "max_cache_len": max_cache_len,
+               "constant": constant, "external": external,
+               "max_cache_len": max_cache_len,
                "min_prefill_len": MIN_PREFILL_LEN, **ds.binding_extras(args)}
     with open(os.path.join(out_dir, "manifest.json"), "w") as f:
         json.dump(manifest, f, indent=1, sort_keys=True)
