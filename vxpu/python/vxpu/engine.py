@@ -34,6 +34,7 @@ has a dynamic sequence dimension and explicit cache positions, so a
 follow-up turn prefills only the tokens beyond the cached prefix.
 """
 
+import hashlib
 import json
 import os
 import threading
@@ -81,7 +82,7 @@ def _has_tokenizer_files(repo):
 
 class Engine:
     def __init__(self, artifact_dir, device="cpu", compile_decode=False,
-                 cas_dir=None):
+                 cas_dir=None, external_dir=None):
         from transformers import AutoTokenizer
         from transformers.models.auto.configuration_auto import (
             CONFIG_MAPPING)
@@ -89,6 +90,11 @@ class Engine:
         self.artifact_dir = artifact_dir
         self.device = device
         self.compile_decode = compile_decode
+        # Where the tensors the graphs call out for (expert banks, n-gram
+        # tables) are placed: None keeps them in host memory; a directory
+        # (local SSD) memory-maps them from files there, the page cache
+        # being the RAM tier. VXPU_EXTERNAL_DIR sets it for the executor.
+        self.external_dir = external_dir or os.environ.get("VXPU_EXTERNAL_DIR") or None
         with open(os.path.join(artifact_dir, "manifest.json")) as f:
             self.manifest = json.load(f)
         with open(os.path.join(artifact_dir, "binding.json")) as f:
@@ -202,18 +208,25 @@ class Engine:
         from . import deepseek_v41 as ds
         from . import ops
         args = ds.model_args(self.manifest["source"]["repo"], self.max_cache_len)
+        mm = self.external_dir
+        if mm:
+            # files are keyed by the model's manifest so two artifacts of
+            # one checkpoint share them and another checkpoint cannot
+            mm = os.path.join(mm, hashlib.sha256(json.dumps(
+                self.manifest["source"], sort_keys=True).encode()).hexdigest()[:16])
         for layer, specs in external.get("experts", {}).items():
             banks = {}
             for name, spec in specs.items():
                 tensor, downloaded = fetch_stacked(
-                    spec, self.manifest["tensors"], self.manifest["files"], cas_dir)
+                    spec, self.manifest["tensors"], self.manifest["files"], cas_dir,
+                    mmap_path=os.path.join(mm, f"experts.{layer}.{name}") if mm else None)
                 banks[name] = tensor
                 self.bytes_fetched += downloaded
             ops.EXPERTS[int(layer)] = ds.host_experts(int(layer), args, banks)
         for layer, spec in external.get("engram", {}).items():
-            weight, downloaded = fetch_tensor(self.manifest["tensors"][spec["weight"]], self.manifest["files"], cas_dir)
+            weight, downloaded = fetch_tensor(self.manifest["tensors"][spec["weight"]], self.manifest["files"], cas_dir, mmap_dir=mm)
             self.bytes_fetched += downloaded
-            scale, downloaded = fetch_tensor(self.manifest["tensors"][spec["scale"]], self.manifest["files"], cas_dir)
+            scale, downloaded = fetch_tensor(self.manifest["tensors"][spec["scale"]], self.manifest["files"], cas_dir, mmap_dir=mm)
             self.bytes_fetched += downloaded
             ops.ENGRAM[int(layer)] = ds.host_engram(int(layer), spec["num_embeddings"], spec["dim"], weight, scale)
             ops.ENGRAM_DIM[int(layer)] = spec["dim"]
