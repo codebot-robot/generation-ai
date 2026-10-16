@@ -19,7 +19,7 @@ WORKDIR /app
 # torch JIT-compiles some eager CUDA ops via Triton at runtime,
 # which needs a C compiler even without torch.compile.
 RUN apt-get update && apt-get install -y --no-install-recommends \
-    gcc libc6-dev \
+    gcc g++ libc6-dev \
     && rm -rf /var/lib/apt/lists/*
 
 # torch is pinned to the exporting torch version: serialized
@@ -68,5 +68,12 @@ RUN if [ ! -f /src/deepseek_v41/inference/model.py ]; then \
 ENV VXPU_DEEPSEEK_V41=/src/deepseek_v41/inference
 
 COPY python/vxpu/ /app/vxpu/
+
+# The CPU kernels (vxpu/csrc) are a C++ extension torch builds on first
+# use; build it here so a pod never compiles. The cache is keyed by the
+# sources' hash, so a changed kernel rebuilds at image build time.
+ENV TORCH_EXTENSIONS_DIR=/app/.torch_extensions
+RUN pip install --no-cache-dir ninja \
+    && cd /app && python -c "import vxpu.kernels as k; assert k.available(), k.why_not()"
 
 ENTRYPOINT ["python", "-m", "vxpu.server"]

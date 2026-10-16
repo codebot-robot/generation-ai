@@ -34,6 +34,8 @@ import threading
 import torch
 from torch.library import custom_op
 
+from . import experts_cpu
+
 
 class External:
     """The tensors one engine placed outside its graphs: the fork's MoE
@@ -89,7 +91,10 @@ def moe_experts(x_in: torch.Tensor, weights: torch.Tensor, indices: torch.Tensor
     moe = _current("experts", layer)
     host = moe.w1.device
     x, w, i = x_in.to(host), weights.to(host), indices.to(host)
-    if x.shape[0] == 1:
+    if experts_cpu.applicable(moe):
+        # the fused fp4 kernels (csrc/): same routings, no dequantized copy
+        y = experts_cpu.forward_batched(moe, x, w, i) if x.shape[0] == 1 else experts_cpu.forward_grouped(moe, x, w, i)
+    elif x.shape[0] == 1:
         y = moe._forward_batched(x, w, i)
     else:
         y = moe._forward_grouped(x, w, i)
