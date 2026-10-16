@@ -25,7 +25,9 @@ on the same bytes, so the result does not depend on the placement.
 
 Each engine owns what it placed (an External) and makes it the ops'
 source only while it runs a graph; the exporter only records the shape
-information tracing needs.
+information tracing needs. The ops are tagged cudagraph_unsafe: they do
+host work and host-device copies, so inductor partitions the graph
+around them and captures CUDA graphs for the dense segments between.
 """
 
 import contextlib
@@ -77,7 +79,7 @@ def _current(what, key):
     return table[key]
 
 
-@custom_op("vxpu::moe_experts", mutates_args=())
+@custom_op("vxpu::moe_experts", mutates_args=(), tags=(torch.Tag.cudagraph_unsafe,))
 def moe_experts(x_in: torch.Tensor, weights: torch.Tensor, indices: torch.Tensor,
                 layer: int) -> torch.Tensor:
     """The routed experts of `layer` applied to x_in [n, dim] (already
@@ -106,7 +108,7 @@ def _(x_in, weights, indices, layer):
     return x_in.new_empty((x_in.shape[0], x_in.shape[1]), dtype=torch.float32)
 
 
-@custom_op("vxpu::engram_rows", mutates_args=())
+@custom_op("vxpu::engram_rows", mutates_args=(), tags=(torch.Tag.cudagraph_unsafe,))
 def engram_rows(indices: torch.Tensor, table: int) -> torch.Tensor:
     """The rows of n-gram table `table` for hash ids `indices`, dequantized
     to bf16 [..., dim], what the module's lookup returns."""
@@ -122,7 +124,7 @@ def _(indices, table):
     return indices.new_empty(tuple(indices.shape) + (ENGRAM_DIM[table],), dtype=torch.bfloat16)
 
 
-@custom_op("vxpu::fp8_linear", mutates_args=())
+@custom_op("vxpu::fp8_linear", mutates_args=(), tags=(torch.Tag.cudagraph_unsafe,))
 def fp8_linear(x: torch.Tensor, weight: torch.Tensor, scale: torch.Tensor) -> torch.Tensor:
     """The fork's fp8 linear: x [..., K] bf16, weight [N, K] fp8 with
     [N/32, K/32] e8m0 block scales -> [..., N] in x's dtype. The
