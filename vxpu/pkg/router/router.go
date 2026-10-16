@@ -104,54 +104,50 @@ func (s *Server) UseWeightStore(ws *weightstore.Client) {
 
 // rewriteViaWeightStore makes every file of the manifest present in
 // modelstore (which fetches what it lacks from the manifest's sources)
-// and points the sources at modelstore's blob URLs. Files are handled concurrently;
-// modelstore de-duplicates and serializes the actual downloads.
+// and points the sources at modelstore's blob URLs. Files are handled
+// concurrently; modelstore de-duplicates and serializes the actual
+// downloads. The manifest goes through the typed Manifest, whose config
+// and tensors are raw JSON, so every byte the router does not touch is
+// reproduced verbatim (a generic decode would turn 30.0 into 30, which
+// transformers rejects where it expects a float).
 func (s *Server) rewriteViaWeightStore(ctx context.Context, manifestJSON string) (string, error) {
-	var manifest manifestFiles
-	if err := json.Unmarshal([]byte(manifestJSON), &manifest.raw); err != nil {
+	var manifest pb.Manifest
+	if err := json.Unmarshal([]byte(manifestJSON), &manifest); err != nil {
 		return "", fmt.Errorf("parsing manifest: %w", err)
 	}
-	files, ok := manifest.raw["files"].(map[string]any)
-	if !ok {
+	if len(manifest.Files) == 0 {
 		return "", fmt.Errorf("manifest has no files")
 	}
 	type result struct {
 		sha, url string
 		err      error
 	}
-	results := make(chan result, len(files))
-	for sha, f := range files {
-		file, _ := f.(map[string]any)
-		src, _ := file["source"].(string)
+	results := make(chan result, len(manifest.Files))
+	for sha, file := range manifest.Files {
 		go func(sha, src string) {
 			url, err := s.weightStore.Ensure(ctx, sha, src)
 			results <- result{sha, url, err}
-		}(sha, src)
+		}(sha, file.Source)
 	}
 	var errs []string
-	for range files {
+	for range manifest.Files {
 		r := <-results
 		if r.err != nil {
 			errs = append(errs, r.err.Error())
 			continue
 		}
-		files[r.sha].(map[string]any)["source"] = r.url
+		file := manifest.Files[r.sha]
+		file.Source = r.url
+		manifest.Files[r.sha] = file
 	}
 	if len(errs) > 0 {
 		return "", fmt.Errorf("weight store: %s", strings.Join(errs, "; "))
 	}
-	out, err := json.Marshal(manifest.raw)
+	out, err := json.Marshal(manifest)
 	if err != nil {
 		return "", fmt.Errorf("serializing manifest: %w", err)
 	}
 	return string(out), nil
-}
-
-// manifestFiles keeps the manifest as generic JSON so that rewriting
-// one field round-trips every other field untouched (numbers included:
-// the exporter writes floats the typed decoder would reformat).
-type manifestFiles struct {
-	raw map[string]any
 }
 
 // executorClient dials the executor already serving modelKey; it does

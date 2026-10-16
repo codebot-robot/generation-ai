@@ -17,9 +17,12 @@ package router
 import (
 	"crypto/sha256"
 	"encoding/hex"
+	"encoding/json"
 	stderrors "errors"
 	"io"
 	"net"
+	"net/http"
+	"net/http/httptest"
 	"strings"
 	"testing"
 
@@ -35,6 +38,7 @@ import (
 	k8stesting "k8s.io/client-go/testing"
 
 	pb "github.com/gke-labs/generation-ai/vxpu/pkg/api/v1alpha1"
+	"github.com/gke-labs/generation-ai/vxpu/pkg/weightstore"
 )
 
 func TestGetOrStartPod_ExistingRunningPod(t *testing.T) {
@@ -342,5 +346,41 @@ func TestGenerate_ProxiesStreamToExecutor(t *testing.T) {
 	}
 	if len(executor.gotIDs) != 3 || executor.gotTopK == nil || *executor.gotTopK != 5 {
 		t.Errorf("request fields not forwarded: ids=%v topK=%v", executor.gotIDs, executor.gotTopK)
+	}
+}
+
+// The rewritten manifest must reproduce config and tensors byte for
+// byte (as blobserver's rewrite does): transformers validates config
+// field types, and a Go number round trip would turn 30.0 into 30.
+func TestRewriteViaWeightStore_PreservesConfigVerbatim(t *testing.T) {
+	store := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Method == http.MethodPost && strings.HasSuffix(r.URL.Path, "/import") {
+			w.WriteHeader(http.StatusCreated)
+			return
+		}
+		http.NotFound(w, r)
+	}))
+	defer store.Close()
+	s := &Server{weightStore: weightstore.New(store.URL)}
+	in := `{"format":"vxpu-manifest/v1alpha1","source":{"repo":"r","revision":"main","commit_sha":"c"},` +
+		`"config":{"final_logit_softcapping":30.0,"rope_theta":1000000.0,"attention_dropout":0.0,"nested":{"x":1.0}},` +
+		`"files":{"abc":{"size":4,"name":"model.safetensors","source":"https://huggingface.co/r/resolve/c/model.safetensors"}},` +
+		`"tensors":{"w":{"dtype":"BF16","length":4,"offset":0,"shape":[2],"file_sha256":"abc"}}}`
+	out, err := s.rewriteViaWeightStore(t.Context(), in)
+	if err != nil {
+		t.Fatalf("rewriteViaWeightStore: %v", err)
+	}
+	var got pb.Manifest
+	if err := json.Unmarshal([]byte(out), &got); err != nil {
+		t.Fatalf("rewritten manifest is not JSON: %v", err)
+	}
+	if want := `{"final_logit_softcapping":30.0,"rope_theta":1000000.0,"attention_dropout":0.0,"nested":{"x":1.0}}`; string(got.Config) != want {
+		t.Errorf("config altered by round trip:\n got %s\nwant %s", got.Config, want)
+	}
+	if want := `{"w":{"dtype":"BF16","length":4,"offset":0,"shape":[2],"file_sha256":"abc"}}`; string(got.Tensors) != want {
+		t.Errorf("tensors altered by round trip:\n got %s\nwant %s", got.Tensors, want)
+	}
+	if want := store.URL + "/blobs/abc"; got.Files["abc"].Source != want {
+		t.Errorf("source: got %q want %q", got.Files["abc"].Source, want)
 	}
 }

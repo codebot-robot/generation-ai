@@ -27,6 +27,7 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"net"
@@ -61,10 +62,23 @@ func Discover(ctx context.Context, url string) *Client {
 		return New(url)
 	}
 	host := strings.TrimPrefix(DefaultURL, "http://")
-	lookup, cancel := context.WithTimeout(ctx, 3*time.Second)
-	defer cancel()
-	if _, err := net.DefaultResolver.LookupHost(lookup, host); err != nil {
-		log.Info("No modelstore in this cluster; the router caches weights itself", "host", host)
+	// The answer decides the router's behaviour for its lifetime, so a
+	// transient resolver fault (cluster DNS not answering yet at pod
+	// start) is retried; only a definite "no such host" means no store.
+	var err error
+	for attempt := 0; attempt < 10; attempt++ {
+		lookup, cancel := context.WithTimeout(ctx, 3*time.Second)
+		_, err = net.DefaultResolver.LookupHost(lookup, host)
+		cancel()
+		var dnsErr *net.DNSError
+		if err == nil || (errors.As(err, &dnsErr) && dnsErr.IsNotFound) || ctx.Err() != nil {
+			break
+		}
+		log.Info("Resolving modelstore failed, retrying", "host", host, "error", err.Error())
+		time.Sleep(2 * time.Second)
+	}
+	if err != nil {
+		log.Info("No modelstore in this cluster; the router caches weights itself", "host", host, "error", err.Error())
 		return nil
 	}
 	log.Info("Using modelstore as the weight store", "url", DefaultURL)
@@ -94,6 +108,11 @@ func (c *Client) Ensure(ctx context.Context, sha, srcURL string) (string, error)
 		return "", fmt.Errorf("modelstore import of %s: %w", sha, err)
 	}
 	defer closeBody(ctx, resp)
+	if resp.StatusCode == http.StatusNotFound {
+		// An older modelstore (before blob import) answers 404 here; say
+		// so rather than letting every LoadModel fail with a bare status.
+		return "", fmt.Errorf("modelstore at %s has no blob import route (deploy the modelstore from this tree): %s", c.base, errorBody(resp))
+	}
 	if resp.StatusCode != http.StatusCreated && resp.StatusCode != http.StatusOK {
 		return "", fmt.Errorf("modelstore import of %s: %s: %s", sha, resp.Status, errorBody(resp))
 	}
