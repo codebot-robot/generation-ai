@@ -16,6 +16,7 @@ package blobstore
 
 import (
 	"bytes"
+	"context"
 	"crypto/sha256"
 	"encoding/hex"
 	"errors"
@@ -91,8 +92,8 @@ func TestGCS(t *testing.T) {
 	if string(tail) != "lob " {
 		t.Fatalf("tail read: %q", tail)
 	}
-	if !strings.HasPrefix(store.DirectURL(sha), "gs://") || !strings.HasSuffix(store.DirectURL(sha), "/_blobs/"+sha) {
-		t.Fatalf("DirectURL: %s", store.DirectURL(sha))
+	if u, err := store.DirectURL(ctx, sha); err != nil || u != "" {
+		t.Fatalf("DirectURL without signer: url=%q err=%v", u, err)
 	}
 	// Refs: tags and manifest records next to the blobs.
 	if err := store.PutRef(ctx, "tags/org/name/main", []byte("sha256:"+sha)); err != nil {
@@ -250,5 +251,21 @@ func TestGCSSizeCacheInvalidationOnDelete(t *testing.T) {
 	// Subsequent StatCached must now return ErrNotFound
 	if _, err := g.StatCached(ctx, sha); !errors.Is(err, ErrNotFound) {
 		t.Fatalf("StatCached after Open eviction: got %v, want ErrNotFound", err)
+	}
+}
+
+func TestNewGCS_SignerProbeFailure(t *testing.T) {
+	t.Setenv("STORAGE_EMULATOR_HOST", "localhost:9099")
+	ctx := t.Context()
+	failingSigner := URLSignerFunc(func(ctx context.Context, bucket, object string, expires time.Time) (string, error) {
+		return "", errors.New("simulated IAM token creator permission denied")
+	})
+
+	_, err := NewGCS(ctx, "gs://test-bucket/prefix", WithURLSigner(failingSigner))
+	if err == nil {
+		t.Fatal("expected NewGCS to fail during signer startup probe")
+	}
+	if !strings.Contains(err.Error(), "probing blob URL signer") {
+		t.Fatalf("expected probing error, got: %v", err)
 	}
 }

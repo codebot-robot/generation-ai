@@ -48,6 +48,7 @@ type GCS struct {
 	bucket    string
 	prefix    string
 	sizeCache sync.Map // sha -> int64
+	cache     *URLSignerCache
 }
 
 // newGCSTransport returns an HTTP/1.1 transport with connection pooling
@@ -75,9 +76,46 @@ func newGCSTransport() *http.Transport {
 	}
 }
 
+type gcsSigner struct {
+	client         *storage.Client
+	serviceAccount string
+}
+
+func (s *gcsSigner) SignURL(ctx context.Context, bucket, object string, expires time.Time) (string, error) {
+	if err := ctx.Err(); err != nil {
+		return "", err
+	}
+	opts := &storage.SignedURLOptions{
+		GoogleAccessID: s.serviceAccount,
+		Method:         http.MethodGet,
+		Expires:        expires,
+		Scheme:         storage.SigningSchemeV4,
+	}
+	type signResult struct {
+		url string
+		err error
+	}
+	ch := make(chan signResult, 1)
+	go func() {
+		u, err := s.client.Bucket(bucket).SignedURL(object, opts)
+		ch <- signResult{url: u, err: err}
+	}()
+	select {
+	case <-ctx.Done():
+		return "", ctx.Err()
+	case res := <-ch:
+		return res.url, res.err
+	}
+}
+
 // NewGCS opens gs://bucket[/prefix] with application default credentials
 // (workload identity on GKE).
-func NewGCS(ctx context.Context, location string) (*GCS, error) {
+func NewGCS(ctx context.Context, location string, opts ...Option) (*GCS, error) {
+	var options Options
+	for _, opt := range opts {
+		opt(&options)
+	}
+
 	rest := strings.TrimPrefix(location, "gs://")
 	bucket, prefix, _ := strings.Cut(rest, "/")
 	if bucket == "" {
@@ -102,6 +140,37 @@ func NewGCS(ctx context.Context, location string) (*GCS, error) {
 		return nil, fmt.Errorf("creating GCS client: %w", err)
 	}
 	g := &GCS{client: client, bucket: bucket, prefix: strings.Trim(prefix, "/")}
+
+	var signer URLSigner = options.URLSigner
+	if signer == nil && options.SignerServiceAccount != "" {
+		signer = &gcsSigner{
+			client:         client,
+			serviceAccount: options.SignerServiceAccount,
+		}
+	}
+	if signer != nil {
+		nowFn := options.Now
+		if nowFn == nil {
+			nowFn = time.Now
+		}
+		// Probe the signer at startup to fail fast on misconfiguration
+		// (wrong service account name, missing roles/iam.serviceAccountTokenCreator, etc.).
+		probeExpires := nowFn().Add(time.Hour)
+		if _, err := signer.SignURL(ctx, bucket, g.object("_probe"), probeExpires); err != nil {
+			signerName := options.SignerServiceAccount
+			if signerName == "" {
+				signerName = "custom"
+			}
+			return nil, fmt.Errorf("probing blob URL signer %q for bucket gs://%s: %w", signerName, bucket, err)
+		}
+		signerName := options.SignerServiceAccount
+		if signerName == "" {
+			signerName = "custom"
+		}
+		klog.FromContext(ctx).Info("configured blob URL signer", "signer", signerName, "bucket", bucket)
+		g.cache = NewURLSignerCache(bucket, signer, options.Validity, options.Now)
+	}
+
 	// Fail at startup, not on the first Put, if the bucket is not ours
 	// to use (wrong name, missing grant). Listing one object needs only
 	// the object roles the README grants; bucket metadata would need
@@ -246,8 +315,11 @@ func (g *GCS) ListRefs(ctx context.Context, prefix string) ([]string, error) {
 	return keys, nil
 }
 
-func (g *GCS) DirectURL(sha string) string {
-	return "gs://" + g.bucket + "/" + g.object(sha)
+func (g *GCS) DirectURL(ctx context.Context, sha string) (string, error) {
+	if g.cache == nil {
+		return "", nil
+	}
+	return g.cache.Get(ctx, sha, g.object(sha))
 }
 
 func (g *GCS) String() string { return "gs://" + g.bucket + "/" + g.prefix }

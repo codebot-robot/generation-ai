@@ -259,8 +259,23 @@ func (reg *Registry) ServeBlob(w http.ResponseWriter, r *http.Request, sha strin
 	}
 	w.Header().Set("Accept-Ranges", "bytes")
 	w.Header().Set("Content-Type", "application/octet-stream")
-	if u := reg.store.DirectURL(sha); u != "" {
-		w.Header().Set(headerDirectURL, u)
+	wantDirect := (r.URL.Query().Get("redirect") == "1") ||
+		(r.Header.Get("X-Modelstore-Want-Direct-Url") == "1")
+	if wantDirect {
+		u, err := reg.store.DirectURL(ctx, sha)
+		if err != nil {
+			klog.FromContext(ctx).Error(err, "generating direct URL for blob", "sha", sha)
+			w.Header().Set("Retry-After", "5")
+			http.Error(w, "temporarily unable to sign direct URL", http.StatusServiceUnavailable)
+			return nil
+		}
+		if u != "" {
+			w.Header().Set(headerDirectURL, u)
+			if r.URL.Query().Get("redirect") == "1" {
+				http.Redirect(w, r, u, http.StatusTemporaryRedirect)
+				return nil
+			}
+		}
 	}
 	offset, length := int64(0), size
 	status := http.StatusOK

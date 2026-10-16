@@ -20,6 +20,7 @@ import (
 	"crypto/sha256"
 	"encoding/hex"
 	"encoding/json"
+	"errors"
 	"io"
 	"net/http"
 	"net/http/httptest"
@@ -344,5 +345,177 @@ func TestServeBlobNotFoundOnOpen(t *testing.T) {
 	}
 	if !strings.Contains(rec.Body.String(), "BLOB_UNKNOWN") {
 		t.Fatalf("ServeBlob body %q does not contain BLOB_UNKNOWN", rec.Body.String())
+	}
+}
+
+type directURLStore struct {
+	blobstore.Store
+	directURL string
+	err       error
+}
+
+func (s *directURLStore) DirectURL(ctx context.Context, sha string) (string, error) {
+	if s.err != nil {
+		return "", s.err
+	}
+	return s.directURL, nil
+}
+
+func TestDirectURL_HeadAndRedirect(t *testing.T) {
+	local, err := blobstore.NewLocal(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	content := []byte("weight content 12345")
+	digest := digestOf(content)
+	sha, _ := ParseDigest(digest)
+	if _, _, err := local.Put(t.Context(), sha, bytes.NewReader(content)); err != nil {
+		t.Fatal(err)
+	}
+
+	signedURL := "https://storage.googleapis.com/test-bucket/_blobs/" + sha + "?signed=token"
+	store := &directURLStore{Store: local, directURL: signedURL}
+	reg := New(store)
+
+	serveBlob := func(r *Registry, method, path string, headers ...string) *httptest.ResponseRecorder {
+		req := httptest.NewRequest(method, path, nil)
+		for i := 0; i+1 < len(headers); i += 2 {
+			req.Header.Set(headers[i], headers[i+1])
+		}
+		rec := httptest.NewRecorder()
+		_ = r.ServeBlob(rec, req, sha)
+		return rec
+	}
+
+	// Plain HEAD /blobs/<sha> without opt-in header does NOT include X-Modelstore-Direct-Url
+	w := serveBlob(reg, http.MethodHead, "/blobs/"+sha)
+	if w.Code != http.StatusOK {
+		t.Fatalf("HEAD blob status: %d", w.Code)
+	}
+	if got := w.Header().Get(headerDirectURL); got != "" {
+		t.Errorf("plain HEAD /blobs/<sha> X-Modelstore-Direct-Url: got %q, want empty", got)
+	}
+
+	// HEAD /blobs/<sha> with X-Modelstore-Want-Direct-Url: 1 includes X-Modelstore-Direct-Url
+	w = serveBlob(reg, http.MethodHead, "/blobs/"+sha, "X-Modelstore-Want-Direct-Url", "1")
+	if w.Code != http.StatusOK {
+		t.Fatalf("HEAD blob status: %d", w.Code)
+	}
+	if got := w.Header().Get(headerDirectURL); got != signedURL {
+		t.Errorf("HEAD /blobs/<sha> with header X-Modelstore-Direct-Url: got %q, want %q", got, signedURL)
+	}
+
+	// HEAD /v2/org/name/blobs/<digest> (OCI route) must NOT include X-Modelstore-Direct-Url
+	w = do(reg, http.MethodHead, "/v2/org/name/blobs/"+digest, nil)
+	if w.Code != http.StatusOK {
+		t.Fatalf("HEAD OCI blob status: %d", w.Code)
+	}
+	if got := w.Header().Get(headerDirectURL); got != "" {
+		t.Errorf("HEAD OCI X-Modelstore-Direct-Url: got %q, want empty", got)
+	}
+
+	// GET /v2/org/name/blobs/<digest> (OCI route) without redirect serves content directly without direct URL header
+	w = do(reg, http.MethodGet, "/v2/org/name/blobs/"+digest, nil)
+	if w.Code != http.StatusOK {
+		t.Fatalf("GET blob status: %d", w.Code)
+	}
+	if got := w.Header().Get(headerDirectURL); got != "" {
+		t.Errorf("GET OCI X-Modelstore-Direct-Url: got %q, want empty", got)
+	}
+	if w.Body.String() != string(content) {
+		t.Errorf("GET body: got %q, want %q", w.Body.String(), string(content))
+	}
+
+	// GET /blobs/<sha>?redirect=1 returns 307 Temporary Redirect to signed URL
+	w = serveBlob(reg, http.MethodGet, "/blobs/"+sha+"?redirect=1")
+	if w.Code != http.StatusTemporaryRedirect {
+		t.Fatalf("GET with redirect=1: status %d, want 307", w.Code)
+	}
+	if got := w.Header().Get("Location"); got != signedURL {
+		t.Errorf("GET with redirect=1 Location: got %q, want %q", got, signedURL)
+	}
+	if got := w.Header().Get(headerDirectURL); got != signedURL {
+		t.Errorf("GET with redirect=1 X-Modelstore-Direct-Url: got %q, want %q", got, signedURL)
+	}
+
+	// GET /blobs/<sha> without redirect serves content directly without direct URL header
+	w = serveBlob(reg, http.MethodGet, "/blobs/"+sha)
+	if w.Code != http.StatusOK {
+		t.Fatalf("GET blob status: %d", w.Code)
+	}
+	if got := w.Header().Get(headerDirectURL); got != "" {
+		t.Errorf("GET without redirect: got %q, want empty", got)
+	}
+
+	// GET /blobs/<sha> with X-Modelstore-Want-Direct-Url: 1 includes X-Modelstore-Direct-Url
+	w = serveBlob(reg, http.MethodGet, "/blobs/"+sha, "X-Modelstore-Want-Direct-Url", "1")
+	if got := w.Header().Get(headerDirectURL); got != signedURL {
+		t.Errorf("GET with want-direct header: got %q, want %q", got, signedURL)
+	}
+
+	// When no direct URL is configured (local store)
+	regNoSigner := New(local)
+	w = do(regNoSigner, http.MethodHead, "/v2/org/name/blobs/"+digest, nil)
+	if w.Code != http.StatusOK {
+		t.Fatalf("HEAD without direct URL: status %d", w.Code)
+	}
+	if got := w.Header().Get(headerDirectURL); got != "" {
+		t.Errorf("HEAD without direct URL: got %q, want empty", got)
+	}
+
+	// GET ?redirect=1 without direct URL serves content normally (no redirect)
+	w = do(regNoSigner, http.MethodGet, "/v2/org/name/blobs/"+digest+"?redirect=1", nil)
+	if w.Code != http.StatusOK {
+		t.Fatalf("GET redirect=1 without direct URL: status %d, want 200", w.Code)
+	}
+	if w.Body.String() != string(content) {
+		t.Errorf("GET body without direct URL: got %q, want %q", w.Body.String(), string(content))
+	}
+}
+
+func TestDirectURL_SignerErrorReturns503(t *testing.T) {
+	local, err := blobstore.NewLocal(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	content := []byte("error test")
+	ctx := t.Context()
+	sha, _, err := local.Put(ctx, "", bytes.NewReader(content))
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	store := &directURLStore{Store: local, err: errors.New("simulated IAM signing failure")}
+	reg := New(store)
+
+	// Plain HEAD from a client that did not explicitly ask for a direct URL gets 200 normal answer
+	reqPlain := httptest.NewRequest(http.MethodHead, "/blobs/"+sha, nil)
+	wPlain := httptest.NewRecorder()
+	_ = reg.ServeBlob(wPlain, reqPlain, sha)
+	if wPlain.Code != http.StatusOK {
+		t.Fatalf("plain HEAD on signing error: got %d, want 200", wPlain.Code)
+	}
+
+	// Caller that explicitly requested direct URL with header gets 503 Service Unavailable with Retry-After
+	reqHeader := httptest.NewRequest(http.MethodHead, "/blobs/"+sha, nil)
+	reqHeader.Header.Set("X-Modelstore-Want-Direct-Url", "1")
+	wHeader := httptest.NewRecorder()
+	_ = reg.ServeBlob(wHeader, reqHeader, sha)
+	if wHeader.Code != http.StatusServiceUnavailable {
+		t.Fatalf("HEAD with want-direct header on signing error: got %d, want 503", wHeader.Code)
+	}
+	if got := wHeader.Header().Get("Retry-After"); got != "5" {
+		t.Errorf("expected Retry-After: 5, got %q", got)
+	}
+
+	// Caller requesting redirect=1 gets 503 Service Unavailable with Retry-After
+	reqRedirect := httptest.NewRequest(http.MethodGet, "/blobs/"+sha+"?redirect=1", nil)
+	wRedirect := httptest.NewRecorder()
+	_ = reg.ServeBlob(wRedirect, reqRedirect, sha)
+	if wRedirect.Code != http.StatusServiceUnavailable {
+		t.Fatalf("GET redirect=1 on signing error: got %d, want 503", wRedirect.Code)
+	}
+	if got := wRedirect.Header().Get("Retry-After"); got != "5" {
+		t.Errorf("expected Retry-After: 5, got %q", got)
 	}
 }
