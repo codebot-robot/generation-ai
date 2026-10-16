@@ -42,6 +42,7 @@
 // path everywhere else.
 
 #include <torch/extension.h>
+#include "fetch.h"
 #include <c10/util/Float8_e4m3fn.h>
 #include <ATen/Parallel.h>
 
@@ -606,6 +607,7 @@ bool has_neon() {
 }
 
 PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
+  register_fetch(m);
   m.def("fp4_gather_mm", &fp4_gather_mm, "x[M,K] bf16 x packed fp4 experts sel[M] -> bf16 [M,N]");
   m.def("fp4_grouped_mm", &fp4_grouped_mm, "x[M,K] bf16 (sorted by expert, offs[E]) x packed fp4 experts -> bf16 [M,N]");
   m.def("fp4_dequant", &fp4_dequant, "one expert of a packed bank -> bf16 [N,K]");

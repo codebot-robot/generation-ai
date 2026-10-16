@@ -33,7 +33,35 @@ _module = None
 _error = None
 _enabled = True
 
-SOURCES = [os.path.join(os.path.dirname(__file__), "csrc", "fp4_kernels.cpp")]
+SOURCES = [
+    os.path.join(os.path.dirname(__file__), "csrc", "fp4_kernels.cpp"),
+    os.path.join(os.path.dirname(__file__), "csrc", "fetch.cpp"),
+]
+
+
+def _has_libcurl():
+    if os.environ.get("VXPU_FETCH", "").lower() in ("0", "off", "requests", "fallback"):
+        return False
+    import shutil
+    import subprocess
+    if shutil.which("curl-config") is not None:
+        try:
+            res = subprocess.run(["curl-config", "--libs"], capture_output=True, text=True)
+            if res.returncode == 0:
+                return True
+        except Exception:
+            pass
+    if shutil.which("pkg-config") is not None:
+        try:
+            res = subprocess.run(["pkg-config", "--exists", "libcurl"], capture_output=True)
+            if res.returncode == 0:
+                return True
+        except Exception:
+            pass
+    for inc in ["/usr/include", "/usr/local/include", "/opt/homebrew/include"]:
+        if os.path.exists(os.path.join(inc, "curl", "curl.h")):
+            return True
+    return False
 
 
 def set_enabled(on):
@@ -64,18 +92,28 @@ def load():
             if sys.platform != "darwin":  # gcc/clang with an OpenMP runtime; Apple clang has none
                 cflags.append("-fopenmp")
                 ldflags.append("-fopenmp")
+            if _has_libcurl():
+                cflags.append("-DHAVE_LIBCURL")
+                ldflags.append("-lcurl")
             _module = jit_load(name="vxpu_fp4_kernels", sources=SOURCES,
                                extra_cflags=cflags, extra_ldflags=ldflags, verbose=False)
         except Exception as e:  # noqa: BLE001  (no compiler, no headers: the aten path remains)
             _error = f"{type(e).__name__}: {e}"
             print(f"[vxpu] CPU kernels unavailable, using the plain-aten path: {_error.splitlines()[0][:200]}", flush=True)
             return None
-        print(f"[vxpu] CPU kernels loaded (avx512: {_module.has_avx512()}, neon: {_module.has_neon()})", flush=True)
+        has_fetch_str = f", fetch: {_module.has_fetch()}" if hasattr(_module, "has_fetch") else ""
+        print(f"[vxpu] CPU kernels loaded (avx512: {_module.has_avx512()}, neon: {_module.has_neon()}{has_fetch_str})", flush=True)
         return _module
 
 
 def available():
     return load() is not None
+
+
+def has_fetch():
+    """Whether the C++ libcurl range fetcher is available."""
+    mod = load()
+    return mod is not None and getattr(mod, "has_fetch", lambda: False)()
 
 
 def why_not():
