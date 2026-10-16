@@ -40,7 +40,9 @@ func TestTransformersPinMatchesSubmodule(t *testing.T) {
 
 	// The gitlink is in the tree whether or not the submodule is
 	// checked out.
-	out, err := exec.Command("git", "rev-parse", "HEAD:third_party/transformers").Output()
+	// <rev>:<path> is relative to the repository root unless the path
+	// starts with ./ or ../; the test runs in vxpu/images/executor.
+	out, err := exec.Command("git", "rev-parse", "HEAD:./../../third_party/transformers").Output()
 	if err != nil {
 		t.Skipf("not in a git checkout with the submodule gitlink: %v", err)
 	}
@@ -60,7 +62,7 @@ func TestDeepseekPinMatchesSubmodule(t *testing.T) {
 		t.Fatal("Dockerfile has no ARG DEEPSEEK_V41_COMMIT=<sha>")
 	}
 	pinned := string(m[1])
-	out, err := exec.Command("git", "rev-parse", "HEAD:third_party/deepseek_v41").Output()
+	out, err := exec.Command("git", "rev-parse", "HEAD:./../../third_party/deepseek_v41").Output()
 	if err != nil {
 		t.Skipf("not in a git checkout with the submodule gitlink: %v", err)
 	}

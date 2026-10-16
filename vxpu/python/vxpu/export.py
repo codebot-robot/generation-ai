@@ -545,10 +545,7 @@ def export_deepseek_v41(repo_id, out_dir, manifest, max_cache_len, revision):
         json.dump(manifest, f, indent=1, sort_keys=True)
     with open(os.path.join(out_dir, "binding.json"), "w") as f:
         json.dump(binding, f, indent=1, sort_keys=True)
-    print(f"  model: {repo_id} (deepseek_v41 via the fork; {len(manifest['tensors'])} tensors)")
-    print(f"  binding: {len(bound)} bound, {len(state)} state, {len(stacked)} stacked, "
-          f"{len(aliases)} aliases, {len(unused)} unused, {len(constant)} constant")
-    return manifest, binding
+    return manifest, binding  # main() prints the summary, as for every exporter
 
 
 def main():

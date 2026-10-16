@@ -197,10 +197,11 @@ def _download(url, dest, size=None):
     return dest
 
 
-def record_deepseek_eager(model, revision, prompts, settings, device="cpu"):
+def record_deepseek_eager(model, revision, prompts, settings):
     """Reference for a deepseek_v41 checkpoint: the model maker's module
     from the fork, run eagerly with the plain-aten kernels on the CPU (no
-    transformers implementation exists). Greedy; logits at every step."""
+    transformers implementation exists; the plain-aten kernels are CPU
+    code, so there is no device to choose). Greedy; logits at every step."""
     import torch
     from safetensors.torch import load_file
     from transformers import AutoTokenizer
@@ -229,18 +230,40 @@ def record_deepseek_eager(model, revision, prompts, settings, device="cpu"):
         return _download(hf_hub_url(model, ref["name"], revision=revision),
                          os.path.join(cache, ref["name"]), ref.get("size")), True
 
+    # Every tensor the module declares must come from some shard, else the
+    # reference would run on random initialisation and the comparator would
+    # blame the engine. A key is missing only if every shard load reported
+    # it so; expert banks are assembled from per-expert checkpoint tensors
+    # (the module's _load_from_state_dict), so they are checked by count.
+    import re
+    expert_re = re.compile(r"^layers\.(\d+)\.ffn\.experts\.(\d+)\.(w[123])\.(weight|scale)$")
+    missing_all, experts_seen = None, {}
     with ThreadPoolExecutor(max_workers=4) as pool:
         futures = [pool.submit(fetch, ref) for ref in sorted(manifest["files"].values(), key=lambda r: r["name"])]
         for fut in futures:
             path, fetched = fut.result()
             shard = load_file(path)
-            _, unexpected = lm.load_state_dict(shard, strict=False)
+            for key in shard:
+                m = expert_re.match(key)
+                if m:
+                    experts_seen.setdefault((int(m.group(1)), m.group(3), m.group(4)), set()).add(int(m.group(2)))
+            missing, unexpected = lm.load_state_dict(shard, strict=False)
+            missing_all = set(missing) if missing_all is None else missing_all & set(missing)
             unexpected = [u for u in unexpected if not u.startswith(("mtp.", "vision.", "aligner.", "image_"))]
             if unexpected:
                 raise RuntimeError(f"checkpoint tensors the module did not take: {unexpected[:5]}")
             del shard
             if fetched:
                 os.remove(path)
+    bank_re = re.compile(r"^layers\.(\d+)\.ffn\.(w[123])(_scale)?$")
+    problems = sorted(k for k in (missing_all or set()) if not bank_re.match(k))
+    for key in sorted(k for k in (missing_all or set()) if bank_re.match(k)):
+        layer, proj, scale = bank_re.match(key).groups()
+        seen = experts_seen.get((int(layer), proj, "scale" if scale else "weight"), set())
+        if len(seen) != args.n_routed_experts:
+            problems.append(f"{key}: {len(seen)} of {args.n_routed_experts} experts in the checkpoint")
+    if problems:
+        raise RuntimeError(f"module tensors the checkpoint did not provide: {problems[:5]}")
     eos_ids = {tokenizer.eos_token_id} if tokenizer.eos_token_id is not None else set()
     out = []
     for prompt in _prompt_set(tok, prompts):
@@ -270,7 +293,7 @@ def record_deepseek_eager(model, revision, prompts, settings, device="cpu"):
                     "top_logits": top,
                     "ms_per_token": round(1000 * elapsed / max(1, len(new)), 1)})
         _progress(prompt, new, 1000 * elapsed / max(1, len(new)))
-    producer = {"kind": "deepseek-eager", **_versions(device), "kernels": "aten"}
+    producer = {"kind": "deepseek-eager", **_versions("cpu"), "kernels": "aten"}
     return _document(model, revision, type("Config", (), {"model_type": ds.MODEL_TYPE})(), producer, settings, out)
 
 
@@ -620,8 +643,7 @@ def cmd_record(args):
                                  args.artifact, device=args.device,
                                  compile_decode=args.compile)
     elif args.producer == "deepseek-eager":
-        doc = record_deepseek_eager(args.model, args.revision, args.prompts, settings,
-                                    device=args.device)
+        doc = record_deepseek_eager(args.model, args.revision, args.prompts, settings)
     elif args.producer == "vllm":
         doc = record_vllm(args.model, args.revision, args.prompts, settings,
                           dtype=args.dtype,
@@ -666,6 +688,37 @@ def _check_compare():
     assert ok
 
 
+def _check_continuation(artifact, ids, new_tokens=4):
+    """A session extended by a later turn must see what a fresh session
+    given the whole transcript sees. For a model whose prefill graph
+    starts at position 0 the engine re-prefills from the start, so the
+    two are bit-identical; this is the multi-turn case of chat."""
+    import torch
+    from .engine import Engine, SamplingParams
+    engine = Engine(artifact)
+
+    def run(sid, ids):
+        first = {}
+
+        def sink(position, logits):
+            if position == 0:
+                first["logits"] = logits.detach().float().clone()
+        gen = []
+        for ev in engine.generate(sid, ids, new_tokens, SamplingParams(do_sample=False), logits_sink=sink):
+            gen.extend(ev.get("token_ids", []))
+        return gen, first["logits"]
+
+    sid = engine.new_session()
+    gen1, _ = run(sid, ids)
+    turn2 = ids + gen1 + ids[:7]  # the transcript so far plus a new turn
+    gen2, extended = run(sid, turn2)
+    gen3, fresh = run(engine.new_session(), turn2)
+    if gen2 != gen3 or not torch.equal(extended, fresh):
+        raise SystemExit(f"a continued session differs from a fresh one: {gen2} vs {gen3}, "
+                         f"max logit diff {(extended - fresh).abs().max().item():.4g}")
+    print(f"  continuation ok: {len(turn2)}-token second turn matches a fresh session")
+
+
 def selftest(workdir, settings):
     """The CI tier: tiny models through export, the in-process engine,
     and a transformers reference, token-exact. No cluster."""
@@ -700,6 +753,9 @@ def selftest(workdir, settings):
         for label, doc in (("reference", ref), ("candidate", got)):
             with open(os.path.join(workdir, f"{name}-{label}.json"), "w") as f:
                 json.dump(doc, f, indent=1)
+        with open(os.path.join(artifact, "binding.json")) as f:
+            if json.load(f).get("prefill_from_zero"):
+                _check_continuation(artifact, ID_PROMPTS[0]["ids"])
         rows, ok = compare(ref, got, strict_tokens=True)
         print(table(ref, got, rows))
         if not ok:

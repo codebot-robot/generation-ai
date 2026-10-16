@@ -413,10 +413,15 @@ class Engine:
             # Everything is cached, including the last prompt token;
             # recompute its logits by re-prefilling just that token.
             start = total_len - 1
-        if self.binding.get("prefill_from_zero") and start < len(cached):
+        if self.binding.get("prefill_from_zero") and (
+                start < len(cached)
+                or (start > 0 and total_len - start >= self.min_prefill_len)):
             # This model's prefill graph starts at position 0 (its ring
-            # buffers and compressed caches are seeded by the prefill):
-            # a rewritten prefix means a fresh state and a full prefill.
+            # buffers and compressed caches are seeded by the prefill),
+            # so it cannot extend a cached prefix: a rewritten prefix,
+            # and a multi-token continuation (the next turn of a chat),
+            # mean a fresh state and a full prefill. A single new token
+            # goes through the decode graph below, which takes a position.
             self._reset_state(session)
             start = 0
 
