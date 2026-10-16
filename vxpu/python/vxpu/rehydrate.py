@@ -28,14 +28,34 @@ is exactly bincount).
 """
 
 import hashlib
+import logging
 import math
 import os
 import threading
+import time
 from concurrent.futures import ThreadPoolExecutor
+from datetime import datetime, timezone
+from urllib.parse import parse_qs, urlparse
 
 import requests
 import torch
+import urllib3.util
 from torch.export.passes import move_to_device_pass
+
+logger = logging.getLogger(__name__)
+
+# Quiet urllib3's connection pool retry logs so query strings with signed bearer URLs
+# never reach logs.
+logging.getLogger("urllib3.connectionpool").setLevel(logging.ERROR)
+logging.getLogger("urllib3.util.retry").setLevel(logging.ERROR)
+
+
+def _redact_url(url):
+    """Strip query parameters from a URL to prevent leaking bearer signatures in logs."""
+    try:
+        return urlparse(url)._replace(query="").geturl()
+    except Exception:
+        return url
 
 DTYPES = {
     "F64": torch.float64, "F32": torch.float32, "F16": torch.float16,
@@ -58,10 +78,193 @@ def _session():
     session = getattr(_local, "session", None)
     if session is None:
         session = _local.session = requests.Session()
-        adapter = requests.adapters.HTTPAdapter(pool_connections=4, pool_maxsize=4, max_retries=3)
+        retries = urllib3.util.Retry(
+            total=3,
+            connect=3,
+            read=3,
+            status=0,
+            respect_retry_after_header=False,
+        )
+        adapter = requests.adapters.HTTPAdapter(pool_connections=4, pool_maxsize=4, max_retries=retries)
         session.mount("http://", adapter)
         session.mount("https://", adapter)
     return session
+
+
+# In-process cache for direct GCS signed URLs, resolved once per file.
+_direct_url_cache = {}
+_direct_url_lock = threading.Lock()
+_url_locks = {}
+_locks_lock = threading.Lock()
+
+
+def _get_url_lock(url):
+    with _locks_lock:
+        if url not in _url_locks:
+            _url_locks[url] = threading.Lock()
+        return _url_locks[url]
+
+
+EXPIRY_MARGIN_SEC = 120  # 2 minutes refresh margin for clock skew
+FALLBACK_TTL_SEC = 180   # 3 minutes TTL for definite "no signer" fallback
+
+
+class _CachedDirectURL:
+    def __init__(self, url, expires_at=None, is_direct=True):
+        self.url = url
+        self.expires_at = expires_at
+        self.is_direct = is_direct
+
+    def is_expired(self, now=None):
+        if self.expires_at is None:
+            # An unparseable expiry is treated as expired rather than never
+            return True
+        if now is None:
+            now = time.time()
+        margin = EXPIRY_MARGIN_SEC if self.is_direct else 0
+        return (now + margin) >= self.expires_at
+
+
+def _parse_url_expiry(url):
+    """Extract expiry timestamp from GCS V4 pre-signed URL query parameters."""
+    try:
+        parsed = urlparse(url)
+        qs = parse_qs(parsed.query)
+        if "X-Goog-Date" in qs and "X-Goog-Expires" in qs:
+            date_str = qs["X-Goog-Date"][0]
+            expires_sec = int(qs["X-Goog-Expires"][0])
+            dt = datetime.strptime(date_str, "%Y%m%dT%H%M%SZ").replace(tzinfo=timezone.utc)
+            return dt.timestamp() + expires_sec
+    except Exception:
+        pass
+    return None
+
+
+def _ask_direct_url(source_url):
+    """Ask modelstore for a direct GCS signed URL via HEAD or GET ?redirect=1.
+
+    Returns:
+        (url, should_cache, is_direct, expires_at)
+    """
+    sess = _session()
+    # 1. Try HEAD request on source_url (the existing hook returning X-Modelstore-Direct-Url)
+    try:
+        resp = sess.head(source_url, headers={"X-Modelstore-Want-Direct-Url": "1"})
+        if resp.status_code == 200:
+            direct_url = resp.headers.get("X-Modelstore-Direct-Url")
+            if direct_url:
+                expires_at = _parse_url_expiry(direct_url)
+                return direct_url, True, True, expires_at
+            # Definite "no signer": modelstore answered 200 without direct URL header
+            return source_url, True, False, time.time() + FALLBACK_TTL_SEC
+        elif resp.status_code == 307:
+            direct_url = resp.headers.get("Location") or resp.headers.get("X-Modelstore-Direct-Url")
+            if direct_url:
+                expires_at = _parse_url_expiry(direct_url)
+                return direct_url, True, True, expires_at
+        elif resp.status_code == 503:
+            retry_after_str = resp.headers.get("Retry-After")
+            try:
+                retry_after_sec = int(retry_after_str) if retry_after_str else 5
+            except ValueError:
+                retry_after_sec = 5
+            logger.warning(
+                "probing direct URL for %s returned 503 (retry after %ds); caching proxy fallback for %ds",
+                _redact_url(source_url), retry_after_sec, retry_after_sec,
+            )
+            return source_url, True, False, time.time() + retry_after_sec
+        else:
+            logger.warning(
+                "probing direct URL for %s returned status %d; falling back without caching",
+                _redact_url(source_url), resp.status_code,
+            )
+    except Exception as e:
+        logger.warning(
+            "probing direct URL for %s failed with exception: %s; falling back without caching",
+            _redact_url(source_url), e,
+        )
+
+    # 2. Try GET with ?redirect=1 (answering 307 to the signed URL)
+    try:
+        sep = "&" if "?" in source_url else "?"
+        resp = sess.get(
+            f"{source_url}{sep}redirect=1",
+            headers={"X-Modelstore-Want-Direct-Url": "1"},
+            allow_redirects=False,
+            stream=True,
+        )
+        resp.close()
+        if resp.status_code == 307 and "Location" in resp.headers:
+            direct_url = resp.headers["Location"]
+            expires_at = _parse_url_expiry(direct_url)
+            return direct_url, True, True, expires_at
+        if "X-Modelstore-Direct-Url" in resp.headers:
+            direct_url = resp.headers["X-Modelstore-Direct-Url"]
+            expires_at = _parse_url_expiry(direct_url)
+            return direct_url, True, True, expires_at
+        if resp.status_code == 503:
+            retry_after_str = resp.headers.get("Retry-After")
+            try:
+                retry_after_sec = int(retry_after_str) if retry_after_str else 5
+            except ValueError:
+                retry_after_sec = 5
+            logger.warning(
+                "asking direct URL via redirect for %s returned 503; caching proxy fallback for %ds",
+                _redact_url(source_url), retry_after_sec,
+            )
+            return source_url, True, False, time.time() + retry_after_sec
+    except Exception as e:
+        logger.warning(
+            "asking direct URL via redirect for %s failed: %s",
+            _redact_url(source_url), e,
+        )
+
+    # Non-200/307/503 or exception: do not cache fallback forever
+    return source_url, False, False, None
+
+
+def _resolve_url(source_url, failed_url=None):
+    """Return the cached direct URL for source_url, refreshing if expired or missing,
+    or if failed_url matches the currently cached URL."""
+    if not source_url.startswith(("http://", "https://")):
+        return source_url
+    with _direct_url_lock:
+        if source_url in _direct_url_cache:
+            entry = _direct_url_cache[source_url]
+            # If caller encountered a failure with failed_url, only refresh if the cache
+            # still holds that same failed URL! If another thread already refreshed it,
+            # return what the peer already fetched.
+            if failed_url is not None and entry.url != failed_url:
+                if not entry.is_expired():
+                    return entry.url
+            elif failed_url is None and not entry.is_expired():
+                return entry.url
+
+    with _get_url_lock(source_url):
+        with _direct_url_lock:
+            if source_url in _direct_url_cache:
+                entry = _direct_url_cache[source_url]
+                if failed_url is not None and entry.url != failed_url:
+                    if not entry.is_expired():
+                        return entry.url
+                elif failed_url is None and not entry.is_expired():
+                    return entry.url
+            _direct_url_cache.pop(source_url, None)
+
+        url, should_cache, is_direct, expires_at = _ask_direct_url(source_url)
+        if should_cache:
+            entry = _CachedDirectURL(url, expires_at=expires_at, is_direct=is_direct)
+            with _direct_url_lock:
+                _direct_url_cache[source_url] = entry
+        return url
+
+
+def clear_url_cache():
+    """Clear in-process cached direct URLs (useful for tests)."""
+    with _direct_url_lock:
+        _direct_url_cache.clear()
+    with _locks_lock:
+        _url_locks.clear()
 
 
 # A tensor larger than this is read as several concurrent ranges into
@@ -73,24 +276,51 @@ CHUNK = 8 << 20
 
 def _read_range(url, offset, length, into):
     """Stream bytes [offset, offset + length) of url into the memoryview
-    `into`, in chunks, so nothing is held twice."""
+    `into`, in chunks, so nothing is held twice. Asks for direct URLs once per
+    file, caches in-process, and retries on 400/403/expired."""
     end = offset + length - 1
     if url.startswith("file://"):  # a local checkpoint directory
         with open(url[len("file://"):], "rb") as f:
             f.seek(offset)
             got = f.readinto(into)
     else:
-        resp = _session().get(url, headers={"Range": f"bytes={offset}-{end}"}, stream=True)
-        resp.raise_for_status()
-        if resp.status_code != 206:
-            raise RuntimeError(f"expected HTTP 206 Partial Content, got {resp.status_code}")
-        got = 0
-        for chunk in resp.iter_content(CHUNK):
-            n = len(chunk)
-            if got + n > length:
-                raise RuntimeError(f"server sent more than {length} bytes")
-            into[got:got + n] = chunk
-            got += n
+        last_failed_url = None
+        for attempt in range(2):
+            fetch_url = _resolve_url(url, failed_url=(last_failed_url if attempt > 0 else None))
+            redacted_fetch_url = _redact_url(fetch_url)
+            try:
+                resp = _session().get(fetch_url, headers={"Range": f"bytes={offset}-{end}"}, stream=True)
+                if resp.status_code in (400, 403) and attempt == 0 and fetch_url != url:
+                    resp.close()
+                    last_failed_url = fetch_url
+                    continue
+                if resp.status_code >= 400:
+                    status_code = resp.status_code
+                    reason = resp.reason or "Error"
+                    resp.close()
+                    resp.url = redacted_fetch_url
+                    if hasattr(resp, "request") and resp.request is not None:
+                        resp.request.url = redacted_fetch_url
+                    raise requests.HTTPError(
+                        f"{status_code} {reason} for url: {redacted_fetch_url}",
+                        response=resp,
+                    )
+                if resp.status_code != 206:
+                    resp.close()
+                    raise RuntimeError(f"expected HTTP 206 Partial Content, got {resp.status_code} for {redacted_fetch_url}")
+                got = 0
+                for chunk in resp.iter_content(CHUNK):
+                    n = len(chunk)
+                    if got + n > length:
+                        raise RuntimeError(f"server sent more than {length} bytes for {redacted_fetch_url}")
+                    into[got:got + n] = chunk
+                    got += n
+                break
+            except requests.HTTPError:
+                raise
+            except requests.RequestException as e:
+                err_type = type(e).__name__
+                raise type(e)(f"{err_type} reading {redacted_fetch_url}") from None
     if got != length:
         raise RuntimeError(f"expected {length} bytes, got {got} bytes")
 
