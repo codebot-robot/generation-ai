@@ -31,12 +31,14 @@ from torch.distributed.fsdp.wrap import (
 )
 
 def download_from_modelstore(model_id, modelstore_url, local_dir):
-    """Downloads model files from modelstore. Returns True if successful."""
+    """Downloads a model's files from modelstore. Returns True if successful.
+
+    modelstore is an OCI registry with a Hugging Face facade: the tree
+    listing names the files and `resolve` serves them (the same URLs
+    transformers would use with HF_ENDPOINT=modelstore_url)."""
     print(f"Checking for model {model_id} in modelstore at {modelstore_url}...")
-    
-    # Get model metadata
     try:
-        resp = requests.get(f"{modelstore_url}/models/{model_id}", timeout=10)
+        resp = requests.get(f"{modelstore_url}/api/models/{model_id}/tree/main", timeout=10)
         if resp.status_code == 404:
             print(f"Model {model_id} not found in modelstore.")
             return False
@@ -45,27 +47,22 @@ def download_from_modelstore(model_id, modelstore_url, local_dir):
         print(f"Error connecting to modelstore: {e}")
         return False
 
-    model_data = resp.json()
-    print(f"Downloading model {model_id} to {local_dir}...")
+    entries = [e for e in resp.json() if e.get("type") == "file"]
+    print(f"Downloading model {model_id} ({len(entries)} files) to {local_dir}...")
     local_path = Path(local_dir)
     local_path.mkdir(parents=True, exist_ok=True)
 
-    for file_info in model_data["spec"]["files"]:
-        rel_path = file_info["path"]
-        sha256 = file_info["sha256"]
-        
+    for entry in entries:
+        rel_path = entry["path"]
         file_local_path = local_path / rel_path
         file_local_path.parent.mkdir(parents=True, exist_ok=True)
-        
-        # Download blob
         print(f"  Downloading {rel_path}...")
-        blob_url = f"{modelstore_url}/blobs/{sha256}"
-        with requests.get(blob_url, stream=True) as r:
+        with requests.get(f"{modelstore_url}/{model_id}/resolve/main/{rel_path}", stream=True) as r:
             r.raise_for_status()
             with open(file_local_path, 'wb') as f:
-                for chunk in r.iter_content(chunk_size=8192):
+                for chunk in r.iter_content(chunk_size=1 << 20):
                     f.write(chunk)
-    
+
     print("Download complete.")
     return True
 

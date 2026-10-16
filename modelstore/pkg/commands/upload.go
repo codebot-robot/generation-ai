@@ -28,9 +28,8 @@ import (
 	"path/filepath"
 	"strings"
 
-	"github.com/gke-labs/generation-ai/modelstore/apis/v1alpha1"
+	"github.com/gke-labs/generation-ai/modelstore/pkg/registry"
 	"github.com/spf13/cobra"
-	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/klog/v2"
 )
 
@@ -38,10 +37,12 @@ type UploadOptions struct {
 	ModelstoreURL string
 	ModelName     string
 	ModelDir      string
+	Tag           string
 }
 
 func (o *UploadOptions) InitDefaults() {
 	o.ModelstoreURL = "http://localhost:8080"
+	o.Tag = "latest"
 }
 
 func BuildUploadCommand() *cobra.Command {
@@ -57,8 +58,9 @@ func BuildUploadCommand() *cobra.Command {
 	}
 
 	cmd.Flags().StringVar(&opt.ModelstoreURL, "modelstore-url", opt.ModelstoreURL, "URL of the modelstore server")
-	cmd.Flags().StringVar(&opt.ModelName, "model-name", "", "Name of the model")
+	cmd.Flags().StringVar(&opt.ModelName, "model-name", "", "Registry name for the model (lowercase, e.g. org/name)")
 	cmd.Flags().StringVar(&opt.ModelDir, "model-dir", "", "Directory containing the model files")
+	cmd.Flags().StringVar(&opt.Tag, "tag", opt.Tag, "Tag to write")
 
 	if err := cmd.MarkFlagRequired("model-name"); err != nil {
 		panic(err)
@@ -70,11 +72,19 @@ func BuildUploadCommand() *cobra.Command {
 	return cmd
 }
 
+// RunUpload pushes a directory as an OCI artifact: every file as a
+// blob (skipped when the registry already has its digest), then a
+// manifest listing them by name, tagged <model-name>:<tag>.
 func RunUpload(ctx context.Context, opt *UploadOptions) error {
 	log := klog.FromContext(ctx)
+	name := opt.ModelName
+	if !registry.ValidName(name) {
+		return fmt.Errorf("model name %q is not a valid registry name (lowercase, [a-z0-9._-/])", name)
+	}
+	base := strings.TrimSuffix(opt.ModelstoreURL, "/")
+	client := &http.Client{}
 
-	var files []v1alpha1.File
-
+	var layers []registry.Descriptor
 	err := filepath.Walk(opt.ModelDir, func(path string, info os.FileInfo, err error) error {
 		if err != nil {
 			return err
@@ -82,13 +92,41 @@ func RunUpload(ctx context.Context, opt *UploadOptions) error {
 		if info.IsDir() {
 			return nil
 		}
-
+		// Walk reports symlinks as themselves; a Hub cache snapshot is a
+		// tree of symlinks into blobs/, so size (and dir-ness) come from
+		// the target, which is also what fileSHA256 hashes.
+		if info, err = os.Stat(path); err != nil {
+			return err
+		}
+		if info.IsDir() {
+			return nil
+		}
 		relPath, err := filepath.Rel(opt.ModelDir, path)
 		if err != nil {
 			return err
 		}
+		relPath = filepath.ToSlash(relPath)
+		sha, err := fileSHA256(path)
+		if err != nil {
+			return err
+		}
+		digest := "sha256:" + sha
+		layers = append(layers, registry.Descriptor{MediaType: registry.MediaTypeFile, Digest: digest, Size: info.Size(),
+			Annotations: map[string]string{registry.AnnotationTitle: relPath}})
 
-		// Calculate SHA256
+		head, err := http.NewRequestWithContext(ctx, http.MethodHead, base+"/v2/"+name+"/blobs/"+digest, nil)
+		if err != nil {
+			return err
+		}
+		resp, err := client.Do(head)
+		if err != nil {
+			return fmt.Errorf("checking blob %s: %w", digest, err)
+		}
+		closeBody(ctx, resp)
+		if resp.StatusCode == http.StatusOK {
+			log.V(2).Info("blob already present", "digest", digest, "path", relPath)
+			return nil
+		}
 		f, err := os.Open(path)
 		if err != nil {
 			return err
@@ -98,104 +136,73 @@ func RunUpload(ctx context.Context, opt *UploadOptions) error {
 				log.Error(err, "closing file", "path", path)
 			}
 		}()
-
-		h := sha256.New()
-		if _, err := io.Copy(h, f); err != nil {
-			return err
-		}
-		sha := hex.EncodeToString(h.Sum(nil))
-
-		files = append(files, v1alpha1.File{
-			Path:   relPath,
-			SHA256: sha,
-		})
-
-		// Check if blob already exists
-		blobURL := fmt.Sprintf("%s/blobs/%s", strings.TrimSuffix(opt.ModelstoreURL, "/"), sha)
-		resp, err := http.Head(blobURL)
-		if err == nil && resp.StatusCode == http.StatusOK {
-			log.V(2).Info("blob already exists", "sha", sha, "path", relPath)
-			return nil
-		}
-
-		// Upload blob
-		if _, err := f.Seek(0, 0); err != nil {
-			return err
-		}
-
-		log.Info("uploading blob", "sha", sha, "path", relPath)
-		req, err := http.NewRequestWithContext(ctx, http.MethodPut, blobURL, f)
+		log.Info("uploading blob", "digest", digest, "path", relPath, "bytes", info.Size())
+		req, err := http.NewRequestWithContext(ctx, http.MethodPost, base+"/v2/"+name+"/blobs/uploads/?digest="+digest, f)
 		if err != nil {
 			return err
 		}
+		req.ContentLength = info.Size()
 		req.Header.Set("Content-Type", "application/octet-stream")
-
-		resp, err = http.DefaultClient.Do(req)
-		if err != nil {
-			return err
-		}
-		defer func() {
-			if err := resp.Body.Close(); err != nil {
-				log.Error(err, "closing response body", "url", blobURL)
-			}
-		}()
-
-		if resp.StatusCode != http.StatusCreated && resp.StatusCode != http.StatusOK {
-			body, err := io.ReadAll(resp.Body)
-			if err != nil {
-				return fmt.Errorf("failed to upload blob %s (status %s): reading body: %w", sha, resp.Status, err)
-			}
-			return fmt.Errorf("failed to upload blob %s: %s %s", sha, resp.Status, string(body))
-		}
-
-		return nil
+		return expect(client, req, http.StatusCreated)
 	})
-
 	if err != nil {
-		return fmt.Errorf("failed to walk model directory: %w", err)
+		return fmt.Errorf("uploading %s: %w", opt.ModelDir, err)
 	}
 
-	model := &v1alpha1.Model{
-		ObjectMeta: metav1.ObjectMeta{
-			Name: opt.ModelName,
-		},
-		Spec: v1alpha1.ModelSpec{
-			Files: files,
-		},
-	}
-
-	// Post completed model
-	modelURL := fmt.Sprintf("%s/models", strings.TrimSuffix(opt.ModelstoreURL, "/"))
-	body, err := json.Marshal(model)
+	manifest := registry.Manifest{SchemaVersion: 2, MediaType: registry.MediaTypeManifest,
+		ArtifactType: registry.ArtifactWeights, Config: registry.EmptyConfig, Layers: layers}
+	body, err := json.Marshal(manifest)
 	if err != nil {
 		return err
 	}
-
-	log.Info("creating model", "name", opt.ModelName)
-	req, err := http.NewRequestWithContext(ctx, http.MethodPost, modelURL, bytes.NewReader(body))
+	log.Info("writing manifest", "name", name, "tag", opt.Tag, "files", len(layers))
+	req, err := http.NewRequestWithContext(ctx, http.MethodPut, base+"/v2/"+name+"/manifests/"+opt.Tag, bytes.NewReader(body))
 	if err != nil {
 		return err
 	}
-	req.Header.Set("Content-Type", "application/json")
+	req.Header.Set("Content-Type", registry.MediaTypeManifest)
+	if err := expect(client, req, http.StatusCreated); err != nil {
+		return fmt.Errorf("writing manifest: %w", err)
+	}
+	log.Info("uploaded model", "reference", name+":"+opt.Tag)
+	return nil
+}
 
-	resp, err := http.DefaultClient.Do(req)
+func fileSHA256(path string) (string, error) {
+	f, err := os.Open(path)
+	if err != nil {
+		return "", err
+	}
+	h := sha256.New()
+	_, err = io.Copy(h, f)
+	if cerr := f.Close(); err == nil {
+		err = cerr
+	}
+	if err != nil {
+		return "", err
+	}
+	return hex.EncodeToString(h.Sum(nil)), nil
+}
+
+func closeBody(ctx context.Context, resp *http.Response) {
+	if err := resp.Body.Close(); err != nil {
+		klog.FromContext(ctx).Error(err, "closing response body", "url", resp.Request.URL.String())
+	}
+}
+
+// expect runs req and fails unless the status is want.
+func expect(client *http.Client, req *http.Request, want int) error {
+	resp, err := client.Do(req)
 	if err != nil {
 		return err
 	}
-	defer func() {
-		if err := resp.Body.Close(); err != nil {
-			log.Error(err, "closing response body", "url", modelURL)
+	defer closeBody(req.Context(), resp)
+	if resp.StatusCode != want {
+		msg, rerr := io.ReadAll(io.LimitReader(resp.Body, 2048))
+		if rerr != nil {
+			msg = []byte("(unreadable body)")
 		}
-	}()
-
-	if resp.StatusCode != http.StatusCreated && resp.StatusCode != http.StatusOK {
-		body, err := io.ReadAll(resp.Body)
-		if err != nil {
-			return fmt.Errorf("failed to create model %s (status %s): reading body: %w", opt.ModelName, resp.Status, err)
-		}
-		return fmt.Errorf("failed to create model %s: %s %s", opt.ModelName, resp.Status, string(body))
+		return fmt.Errorf("%s %s: %s: %s", req.Method, req.URL.Path, resp.Status, strings.TrimSpace(string(msg)))
 	}
-
-	log.Info("successfully uploaded model", "name", opt.ModelName)
 	return nil
 }

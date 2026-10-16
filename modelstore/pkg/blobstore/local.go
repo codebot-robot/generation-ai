@@ -21,6 +21,8 @@ import (
 	"io"
 	"os"
 	"path/filepath"
+	"sort"
+	"strings"
 
 	"k8s.io/klog/v2"
 )
@@ -32,8 +34,23 @@ type Local struct {
 
 // NewLocal opens (creating if needed) a directory-backed store.
 func NewLocal(dir string) (*Local, error) {
-	if err := os.MkdirAll(filepath.Join(dir, "blobs"), 0o755); err != nil {
-		return nil, fmt.Errorf("creating blob directory: %w", err)
+	for _, sub := range []string{"blobs", filepath.Join("refs", ".tmp")} {
+		if err := os.MkdirAll(filepath.Join(dir, sub), 0o755); err != nil {
+			return nil, fmt.Errorf("creating %s directory: %w", sub, err)
+		}
+	}
+	// A process killed mid-Put leaves its temp file; nothing else would
+	// ever remove it.
+	for _, pattern := range []string{filepath.Join(dir, "blobs", "upload-*"), filepath.Join(dir, "refs", ".tmp", "*")} {
+		stale, err := filepath.Glob(pattern)
+		if err != nil {
+			return nil, fmt.Errorf("listing stale temp files: %w", err)
+		}
+		for _, p := range stale {
+			if err := os.Remove(p); err != nil && !errors.Is(err, os.ErrNotExist) {
+				return nil, fmt.Errorf("removing stale temp file %s: %w", p, err)
+			}
+		}
 	}
 	return &Local{dir: dir}, nil
 }
@@ -117,5 +134,77 @@ type limitedFile struct {
 func (l *limitedFile) Close() error { return l.f.Close() }
 
 func (l *Local) DirectURL(sha string) string { return "" }
+
+// refPath is flat, like the GCS backend's object names: one file per
+// key with its slashes encoded ('%' is outside the key grammar). Nested
+// directories would make "tags/org/name" (a tag of org) and
+// "tags/org/name/<tag>" (tags of org/name) a file and a directory of
+// the same path.
+func (l *Local) refPath(key string) string {
+	return filepath.Join(l.dir, "refs", strings.ReplaceAll(key, "/", "%2F"))
+}
+
+func (l *Local) PutRef(ctx context.Context, key string, value []byte) error {
+	if !ValidRefKey(key) {
+		return fmt.Errorf("invalid ref key %q", key)
+	}
+	// Staged in a directory of its own, so no tag name can collide with
+	// a temporary and ListRefs never sees one.
+	tmp, err := os.CreateTemp(filepath.Join(l.dir, "refs", ".tmp"), "ref-*")
+	if err != nil {
+		return err
+	}
+	discard := func(err error) error {
+		// the temp is worthless after a failed write: report the first error, log the rest
+		log := klog.FromContext(ctx)
+		if cerr := tmp.Close(); cerr != nil && !errors.Is(cerr, os.ErrClosed) {
+			log.Error(cerr, "closing temp ref", "path", tmp.Name())
+		}
+		if rerr := os.Remove(tmp.Name()); rerr != nil && !errors.Is(rerr, os.ErrNotExist) {
+			log.Error(rerr, "removing temp ref", "path", tmp.Name())
+		}
+		return err
+	}
+	if _, err := tmp.Write(value); err != nil {
+		return discard(err)
+	}
+	if err := tmp.Close(); err != nil {
+		return discard(err)
+	}
+	return os.Rename(tmp.Name(), l.refPath(key))
+}
+
+func (l *Local) GetRef(ctx context.Context, key string) ([]byte, error) {
+	if !ValidRefKey(key) {
+		return nil, ErrNotFound
+	}
+	b, err := os.ReadFile(l.refPath(key))
+	if errors.Is(err, os.ErrNotExist) {
+		return nil, ErrNotFound
+	}
+	return b, err
+}
+
+func (l *Local) ListRefs(ctx context.Context, prefix string) ([]string, error) {
+	entries, err := os.ReadDir(filepath.Join(l.dir, "refs"))
+	if errors.Is(err, os.ErrNotExist) {
+		return nil, nil
+	}
+	if err != nil {
+		return nil, err
+	}
+	var keys []string
+	for _, e := range entries {
+		if e.IsDir() {
+			continue
+		}
+		key := strings.ReplaceAll(e.Name(), "%2F", "/")
+		if strings.HasPrefix(key, prefix) {
+			keys = append(keys, key)
+		}
+	}
+	sort.Strings(keys)
+	return keys, nil
+}
 
 func (l *Local) String() string { return "local:" + l.dir }

@@ -27,27 +27,18 @@ import (
 	"testing"
 	"time"
 
-	"github.com/gke-labs/generation-ai/modelstore/apis/v1alpha1"
 	"github.com/gke-labs/generation-ai/modelstore/pkg/blobstore"
 	"github.com/gke-labs/generation-ai/modelstore/pkg/importer"
-	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
-	"k8s.io/apimachinery/pkg/runtime"
-	"sigs.k8s.io/controller-runtime/pkg/client"
-	"sigs.k8s.io/controller-runtime/pkg/client/fake"
+	"github.com/gke-labs/generation-ai/modelstore/pkg/registry"
 )
 
-func newTestProxy(t *testing.T, hfEndpoint string) (*Proxy, client.Client) {
+func newTestProxy(t *testing.T, hfEndpoint string) *Proxy {
 	t.Helper()
 	store, err := blobstore.NewLocal(t.TempDir())
 	if err != nil {
 		t.Fatal(err)
 	}
-	scheme := runtime.NewScheme()
-	if err := v1alpha1.AddToScheme(scheme); err != nil {
-		t.Fatal(err)
-	}
-	kube := fake.NewClientBuilder().WithScheme(scheme).WithStatusSubresource(&v1alpha1.Model{}).Build()
-	return NewProxy(store, importer.New(store, hfEndpoint), kube), kube
+	return NewProxy(registry.New(store), importer.New(store, hfEndpoint))
 }
 
 func shaOf(b []byte) string {
@@ -65,118 +56,44 @@ func do(p *Proxy, method, path string, body io.Reader, headers ...string) *httpt
 	return w
 }
 
-func TestModelName(t *testing.T) {
+func TestRepositoryName(t *testing.T) {
 	for in, want := range map[string]string{
-		"Qwen/Qwen3-8B-FP8":                   "qwen-qwen3-8b-fp8",
-		"google/gemma-4-E4B-it":               "google-gemma-4-e4b-it",
-		"trl-internal-testing/tiny_random.v2": "trl-internal-testing-tiny-random.v2",
-		"user/repo":                           "user-repo",
+		"Qwen/Qwen3-8B-FP8":     "qwen/qwen3-8b-fp8",
+		"google/gemma-4-E4B-it": "google/gemma-4-e4b-it",
+		"user/repo":             "user/repo",
+		"org/my_model":          "org/my_model",
 	} {
-		if got := modelName(in); got != want {
-			t.Errorf("modelName(%q) = %q, want %q", in, got, want)
+		if got, err := RepositoryName(in); err != nil || got != want {
+			t.Errorf("RepositoryName(%q) = %q, %v; want %q", in, got, err, want)
+		}
+	}
+	for _, bad := range []string{"/", "org//name", "a/"} {
+		if _, err := RepositoryName(bad); err == nil {
+			t.Errorf("RepositoryName(%q) should fail", bad)
 		}
 	}
 }
 
-func TestBlobPutGetAndRanges(t *testing.T) {
-	p, _ := newTestProxy(t, "")
+func TestPlainBlobRoutes(t *testing.T) {
+	p := newTestProxy(t, "")
 	content := []byte("0123456789abcdef")
 	sha := shaOf(content)
-
 	if w := do(p, http.MethodPut, "/blobs/"+sha, bytes.NewReader(content)); w.Code != http.StatusCreated {
-		t.Fatalf("PUT: got %d: %s", w.Code, w.Body.String())
+		t.Fatalf("PUT: %d %s", w.Code, w.Body.String())
 	}
 	if w := do(p, http.MethodPut, "/blobs/"+strings.Repeat("0", 64), bytes.NewReader(content)); w.Code != http.StatusBadRequest {
-		t.Errorf("PUT with wrong sha: got %d, want 400", w.Code)
+		t.Errorf("PUT with wrong sha: %d", w.Code)
 	}
-	if w := do(p, http.MethodPut, "/blobs/not-a-sha", bytes.NewReader(content)); w.Code != http.StatusBadRequest {
-		t.Errorf("PUT with malformed name: got %d, want 400", w.Code)
+	w := do(p, http.MethodGet, "/blobs/"+sha, nil, "Range", "bytes=4-7")
+	if w.Code != http.StatusPartialContent || w.Body.String() != "4567" {
+		t.Errorf("range through /blobs: %d %q", w.Code, w.Body.String())
 	}
-
-	w := do(p, http.MethodHead, "/blobs/"+sha, nil)
-	if w.Code != http.StatusOK || w.Header().Get("Content-Length") != "16" || w.Header().Get("Accept-Ranges") != "bytes" {
-		t.Errorf("HEAD: got %d %v", w.Code, w.Header())
-	}
-	if w := do(p, http.MethodGet, "/blobs/"+sha, nil); w.Code != http.StatusOK || w.Body.String() != string(content) {
-		t.Errorf("GET: got %d %q", w.Code, w.Body.String())
+	// The same blob through the registry route.
+	if w := do(p, http.MethodHead, "/v2/any/name/blobs/sha256:"+sha, nil); w.Code != 200 {
+		t.Errorf("registry HEAD: %d", w.Code)
 	}
 	if w := do(p, http.MethodGet, "/blobs/"+strings.Repeat("1", 64), nil); w.Code != http.StatusNotFound {
-		t.Errorf("GET missing: got %d, want 404", w.Code)
-	}
-
-	for _, tc := range []struct {
-		rng, want, contentRange string
-	}{
-		{"bytes=4-7", "4567", "bytes 4-7/16"},
-		{"bytes=12-", "cdef", "bytes 12-15/16"},
-		{"bytes=-3", "def", "bytes 13-15/16"},
-		{"bytes=10-99", "abcdef", "bytes 10-15/16"},
-	} {
-		w := do(p, http.MethodGet, "/blobs/"+sha, nil, "Range", tc.rng)
-		if w.Code != http.StatusPartialContent || w.Body.String() != tc.want ||
-			w.Header().Get("Content-Range") != tc.contentRange ||
-			w.Header().Get("Content-Length") != fmt.Sprint(len(tc.want)) {
-			t.Errorf("Range %s: got %d %q %q", tc.rng, w.Code, w.Body.String(), w.Header().Get("Content-Range"))
-		}
-	}
-	if w := do(p, http.MethodGet, "/blobs/"+sha, nil, "Range", "bytes=16-20"); w.Code != http.StatusRequestedRangeNotSatisfiable {
-		t.Errorf("unsatisfiable range: got %d, want 416", w.Code)
-	}
-	if w := do(p, http.MethodGet, "/blobs/"+sha, nil, "Range", "bytes=0-1,4-5"); w.Code != http.StatusRequestedRangeNotSatisfiable {
-		t.Errorf("multi range: got %d, want 416", w.Code)
-	}
-}
-
-func TestModelCreateAndHubReads(t *testing.T) {
-	p, _ := newTestProxy(t, "")
-	content := []byte("blob content")
-	sha := shaOf(content)
-	do(p, http.MethodPut, "/blobs/"+sha, bytes.NewReader(content))
-
-	missing := strings.Repeat("2", 64)
-	bad, _ := json.Marshal(v1alpha1.Model{ObjectMeta: metav1.ObjectMeta{Name: "bad"},
-		Spec: v1alpha1.ModelSpec{Files: []v1alpha1.File{{Path: "x", SHA256: missing}}}})
-	if w := do(p, http.MethodPost, "/models", bytes.NewReader(bad)); w.Code != http.StatusBadRequest {
-		t.Errorf("model with missing blob: got %d, want 400", w.Code)
-	}
-
-	model, _ := json.Marshal(v1alpha1.Model{ObjectMeta: metav1.ObjectMeta{Name: "user-repo"},
-		Spec: v1alpha1.ModelSpec{Files: []v1alpha1.File{{Path: "config.json", SHA256: sha, Size: int64(len(content))}}}})
-	if w := do(p, http.MethodPost, "/models", bytes.NewReader(model)); w.Code != http.StatusCreated {
-		t.Fatalf("POST model: got %d: %s", w.Code, w.Body.String())
-	}
-	w := do(p, http.MethodGet, "/models/user-repo", nil)
-	var got v1alpha1.Model
-	if err := json.NewDecoder(w.Body).Decode(&got); err != nil || got.Status.Phase != v1alpha1.PhaseReady {
-		t.Errorf("GET model: %v phase=%q", err, got.Status.Phase)
-	}
-	w = do(p, http.MethodGet, "/models", nil)
-	var list v1alpha1.ModelList
-	if err := json.NewDecoder(w.Body).Decode(&list); err != nil || len(list.Items) != 1 {
-		t.Errorf("list: %v %d items", err, len(list.Items))
-	}
-
-	// Hub-compatible reads, with and without a revision in the path.
-	for _, path := range []string{"/api/models/user/repo", "/api/models/user/repo/revision/main"} {
-		w := do(p, http.MethodGet, path, nil)
-		var meta map[string]any
-		if err := json.NewDecoder(w.Body).Decode(&meta); w.Code != 200 || err != nil || meta["modelId"] != "user/repo" {
-			t.Errorf("%s: %d %v %v", path, w.Code, err, meta)
-		}
-	}
-	w = do(p, http.MethodGet, "/user/repo/resolve/main/config.json", nil)
-	if w.Code != http.StatusOK || w.Body.String() != string(content) || w.Header().Get("ETag") != `"`+sha+`"` {
-		t.Errorf("resolve: %d %q etag=%s", w.Code, w.Body.String(), w.Header().Get("ETag"))
-	}
-	w = do(p, http.MethodGet, "/user/repo/resolve/main/config.json", nil, "Range", "bytes=0-3")
-	if w.Code != http.StatusPartialContent || w.Body.String() != "blob" {
-		t.Errorf("resolve range: %d %q", w.Code, w.Body.String())
-	}
-	if w := do(p, http.MethodGet, "/user/repo/resolve/main/missing.bin", nil); w.Code != http.StatusNotFound {
-		t.Errorf("resolve missing file: %d", w.Code)
-	}
-	if w := do(p, http.MethodGet, "/api/models/nobody/nothing", nil); w.Code != http.StatusNotFound {
-		t.Errorf("metadata of unknown model: %d", w.Code)
+		t.Errorf("missing blob: %d", w.Code)
 	}
 }
 
@@ -200,142 +117,174 @@ func fakeHub(t *testing.T, weights, config []byte) *httptest.Server {
 	return httptest.NewServer(mux)
 }
 
-func TestBlobImport(t *testing.T) {
-	weights := bytes.Repeat([]byte("w"), 1000)
-	hub := fakeHub(t, weights, []byte("{}"))
-	defer hub.Close()
-	p, _ := newTestProxy(t, hub.URL)
-	sha := shaOf(weights)
-	body := fmt.Sprintf(`{"url": %q}`, hub.URL+"/org/name/resolve/abc123/model.safetensors")
-
-	w := do(p, http.MethodPost, "/blobs/"+sha+"/import?wait=true", strings.NewReader(body))
-	if w.Code != http.StatusCreated {
-		t.Fatalf("import: got %d: %s", w.Code, w.Body.String())
-	}
-	if w := do(p, http.MethodGet, "/blobs/"+sha, nil, "Range", "bytes=0-9"); w.Code != 206 || w.Body.String() != "wwwwwwwwww" {
-		t.Errorf("after import: %d %q", w.Code, w.Body.String())
-	}
-	// Importing again is a no-op that reports the blob present.
-	if w := do(p, http.MethodPost, "/blobs/"+sha+"/import", strings.NewReader(body)); w.Code != http.StatusCreated {
-		t.Errorf("re-import: got %d, want 201", w.Code)
-	}
-	// A URL whose bytes do not match the sha leaves no blob.
-	wrong := strings.Repeat("3", 64)
-	w = do(p, http.MethodPost, "/blobs/"+wrong+"/import?wait=true", strings.NewReader(body))
-	if w.Code != http.StatusInternalServerError || !strings.Contains(w.Body.String(), "sha256 mismatch") {
-		t.Errorf("mismatched import: %d %s", w.Code, w.Body.String())
-	}
-	if w := do(p, http.MethodHead, "/blobs/"+wrong, nil); w.Code != http.StatusNotFound {
-		t.Errorf("mismatched blob should not exist: %d", w.Code)
+// waitImport polls GET /models/<name> until the import leaves Importing.
+func waitImport(t *testing.T, p *Proxy, name string) ImportStatus {
+	t.Helper()
+	deadline := time.Now().Add(10 * time.Second)
+	for {
+		w := do(p, http.MethodGet, "/models/"+name, nil)
+		var v modelView
+		_ = json.Unmarshal(w.Body.Bytes(), &v)
+		if v.Status.Phase != PhaseImporting || time.Now().After(deadline) {
+			return v.Status
+		}
+		time.Sleep(20 * time.Millisecond)
 	}
 }
 
-func TestModelImport(t *testing.T) {
+func TestModelImportWritesAnArtifact(t *testing.T) {
 	weights := bytes.Repeat([]byte("x"), 4096)
 	config := []byte(`{"model_type": "test"}`)
 	hub := fakeHub(t, weights, config)
 	defer hub.Close()
-	p, kube := newTestProxy(t, hub.URL)
+	p := newTestProxy(t, hub.URL)
 
 	w := do(p, http.MethodPost, "/models/import", strings.NewReader(`{"repo": "org/name", "revision": "main"}`))
 	if w.Code != http.StatusAccepted {
-		t.Fatalf("import: got %d: %s", w.Code, w.Body.String())
+		t.Fatalf("import: %d %s", w.Code, w.Body.String())
 	}
-	var model v1alpha1.Model
-	deadline := time.Now().Add(10 * time.Second)
-	for {
-		if err := kube.Get(t.Context(), client.ObjectKey{Name: "org-name"}, &model); err != nil {
-			t.Fatal(err)
-		}
-		if model.Status.Phase != v1alpha1.PhaseImporting || time.Now().After(deadline) {
-			break
-		}
-		time.Sleep(20 * time.Millisecond)
+	var accepted modelView
+	_ = json.Unmarshal(w.Body.Bytes(), &accepted)
+	if accepted.Metadata.Name != "org/name" {
+		t.Errorf("accepted name: %q", accepted.Metadata.Name)
 	}
-	if model.Status.Phase != v1alpha1.PhaseReady {
-		t.Fatalf("phase %q (%s)", model.Status.Phase, model.Status.Message)
+	st := waitImport(t, p, "org/name")
+	if st.Phase != PhaseReady || st.FilesImported != 2 || st.BytesImported != int64(len(weights)+len(config)) {
+		t.Fatalf("status: %+v", st)
 	}
-	if model.Spec.Source == nil || model.Spec.Source.CommitSHA != "abc123" || len(model.Spec.Files) != 2 {
-		t.Fatalf("spec: %+v", model.Spec)
+	// The result is an OCI artifact: tags for the revision and the commit, layers named by file.
+	w = do(p, http.MethodGet, "/v2/org/name/tags/list", nil)
+	if !strings.Contains(w.Body.String(), `"abc123"`) || !strings.Contains(w.Body.String(), `"main"`) {
+		t.Errorf("tags: %s", w.Body.String())
 	}
-	if model.Status.FilesImported != 2 || model.Status.BytesImported != int64(len(weights)+len(config)) {
-		t.Errorf("status: %+v", model.Status)
+	w = do(p, http.MethodGet, "/v2/org/name/manifests/main", nil)
+	var m registry.Manifest
+	if err := json.Unmarshal(w.Body.Bytes(), &m); err != nil || len(m.Layers) != 2 || m.Annotations[registry.AnnotationHubRepo] != "org/name" {
+		t.Fatalf("manifest: %v %s", err, w.Body.String())
 	}
-	// The small file was hashed on the way in; the Hub reads now serve both.
-	w = do(p, http.MethodGet, "/org/name/resolve/main/config.json", nil)
+	// Hub-compatible reads come from the manifest (any casing of the id).
+	w = do(p, http.MethodGet, "/api/models/Org/Name", nil)
+	var meta map[string]any
+	_ = json.NewDecoder(w.Body).Decode(&meta)
+	if meta["sha"] != "abc123" || len(meta["siblings"].([]any)) != 2 {
+		t.Errorf("metadata: %v", meta)
+	}
+	// The tree and paths-info routes huggingface_hub lists with.
+	w = do(p, http.MethodGet, "/api/models/Org/Name/tree/abc123?recursive=true&expand=false", nil)
+	var tree []map[string]any
+	if err := json.Unmarshal(w.Body.Bytes(), &tree); err != nil || len(tree) != 2 || tree[0]["type"] != "file" || tree[0]["lfs"] == nil {
+		t.Errorf("tree: %d %s", w.Code, w.Body.String())
+	}
+	w = do(p, http.MethodPost, "/api/models/org/name/paths-info/main", strings.NewReader("paths=config.json&paths=missing"), "Content-Type", "application/x-www-form-urlencoded")
+	var infos []map[string]any
+	if err := json.Unmarshal(w.Body.Bytes(), &infos); err != nil || len(infos) != 1 || infos[0]["path"] != "config.json" {
+		t.Errorf("paths-info: %d %s", w.Code, w.Body.String())
+	}
+	w = do(p, http.MethodGet, "/Org/Name/resolve/main/config.json", nil)
 	if w.Code != 200 || w.Body.String() != string(config) || w.Header().Get("X-Repo-Commit") != "abc123" {
 		t.Errorf("config via resolve: %d %q commit=%s", w.Code, w.Body.String(), w.Header().Get("X-Repo-Commit"))
 	}
-	w = do(p, http.MethodHead, "/org/name/resolve/main/model.safetensors", nil)
-	if w.Code != 200 || w.Header().Get("Content-Length") != "4096" {
-		t.Errorf("weights HEAD: %d %s", w.Code, w.Header().Get("Content-Length"))
+	w = do(p, http.MethodGet, "/org/name/resolve/abc123/model.safetensors", nil, "Range", "bytes=0-3")
+	if w.Code != http.StatusPartialContent || w.Body.String() != "xxxx" {
+		t.Errorf("weights range via commit tag: %d %q", w.Code, w.Body.String())
 	}
-	w = do(p, http.MethodGet, "/api/models/org/name", nil)
-	var meta map[string]any
-	_ = json.NewDecoder(w.Body).Decode(&meta)
-	if meta["sha"] != "abc123" {
-		t.Errorf("metadata sha: %v", meta["sha"])
-	}
-}
-
-func TestModelImportRefusesCollisionsAndBadNames(t *testing.T) {
-	weights := bytes.Repeat([]byte("y"), 100)
-	hub := fakeHub(t, weights, []byte("{}"))
-	defer hub.Close()
-	p, kube := newTestProxy(t, hub.URL)
-
-	// A hand-created Model owns its name; a repository that normalizes to it is refused.
-	sha := shaOf(weights)
-	do(p, http.MethodPut, "/blobs/"+sha, bytes.NewReader(weights))
-	owned, _ := json.Marshal(v1alpha1.Model{ObjectMeta: metav1.ObjectMeta{Name: "org-name"},
-		Spec: v1alpha1.ModelSpec{Files: []v1alpha1.File{{Path: "w", SHA256: sha}}}})
-	if w := do(p, http.MethodPost, "/models", bytes.NewReader(owned)); w.Code != http.StatusCreated {
-		t.Fatalf("create: %d %s", w.Code, w.Body.String())
-	}
-	w := do(p, http.MethodPost, "/models/import", strings.NewReader(`{"repo": "org/name"}`))
-	if w.Code != http.StatusConflict {
-		t.Errorf("import over an upload: got %d, want 409: %s", w.Code, w.Body.String())
-	}
-	// Two repositories with one normalized name: the second is refused.
-	var m v1alpha1.Model
-	_ = kube.Get(t.Context(), client.ObjectKey{Name: "org-name"}, &m)
-	m.Spec.Source = &v1alpha1.ModelSource{Repo: "Org/Name"}
-	_ = kube.Update(t.Context(), &m)
-	w = do(p, http.MethodPost, "/models/import", strings.NewReader(`{"repo": "org/name"}`))
-	if w.Code != http.StatusConflict || !strings.Contains(w.Body.String(), "Org/Name") {
-		t.Errorf("import over another repo: got %d, want 409 naming the owner: %s", w.Code, w.Body.String())
-	}
-	// Names the API server would refuse are a client error, not a 500.
-	for _, repo := range []string{"org/v1.-beta", "/", "a..b"} {
-		w := do(p, http.MethodPost, "/models/import", strings.NewReader(fmt.Sprintf(`{"repo": %q}`, repo)))
-		if w.Code != http.StatusBadRequest {
-			t.Errorf("repo %q: got %d, want 400: %s", repo, w.Code, w.Body.String())
+	// 404s carry the Hub's error codes: huggingface_hub turns them into
+	// EntryNotFoundError / RepositoryNotFoundError / RevisionNotFoundError,
+	// and transformers skips an optional file only on the first.
+	for _, c := range []struct{ path, code string }{
+		{"/org/name/resolve/main/missing.bin", "EntryNotFound"},
+		{"/org/name/resolve/nosuchrev/config.json", "RevisionNotFound"},
+		{"/nobody/nothing/resolve/main/config.json", "RepoNotFound"},
+		{"/api/models/nobody/nothing", "RepoNotFound"},
+		{"/api/models/org/name/tree/nosuchrev", "RevisionNotFound"},
+	} {
+		if w := do(p, http.MethodGet, c.path, nil); w.Code != http.StatusNotFound || w.Header().Get("X-Error-Code") != c.code {
+			t.Errorf("%s: %d %q, want 404 %s", c.path, w.Code, w.Header().Get("X-Error-Code"), c.code)
 		}
 	}
-	if w := do(p, http.MethodGet, "/api/models/", nil); w.Code != http.StatusNotFound {
-		t.Errorf("empty repo metadata: got %d, want 404", w.Code)
+	// Listing shows it; a second import of the same repo is allowed, a
+	// different repo under the same name is not.
+	w = do(p, http.MethodGet, "/models", nil)
+	if !strings.Contains(w.Body.String(), `"org/name"`) {
+		t.Errorf("list: %s", w.Body.String())
+	}
+	if w := do(p, http.MethodPost, "/models/import", strings.NewReader(`{"repo": "org/name"}`)); w.Code != http.StatusAccepted {
+		t.Errorf("re-import: %d %s", w.Code, w.Body.String())
+	}
+	waitImport(t, p, "org/name")
+	if w := do(p, http.MethodPost, "/models/import", strings.NewReader(`{"repo": "Org/Name"}`)); w.Code != http.StatusConflict {
+		t.Errorf("other repo under the same name: %d, want 409: %s", w.Code, w.Body.String())
+	}
+	for _, repo := range []string{"/", "a//b"} {
+		if w := do(p, http.MethodPost, "/models/import", strings.NewReader(fmt.Sprintf(`{"repo": %q}`, repo))); w.Code != http.StatusBadRequest {
+			t.Errorf("repo %q: %d, want 400", repo, w.Code)
+		}
 	}
 }
 
 func TestBlobImportRefusesForeignURLs(t *testing.T) {
 	hub := fakeHub(t, []byte("w"), []byte("{}"))
 	defer hub.Close()
-	p, _ := newTestProxy(t, hub.URL)
+	p := newTestProxy(t, hub.URL)
 	other := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		t.Errorf("modelstore fetched %s from a host that is not the Hub", r.URL)
 	}))
 	defer other.Close()
 	sha := strings.Repeat("a", 64)
-	for _, u := range []string{other.URL + "/x", "https://" + strings.TrimPrefix(hub.URL, "http://") + "/x", "file:///etc/passwd", "::bad"} {
+	for _, u := range []string{other.URL + "/x", "file:///etc/passwd", "::bad"} {
 		w := do(p, http.MethodPost, "/blobs/"+sha+"/import", strings.NewReader(fmt.Sprintf(`{"url": %q}`, u)))
 		if w.Code != http.StatusBadRequest {
 			t.Errorf("url %q: got %d, want 400: %s", u, w.Code, w.Body.String())
 		}
 	}
+	// And the Hub path works, with a wrong digest leaving nothing behind.
+	weights := []byte("w")
+	body := fmt.Sprintf(`{"url": %q}`, hub.URL+"/org/name/resolve/abc123/model.safetensors")
+	if w := do(p, http.MethodPost, "/blobs/"+shaOf(weights)+"/import?wait=true", strings.NewReader(body)); w.Code != http.StatusCreated {
+		t.Errorf("hub import: %d %s", w.Code, w.Body.String())
+	}
+	wrong := strings.Repeat("3", 64)
+	// The client named a digest the url does not produce: its mistake (422), not a server error,
+	// and asking again for the same pair is answered from memory rather than fetched again.
+	if w := do(p, http.MethodPost, "/blobs/"+wrong+"/import?wait=true", strings.NewReader(body)); w.Code != http.StatusUnprocessableEntity {
+		t.Errorf("mismatched import: %d", w.Code)
+	}
+	if w := do(p, http.MethodHead, "/blobs/"+wrong, nil); w.Code != http.StatusNotFound {
+		t.Errorf("mismatched blob should not exist: %d", w.Code)
+	}
+	if w := do(p, http.MethodPost, "/blobs/"+wrong+"/import", strings.NewReader(body)); w.Code != http.StatusUnprocessableEntity || !strings.Contains(w.Body.String(), "sha256 mismatch") {
+		t.Errorf("repeat of a failed pair: %d %s", w.Code, w.Body.String())
+	}
+}
+
+// A revision that cannot be a tag is refused before anything is
+// downloaded, and a second import under a busy name is refused rather
+// than silently joined to a different revision.
+func TestModelImportRefusesBadRevisionAndBusyName(t *testing.T) {
+	hub := fakeHub(t, []byte("w"), []byte("{}"))
+	defer hub.Close()
+	p := newTestProxy(t, hub.URL)
+	for _, rev := range []string{"refs/pr/1", "release/v1", "a b"} {
+		w := do(p, http.MethodPost, "/models/import", strings.NewReader(fmt.Sprintf(`{"repo": "org/name", "revision": %q}`, rev)))
+		if w.Code != http.StatusBadRequest {
+			t.Errorf("revision %q: %d, want 400", rev, w.Code)
+		}
+	}
+	p.mu.Lock()
+	p.imports["org/name"] = &ImportStatus{Phase: PhaseImporting, Repo: "org/name", Revision: "main"}
+	p.mu.Unlock()
+	if w := do(p, http.MethodPost, "/models/import", strings.NewReader(`{"repo": "org/name", "revision": "main"}`)); w.Code != http.StatusAccepted {
+		t.Errorf("same revision joins: %d", w.Code)
+	}
+	if w := do(p, http.MethodPost, "/models/import", strings.NewReader(`{"repo": "org/name", "revision": "v2"}`)); w.Code != http.StatusConflict {
+		t.Errorf("other revision while importing: %d, want 409", w.Code)
+	}
+	if w := do(p, http.MethodPost, "/models/import", strings.NewReader(`{"repo": "Org/Name", "revision": "main"}`)); w.Code != http.StatusConflict {
+		t.Errorf("other repo under the same name while importing: %d, want 409", w.Code)
+	}
 }
 
 func TestModelImportEscapesFileNames(t *testing.T) {
-	// A fake Hub whose small file has URL syntax in its name.
 	mux := http.NewServeMux()
 	mux.HandleFunc("/api/models/org/name/revision/main", func(w http.ResponseWriter, r *http.Request) {
 		_ = json.NewEncoder(w).Encode(map[string]any{"sha": "c1",
@@ -346,13 +295,12 @@ func TestModelImportEscapesFileNames(t *testing.T) {
 	mux.HandleFunc("/org/name/resolve/c1/100%25.json", func(w http.ResponseWriter, r *http.Request) { _, _ = w.Write([]byte("{}")) })
 	hub := httptest.NewServer(mux)
 	defer hub.Close()
-	p, kube := newTestProxy(t, hub.URL)
+	p := newTestProxy(t, hub.URL)
 	if w := do(p, http.MethodPost, "/models/import", strings.NewReader(`{"repo": "org/name"}`)); w.Code != http.StatusAccepted {
 		t.Fatalf("import: %d %s", w.Code, w.Body.String())
 	}
-	model := waitPhase(t, kube, "org-name")
-	if model.Status.Phase != v1alpha1.PhaseReady {
-		t.Fatalf("phase %q: %s", model.Status.Phase, model.Status.Message)
+	if st := waitImport(t, p, "org/name"); st.Phase != PhaseReady {
+		t.Fatalf("phase %q: %s", st.Phase, st.Message)
 	}
 	w := do(p, http.MethodGet, "/org/name/resolve/main/notes%231.md", nil)
 	if w.Code != 200 || w.Body.String() != "right" {
@@ -360,50 +308,37 @@ func TestModelImportEscapesFileNames(t *testing.T) {
 	}
 }
 
-func TestResumeRestartsInterruptedImports(t *testing.T) {
-	weights := bytes.Repeat([]byte("z"), 300)
-	hub := fakeHub(t, weights, []byte("{}"))
-	defer hub.Close()
-	p, kube := newTestProxy(t, hub.URL)
-	// A Model a previous process left in Importing, and one with no source.
-	for _, m := range []v1alpha1.Model{
-		{ObjectMeta: metav1.ObjectMeta{Name: "org-name"}, Spec: v1alpha1.ModelSpec{Source: &v1alpha1.ModelSource{Repo: "org/name", Revision: "main"}}},
-		{ObjectMeta: metav1.ObjectMeta{Name: "orphan"}},
-	} {
-		m := m
-		if err := kube.Create(t.Context(), &m); err != nil {
-			t.Fatal(err)
-		}
-		m.Status.Phase = v1alpha1.PhaseImporting
-		if err := kube.Status().Update(t.Context(), &m); err != nil {
-			t.Fatal(err)
-		}
+// A model pushed the registry way (tag "latest", as modelstore upload
+// does) is readable through the Hub facade at "main", which is what
+// transformers asks for when no revision is given.
+func TestMainReadsLatest(t *testing.T) {
+	p := newTestProxy(t, "http://unused.invalid")
+	cfg := `{"model_type": "opt"}`
+	if w := do(p, http.MethodPut, "/blobs/c30559e07871356681c6f76200d795084b1b523a6d5ed4935c94297da8f5850e", strings.NewReader(cfg)); w.Code != http.StatusCreated {
+		t.Fatalf("blob put: %d %s", w.Code, w.Body.String())
 	}
-	if err := p.Resume(t.Context()); err != nil {
-		t.Fatal(err)
+	manifest := `{"schemaVersion":2,"mediaType":"application/vnd.oci.image.manifest.v1+json",` +
+		`"artifactType":"application/vnd.gke-labs.model.weights.v1+json",` +
+		`"config":{"mediaType":"application/vnd.oci.empty.v1+json","digest":"sha256:44136fa355b3678a1146ad16f7e8649e94fb4fc21fe77e8310c060f61caaff8a","size":2},` +
+		`"layers":[{"mediaType":"application/vnd.gke-labs.model.file.v1","digest":"sha256:c30559e07871356681c6f76200d795084b1b523a6d5ed4935c94297da8f5850e","size":21,` +
+		`"annotations":{"org.opencontainers.image.title":"config.json"}}]}`
+	w := do(p, http.MethodPut, "/v2/opt-125m/manifests/latest", strings.NewReader(manifest), "Content-Type", "application/vnd.oci.image.manifest.v1+json")
+	if w.Code != http.StatusCreated {
+		t.Fatalf("manifest put: %d %s", w.Code, w.Body.String())
 	}
-	if model := waitPhase(t, kube, "org-name"); model.Status.Phase != v1alpha1.PhaseReady || len(model.Spec.Files) != 2 {
-		t.Errorf("resumed import: phase %q files %d (%s)", model.Status.Phase, len(model.Spec.Files), model.Status.Message)
+	w = do(p, http.MethodGet, "/api/models/opt-125m/tree/main", nil)
+	if w.Code != 200 || !strings.Contains(w.Body.String(), `"config.json"`) {
+		t.Errorf("tree at main: %d %s", w.Code, w.Body.String())
 	}
-	var orphan v1alpha1.Model
-	_ = kube.Get(t.Context(), client.ObjectKey{Name: "orphan"}, &orphan)
-	if orphan.Status.Phase != v1alpha1.PhaseFailed {
-		t.Errorf("orphan: phase %q, want Failed", orphan.Status.Phase)
+	w = do(p, http.MethodGet, "/api/models/opt-125m/revision/main", nil)
+	if w.Code != 200 || !strings.Contains(w.Body.String(), `"sha256":"c30559e07871356681c6f76200d795084b1b523a6d5ed4935c94297da8f5850e"`) {
+		t.Errorf("model info carries each file's sha256: %d %s", w.Code, w.Body.String())
 	}
-}
-
-// waitPhase polls until the Model leaves Importing (or 10 s pass).
-func waitPhase(t *testing.T, kube client.Client, name string) v1alpha1.Model {
-	t.Helper()
-	var model v1alpha1.Model
-	deadline := time.Now().Add(10 * time.Second)
-	for {
-		if err := kube.Get(t.Context(), client.ObjectKey{Name: name}, &model); err != nil {
-			t.Fatal(err)
-		}
-		if model.Status.Phase != v1alpha1.PhaseImporting || time.Now().After(deadline) {
-			return model
-		}
-		time.Sleep(20 * time.Millisecond)
+	w = do(p, http.MethodGet, "/opt-125m/resolve/main/config.json", nil)
+	if w.Code != 200 || w.Body.String() != cfg {
+		t.Errorf("resolve at main: %d %q", w.Code, w.Body.String())
+	}
+	if w := do(p, http.MethodGet, "/opt-125m/resolve/v2/config.json", nil); w.Code != http.StatusNotFound || w.Header().Get("X-Error-Code") != "RevisionNotFound" {
+		t.Errorf("other revisions do not fall back: %d %s", w.Code, w.Header().Get("X-Error-Code"))
 	}
 }

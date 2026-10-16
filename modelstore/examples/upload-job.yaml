@@ -12,6 +12,10 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+# Pushes a model directory into modelstore as the OCI artifact
+# opt-125m:main (the finetuning e2e seeds its base model this way). For
+# a Hub repository, POST /models/import does the same without a
+# download step; this is the path for weights you already have.
 apiVersion: batch/v1
 kind: Job
 metadata:

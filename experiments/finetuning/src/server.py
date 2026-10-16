@@ -24,10 +24,8 @@ from datasets import load_dataset
 
 import finetuning_pb2
 import finetuning_pb2_grpc
-import http.client
 import json
 import hashlib
-from urllib.parse import urlparse
 import requests
 from pathlib import Path
 
@@ -38,13 +36,19 @@ def calculate_sha256(file_path):
             sha256_hash.update(byte_block)
     return sha256_hash.hexdigest()
 
+EMPTY_CONFIG_JSON = b"{}"  # the OCI empty descriptor: artifacts with no config point at sha256("{}")
+
+
 def download_from_modelstore(model_id, modelstore_url, local_dir, log_queue):
-    """Downloads model files from modelstore. Returns True if successful."""
+    """Downloads a model's files from modelstore. Returns True if successful.
+
+    modelstore is an OCI registry with a Hugging Face facade: the tree
+    listing names the files and `resolve` serves them, so the same URLs
+    transformers would use are used here (and HF_ENDPOINT=modelstore_url
+    would do the same job inside from_pretrained)."""
     log_queue.put(f"Checking for model {model_id} in modelstore at {modelstore_url}...")
-    
-    # Get model metadata
     try:
-        resp = requests.get(f"{modelstore_url}/models/{model_id}", timeout=10)
+        resp = requests.get(f"{modelstore_url}/api/models/{model_id}/tree/main", timeout=10)
         if resp.status_code == 404:
             log_queue.put(f"Model {model_id} not found in modelstore.")
             return False
@@ -53,82 +57,85 @@ def download_from_modelstore(model_id, modelstore_url, local_dir, log_queue):
         log_queue.put(f"Error connecting to modelstore: {e}")
         return False
 
-    model_data = resp.json()
-    log_queue.put(f"Downloading model {model_id} to {local_dir}...")
+    entries = [e for e in resp.json() if e.get("type") == "file"]
+    log_queue.put(f"Downloading model {model_id} ({len(entries)} files) to {local_dir}...")
     local_path = Path(local_dir)
     local_path.mkdir(parents=True, exist_ok=True)
 
-    for file_info in model_data["spec"]["files"]:
-        rel_path = file_info["path"]
-        sha256 = file_info["sha256"]
-        
+    for entry in entries:
+        rel_path = entry["path"]
         file_local_path = local_path / rel_path
         file_local_path.parent.mkdir(parents=True, exist_ok=True)
-        
-        # Download blob
         log_queue.put(f"  Downloading {rel_path}...")
-        blob_url = f"{modelstore_url}/blobs/{sha256}"
-        with requests.get(blob_url, stream=True) as r:
+        with requests.get(f"{modelstore_url}/{model_id}/resolve/main/{rel_path}", stream=True) as r:
             r.raise_for_status()
             with open(file_local_path, 'wb') as f:
-                for chunk in r.iter_content(chunk_size=8192):
+                for chunk in r.iter_content(chunk_size=1 << 20):
                     f.write(chunk)
-    
+
     log_queue.put("Download complete.")
     return True
 
+
 def push_to_modelstore(model_dir, model_id, log_queue, modelstore_url=os.getenv("MODELSTORE_URL", "http://modelstore.modelstore")):
+    """Pushes a directory to modelstore as an OCI artifact tagged
+    <model_id>:latest: every file becomes a blob, the manifest lists them
+    by name (the same layout and tag `modelstore upload` writes; the Hub
+    facade reads it back as revision main)."""
     log_queue.put(f"Pushing fine-tuned model to modelstore at {modelstore_url}...")
-    parsed_url = urlparse(modelstore_url)
-    
-    files_to_register = []
-    
+    base = modelstore_url.rstrip("/")
+
+    def put_blob(sha256, body, label):
+        # content-addressed: a blob the registry already has is a no-op
+        head = requests.head(f"{base}/v2/{model_id}/blobs/sha256:{sha256}", timeout=10)
+        if head.status_code == 200:
+            return True
+        resp = requests.put(f"{base}/blobs/{sha256}", data=body, timeout=600)
+        if resp.status_code not in (200, 201):
+            log_queue.put(f"Failed to push blob {label}: {resp.status_code} {resp.reason}")
+            return False
+        return True
+
+    layers = []
     for root, dirs, files in os.walk(model_dir):
         for file in files:
             file_path = os.path.join(root, file)
-            rel_path = os.path.relpath(file_path, model_dir)
+            rel_path = os.path.relpath(file_path, model_dir).replace(os.sep, "/")
             sha256 = calculate_sha256(file_path)
-            
             log_queue.put(f"Pushing blob {rel_path} (sha256: {sha256})...")
             try:
-                conn = http.client.HTTPConnection(parsed_url.netloc)
                 with open(file_path, 'rb') as f:
-                    blob_path = f"/blobs/{sha256}"
-                    conn.request("PUT", blob_path, body=f)
-                    resp = conn.getresponse()
-                    if resp.status not in (200, 201):
-                        log_queue.put(f"Failed to push blob {rel_path}: {resp.status} {resp.reason}")
-                    resp.read()
-                conn.close()
-                files_to_register.append({
-                    "path": rel_path,
-                    "sha256": sha256
-                })
+                    if not put_blob(sha256, f, rel_path):
+                        return
             except Exception as e:
                 log_queue.put(f"Error pushing blob {rel_path}: {str(e)}")
+                return
+            layers.append({
+                "mediaType": "application/vnd.gke-labs.model.file.v1",
+                "digest": f"sha256:{sha256}",
+                "size": os.path.getsize(file_path),
+                "annotations": {"org.opencontainers.image.title": rel_path},
+            })
 
-    # Register the model
     log_queue.put(f"Registering model {model_id}...")
     try:
-        model_spec = {
-            "apiVersion": "generationai.labs.gke.io/v1alpha1",
-            "kind": "Model",
-            "metadata": {
-                "name": model_id
-            },
-            "spec": {
-                "files": files_to_register
-            }
+        empty_sha = hashlib.sha256(EMPTY_CONFIG_JSON).hexdigest()
+        if not put_blob(empty_sha, EMPTY_CONFIG_JSON, "empty config"):
+            return
+        manifest = {
+            "schemaVersion": 2,
+            "mediaType": "application/vnd.oci.image.manifest.v1+json",
+            "artifactType": "application/vnd.gke-labs.model.weights.v1+json",
+            "config": {"mediaType": "application/vnd.oci.empty.v1+json",
+                       "digest": f"sha256:{empty_sha}", "size": len(EMPTY_CONFIG_JSON)},
+            "layers": layers,
         }
-        conn = http.client.HTTPConnection(parsed_url.netloc)
-        conn.request("POST", "/models", body=json.dumps(model_spec), headers={"Content-Type": "application/json"})
-        resp = conn.getresponse()
-        if resp.status not in (200, 201):
-            log_queue.put(f"Failed to register model {model_id}: {resp.status} {resp.reason}")
+        resp = requests.put(f"{base}/v2/{model_id}/manifests/latest", data=json.dumps(manifest),
+                            headers={"Content-Type": "application/vnd.oci.image.manifest.v1+json"}, timeout=60)
+        if resp.status_code not in (200, 201):
+            log_queue.put(f"Failed to register model {model_id}: {resp.status_code} {resp.reason} {resp.text[:200]}")
         else:
-            log_queue.put(f"Model {model_id} registered successfully.")
-        resp.read()
-        conn.close()
+            log_queue.put(f"Model {model_id} registered successfully as {model_id}:latest.")
     except Exception as e:
         log_queue.put(f"Error registering model {model_id}: {str(e)}")
 

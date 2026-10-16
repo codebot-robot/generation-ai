@@ -1,41 +1,49 @@
 # Model Store
-A simple in-cluster model cache for Hugging Face models.
 
-## What it is
+modelstore is the cluster's registry for models: an OCI registry whose
+blobs are model files and vxpu graphs, backed by a Google Cloud Storage
+bucket. A model's weight files, its exported graphs and its vLLM recipe
+share one content-addressed store, and the same sha256 names a file on
+the Hugging Face Hub, in a vxpu manifest and as an OCI blob, so nothing
+is re-hashed on the way in and executors range-read exactly what the
+Hub published.
 
-modelstore keeps model files once, by content, and hands them to
-everything in the cluster that needs them:
+## What it serves
 
-- **Blobs** are stored by sha256 in a Google Cloud Storage bucket
-  (`--blob-store gs://bucket[/prefix]`; a local directory works for
-  kind and tests). `PUT /blobs/<sha>` uploads, `GET`/`HEAD /blobs/<sha>`
-  reads with HTTP `Range` support, and every blob response carries
-  `X-Modelstore-Direct-Url: gs://...` so a reader with its own bucket
-  access (the vXPU executor) can range-read the object directly.
-- **Imports** pull from the Hugging Face Hub without the bytes passing
-  through a client: `POST /blobs/<sha>/import {"url": ...}` fetches one
-  file and verifies its digest (`202` while in flight, `201` when
-  present, idempotent; the URL must be `https` on the configured Hub
-  host, since this pod holds the bucket credentials and is not a
-  general fetcher); `POST /models/import {"repo": "org/name",
-  "revision": "main"}` imports a whole repository revision in the
-  background and records progress on the `Model` object
-  (`kubectl get models` shows phase, files and bytes). A download that
-  delivers nothing for five minutes is cancelled and the Model marked
-  Failed; a restart of the pod resumes any Model it finds in phase
-  Importing (blobs already present are skipped). Set `HF_TOKEN` in the
-  pod's environment for gated repositories. A repository whose
-  normalized name collides with an existing Model from another source
-  is refused with `409`.
-- **Models** (`kubectl get models`, a cluster-scoped CRD) map file names
-  to blobs for one repository revision, with the source repo and the
-  commit it resolved to.
+- **The OCI distribution API** (`/v2/`), a deliberate subset: blob
+  `HEAD`/`GET` with HTTP `Range` (the vxpu executor's read path), the
+  two-step monolithic upload (`POST` for a session, `PUT` with the
+  digest and body) and the single-`POST` form, which is what `oras`
+  and `modelstore upload` use, cross-repository mounts (blobs are
+  shared by digest), manifest `PUT`/`GET`/`HEAD` for image manifests
+  and indexes with every referenced blob checked to exist, and tag
+  listing. Chunked uploads (`PATCH`) and deletes answer `405`; `crane`
+  pushes blobs with `PATCH` and so cannot push here yet.
+- **Imports from the Hugging Face Hub** without the bytes passing
+  through a client: `POST /models/import {"repo": "org/name",
+  "revision": "main"}` streams every file into the store (LFS files by
+  their published sha256, small files hashed on the way), then writes
+  an artifact manifest with one layer per file, tagged with the
+  revision and the commit it resolved to. `GET /models/<name>` reports
+  progress while it runs; the result is durable in the registry. The
+  per-blob form, `POST /blobs/<sha>/import {"url": ...}`, is what the
+  vxpu router uses. Sources must be `https` on the configured Hub
+  host: this pod holds the bucket credentials and is not a general
+  fetcher. Set `HF_TOKEN` for gated repositories. A repository whose
+  lowercased name is already held by a different repository is refused
+  with `409`.
 - **Hub-compatible reads**: `/api/models/<repo>` and
-  `/<repo>/resolve/<rev>/<file>` are served from the Model and its
-  blobs, so transformers, vLLM and `huggingface_hub` load from the
-  store unchanged with `HF_ENDPOINT=http://modelstore.modelstore`
-  (the revision in the path is accepted as-is; the store holds the
-  imported one).
+  `/<repo>/resolve/<rev>/<file>` are served from the manifest's layer
+  annotations, so transformers, vLLM and `huggingface_hub` load from
+  the store unchanged with `HF_ENDPOINT=http://modelstore.modelstore`.
+- **Plain blob routes**, `GET`/`HEAD`/`PUT /blobs/<sha256>`, the same
+  blobs without the registry's naming, for the vxpu router today.
+
+Repository names are the Hub id lowercased (`Qwen/Qwen3-8B-FP8` is
+`qwen/qwen3-8b-fp8`); the exact id is in the manifest's annotations.
+Manifests and tags live in the bucket next to the blobs
+(`_blobs/<sha256>`, `_refs/manifests/...`, `_refs/tags/...`), so a pod
+can be replaced freely and a local directory works for kind and tests.
 
 ## Deploying
 
@@ -52,7 +60,8 @@ POOL=projects/$NUMBER/locations/global/workloadIdentityPools/$PROJECT.svc.id.goo
 gcloud storage buckets create $BUCKET --project=$PROJECT --location=us-central1 \
     --uniform-bucket-level-access
 # uploads stage under _tmp/ and are removed after publish; this collects
-# any left behind by a pod replaced mid-upload
+# any left behind by a pod replaced mid-upload (with --blob-store=gs://BUCKET/prefix
+# the rule must match "prefix/_tmp/" instead)
 gcloud storage buckets update $BUCKET --lifecycle-file=<(echo \
     '{"rule":[{"action":{"type":"Delete"},"condition":{"age":1,"matchesPrefix":["_tmp/"]}}]}')
 gcloud storage buckets add-iam-policy-binding $BUCKET \
@@ -65,12 +74,11 @@ for sa in ns/default/sa/vxpu-executor ns/default/sa/vxpu-router ns/default/sa/de
 done
 ```
 
-Then the image and the manifests:
+Then the image and the manifest:
 
 ```sh
 gcloud builds submit --config cloudbuild.yaml --project=$PROJECT \
     --substitutions _IMAGE=gcr.io/$PROJECT/generation-ai/modelstore:v1 .
-kubectl apply -f k8s/crds/
 sed -e "s#image: modelstore:latest#image: gcr.io/$PROJECT/generation-ai/modelstore:v1#" \
     -e "s#gs://BUCKET#$BUCKET#" k8s/manifest.yaml | kubectl apply -f -
 ```
@@ -79,14 +87,14 @@ The manifest carries placeholders for the image and the bucket; the
 server refuses to start if the bucket is not reachable with the pod's
 identity, so a wrong name fails at rollout, not on the first upload.
 
-**Upgrading from the StatefulSet version.** The earlier manifest ran
-modelstore as a StatefulSet with a PVC under the same name and Service
-selector. `kubectl apply` does not remove it, and the Service would
-balance between the old pod and the new one. Delete it first:
+**Upgrading from the StatefulSet / CRD version.** Earlier manifests ran
+modelstore as a StatefulSet with a PVC and kept an index in a `Model`
+CRD. `kubectl apply` removes neither; delete them first:
 
 ```sh
 kubectl -n modelstore delete statefulset modelstore --ignore-not-found
 kubectl -n modelstore delete pvc -l app=modelstore --ignore-not-found
+kubectl delete crd models.generationai.labs.gke.io --ignore-not-found
 ```
 
 Blobs on the old PVC are not migrated; re-import or re-upload them.
@@ -95,60 +103,31 @@ Blobs on the old PVC are not migrated; re-import or re-upload them.
 
 ```sh
 kubectl -n modelstore port-forward svc/modelstore 8080:80 &
-# import a repository (returns at once; watch progress)
+# import a repository (returns at once; poll for progress)
 curl -X POST localhost:8080/models/import -d '{"repo": "Qwen/Qwen3-8B-FP8", "revision": "main"}'
-kubectl get models -w
+curl localhost:8080/models/qwen/qwen3-8b-fp8
+# the artifact, as any OCI client sees it
+curl localhost:8080/v2/qwen/qwen3-8b-fp8/tags/list
+curl localhost:8080/v2/qwen/qwen3-8b-fp8/manifests/main
+oras manifest fetch localhost:8080/qwen/qwen3-8b-fp8:main --plain-http
 # a file, with a range
 curl -r 0-99 localhost:8080/Qwen/Qwen3-8B-FP8/resolve/main/config.json
-# a blob by digest, and where it lives
-curl -I localhost:8080/blobs/<sha256>
 ```
 
-From a pod: `HF_ENDPOINT=http://modelstore.modelstore` and the
-usual `from_pretrained("Qwen/Qwen3-8B-FP8")`.
+From a pod: `HF_ENDPOINT=http://modelstore.modelstore` and the usual
+`from_pretrained("Qwen/Qwen3-8B-FP8")`. From vxpu: `vxpu mirror REPO`
+runs the import and follows it.
 
 ### Upload from a directory
 
-`modelstore upload --model-name NAME --model-dir DIR` hashes and uploads
-every file, then creates the `Model`.
+`modelstore upload --model-name org/name --model-dir DIR [--tag latest]`
+hashes every file, pushes the blobs the registry does not have, and
+writes the manifest and tag through the registry API.
 
-### Model API (low level)
-The model store provides a Kubernetes-native API for managing models.
+## What comes next
 
-#### 1. Upload Blobs
-Upload model files as blobs identified by their SHA256 hash:
-```bash
-curl -X PUT --data-binary @weights.bin http://modelstore.modelstore/blobs/<sha256>
-```
-
-#### 2. Create Model
-Create a `Model` object that references the uploaded blobs:
-```bash
-curl -X POST -H "Content-Type: application/json" -d '{
-  "apiVersion": "generationai.labs.gke.io/v1alpha1",
-  "kind": "Model",
-  "metadata": { "name": "my-model" },
-  "spec": {
-    "files": [
-      { "path": "weights.bin", "sha256": "<sha256>" }
-    ]
-  }
-}' http://modelstore.modelstore/models
-```
-
-#### 3. List Models
-```bash
-curl http://modelstore.modelstore/models
-# or
-kubectl get models
-```
-
-### Deployment
-The model store can be deployed to Kubernetes using the provided manifest:
-
-```bash
-# Register the Model CRD
-kubectl apply -f k8s/crds/
-# Deploy the model store
-kubectl apply -f k8s/manifest.yaml
-```
+The vxpu artifact (manifest, binding, graphs) joins the weights as a
+second manifest under the same tag through an index per repository and
+revision, written by an in-cluster converter (`vxpu convert`); the
+router then loads a model by reference. See the issue tracker (#247,
+#254, #255, #256).

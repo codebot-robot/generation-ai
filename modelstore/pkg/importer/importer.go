@@ -31,7 +31,6 @@ import (
 	"sync/atomic"
 	"time"
 
-	"github.com/gke-labs/generation-ai/modelstore/apis/v1alpha1"
 	"github.com/gke-labs/generation-ai/modelstore/pkg/blobstore"
 	"k8s.io/klog/v2"
 )
@@ -44,15 +43,32 @@ type Importer struct {
 	hfToken    string
 	client     *http.Client
 
-	mu   sync.Mutex
-	jobs map[string]*job // by sha
+	mu     sync.Mutex
+	jobs   map[string]*job    // by sha
+	failed map[string]failure // last failed import by sha, for failureTTL
 }
 
 type job struct {
+	url  string
 	done chan struct{}
 	err  error
 	n    int64
 }
+
+// failure remembers why an import failed, so the next request for the
+// same blob from the same url is answered with the reason instead of
+// starting the same download again.
+type failure struct {
+	url string
+	err error
+	at  time.Time
+}
+
+const failureTTL = 10 * time.Minute
+
+// ErrRecentFailure wraps the error of an import that failed within
+// failureTTL when the same blob is requested from the same url again.
+var ErrRecentFailure = errors.New("a recent import of this blob from this url failed")
 
 // New creates an Importer. hfEndpoint is the Hub base URL (default
 // https://huggingface.co); the HF_TOKEN environment variable, when set,
@@ -145,11 +161,33 @@ func (im *Importer) EnsureBlob(ctx context.Context, sha, srcURL string) (Status,
 		im.mu.Unlock()
 		return InFlight, nil
 	}
-	j := &job{done: make(chan struct{})}
+	if f, ok := im.failed[sha]; ok && f.url == srcURL && time.Since(f.at) < failureTTL {
+		im.mu.Unlock()
+		return Absent, fmt.Errorf("%w: %v", ErrRecentFailure, f.err)
+	}
+	j := &job{url: srcURL, done: make(chan struct{})}
 	im.jobs[sha] = j
 	im.mu.Unlock()
 	go im.run(sha, srcURL, j)
 	return InFlight, nil
+}
+
+// WaitFor is Wait for a caller that asked for srcURL. An import keyed
+// by digest alone could be in flight from another caller's url; if that
+// one fails, this caller's url is tried once rather than inheriting a
+// failure it never asked for.
+func (im *Importer) WaitFor(ctx context.Context, sha, srcURL string) (int64, error) {
+	im.mu.Lock()
+	j, running := im.jobs[sha]
+	im.mu.Unlock()
+	n, err := im.Wait(ctx, sha)
+	if err == nil || !running || j.url == srcURL || ctx.Err() != nil {
+		return n, err
+	}
+	if _, err := im.EnsureBlob(ctx, sha, srcURL); err != nil {
+		return 0, err
+	}
+	return im.Wait(ctx, sha)
 }
 
 // Wait blocks until the import of sha (if any) finishes and returns
@@ -186,6 +224,14 @@ func (im *Importer) run(sha, srcURL string, j *job) {
 	}
 	im.mu.Lock()
 	delete(im.jobs, sha)
+	if err != nil {
+		if im.failed == nil {
+			im.failed = map[string]failure{}
+		}
+		im.failed[sha] = failure{url: srcURL, err: err, at: time.Now()}
+	} else {
+		delete(im.failed, sha)
+	}
 	im.mu.Unlock()
 	close(j.done)
 }
@@ -264,6 +310,14 @@ func (w *stallWatch) Read(p []byte) (int, error) {
 func (w *stallWatch) stop() {
 	w.stopped.Store(true)
 	w.timer.Stop()
+}
+
+// File is an imported file: its path in the repository, its sha256
+// and its size.
+type File struct {
+	Path   string
+	SHA256 string
+	Size   int64
 }
 
 // HubFile is one file of a Hub repository at a commit.
@@ -351,33 +405,37 @@ type Progress struct {
 // are fetched by their published sha256 and verified; other files
 // (configs, tokenizers) are hashed as they stream. report, if set, is
 // called after each file.
-func (im *Importer) ImportRepo(ctx context.Context, repo, revision string, report func(Progress)) (string, []v1alpha1.File, error) {
+func (im *Importer) ImportRepo(ctx context.Context, repo, revision string, report func(Progress)) (string, []File, error) {
 	commit, files, err := im.ListRepo(ctx, repo, revision)
 	if err != nil {
 		return "", nil, err
 	}
-	var out []v1alpha1.File
+	var out []File
 	prog := Progress{FilesTotal: len(files)}
 	for _, f := range files {
 		sha := f.SHA256
+		var n int64
 		if sha != "" {
 			if _, err := im.EnsureBlob(ctx, sha, f.URL); err != nil {
 				return commit, out, err
 			}
-			n, err := im.Wait(ctx, sha)
-			if err != nil {
+			var err error
+			if n, err = im.WaitFor(ctx, sha, f.URL); err != nil {
 				return commit, out, fmt.Errorf("%s: %w", f.Path, err)
 			}
-			prog.BytesImported += n
 		} else {
-			got, n, err := im.fetch(ctx, "", f.URL)
+			got, fetched, err := im.fetch(ctx, "", f.URL)
 			if err != nil {
 				return commit, out, fmt.Errorf("%s: %w", f.Path, err)
 			}
-			sha = got
-			prog.BytesImported += n
+			sha, n = got, fetched
 		}
-		out = append(out, v1alpha1.File{Path: f.Path, SHA256: sha, Size: f.Size})
+		prog.BytesImported += n
+		size := f.Size
+		if size == 0 {
+			size = n
+		}
+		out = append(out, File{Path: f.Path, SHA256: sha, Size: size})
 		prog.FilesImported++
 		if report != nil {
 			report(prog)

@@ -15,181 +15,83 @@
 package commands
 
 import (
-	"context"
-	"crypto/sha256"
-	"encoding/hex"
+	"encoding/json"
 	"net/http"
 	"net/http/httptest"
 	"os"
 	"path/filepath"
-	"strings"
 	"testing"
+
+	"github.com/gke-labs/generation-ai/modelstore/pkg/blobstore"
+	"github.com/gke-labs/generation-ai/modelstore/pkg/importer"
+	"github.com/gke-labs/generation-ai/modelstore/pkg/proxy"
+	"github.com/gke-labs/generation-ai/modelstore/pkg/registry"
 )
 
 func TestBuildUploadCommand(t *testing.T) {
 	cmd := BuildUploadCommand()
-	if cmd == nil {
-		t.Fatal("expected non-nil command")
+	if cmd.Use != "upload" {
+		t.Errorf("Use = %q", cmd.Use)
 	}
-
-	modelNameFlag := cmd.Flag("model-name")
-	if modelNameFlag == nil {
-		t.Fatal("missing flag model-name")
-	}
-	modelDirFlag := cmd.Flag("model-dir")
-	if modelDirFlag == nil {
-		t.Fatal("missing flag model-dir")
+	for _, f := range []string{"model-name", "model-dir", "modelstore-url", "tag"} {
+		if cmd.Flags().Lookup(f) == nil {
+			t.Errorf("flag %s missing", f)
+		}
 	}
 }
 
 func TestRunUpload(t *testing.T) {
-	tmpDir, err := os.MkdirTemp("", "upload-test-*")
+	store, err := blobstore.NewLocal(t.TempDir())
 	if err != nil {
-		t.Fatalf("failed to create temp dir: %v", err)
+		t.Fatal(err)
 	}
-	defer func() {
-		_ = os.RemoveAll(tmpDir)
-	}()
+	reg := registry.New(store)
+	srv := httptest.NewServer(proxy.NewProxy(reg, importer.New(store, "")))
+	defer srv.Close()
 
-	testContent := []byte("hello model weights")
-	testFile := filepath.Join(tmpDir, "weights.bin")
-	if err := os.WriteFile(testFile, testContent, 0644); err != nil {
-		t.Fatalf("failed to write test file: %v", err)
+	dir := t.TempDir()
+	if err := os.WriteFile(filepath.Join(dir, "config.json"), []byte(`{"a": 1}`), 0o644); err != nil {
+		t.Fatal(err)
 	}
-
-	h := sha256.New()
-	_, err = h.Write(testContent)
+	if err := os.MkdirAll(filepath.Join(dir, "sub"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(dir, "sub", "weights.bin"), []byte("weights"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	opt := &UploadOptions{ModelstoreURL: srv.URL, ModelName: "org/test", ModelDir: dir, Tag: "v1"}
+	if err := RunUpload(t.Context(), opt); err != nil {
+		t.Fatalf("RunUpload: %v", err)
+	}
+	// Uploading again skips present blobs and rewrites the tag.
+	if err := RunUpload(t.Context(), opt); err != nil {
+		t.Fatalf("second RunUpload: %v", err)
+	}
+	resp, err := http.Get(srv.URL + "/v2/org/test/manifests/v1")
 	if err != nil {
-		t.Fatalf("failed to hash test content: %v", err)
+		t.Fatal(err)
 	}
-	expectedSha := hex.EncodeToString(h.Sum(nil))
-
-	uploadedBlobs := make(map[string]bool)
-	createdModels := make(map[string]bool)
-
-	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		if strings.HasPrefix(r.URL.Path, "/blobs/") {
-			sha := strings.TrimPrefix(r.URL.Path, "/blobs/")
-			if r.Method == http.MethodHead {
-				if uploadedBlobs[sha] {
-					w.WriteHeader(http.StatusOK)
-				} else {
-					w.WriteHeader(http.StatusNotFound)
-				}
-				return
-			}
-			if r.Method == http.MethodPut {
-				uploadedBlobs[sha] = true
-				w.WriteHeader(http.StatusCreated)
-				return
-			}
-		}
-		if r.URL.Path == "/models" && r.Method == http.MethodPost {
-			createdModels["test-model"] = true
-			w.WriteHeader(http.StatusCreated)
-			return
-		}
-		http.NotFound(w, r)
-	}))
-	defer server.Close()
-
-	opt := &UploadOptions{
-		ModelstoreURL: server.URL,
-		ModelName:     "test-model",
-		ModelDir:      tmpDir,
+	defer func() { _ = resp.Body.Close() }()
+	var m registry.Manifest
+	if err := json.NewDecoder(resp.Body).Decode(&m); err != nil || len(m.Layers) != 2 {
+		t.Fatalf("manifest: %v %+v", err, m)
 	}
-
-	ctx := context.Background()
-	if err := RunUpload(ctx, opt); err != nil {
-		t.Fatalf("RunUpload failed: %v", err)
+	titles := map[string]bool{}
+	for _, l := range m.Layers {
+		titles[l.Annotations[registry.AnnotationTitle]] = true
 	}
-
-	if !uploadedBlobs[expectedSha] {
-		t.Errorf("expected blob %s to be uploaded", expectedSha)
+	if !titles["config.json"] || !titles["sub/weights.bin"] {
+		t.Errorf("layer titles: %v", titles)
 	}
-	if !createdModels["test-model"] {
-		t.Errorf("expected model test-model to be created")
-	}
-}
-
-func TestRunUpload_UploadBlobFailure(t *testing.T) {
-	tmpDir, err := os.MkdirTemp("", "upload-test-err-*")
+	resp2, err := http.Get(srv.URL + "/org/test/resolve/v1/sub/weights.bin")
 	if err != nil {
-		t.Fatalf("failed to create temp dir: %v", err)
+		t.Fatal(err)
 	}
-	defer func() {
-		_ = os.RemoveAll(tmpDir)
-	}()
-
-	testContent := []byte("error content")
-	testFile := filepath.Join(tmpDir, "weights.bin")
-	if err := os.WriteFile(testFile, testContent, 0644); err != nil {
-		t.Fatalf("failed to write test file: %v", err)
+	defer func() { _ = resp2.Body.Close() }()
+	if resp2.StatusCode != 200 {
+		t.Errorf("resolve after upload: %d", resp2.StatusCode)
 	}
-
-	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		if strings.HasPrefix(r.URL.Path, "/blobs/") && r.Method == http.MethodPut {
-			http.Error(w, "internal server error", http.StatusInternalServerError)
-			return
-		}
-		http.NotFound(w, r)
-	}))
-	defer server.Close()
-
-	opt := &UploadOptions{
-		ModelstoreURL: server.URL,
-		ModelName:     "test-model",
-		ModelDir:      tmpDir,
-	}
-
-	err = RunUpload(context.Background(), opt)
-	if err == nil {
-		t.Fatal("expected error on failed blob upload, got nil")
-	}
-	if !strings.Contains(err.Error(), "failed to upload blob") {
-		t.Errorf("unexpected error message: %v", err)
-	}
-}
-
-func TestRunUpload_CreateModelFailure(t *testing.T) {
-	tmpDir, err := os.MkdirTemp("", "upload-test-err-*")
-	if err != nil {
-		t.Fatalf("failed to create temp dir: %v", err)
-	}
-	defer func() {
-		_ = os.RemoveAll(tmpDir)
-	}()
-
-	testContent := []byte("error content")
-	testFile := filepath.Join(tmpDir, "weights.bin")
-	if err := os.WriteFile(testFile, testContent, 0644); err != nil {
-		t.Fatalf("failed to write test file: %v", err)
-	}
-
-	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		if strings.HasPrefix(r.URL.Path, "/blobs/") && r.Method == http.MethodPut {
-			w.WriteHeader(http.StatusCreated)
-			return
-		}
-		if r.URL.Path == "/models" && r.Method == http.MethodPost {
-			http.Error(w, "conflict creating model", http.StatusConflict)
-			return
-		}
-		http.NotFound(w, r)
-	}))
-	defer server.Close()
-
-	opt := &UploadOptions{
-		ModelstoreURL: server.URL,
-		ModelName:     "test-model",
-		ModelDir:      tmpDir,
-	}
-
-	err = RunUpload(context.Background(), opt)
-	if err == nil {
-		t.Fatal("expected error on failed model creation, got nil")
-	}
-	if !strings.Contains(err.Error(), "failed to create model") {
-		t.Errorf("unexpected error message: %v", err)
+	if err := RunUpload(t.Context(), &UploadOptions{ModelstoreURL: srv.URL, ModelName: "Bad/Name", ModelDir: dir, Tag: "v1"}); err == nil {
+		t.Error("invalid name should fail before any upload")
 	}
 }
