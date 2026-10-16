@@ -370,17 +370,23 @@ torch::Tensor fp4_gather_mm(torch::Tensor x, torch::Tensor w, torch::Tensor scal
   return out;
 }
 
-torch::Tensor fp4_dequant(torch::Tensor w, torch::Tensor scale, int64_t e) {
-  TORCH_CHECK(w.dtype() == torch::kUInt8 && w.dim() == 3 && w.is_contiguous(), "w must be contiguous uint8 [E, N, K/2]");
-  TORCH_CHECK(e >= 0 && e < w.size(0), "expert index out of range");
+// Decode expert e into `out` ([N, K] bf16, contiguous).
+void fp4_dequant_into(const torch::Tensor& w, const torch::Tensor& scale, int64_t e, torch::Tensor& out) {
   const int64_t N = w.size(1), K = w.size(2) * 2;
-  auto out = torch::empty({N, K}, w.options().dtype(torch::kBFloat16));
   const uint8_t* wp = w.data_ptr<uint8_t>() + e * N * (K / 2);
   const uint8_t* sp = reinterpret_cast<const uint8_t*>(scale.data_ptr()) + e * N * (K / 32);
   uint16_t* op = reinterpret_cast<uint16_t*>(out.data_ptr<at::BFloat16>());
   parallel_range(N, 8, [&](int64_t n0, int64_t n1) {
     for (int64_t n = n0; n < n1; ++n) decode_row(wp + n * (K / 2), sp + n * (K / 32), K, op + n * K);
   });
+}
+
+torch::Tensor fp4_dequant(torch::Tensor w, torch::Tensor scale, int64_t e) {
+  TORCH_CHECK(w.dtype() == torch::kUInt8 && w.dim() == 3 && w.is_contiguous(), "w must be contiguous uint8 [E, N, K/2]");
+  TORCH_CHECK(e >= 0 && e < w.size(0), "expert index out of range");
+  const int64_t N = w.size(1), K = w.size(2) * 2;
+  auto out = torch::empty({N, K}, w.options().dtype(torch::kBFloat16));
+  fp4_dequant_into(w, scale, e, out);
   return out;
 }
 
@@ -392,18 +398,150 @@ torch::Tensor fp4_grouped_mm(torch::Tensor x, torch::Tensor w, torch::Tensor sca
   auto offc = offs.contiguous();
   const int32_t* offp = offc.data_ptr<int32_t>();
   TORCH_CHECK(E == 0 || offp[E - 1] == M, "offs must end at M");
+  // one decode buffer, reused for every expert (a fresh allocation per
+  // expert would pay its page faults every time)
+  auto we = torch::empty({N, x.size(1)}, x.options());
   int64_t r0 = 0;
   for (int64_t e = 0; e < E; ++e) {
     const int64_t r1 = offp[e];
     if (r1 > r0) {
       // decoded once per expert; the GEMM over its tokens is torch's bf16 mm
-      auto we = fp4_dequant(w, scale, e);
+      fp4_dequant_into(w, scale, e, we);
       auto rows = out.slice(0, r0, r1);
       at::mm_out(rows, x.slice(0, r0, r1), we.t());
     }
     r0 = r1;
   }
   return out;
+}
+
+// ---------------------------------------------------------------- fp8 dense
+
+// e4m3fn byte -> fp32 (no infinities; 0x7F/0xFF are NaN and never occur in weights)
+inline float e4m3(uint8_t b) {
+  const uint32_t sign = uint32_t(b & 0x80) << 24;
+  const uint32_t exp = (b >> 3) & 0xF, man = b & 7;
+  uint32_t bits;
+  if (exp == 0) {  // subnormal: man * 2^-9
+    float f = float(man) * (1.0f / 512.0f);
+    std::memcpy(&bits, &f, 4);
+  } else {
+    bits = ((exp + 120u) << 23) | (man << 20);
+  }
+  bits |= sign;
+  float f;
+  std::memcpy(&f, &bits, 4);
+  return f;
+}
+
+#if defined(__x86_64__) || defined(_M_X64)
+__attribute__((target("avx512f,avx512bw,avx512vl")))
+inline __m512 e4m3_avx512(__m128i bytes16) {
+  __m512i b = _mm512_cvtepu8_epi32(bytes16);
+  __m512i sign = _mm512_slli_epi32(_mm512_and_si512(b, _mm512_set1_epi32(0x80)), 24);
+  __m512i exp = _mm512_and_si512(_mm512_srli_epi32(b, 3), _mm512_set1_epi32(0xF));
+  __m512i man = _mm512_and_si512(b, _mm512_set1_epi32(7));
+  __m512i normal = _mm512_or_si512(_mm512_slli_epi32(_mm512_add_epi32(exp, _mm512_set1_epi32(120)), 23), _mm512_slli_epi32(man, 20));
+  __m512 sub = _mm512_mul_ps(_mm512_cvtepi32_ps(man), _mm512_set1_ps(1.0f / 512.0f));
+  __mmask16 is_sub = _mm512_cmpeq_epi32_mask(exp, _mm512_setzero_si512());
+  __m512 val = _mm512_mask_blend_ps(is_sub, _mm512_castsi512_ps(normal), sub);
+  return _mm512_castsi512_ps(_mm512_or_si512(_mm512_castps_si512(val), sign));
+}
+
+// x[K] fp32 dot one fp8 row with its K/32 block scales (row n's scales)
+__attribute__((target("avx512f,avx512bw,avx512vl")))
+inline float dot_fp8_avx512(const float* x, const uint8_t* w, const uint8_t* s, int64_t K) {
+  __m512 acc = _mm512_setzero_ps();
+  for (int64_t b = 0; b < K / 32; ++b) {
+    const uint8_t* wb = w + b * 32;
+    __m512 part = _mm512_mul_ps(e4m3_avx512(_mm_loadu_si128(reinterpret_cast<const __m128i*>(wb))), _mm512_loadu_ps(x + b * 32));
+    part = _mm512_fmadd_ps(e4m3_avx512(_mm_loadu_si128(reinterpret_cast<const __m128i*>(wb + 16))), _mm512_loadu_ps(x + b * 32 + 16), part);
+    acc = _mm512_fmadd_ps(part, _mm512_set1_ps(e8m0(s[b])), acc);
+  }
+  return _mm512_reduce_add_ps(acc);
+}
+
+__attribute__((target("avx512f,avx512bw,avx512vl")))
+inline void decode_fp8_row_avx512(const uint8_t* w, const uint8_t* s, int64_t K, uint16_t* out) {
+  for (int64_t b = 0; b < K / 32; ++b) {
+    const __m512 sc = _mm512_set1_ps(e8m0(s[b]));
+    const uint8_t* wb = w + b * 32;
+    __m512 a = _mm512_mul_ps(e4m3_avx512(_mm_loadu_si128(reinterpret_cast<const __m128i*>(wb))), sc);
+    __m512 c = _mm512_mul_ps(e4m3_avx512(_mm_loadu_si128(reinterpret_cast<const __m128i*>(wb + 16))), sc);
+    _mm256_storeu_si256(reinterpret_cast<__m256i*>(out + b * 32), to_bf16_avx512(a));
+    _mm256_storeu_si256(reinterpret_cast<__m256i*>(out + b * 32 + 16), to_bf16_avx512(c));
+  }
+}
+#endif
+
+inline float dot_fp8_scalar(const float* x, const uint8_t* w, const uint8_t* s, int64_t K) {
+  float acc = 0.f;
+  for (int64_t b = 0; b < K / 32; ++b) {
+    float part = 0.f;
+    for (int j = 0; j < 32; ++j) part += x[b * 32 + j] * e4m3(w[b * 32 + j]);
+    acc += part * e8m0(s[b]);
+  }
+  return acc;
+}
+
+inline void decode_fp8_row_scalar(const uint8_t* w, const uint8_t* s, int64_t K, uint16_t* out) {
+  for (int64_t b = 0; b < K / 32; ++b) {
+    const float sc = e8m0(s[b]);
+    for (int j = 0; j < 32; ++j) out[b * 32 + j] = bf16_bits(e4m3(w[b * 32 + j]) * sc);
+  }
+}
+
+inline float dot_fp8(const float* x, const uint8_t* w, const uint8_t* s, int64_t K) {
+#if defined(__x86_64__) || defined(_M_X64)
+  if (have_avx512()) return dot_fp8_avx512(x, w, s, K);
+#endif
+  return dot_fp8_scalar(x, w, s, K);
+}
+
+inline void decode_fp8_row(const uint8_t* w, const uint8_t* s, int64_t K, uint16_t* out) {
+#if defined(__x86_64__) || defined(_M_X64)
+  if (have_avx512()) { decode_fp8_row_avx512(w, s, K, out); return; }
+#endif
+  decode_fp8_row_scalar(w, s, K, out);
+}
+
+void check_fp8(const torch::Tensor& x, const torch::Tensor& w, const torch::Tensor& scale) {
+  TORCH_CHECK(x.dtype() == torch::kBFloat16 && x.dim() == 2 && x.is_contiguous(), "x must be contiguous bf16 [M, K]");
+  TORCH_CHECK(w.dtype() == torch::kFloat8_e4m3fn && w.dim() == 2 && w.is_contiguous(), "w must be contiguous fp8 [N, K]");
+  TORCH_CHECK(scale.dtype() == torch::kFloat8_e8m0fnu && scale.dim() == 2 && scale.is_contiguous(), "scale must be contiguous e8m0 [N/32, K/32]");
+  TORCH_CHECK(x.size(1) == w.size(1) && w.size(1) % 32 == 0 && w.size(0) % 32 == 0, "N and K must be multiples of 32");
+  TORCH_CHECK(scale.size(0) * 32 == w.size(0) && scale.size(1) * 32 == w.size(1), "one scale per 32x32 block");
+  TORCH_CHECK(x.device().is_cpu() && w.device().is_cpu() && scale.device().is_cpu(), "CPU tensors only");
+}
+
+// The dense fp8 linear: x [M, K] bf16 (already the fork's act_quant'd
+// values, exact in bf16) times w [N, K] fp8 with [N/32, K/32] e8m0
+// block scales -> bf16 [M, N]. One token: a fused GEMV per output row;
+// more: each row decoded once to bf16 and torch's GEMM over the tokens.
+torch::Tensor fp8_linear(torch::Tensor x, torch::Tensor w, torch::Tensor scale) {
+  check_fp8(x, w, scale);
+  const int64_t M = x.size(0), K = x.size(1), N = w.size(0), KB = K / 32;
+  const uint8_t* wp = reinterpret_cast<const uint8_t*>(w.data_ptr());
+  const uint8_t* sp = reinterpret_cast<const uint8_t*>(scale.data_ptr());
+  if (M == 1) {
+    auto out = torch::empty({1, N}, x.options());
+    std::vector<float> xf(K);
+    const at::BFloat16* xs = x.data_ptr<at::BFloat16>();
+    for (int64_t k = 0; k < K; ++k) xf[k] = static_cast<float>(xs[k]);
+    at::BFloat16* op = out.data_ptr<at::BFloat16>();
+    parallel_range(N, 8, [&](int64_t n0, int64_t n1) {
+      for (int64_t n = n0; n < n1; ++n) {
+        op[n] = static_cast<at::BFloat16>(dot_fp8(xf.data(), wp + n * K, sp + (n / 32) * KB, K));
+      }
+    });
+    return out;
+  }
+  auto wd = torch::empty({N, K}, x.options());
+  uint16_t* dp = reinterpret_cast<uint16_t*>(wd.data_ptr<at::BFloat16>());
+  parallel_range(N, 8, [&](int64_t n0, int64_t n1) {
+    for (int64_t n = n0; n < n1; ++n) decode_fp8_row(wp + n * K, sp + (n / 32) * KB, K, dp + n * K);
+  });
+  return at::mm(x, wd.t());
 }
 
 bool has_avx512() { return have_avx512(); }
@@ -419,6 +557,7 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
   m.def("fp4_gather_mm", &fp4_gather_mm, "x[M,K] bf16 x packed fp4 experts sel[M] -> bf16 [M,N]");
   m.def("fp4_grouped_mm", &fp4_grouped_mm, "x[M,K] bf16 (sorted by expert, offs[E]) x packed fp4 experts -> bf16 [M,N]");
   m.def("fp4_dequant", &fp4_dequant, "one expert of a packed bank -> bf16 [N,K]");
+  m.def("fp8_linear", &fp8_linear, "x[M,K] bf16 x fp8 [N,K] with e8m0 32x32 block scales -> bf16 [M,N]");
   m.def("has_avx512", &has_avx512, "whether the AVX-512 paths are in use");
   m.def("has_neon", &has_neon, "whether the NEON paths are in use");
 }

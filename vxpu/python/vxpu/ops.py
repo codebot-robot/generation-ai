@@ -34,7 +34,7 @@ import threading
 import torch
 from torch.library import custom_op
 
-from . import experts_cpu
+from . import experts_cpu, kernels
 
 
 class External:
@@ -120,3 +120,32 @@ def engram_rows(indices: torch.Tensor, table: int) -> torch.Tensor:
 @engram_rows.register_fake
 def _(indices, table):
     return indices.new_empty(tuple(indices.shape) + (ENGRAM_DIM[table],), dtype=torch.bfloat16)
+
+
+@custom_op("vxpu::fp8_linear", mutates_args=())
+def fp8_linear(x: torch.Tensor, weight: torch.Tensor, scale: torch.Tensor) -> torch.Tensor:
+    """The fork's fp8 linear: x [..., K] bf16, weight [N, K] fp8 with
+    [N/32, K/32] e8m0 block scales -> [..., N] in x's dtype. The
+    activation is quantized per 32-block (the fork's act_quant) as the
+    reference does; on the CPU the fused kernel reads the fp8 weight once
+    (one token: a GEMV per row; more: decode once and GEMM), elsewhere
+    the fork's own fp8_gemm."""
+    if x.is_meta:
+        return x.new_empty(tuple(x.shape[:-1]) + (weight.shape[0],))
+    from .deepseek_v41 import _fork
+    ds = _fork()
+    import kernel_aten as ka
+    xq, xs = ka.act_quant(x, ds.fp8_block_size, ds.scale_fmt, ds.scale_dtype)
+    k = kernels.load() if x.device.type == "cpu" else None
+    if k is not None:
+        # the quantized activation's values are exact in bf16 (fp8 times a power of two)
+        K = x.shape[-1]
+        xf = (xq.float().unflatten(-1, (K // 32, 32)) * xs.float().unsqueeze(-1)).flatten(-2).to(torch.bfloat16)
+        y = k.fp8_linear(xf.reshape(-1, K).contiguous(), weight, scale)
+        return y.reshape(tuple(x.shape[:-1]) + (weight.shape[0],)).to(x.dtype)
+    return ka.fp8_gemm(xq, xs, weight, scale, ds.scale_dtype, ds.fp8_block_size).to(x.dtype)
+
+
+@fp8_linear.register_fake
+def _(x, weight, scale):
+    return x.new_empty(tuple(x.shape[:-1]) + (weight.shape[0],))
