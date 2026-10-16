@@ -13,11 +13,12 @@ Hub published.
 - **The OCI distribution API** (`/v2/`), a deliberate subset: blob
   `HEAD`/`GET` with HTTP `Range` (the vxpu executor's read path), the
   two-step monolithic upload (`POST` for a session, `PUT` with the
-  digest and body) and the single-`POST` form so `oras` and `crane` can
-  push, cross-repository mounts (blobs are shared by digest), manifest
-  `PUT`/`GET`/`HEAD` for image manifests and indexes with every
-  referenced blob checked to exist, and tag listing. Chunked uploads
-  and deletes answer `405`.
+  digest and body) and the single-`POST` form, which is what `oras`
+  and `modelstore upload` use, cross-repository mounts (blobs are
+  shared by digest), manifest `PUT`/`GET`/`HEAD` for image manifests
+  and indexes with every referenced blob checked to exist, and tag
+  listing. Chunked uploads (`PATCH`) and deletes answer `405`; `crane`
+  pushes blobs with `PATCH` and so cannot push here yet.
 - **Imports from the Hugging Face Hub** without the bytes passing
   through a client: `POST /models/import {"repo": "org/name",
   "revision": "main"}` streams every file into the store (LFS files by
@@ -59,7 +60,8 @@ POOL=projects/$NUMBER/locations/global/workloadIdentityPools/$PROJECT.svc.id.goo
 gcloud storage buckets create $BUCKET --project=$PROJECT --location=us-central1 \
     --uniform-bucket-level-access
 # uploads stage under _tmp/ and are removed after publish; this collects
-# any left behind by a pod replaced mid-upload
+# any left behind by a pod replaced mid-upload (with --blob-store=gs://BUCKET/prefix
+# the rule must match "prefix/_tmp/" instead)
 gcloud storage buckets update $BUCKET --lifecycle-file=<(echo \
     '{"rule":[{"action":{"type":"Delete"},"condition":{"age":1,"matchesPrefix":["_tmp/"]}}]}')
 gcloud storage buckets add-iam-policy-binding $BUCKET \

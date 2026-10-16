@@ -204,3 +204,40 @@ func TestManifestsAndTags(t *testing.T) {
 		t.Errorf("repositories: %v", names)
 	}
 }
+
+// A repository may be called "blobs", "manifests" or "tags": the route
+// is the reserved component nearest the end, never the first found.
+func TestRoutesWithReservedNameComponents(t *testing.T) {
+	reg := newReg(t)
+	w := do(reg, http.MethodGet, "/v2/someone/blobs/tags/list", nil)
+	if w.Code != 200 || !strings.Contains(w.Body.String(), `"someone/blobs"`) {
+		t.Errorf("tags of someone/blobs: %d %s", w.Code, w.Body.String())
+	}
+	if w := do(reg, http.MethodGet, "/v2/someone/blobs/manifests/main", nil); w.Code != http.StatusNotFound || !strings.Contains(w.Body.String(), "MANIFEST_UNKNOWN") {
+		t.Errorf("manifest of someone/blobs: %d %s", w.Code, w.Body.String())
+	}
+	if w := do(reg, http.MethodPost, "/v2/someone/manifests/blobs/uploads/", nil); w.Code != http.StatusAccepted {
+		t.Errorf("upload under someone/manifests: %d %s", w.Code, w.Body.String())
+	}
+}
+
+// A refused tag leaves nothing behind, and a suffix range of an empty
+// blob is unsatisfiable rather than a 206 with a nonsense Content-Range.
+func TestTagValidatedBeforeWriteAndEmptyBlobRange(t *testing.T) {
+	reg := newReg(t)
+	manifest := []byte(`{"schemaVersion":2,"mediaType":"application/vnd.oci.image.manifest.v1+json","config":{"mediaType":"application/vnd.oci.empty.v1+json","digest":"sha256:44136fa355b3678a1146ad16f7e8649e94fb4fc21fe77e8310c060f61caaff8a","size":2},"layers":[]}`)
+	w := do(reg, http.MethodPut, "/v2/org/name/manifests/foo/bar", bytes.NewReader(manifest), "Content-Type", MediaTypeManifest)
+	if w.Code != http.StatusBadRequest || !strings.Contains(w.Body.String(), "TAG_INVALID") {
+		t.Fatalf("manifest with a bad tag: %d %s", w.Code, w.Body.String())
+	}
+	if w := do(reg, http.MethodHead, "/v2/org/name/manifests/"+digestOf(manifest), nil); w.Code != http.StatusNotFound {
+		t.Errorf("refused manifest is fetchable: %d", w.Code)
+	}
+	empty := digestOf(nil)
+	if w := do(reg, http.MethodPost, "/v2/org/name/blobs/uploads/?digest="+empty, bytes.NewReader(nil)); w.Code != http.StatusCreated {
+		t.Fatalf("empty blob: %d %s", w.Code, w.Body.String())
+	}
+	if w := do(reg, http.MethodGet, "/v2/org/name/blobs/"+empty, nil, "Range", "bytes=-5"); w.Code != http.StatusRequestedRangeNotSatisfiable {
+		t.Errorf("suffix range of an empty blob: %d %q", w.Code, w.Header().Get("Content-Range"))
+	}
+}

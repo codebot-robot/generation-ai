@@ -48,6 +48,8 @@ const (
 // its tags in the registry.
 type ImportStatus struct {
 	Phase         string `json:"phase"`
+	Repo          string `json:"repo,omitempty"`
+	Revision      string `json:"revision,omitempty"`
 	FilesTotal    int    `json:"filesTotal,omitempty"`
 	FilesImported int    `json:"filesImported,omitempty"`
 	BytesImported int64  `json:"bytesImported,omitempty"`
@@ -457,12 +459,24 @@ func (p *Proxy) handleBlobImport(w http.ResponseWriter, r *http.Request, sha str
 		http.Error(w, err.Error(), http.StatusBadRequest)
 		return nil
 	}
+	if errors.Is(err, importer.ErrRecentFailure) {
+		http.Error(w, err.Error(), http.StatusUnprocessableEntity)
+		return nil
+	}
 	if err != nil {
 		return err
 	}
 	if r.URL.Query().Get("wait") == "true" {
-		if _, err := p.importer.Wait(r.Context(), sha); err != nil {
-			return err
+		if _, err := p.importer.WaitFor(r.Context(), sha, req.URL); err != nil {
+			// The fetch the client asked for did not produce the blob it
+			// named: the client's problem (422) or the source's (502),
+			// not this server's.
+			code := http.StatusBadGateway
+			if strings.Contains(err.Error(), "sha256 mismatch") || errors.Is(err, importer.ErrRecentFailure) {
+				code = http.StatusUnprocessableEntity
+			}
+			http.Error(w, err.Error(), code)
+			return nil
 		}
 		st = importer.Present
 	}
@@ -527,6 +541,11 @@ func (p *Proxy) handleModelImport(w http.ResponseWriter, r *http.Request) error 
 	if req.Revision == "" {
 		req.Revision = "main"
 	}
+	if !registry.ValidTag(req.Revision) {
+		// checked before a download, not after: the revision becomes the tag
+		http.Error(w, fmt.Sprintf("revision %q is not a valid tag (a Hub revision with '/' such as refs/pr/1 is not supported; use the commit sha)", req.Revision), http.StatusBadRequest)
+		return nil
+	}
 	name, err := RepositoryName(req.Repo)
 	if err != nil {
 		http.Error(w, err.Error(), http.StatusBadRequest)
@@ -542,6 +561,13 @@ func (p *Proxy) handleModelImport(w http.ResponseWriter, r *http.Request) error 
 	}
 	p.mu.Lock()
 	if st := p.imports[name]; st != nil && st.Phase == PhaseImporting {
+		if st.Repo != req.Repo || st.Revision != req.Revision {
+			// one import per name at a time; a second revision would
+			// otherwise be answered 202 and never run
+			p.mu.Unlock()
+			http.Error(w, fmt.Sprintf("import of %s@%s is in progress under %s; retry when it is Ready", st.Repo, st.Revision, name), http.StatusConflict)
+			return nil
+		}
 		p.mu.Unlock()
 		v, err := p.view(r.Context(), name)
 		if err != nil {
@@ -550,7 +576,7 @@ func (p *Proxy) handleModelImport(w http.ResponseWriter, r *http.Request) error 
 		w.WriteHeader(http.StatusAccepted)
 		return json.NewEncoder(w).Encode(v)
 	}
-	st := &ImportStatus{Phase: PhaseImporting}
+	st := &ImportStatus{Phase: PhaseImporting, Repo: req.Repo, Revision: req.Revision}
 	p.imports[name] = st
 	p.mu.Unlock()
 	go p.runModelImport(name, req, st)
@@ -634,14 +660,17 @@ func (p *Proxy) writeWeightsArtifact(ctx context.Context, name string, req Model
 	if err != nil {
 		return "", err
 	}
-	digest, err := p.reg.PutManifest(ctx, name, req.Revision, registry.MediaTypeManifest, body)
-	if err != nil {
-		return "", fmt.Errorf("writing manifest: %w", err)
-	}
+	// The commit tag first: the revision tag is what makes the artifact
+	// Ready and what the facade's "sha" points clients at, so it must
+	// never exist without the commit it names.
 	if commit != "" && commit != req.Revision {
 		if _, err := p.reg.PutManifest(ctx, name, commit, registry.MediaTypeManifest, body); err != nil {
 			return "", fmt.Errorf("tagging commit: %w", err)
 		}
+	}
+	digest, err := p.reg.PutManifest(ctx, name, req.Revision, registry.MediaTypeManifest, body)
+	if err != nil {
+		return "", fmt.Errorf("writing manifest: %w", err)
 	}
 	return digest, nil
 }

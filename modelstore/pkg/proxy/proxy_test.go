@@ -244,11 +244,43 @@ func TestBlobImportRefusesForeignURLs(t *testing.T) {
 		t.Errorf("hub import: %d %s", w.Code, w.Body.String())
 	}
 	wrong := strings.Repeat("3", 64)
-	if w := do(p, http.MethodPost, "/blobs/"+wrong+"/import?wait=true", strings.NewReader(body)); w.Code != http.StatusInternalServerError {
+	// The client named a digest the url does not produce: its mistake (422), not a server error,
+	// and asking again for the same pair is answered from memory rather than fetched again.
+	if w := do(p, http.MethodPost, "/blobs/"+wrong+"/import?wait=true", strings.NewReader(body)); w.Code != http.StatusUnprocessableEntity {
 		t.Errorf("mismatched import: %d", w.Code)
 	}
 	if w := do(p, http.MethodHead, "/blobs/"+wrong, nil); w.Code != http.StatusNotFound {
 		t.Errorf("mismatched blob should not exist: %d", w.Code)
+	}
+	if w := do(p, http.MethodPost, "/blobs/"+wrong+"/import", strings.NewReader(body)); w.Code != http.StatusUnprocessableEntity || !strings.Contains(w.Body.String(), "sha256 mismatch") {
+		t.Errorf("repeat of a failed pair: %d %s", w.Code, w.Body.String())
+	}
+}
+
+// A revision that cannot be a tag is refused before anything is
+// downloaded, and a second import under a busy name is refused rather
+// than silently joined to a different revision.
+func TestModelImportRefusesBadRevisionAndBusyName(t *testing.T) {
+	hub := fakeHub(t, []byte("w"), []byte("{}"))
+	defer hub.Close()
+	p := newTestProxy(t, hub.URL)
+	for _, rev := range []string{"refs/pr/1", "release/v1", "a b"} {
+		w := do(p, http.MethodPost, "/models/import", strings.NewReader(fmt.Sprintf(`{"repo": "org/name", "revision": %q}`, rev)))
+		if w.Code != http.StatusBadRequest {
+			t.Errorf("revision %q: %d, want 400", rev, w.Code)
+		}
+	}
+	p.mu.Lock()
+	p.imports["org/name"] = &ImportStatus{Phase: PhaseImporting, Repo: "org/name", Revision: "main"}
+	p.mu.Unlock()
+	if w := do(p, http.MethodPost, "/models/import", strings.NewReader(`{"repo": "org/name", "revision": "main"}`)); w.Code != http.StatusAccepted {
+		t.Errorf("same revision joins: %d", w.Code)
+	}
+	if w := do(p, http.MethodPost, "/models/import", strings.NewReader(`{"repo": "org/name", "revision": "v2"}`)); w.Code != http.StatusConflict {
+		t.Errorf("other revision while importing: %d, want 409", w.Code)
+	}
+	if w := do(p, http.MethodPost, "/models/import", strings.NewReader(`{"repo": "Org/Name", "revision": "main"}`)); w.Code != http.StatusConflict {
+		t.Errorf("other repo under the same name while importing: %d, want 409", w.Code)
 	}
 }
 

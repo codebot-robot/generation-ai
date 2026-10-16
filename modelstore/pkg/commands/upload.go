@@ -92,6 +92,15 @@ func RunUpload(ctx context.Context, opt *UploadOptions) error {
 		if info.IsDir() {
 			return nil
 		}
+		// Walk reports symlinks as themselves; a Hub cache snapshot is a
+		// tree of symlinks into blobs/, so size (and dir-ness) come from
+		// the target, which is also what fileSHA256 hashes.
+		if info, err = os.Stat(path); err != nil {
+			return err
+		}
+		if info.IsDir() {
+			return nil
+		}
 		relPath, err := filepath.Rel(opt.ModelDir, path)
 		if err != nil {
 			return err

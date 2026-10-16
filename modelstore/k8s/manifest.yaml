@@ -48,6 +48,10 @@ metadata:
   namespace: modelstore
 spec:
   replicas: 1
+  # Upload sessions and import progress live in the process: never run
+  # two servers behind the Service during a rollout.
+  strategy:
+    type: Recreate
   selector:
     matchLabels:
       app: modelstore
@@ -73,6 +77,9 @@ spec:
           #       secretKeyRef: {name: hf-token, key: token}
           ports:
             - containerPort: 8080
+          readinessProbe:
+            httpGet: {path: /v2/, port: 8080}
+            periodSeconds: 5
           resources:
             requests: {cpu: "2", memory: 2Gi}
             limits: {memory: 4Gi}

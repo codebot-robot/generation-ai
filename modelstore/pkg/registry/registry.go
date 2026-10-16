@@ -40,6 +40,7 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+	"time"
 
 	"github.com/gke-labs/generation-ai/modelstore/pkg/blobstore"
 	"github.com/google/uuid"
@@ -62,6 +63,10 @@ const (
 	headerDirectURL    = "X-Modelstore-Direct-Url"
 	emptyDescriptorSHA = "44136fa355b3678a1146ad16f7e8649e94fb4fc21fe77e8310c060f61caaff8a" // sha256("{}")
 )
+
+// ValidTag reports whether ref is a tag the registry accepts (the
+// distribution grammar; a Hub revision such as "refs/pr/1" is not).
+func ValidTag(ref string) bool { return tagRe.MatchString(ref) }
 
 // Descriptor is an OCI content descriptor.
 type Descriptor struct {
@@ -113,13 +118,22 @@ type Registry struct {
 	store blobstore.Store
 
 	mu       sync.Mutex
-	sessions map[string]string // upload session id -> repository name
+	sessions map[string]uploadSession // two-step uploads awaiting their PUT
 }
 
 // New serves the distribution API over store.
 func New(store blobstore.Store) *Registry {
-	return &Registry{store: store, sessions: map[string]string{}}
+	return &Registry{store: store, sessions: map[string]uploadSession{}}
 }
+
+// uploadSession is a two-step upload between its POST and its PUT.
+// Sessions a client abandons are dropped after sessionTTL.
+type uploadSession struct {
+	name    string
+	created time.Time
+}
+
+const sessionTTL = time.Hour
 
 // Store is the registry's blob store.
 func (r *Registry) Store() blobstore.Store { return r.store }
@@ -138,31 +152,35 @@ func (reg *Registry) Handle(w http.ResponseWriter, r *http.Request) (bool, error
 		return false, nil
 	}
 	// <name>/{blobs,manifests,tags}/...: the name may contain slashes,
-	// so find the last recognized component.
-	for _, kind := range []string{"/blobs/uploads/", "/blobs/", "/manifests/", "/tags/list"} {
-		i := strings.LastIndex(rest, kind)
-		if i < 0 {
+	// and even the reserved words as components ("someone/blobs"), but
+	// the argument (a digest, tag or session id) never contains a slash,
+	// so the route is the reserved component nearest the end of the path.
+	kind, at := "", -1
+	for _, k := range []string{"/blobs/uploads/", "/blobs/", "/manifests/", "/tags/list"} {
+		i := strings.LastIndex(rest, k)
+		if i < 0 || (k == "/tags/list" && i+len(k) != len(rest)) { // tags/list takes no argument
 			continue
 		}
-		name, arg := rest[:i], rest[i+len(kind):]
-		if !ValidName(name) {
-			return true, reg.fail(w, http.StatusBadRequest, "NAME_INVALID", "invalid repository name %q", name)
-		}
-		switch kind {
-		case "/blobs/uploads/":
-			return true, reg.handleUpload(w, r, name, arg)
-		case "/blobs/":
-			return true, reg.handleBlob(w, r, name, arg)
-		case "/manifests/":
-			return true, reg.handleManifest(w, r, name, arg)
-		case "/tags/list":
-			if arg != "" {
-				break
-			}
-			return true, reg.handleTags(w, r, name)
+		if i > at || (i == at && k == "/blobs/uploads/") {
+			kind, at = k, i
 		}
 	}
-	return true, reg.fail(w, http.StatusNotFound, "UNSUPPORTED", "no such route")
+	if kind == "" {
+		return true, reg.fail(w, http.StatusNotFound, "UNSUPPORTED", "no such route")
+	}
+	name, arg := rest[:at], rest[at+len(kind):]
+	if !ValidName(name) {
+		return true, reg.fail(w, http.StatusBadRequest, "NAME_INVALID", "invalid repository name %q", name)
+	}
+	switch kind {
+	case "/blobs/uploads/":
+		return true, reg.handleUpload(w, r, name, arg)
+	case "/blobs/":
+		return true, reg.handleBlob(w, r, name, arg)
+	case "/manifests/":
+		return true, reg.handleManifest(w, r, name, arg)
+	}
+	return true, reg.handleTags(w, r, name)
 }
 
 // ociError is the distribution API's error body.
@@ -269,6 +287,9 @@ func parseRange(h string, size int64) (int64, int64, bool) {
 		if n > size {
 			n = size
 		}
+		if n == 0 { // a suffix of an empty blob: nothing to satisfy
+			return 0, 0, false
+		}
 		return size - n, n, true
 	}
 	start, err := strconv.ParseInt(first, 10, 64)
@@ -315,7 +336,12 @@ func (reg *Registry) handleUpload(w http.ResponseWriter, r *http.Request, name, 
 		}
 		id := uuid.NewString()
 		reg.mu.Lock()
-		reg.sessions[id] = name
+		for old, s := range reg.sessions {
+			if time.Since(s.created) > sessionTTL {
+				delete(reg.sessions, old)
+			}
+		}
+		reg.sessions[id] = uploadSession{name: name, created: time.Now()}
 		reg.mu.Unlock()
 		w.Header().Set("Location", "/v2/"+name+"/blobs/uploads/"+id)
 		w.Header().Set("Range", "0-0")
@@ -327,7 +353,7 @@ func (reg *Registry) handleUpload(w http.ResponseWriter, r *http.Request, name, 
 		owner, ok := reg.sessions[session]
 		delete(reg.sessions, session)
 		reg.mu.Unlock()
-		if !ok || owner != name {
+		if !ok || owner.name != name {
 			return reg.fail(w, http.StatusNotFound, "BLOB_UPLOAD_UNKNOWN", "upload session %q unknown", session)
 		}
 		return reg.finishUpload(w, r, name, r.URL.Query().Get("digest"))
@@ -502,6 +528,9 @@ func (reg *Registry) PutManifest(ctx context.Context, name, ref, mediaType strin
 	digest := "sha256:" + hex.EncodeToString(sum[:])
 	if d, ok := ParseDigest(ref); ok && "sha256:"+d != digest {
 		return "", &clientError{"DIGEST_INVALID", "body digest " + digest + " does not match reference " + ref}
+	} else if !ok && !ValidTag(ref) {
+		// before anything is written: a refused manifest must leave nothing behind
+		return "", &clientError{"TAG_INVALID", "invalid tag " + ref}
 	}
 	if _, _, err := reg.store.Put(ctx, hex.EncodeToString(sum[:]), strings.NewReader(string(body))); err != nil {
 		return "", err
@@ -514,9 +543,6 @@ func (reg *Registry) PutManifest(ctx context.Context, name, ref, mediaType strin
 		return "", err
 	}
 	if _, isDigest := ParseDigest(ref); !isDigest {
-		if !tagRe.MatchString(ref) {
-			return "", &clientError{"TAG_INVALID", "invalid tag " + ref}
-		}
 		if err := reg.store.PutRef(ctx, tagKey(name, ref), []byte(digest)); err != nil {
 			return "", err
 		}

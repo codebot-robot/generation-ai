@@ -43,15 +43,32 @@ type Importer struct {
 	hfToken    string
 	client     *http.Client
 
-	mu   sync.Mutex
-	jobs map[string]*job // by sha
+	mu     sync.Mutex
+	jobs   map[string]*job    // by sha
+	failed map[string]failure // last failed import by sha, for failureTTL
 }
 
 type job struct {
+	url  string
 	done chan struct{}
 	err  error
 	n    int64
 }
+
+// failure remembers why an import failed, so the next request for the
+// same blob from the same url is answered with the reason instead of
+// starting the same download again.
+type failure struct {
+	url string
+	err error
+	at  time.Time
+}
+
+const failureTTL = 10 * time.Minute
+
+// ErrRecentFailure wraps the error of an import that failed within
+// failureTTL when the same blob is requested from the same url again.
+var ErrRecentFailure = errors.New("a recent import of this blob from this url failed")
 
 // New creates an Importer. hfEndpoint is the Hub base URL (default
 // https://huggingface.co); the HF_TOKEN environment variable, when set,
@@ -144,11 +161,33 @@ func (im *Importer) EnsureBlob(ctx context.Context, sha, srcURL string) (Status,
 		im.mu.Unlock()
 		return InFlight, nil
 	}
-	j := &job{done: make(chan struct{})}
+	if f, ok := im.failed[sha]; ok && f.url == srcURL && time.Since(f.at) < failureTTL {
+		im.mu.Unlock()
+		return Absent, fmt.Errorf("%w: %v", ErrRecentFailure, f.err)
+	}
+	j := &job{url: srcURL, done: make(chan struct{})}
 	im.jobs[sha] = j
 	im.mu.Unlock()
 	go im.run(sha, srcURL, j)
 	return InFlight, nil
+}
+
+// WaitFor is Wait for a caller that asked for srcURL. An import keyed
+// by digest alone could be in flight from another caller's url; if that
+// one fails, this caller's url is tried once rather than inheriting a
+// failure it never asked for.
+func (im *Importer) WaitFor(ctx context.Context, sha, srcURL string) (int64, error) {
+	im.mu.Lock()
+	j, running := im.jobs[sha]
+	im.mu.Unlock()
+	n, err := im.Wait(ctx, sha)
+	if err == nil || !running || j.url == srcURL || ctx.Err() != nil {
+		return n, err
+	}
+	if _, err := im.EnsureBlob(ctx, sha, srcURL); err != nil {
+		return 0, err
+	}
+	return im.Wait(ctx, sha)
 }
 
 // Wait blocks until the import of sha (if any) finishes and returns
@@ -185,6 +224,14 @@ func (im *Importer) run(sha, srcURL string, j *job) {
 	}
 	im.mu.Lock()
 	delete(im.jobs, sha)
+	if err != nil {
+		if im.failed == nil {
+			im.failed = map[string]failure{}
+		}
+		im.failed[sha] = failure{url: srcURL, err: err, at: time.Now()}
+	} else {
+		delete(im.failed, sha)
+	}
 	im.mu.Unlock()
 	close(j.done)
 }
@@ -373,7 +420,7 @@ func (im *Importer) ImportRepo(ctx context.Context, repo, revision string, repor
 				return commit, out, err
 			}
 			var err error
-			if n, err = im.Wait(ctx, sha); err != nil {
+			if n, err = im.WaitFor(ctx, sha, f.URL); err != nil {
 				return commit, out, fmt.Errorf("%s: %w", f.Path, err)
 			}
 		} else {
