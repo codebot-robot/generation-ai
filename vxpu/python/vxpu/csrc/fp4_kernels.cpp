@@ -42,11 +42,13 @@
 // path everywhere else.
 
 #include <torch/extension.h>
+#include <c10/util/Float8_e4m3fn.h>
 #include <ATen/Parallel.h>
 
 #include <cmath>
 #include <cstdint>
 #include <atomic>
+#include <cstdlib>
 #include <cstring>
 #include <vector>
 
@@ -71,9 +73,23 @@ namespace {
 // with it (Linux, gcc); std::thread otherwise (Apple clang ships no
 // OpenMP runtime). at::parallel_for would be the natural choice, but it
 // runs serially in an extension compiled without OpenMP.
+int64_t kernel_threads() {
+  // VXPU_KERNEL_THREADS: the kernels are memory-bound and want every
+  // core; the graph's thousands of small ops do better on fewer (torch's
+  // own count), so the two can differ.
+  static const int64_t n = [] {
+    if (const char* v = std::getenv("VXPU_KERNEL_THREADS")) {
+      const long k = std::atol(v);
+      if (k > 0) return int64_t(k);
+    }
+    return int64_t(0);
+  }();
+  return n > 0 ? n : std::max<int64_t>(1, at::get_num_threads());
+}
+
 void parallel_range(int64_t n, int64_t grain, const std::function<void(int64_t, int64_t)>& fn) {
   if (n <= 0) return;
-  int64_t threads = std::max<int64_t>(1, at::get_num_threads());
+  int64_t threads = kernel_threads();
   int64_t chunks = std::min(n / std::max<int64_t>(grain, 1), threads * 4);
   if (chunks <= 1) { fn(0, n); return; }
   const int64_t step = (n + chunks - 1) / chunks;
@@ -505,6 +521,31 @@ inline void decode_fp8_row(const uint8_t* w, const uint8_t* s, int64_t K, uint16
   decode_fp8_row_scalar(w, s, K, out);
 }
 
+// The fork's act_quant for one row: per 32-block, amax (floored at
+// 1e-4), the smallest power of two >= amax/448 as the scale (a power
+// of two maps to itself), x/scale clamped to +-448 and rounded to the
+// e4m3 grid (nearest even, as a cast does), then times the scale again:
+// the exact value the reference multiplies with.
+inline float pow2_ceil(float v) {
+  int e;
+  const float m = std::frexp(v, &e);  // v = m * 2^e, m in [0.5, 1)
+  return std::ldexp(1.0f, m == 0.5f ? e - 1 : e);
+}
+
+inline void act_quant_row(const at::BFloat16* x, int64_t K, float* out) {
+  for (int64_t b = 0; b < K / 32; ++b) {
+    float amax = 0.f;
+    for (int j = 0; j < 32; ++j) amax = std::max(amax, std::fabs(static_cast<float>(x[b * 32 + j])));
+    amax = std::max(amax, 1e-4f);
+    const float s = pow2_ceil(amax / 448.0f);
+    for (int j = 0; j < 32; ++j) {
+      float q = static_cast<float>(x[b * 32 + j]) / s;
+      q = std::min(448.0f, std::max(-448.0f, q));
+      out[b * 32 + j] = static_cast<float>(c10::Float8_e4m3fn(q)) * s;
+    }
+  }
+}
+
 void check_fp8(const torch::Tensor& x, const torch::Tensor& w, const torch::Tensor& scale) {
   TORCH_CHECK(x.dtype() == torch::kBFloat16 && x.dim() == 2 && x.is_contiguous(), "x must be contiguous bf16 [M, K]");
   TORCH_CHECK(w.dtype() == torch::kFloat8_e4m3fn && w.dim() == 2 && w.is_contiguous(), "w must be contiguous fp8 [N, K]");
@@ -523,11 +564,11 @@ torch::Tensor fp8_linear(torch::Tensor x, torch::Tensor w, torch::Tensor scale) 
   const int64_t M = x.size(0), K = x.size(1), N = w.size(0), KB = K / 32;
   const uint8_t* wp = reinterpret_cast<const uint8_t*>(w.data_ptr());
   const uint8_t* sp = reinterpret_cast<const uint8_t*>(scale.data_ptr());
+  const at::BFloat16* xs = x.data_ptr<at::BFloat16>();
   if (M == 1) {
     auto out = torch::empty({1, N}, x.options());
     std::vector<float> xf(K);
-    const at::BFloat16* xs = x.data_ptr<at::BFloat16>();
-    for (int64_t k = 0; k < K; ++k) xf[k] = static_cast<float>(xs[k]);
+    act_quant_row(xs, K, xf.data());
     at::BFloat16* op = out.data_ptr<at::BFloat16>();
     parallel_range(N, 8, [&](int64_t n0, int64_t n1) {
       for (int64_t n = n0; n < n1; ++n) {
@@ -536,12 +577,23 @@ torch::Tensor fp8_linear(torch::Tensor x, torch::Tensor w, torch::Tensor scale) 
     });
     return out;
   }
+  // many tokens: quantized activations (exact in bf16) and the weight
+  // decoded once, then torch's GEMM
+  auto xq = torch::empty({M, K}, x.options());
+  at::BFloat16* xqp = xq.data_ptr<at::BFloat16>();
+  parallel_range(M, 1, [&](int64_t i0, int64_t i1) {
+    std::vector<float> row(K);
+    for (int64_t i = i0; i < i1; ++i) {
+      act_quant_row(xs + i * K, K, row.data());
+      for (int64_t k = 0; k < K; ++k) xqp[i * K + k] = static_cast<at::BFloat16>(row[k]);
+    }
+  });
   auto wd = torch::empty({N, K}, x.options());
   uint16_t* dp = reinterpret_cast<uint16_t*>(wd.data_ptr<at::BFloat16>());
   parallel_range(N, 8, [&](int64_t n0, int64_t n1) {
     for (int64_t n = n0; n < n1; ++n) decode_fp8_row(wp + n * K, sp + (n / 32) * KB, K, dp + n * K);
   });
-  return at::mm(x, wd.t());
+  return at::mm(xq, wd.t());
 }
 
 bool has_avx512() { return have_avx512(); }
@@ -557,7 +609,7 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
   m.def("fp4_gather_mm", &fp4_gather_mm, "x[M,K] bf16 x packed fp4 experts sel[M] -> bf16 [M,N]");
   m.def("fp4_grouped_mm", &fp4_grouped_mm, "x[M,K] bf16 (sorted by expert, offs[E]) x packed fp4 experts -> bf16 [M,N]");
   m.def("fp4_dequant", &fp4_dequant, "one expert of a packed bank -> bf16 [N,K]");
-  m.def("fp8_linear", &fp8_linear, "x[M,K] bf16 x fp8 [N,K] with e8m0 32x32 block scales -> bf16 [M,N]");
+  m.def("fp8_linear", &fp8_linear, "x[M,K] bf16 (quantized per 32-block inside, as the fork's act_quant) x fp8 [N,K] with e8m0 32x32 block scales -> bf16 [M,N]");
   m.def("has_avx512", &has_avx512, "whether the AVX-512 paths are in use");
   m.def("has_neon", &has_neon, "whether the NEON paths are in use");
 }

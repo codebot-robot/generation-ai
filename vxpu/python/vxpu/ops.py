@@ -132,17 +132,16 @@ def fp8_linear(x: torch.Tensor, weight: torch.Tensor, scale: torch.Tensor) -> to
     the fork's own fp8_gemm."""
     if x.is_meta:
         return x.new_empty(tuple(x.shape[:-1]) + (weight.shape[0],))
+    k = kernels.load() if x.device.type == "cpu" else None
+    if k is not None:
+        # the kernel quantizes the activation itself (the fork's act_quant, fused)
+        K = x.shape[-1]
+        y = k.fp8_linear(x.reshape(-1, K).contiguous().to(torch.bfloat16), weight, scale)
+        return y.reshape(tuple(x.shape[:-1]) + (weight.shape[0],)).to(x.dtype)
     from .deepseek_v41 import _fork
     ds = _fork()
     import kernel_aten as ka
     xq, xs = ka.act_quant(x, ds.fp8_block_size, ds.scale_fmt, ds.scale_dtype)
-    k = kernels.load() if x.device.type == "cpu" else None
-    if k is not None:
-        # the quantized activation's values are exact in bf16 (fp8 times a power of two)
-        K = x.shape[-1]
-        xf = (xq.float().unflatten(-1, (K // 32, 32)) * xs.float().unsqueeze(-1)).flatten(-2).to(torch.bfloat16)
-        y = k.fp8_linear(xf.reshape(-1, K).contiguous(), weight, scale)
-        return y.reshape(tuple(x.shape[:-1]) + (weight.shape[0],)).to(x.dtype)
     return ka.fp8_gemm(xq, xs, weight, scale, ds.scale_dtype, ds.fp8_block_size).to(x.dtype)
 
 
