@@ -95,9 +95,15 @@ class Engine:
         if cas_dir:
             os.makedirs(cas_dir, exist_ok=True)
 
-        self.config = CONFIG_MAPPING[
-            self.manifest["config"]["model_type"]
-        ].from_dict(self.manifest["config"])
+        model_type = self.manifest["config"].get("model_type")
+        if model_type in CONFIG_MAPPING:
+            self.config = CONFIG_MAPPING[model_type].from_dict(self.manifest["config"])
+        else:
+            # A model transformers does not implement (DeepSeek-V4.1 runs
+            # from the model maker's module): a plain config carries what
+            # generation needs (eos ids, vocab size).
+            from transformers import PretrainedConfig
+            self.config = PretrainedConfig.from_dict(self.manifest["config"])
         self.max_cache_len = int(self.binding.get("max_cache_len", 1024))
         # Tokenizer/processor files are not yet part of the manifest.
         # Generate (ids in, ids out) needs none; Chat does. A local
@@ -135,11 +141,24 @@ class Engine:
         # in place), so a session costs cache memory, not a weight copy.
         self.shared = {}
         self.bytes_fetched = 0
-        for fqn, ref in self.binding["bound"].items():
-            tensor, downloaded = fetch_tensor(
-                ref, self.manifest["files"], cas_dir)
-            self.shared[fqn] = tensor.to(device)
-            self.bytes_fetched += downloaded
+        # Bound tensors are fetched concurrently (a bounded window, so
+        # the memory in flight stays near the window, not the model);
+        # each lands on the device as it completes.
+        from concurrent.futures import ThreadPoolExecutor
+        bound = list(self.binding["bound"].items())
+        with ThreadPoolExecutor(max_workers=16) as pool:
+            pending = {}
+            for i, (fqn, ref) in enumerate(bound):
+                pending[i] = pool.submit(fetch_tensor, ref, self.manifest["files"], cas_dir)
+                if len(pending) >= 32:
+                    j = min(pending)
+                    tensor, downloaded = pending.pop(j).result()
+                    self.shared[bound[j][0]] = tensor.to(device)
+                    self.bytes_fetched += downloaded
+            for j in sorted(pending):
+                tensor, downloaded = pending.pop(j).result()
+                self.shared[bound[j][0]] = tensor.to(device)
+                self.bytes_fetched += downloaded
         # Stacked parameters (mixture-of-experts banks) are assembled
         # from the checkpoint's per-expert tensors.
         for fqn, spec in self.binding.get("stacked", {}).items():
@@ -235,6 +254,11 @@ class Engine:
         if self.compile_decode:
             strip_asserts(self._decode)
             self._decode_run = torch.compile(self._decode, **compile_options(self.device))
+
+    def _reset_state(self, session):
+        """Zero a session's state tensors in place (the graphs stay bound)."""
+        for tensor in session["state"].values():
+            tensor.zero_()
 
     def _bind(self, state):
         """Point both graphs' state buffers at this session's tensors.
@@ -389,6 +413,17 @@ class Engine:
             # Everything is cached, including the last prompt token;
             # recompute its logits by re-prefilling just that token.
             start = total_len - 1
+        if self.binding.get("prefill_from_zero") and (
+                start < len(cached)
+                or (start > 0 and total_len - start >= self.min_prefill_len)):
+            # This model's prefill graph starts at position 0 (its ring
+            # buffers and compressed caches are seeded by the prefill),
+            # so it cannot extend a cached prefix: a rewritten prefix,
+            # and a multi-token continuation (the next turn of a chat),
+            # mean a fresh state and a full prefill. A single new token
+            # goes through the decode graph below, which takes a position.
+            self._reset_state(session)
+            start = 0
 
         allowed_tokens = self.max_cache_len - total_len
         max_tokens_to_generate = max(0, min(max_new_tokens, allowed_tokens))

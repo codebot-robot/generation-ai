@@ -52,6 +52,7 @@ divergence, and they stay useful under any later tolerance.
 import argparse
 import json
 import os
+import sys
 import tempfile
 import time
 
@@ -117,6 +118,13 @@ def _tokenizer(model, revision, prompts="auto"):
         return None
 
 
+def _progress(prompt, new, ms_per_token):
+    """One line per finished prompt on stderr, so a long run (the real
+    DeepSeek reference takes hours on a CPU) shows where it is."""
+    rate = f"{ms_per_token:.0f} ms/token" if ms_per_token else "no timing"
+    print(f"[vectors] {prompt['name']}: {len(new)} tokens, {rate}", file=sys.stderr, flush=True)
+
+
 def _prompt_set(tokenizer, prompts):
     if prompts == "ids" or (prompts == "auto" and tokenizer is None):
         return ID_PROMPTS
@@ -164,10 +172,129 @@ def record_transformers(model, revision, prompts, settings, device="cpu", dtype=
                     "finish": "eos" if new and new[-1] in eos_ids else "length",
                     "top_logits": top,
                     "ms_per_token": round(1000 * elapsed / max(1, len(new)), 1)})
+        _progress(prompt, new, 1000 * elapsed / max(1, len(new)))
     producer = {"kind": "transformers", **_versions(lm.device), "dtype": str(lm.dtype),
                 "dequantize": dequantize,
                 "experts_implementation": getattr(lm.config, "_experts_implementation", None)}
     return _document(model, revision, lm.config, producer, settings, out)
+
+
+def _download(url, dest, size=None):
+    """Stream url to dest (resumes nothing; a complete file of the
+    expected size is kept). Sends the Hub token when one is configured."""
+    import requests
+    from huggingface_hub.utils import build_hf_headers
+    if size is not None and os.path.exists(dest) and os.path.getsize(dest) == size:
+        return dest
+    os.makedirs(os.path.dirname(dest), exist_ok=True)
+    part = dest + ".part"
+    with requests.get(url, headers=build_hf_headers(), stream=True, timeout=(30, 600)) as r:
+        r.raise_for_status()
+        with open(part, "wb") as f:
+            for chunk in r.iter_content(chunk_size=8 << 20):
+                f.write(chunk)
+    os.replace(part, dest)
+    return dest
+
+
+def record_deepseek_eager(model, revision, prompts, settings):
+    """Reference for a deepseek_v41 checkpoint: the model maker's module
+    from the fork, run eagerly with the plain-aten kernels on the CPU (no
+    transformers implementation exists; the plain-aten kernels are CPU
+    code, so there is no device to choose). Greedy; logits at every step."""
+    import torch
+    from safetensors.torch import load_file
+    from transformers import AutoTokenizer
+    from . import deepseek_v41 as ds
+    from .manifest import build_manifest
+    manifest = build_manifest(model, revision)
+    tok = _tokenizer(model, revision, prompts)
+    tokenizer = AutoTokenizer.from_pretrained(model, revision=revision)
+    fork = ds._fork()
+    args = ds.model_args(model, settings.get("max_cache_len", 1024))
+    with ds.bf16_default():
+        lm = fork.Transformer(args, tokenizer).eval()
+    # Load shard by shard into the module: the checkpoint never coexists
+    # with the parameters in memory, so a 510 GB model needs ~510 GB, not
+    # twice that. Remote shards are streamed a few at a time ahead of the
+    # loader and deleted once loaded (hf_hub_download refuses files over
+    # 50 GB without its xet client, and the engram shards are ~100 GB).
+    from concurrent.futures import ThreadPoolExecutor
+    from huggingface_hub import hf_hub_url
+    cache = os.path.join(os.environ.get("VXPU_SHARD_CACHE", os.path.join(tempfile.gettempdir(), "vxpu-shards")),
+                         model.replace("/", "--"))
+
+    def fetch(ref):
+        if ref["source"].startswith("file://"):
+            return ref["source"][len("file://"):], False
+        return _download(hf_hub_url(model, ref["name"], revision=revision),
+                         os.path.join(cache, ref["name"]), ref.get("size")), True
+
+    # Every tensor the module declares must come from some shard, else the
+    # reference would run on random initialisation and the comparator would
+    # blame the engine. A key is missing only if every shard load reported
+    # it so; expert banks are assembled from per-expert checkpoint tensors
+    # (the module's _load_from_state_dict), so they are checked by count.
+    import re
+    expert_re = re.compile(r"^layers\.(\d+)\.ffn\.experts\.(\d+)\.(w[123])\.(weight|scale)$")
+    missing_all, experts_seen = None, {}
+    with ThreadPoolExecutor(max_workers=4) as pool:
+        futures = [pool.submit(fetch, ref) for ref in sorted(manifest["files"].values(), key=lambda r: r["name"])]
+        for fut in futures:
+            path, fetched = fut.result()
+            shard = load_file(path)
+            for key in shard:
+                m = expert_re.match(key)
+                if m:
+                    experts_seen.setdefault((int(m.group(1)), m.group(3), m.group(4)), set()).add(int(m.group(2)))
+            missing, unexpected = lm.load_state_dict(shard, strict=False)
+            missing_all = set(missing) if missing_all is None else missing_all & set(missing)
+            unexpected = [u for u in unexpected if not u.startswith(("mtp.", "vision.", "aligner.", "image_"))]
+            if unexpected:
+                raise RuntimeError(f"checkpoint tensors the module did not take: {unexpected[:5]}")
+            del shard
+            if fetched:
+                os.remove(path)
+    bank_re = re.compile(r"^layers\.(\d+)\.ffn\.(w[123])(_scale)?$")
+    problems = sorted(k for k in (missing_all or set()) if not bank_re.match(k))
+    for key in sorted(k for k in (missing_all or set()) if bank_re.match(k)):
+        layer, proj, scale = bank_re.match(key).groups()
+        seen = experts_seen.get((int(layer), proj, "scale" if scale else "weight"), set())
+        if len(seen) != args.n_routed_experts:
+            problems.append(f"{key}: {len(seen)} of {args.n_routed_experts} experts in the checkpoint")
+    if problems:
+        raise RuntimeError(f"module tensors the checkpoint did not provide: {problems[:5]}")
+    eos_ids = {tokenizer.eos_token_id} if tokenizer.eos_token_id is not None else set()
+    out = []
+    for prompt in _prompt_set(tok, prompts):
+        ids = _encode(tok, prompt)
+        t0 = time.perf_counter()
+        new, top = [], []
+        # The exporter sets the expert routing per graph (grouped for the
+        # prefill, batched for the decode step); the module's default is
+        # grouped, which on a decode step dequantizes every expert of
+        # every layer (384 x 40 here) for one token's six. Same math,
+        # ~40x the work: nine hours instead of fifteen minutes.
+        with torch.no_grad(), ds.bf16_default():
+            ds.set_routing(lm, "grouped")
+            logits = lm(torch.tensor([ids]), 0)[1]
+            ds.set_routing(lm, "batched")
+            for step in range(settings["new_tokens"]):
+                if step < settings["logit_positions"]:
+                    top.append(_top(logits[0], settings["top_k"]))
+                nxt = int(logits[0].argmax())
+                new.append(nxt)
+                if nxt in eos_ids:
+                    break
+                logits = lm(torch.tensor([[nxt]]), len(ids) + step)[1]
+        elapsed = time.perf_counter() - t0
+        out.append({**prompt, "input_ids": ids, "generated_ids": new,
+                    "finish": "eos" if new and new[-1] in eos_ids else "length",
+                    "top_logits": top,
+                    "ms_per_token": round(1000 * elapsed / max(1, len(new)), 1)})
+        _progress(prompt, new, 1000 * elapsed / max(1, len(new)))
+    producer = {"kind": "deepseek-eager", **_versions("cpu"), "kernels": "aten"}
+    return _document(model, revision, type("Config", (), {"model_type": ds.MODEL_TYPE})(), producer, settings, out)
 
 
 def record_vxpu_engine(model, revision, prompts, settings, artifact, device="cpu",
@@ -199,6 +326,7 @@ def record_vxpu_engine(model, revision, prompts, settings, artifact, device="cpu
                     "top_logits": top,
                     "prefill_ms": stats.get("prefill_ms") if stats else None,
                     "ms_per_token": _r(stats.get("ms_per_token")) if stats else None})
+        _progress(prompt, new, stats.get("ms_per_token") if stats else None)
     with open(os.path.join(artifact, "binding.json")) as f:
         binding = json.load(f)
     producer = {"kind": "vxpu-engine", **_versions(device),
@@ -233,6 +361,7 @@ def record_vxpu_router(model, revision, prompts, settings, artifact, router=None
                         "top_logits": [],
                         "prefill_ms": getattr(stats, "prefill_ms", None),
                         "ms_per_token": _r(getattr(stats, "ms_per_token", None))})
+            _progress(prompt, new, getattr(stats, "ms_per_token", None))
     finally:
         lm.close()
     producer = {"kind": "vxpu-router", **_versions("remote"),
@@ -301,6 +430,7 @@ def record_vllm(model, revision, prompts, settings, dtype="auto",
                         completion.finish_reason, completion.finish_reason),
                     "top_logits": top,
                     "ms_per_token": round(1000 * elapsed / max(1, len(new)), 1)})
+        _progress(prompt, new, 1000 * elapsed / max(1, len(new)))
     mc = llm.llm_engine.model_config
     device = "cuda" if torch.cuda.is_available() else "cpu"
     producer = {"kind": "vllm", "vllm": vllm.__version__, **_versions(device),
@@ -512,6 +642,8 @@ def cmd_record(args):
         doc = record_vxpu_engine(args.model, args.revision, args.prompts, settings,
                                  args.artifact, device=args.device,
                                  compile_decode=args.compile)
+    elif args.producer == "deepseek-eager":
+        doc = record_deepseek_eager(args.model, args.revision, args.prompts, settings)
     elif args.producer == "vllm":
         doc = record_vllm(args.model, args.revision, args.prompts, settings,
                           dtype=args.dtype,
@@ -556,6 +688,37 @@ def _check_compare():
     assert ok
 
 
+def _check_continuation(artifact, ids, new_tokens=4):
+    """A session extended by a later turn must see what a fresh session
+    given the whole transcript sees. For a model whose prefill graph
+    starts at position 0 the engine re-prefills from the start, so the
+    two are bit-identical; this is the multi-turn case of chat."""
+    import torch
+    from .engine import Engine, SamplingParams
+    engine = Engine(artifact)
+
+    def run(sid, ids):
+        first = {}
+
+        def sink(position, logits):
+            if position == 0:
+                first["logits"] = logits.detach().float().clone()
+        gen = []
+        for ev in engine.generate(sid, ids, new_tokens, SamplingParams(do_sample=False), logits_sink=sink):
+            gen.extend(ev.get("token_ids", []))
+        return gen, first["logits"]
+
+    sid = engine.new_session()
+    gen1, _ = run(sid, ids)
+    turn2 = ids + gen1 + ids[:7]  # the transcript so far plus a new turn
+    gen2, extended = run(sid, turn2)
+    gen3, fresh = run(engine.new_session(), turn2)
+    if gen2 != gen3 or not torch.equal(extended, fresh):
+        raise SystemExit(f"a continued session differs from a fresh one: {gen2} vs {gen3}, "
+                         f"max logit diff {(extended - fresh).abs().max().item():.4g}")
+    print(f"  continuation ok: {len(turn2)}-token second turn matches a fresh session")
+
+
 def selftest(workdir, settings):
     """The CI tier: tiny models through export, the in-process engine,
     and a transformers reference, token-exact. No cluster."""
@@ -571,15 +734,28 @@ def selftest(workdir, settings):
         models.append(("tiny-qwen4", tiny_qwen4.write(os.path.join(workdir, "tiny-qwen4")), "ids"))
     except ImportError as e:
         print(f"tiny-qwen4 fixture skipped: {e}")
+    try:
+        # DeepSeek-V4.1 layout through the model maker's module (third_party fork):
+        # fp8 dense, fp4 experts, compressed sparse attention, engram table
+        from .fixtures import tiny_deepseek_v41
+        models.append(("tiny-deepseek-v41", tiny_deepseek_v41.write(os.path.join(workdir, "tiny-deepseek-v41")), "ids"))
+    except ImportError as e:
+        print(f"tiny-deepseek-v41 fixture skipped: {e}")
     failed = []
     for name, model, prompts in models:
         artifact = os.path.join(workdir, name + "-artifact")
         export_artifact(model, artifact, max_cache_len=1024)
-        ref = record_transformers(model, "main", prompts, settings)
+        if name == "tiny-deepseek-v41":  # no transformers model: the fork run eagerly is the reference
+            ref = record_deepseek_eager(model, "main", prompts, settings)
+        else:
+            ref = record_transformers(model, "main", prompts, settings)
         got = record_vxpu_engine(model, "main", prompts, settings, artifact)
         for label, doc in (("reference", ref), ("candidate", got)):
             with open(os.path.join(workdir, f"{name}-{label}.json"), "w") as f:
                 json.dump(doc, f, indent=1)
+        with open(os.path.join(artifact, "binding.json")) as f:
+            if json.load(f).get("prefill_from_zero"):
+                _check_continuation(artifact, ID_PROMPTS[0]["ids"])
         rows, ok = compare(ref, got, strict_tokens=True)
         print(table(ref, got, rows))
         if not ok:
@@ -600,7 +776,7 @@ def main(argv=None):
                        help="positions to record top-k logits for (default: all of --new-tokens)")
 
     rec = sub.add_parser("record", help="record vectors with a producer")
-    rec.add_argument("--producer", choices=["transformers", "vxpu-engine", "vxpu-router", "vllm"], required=True)
+    rec.add_argument("--producer", choices=["transformers", "vxpu-engine", "vxpu-router", "vllm", "deepseek-eager"], required=True)
     rec.add_argument("--model", required=True, help="Hub repo id or local checkpoint directory")
     rec.add_argument("--revision", default="main")
     rec.add_argument("--prompts", choices=["auto", "text", "ids"], default="auto",

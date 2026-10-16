@@ -40,7 +40,9 @@ from torch.export.passes import move_to_device_pass
 DTYPES = {
     "F64": torch.float64, "F32": torch.float32, "F16": torch.float16,
     "BF16": torch.bfloat16, "I64": torch.int64, "I32": torch.int32,
+    "I16": torch.int16, "I8": torch.int8, "U8": torch.uint8, "BOOL": torch.bool,
     "F8_E4M3": torch.float8_e4m3fn, "F8_E5M2": torch.float8_e5m2,
+    "F8_E8M0": torch.float8_e8m0fnu,
 }
 
 
@@ -62,56 +64,75 @@ def _session():
     return session
 
 
-def fetch_tensor(ref, files, cas_dir=None):
-    """One ranged read per tensor.
+# A tensor larger than this is read as several concurrent ranges into
+# one buffer (a 98 GB embedding table is one checkpoint tensor).
+PART_BYTES = 1 << 30
+PART_WORKERS = 8
+CHUNK = 8 << 20
 
-    With cas_dir set, bytes are cached on disk under a content-derived
-    key (for persistent volumes). Without it, bytes stream straight to
-    the caller — one tensor in flight, flat memory profile; warm
-    reloads come from the engine keep-alive (digest reuse), not disk.
 
-    Returns (tensor, bytes_downloaded); 0 when served from cache.
-    """
-    def download():
-        url = files[ref["file_sha256"]]["source"]
-        end = ref["offset"] + ref["length"] - 1
-        if url.startswith("file://"):  # a local checkpoint directory
-            with open(url[len("file://"):], "rb") as f:
-                f.seek(ref["offset"])
-                content = f.read(ref["length"])
-            if len(content) != ref["length"]:
-                raise RuntimeError(
-                    f"expected {ref['length']} bytes, got {len(content)} bytes")
-            return content
-        resp = _session().get(
-            url, headers={"Range": f"bytes={ref['offset']}-{end}"})
+def _read_range(url, offset, length, into):
+    """Stream bytes [offset, offset + length) of url into the memoryview
+    `into`, in chunks, so nothing is held twice."""
+    end = offset + length - 1
+    if url.startswith("file://"):  # a local checkpoint directory
+        with open(url[len("file://"):], "rb") as f:
+            f.seek(offset)
+            got = f.readinto(into)
+    else:
+        resp = _session().get(url, headers={"Range": f"bytes={offset}-{end}"}, stream=True)
         resp.raise_for_status()
         if resp.status_code != 206:
-            raise RuntimeError(
-                f"expected HTTP 206 Partial Content, got {resp.status_code}")
-        content = resp.content
-        if len(content) != ref["length"]:
-            raise RuntimeError(
-                f"expected {ref['length']} bytes, got {len(content)} bytes")
-        return content
+            raise RuntimeError(f"expected HTTP 206 Partial Content, got {resp.status_code}")
+        got = 0
+        for chunk in resp.iter_content(CHUNK):
+            n = len(chunk)
+            if got + n > length:
+                raise RuntimeError(f"server sent more than {length} bytes")
+            into[got:got + n] = chunk
+            got += n
+    if got != length:
+        raise RuntimeError(f"expected {length} bytes, got {got} bytes")
 
+
+def fetch_tensor(ref, files, cas_dir=None):
+    """One tensor, read by range into a buffer allocated once.
+
+    Large tensors are read as several concurrent ranges of the same
+    buffer. With cas_dir set, bytes are also kept on disk under a
+    content-derived key (for persistent volumes); warm reloads otherwise
+    come from the engine keep-alive (digest reuse).
+
+    Returns (tensor, bytes_downloaded); 0 when served from the cache.
+    """
+    url = files[ref["file_sha256"]]["source"]
+    length = ref["length"]
+    key = hashlib.sha256(f"{ref['file_sha256']}:{ref['offset']}:{length}".encode()).hexdigest()
+    path = os.path.join(cas_dir, key) if cas_dir else None
+    buf = torch.empty(length, dtype=torch.uint8)
+    view = memoryview(buf.numpy())
     downloaded = 0
-    if cas_dir is None:
-        data = bytearray(download())
-        downloaded = ref["length"]
-    else:
-        key = hashlib.sha256(
-            f"{ref['file_sha256']}:{ref['offset']}:{ref['length']}"
-            .encode()).hexdigest()
-        path = os.path.join(cas_dir, key)
-        if not os.path.exists(path):
-            with open(path, "wb") as f:
-                f.write(download())
-            downloaded = ref["length"]
+    if path is not None and os.path.exists(path):
         with open(path, "rb") as f:
-            data = bytearray(f.read())
-    tensor = torch.frombuffer(
-        data, dtype=DTYPES[ref["dtype"]]).view(ref["shape"])
+            if f.readinto(view) != length:
+                raise RuntimeError(f"cache entry {path} is short")
+    else:
+        parts = max(1, min(PART_WORKERS, -(-length // PART_BYTES)))
+        if parts == 1:
+            _read_range(url, ref["offset"], length, view)
+        else:
+            step = -(-length // parts)
+            with ThreadPoolExecutor(max_workers=parts) as pool:
+                futures = [pool.submit(_read_range, url, ref["offset"] + i * step,
+                                       min(step, length - i * step), view[i * step:min(length, (i + 1) * step)])
+                           for i in range(parts) if i * step < length]
+                for f in futures:
+                    f.result()
+        downloaded = length
+        if path is not None:
+            with open(path, "wb") as f:
+                f.write(view)
+    tensor = buf.view(DTYPES[ref["dtype"]]).view(ref["shape"])
     return tensor, downloaded
 
 
@@ -300,7 +321,13 @@ def load_program(graph_path, tensors, device):
         # dtype (Qwen stores fp8 block scales as bf16; transformers'
         # fp8 modules declare float32). Cast as from_pretrained would.
         expected = exported.state_dict.get(fqn, exported.constants.get(fqn))
-        if (isinstance(expected, torch.Tensor)
+        bytes_like = (torch.int8, torch.uint8)
+        if (isinstance(expected, torch.Tensor) and expected.dtype != tensor.dtype
+                and expected.dtype in bytes_like and tensor.dtype in bytes_like):
+            # Packed fp4 weights: the checkpoint says int8, the graph
+            # keeps them as uint8 bytes. Same bytes, no cast.
+            tensor = tensor.view(expected.dtype)
+        elif (isinstance(expected, torch.Tensor)
                 and expected.dtype != tensor.dtype
                 and expected.is_floating_point()
                 and tensor.is_floating_point()):

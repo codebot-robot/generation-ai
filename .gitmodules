@@ -3,3 +3,7 @@
 	url = https://github.com/justinsb/transformers.git
 	branch = vxpu/v5.18.0
 	shallow = true
+[submodule "vxpu/third_party/deepseek_v41"]
+	path = vxpu/third_party/deepseek_v41
+	url = https://github.com/justinsb/deepseek-v41-flash
+	branch = vxpu
