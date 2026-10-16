@@ -31,13 +31,24 @@ import threading
 _lock = threading.Lock()
 _module = None
 _error = None
+_enabled = True
 
 SOURCES = [os.path.join(os.path.dirname(__file__), "csrc", "fp4_kernels.cpp")]
 
 
+def set_enabled(on):
+    """Switch the kernels off (and back on) at runtime: the ops then take
+    the plain-aten paths. For A/B comparisons on one loaded engine."""
+    global _enabled
+    _enabled = bool(on)
+
+
 def load():
-    """The extension module, or None if it cannot be built here."""
+    """The extension module, or None if it cannot be built here (or the
+    kernels are switched off)."""
     global _module, _error
+    if not _enabled:
+        return None
     if _module is not None or _error is not None:
         return _module
     with _lock:
