@@ -342,3 +342,13 @@ func TestMainReadsLatest(t *testing.T) {
 		t.Errorf("other revisions do not fall back: %d %s", w.Code, w.Header().Get("X-Error-Code"))
 	}
 }
+
+func TestDebugPprofNotServedOnProxy(t *testing.T) {
+	p := newTestProxy(t, "")
+	for _, path := range []string{"/debug/pprof/", "/debug/pprof/cmdline", "/debug/pprof/goroutine"} {
+		w := do(p, http.MethodGet, path, nil)
+		if w.Code == http.StatusOK {
+			t.Errorf("GET %s = %d; pprof must not be served on proxy service port", path, w.Code)
+		}
+	}
+}

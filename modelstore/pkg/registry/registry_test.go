@@ -16,6 +16,7 @@ package registry
 
 import (
 	"bytes"
+	"context"
 	"crypto/sha256"
 	"encoding/hex"
 	"encoding/json"
@@ -28,7 +29,7 @@ import (
 	"github.com/gke-labs/generation-ai/modelstore/pkg/blobstore"
 )
 
-func newReg(t *testing.T) *Registry {
+func newReg(t testing.TB) *Registry {
 	t.Helper()
 	store, err := blobstore.NewLocal(t.TempDir())
 	if err != nil {
@@ -239,5 +240,109 @@ func TestTagValidatedBeforeWriteAndEmptyBlobRange(t *testing.T) {
 	}
 	if w := do(reg, http.MethodGet, "/v2/org/name/blobs/"+empty, nil, "Range", "bytes=-5"); w.Code != http.StatusRequestedRangeNotSatisfiable {
 		t.Errorf("suffix range of an empty blob: %d %q", w.Code, w.Header().Get("Content-Range"))
+	}
+}
+
+// TestServeBlobLargeRange verifies that blobs larger than the 256 KiB copy buffer
+// stream correctly across buffer boundaries.
+func TestServeBlobLargeRange(t *testing.T) {
+	reg := newReg(t)
+	// 5 MiB test payload: exercises multiple 256 KiB buffer copy iterations
+	content := make([]byte, 5<<20)
+	for i := range content {
+		content[i] = byte(i % 251)
+	}
+	digest := digestOf(content)
+	rawSha := strings.TrimPrefix(digest, "sha256:")
+
+	w := do(reg, http.MethodPost, "/v2/org/name/blobs/uploads/?digest="+digest, bytes.NewReader(content))
+	if w.Code != http.StatusCreated {
+		t.Fatalf("upload large blob: %d %s", w.Code, w.Body.String())
+	}
+
+	// 1. Read entire blob
+	req := httptest.NewRequest(http.MethodGet, "/blobs/"+rawSha, nil)
+	rec := httptest.NewRecorder()
+	if err := reg.ServeBlob(rec, req, rawSha); err != nil {
+		t.Fatalf("ServeBlob full: %v", err)
+	}
+	if rec.Code != http.StatusOK || !bytes.Equal(rec.Body.Bytes(), content) {
+		t.Fatalf("ServeBlob full mismatch: code=%d len=%d", rec.Code, rec.Body.Len())
+	}
+
+	// 2. Read range spanning across buffer boundaries (1 MiB to 3 MiB)
+	req = httptest.NewRequest(http.MethodGet, "/blobs/"+rawSha, nil)
+	req.Header.Set("Range", "bytes=1048576-3145727")
+	rec = httptest.NewRecorder()
+	if err := reg.ServeBlob(rec, req, rawSha); err != nil {
+		t.Fatalf("ServeBlob range: %v", err)
+	}
+	if rec.Code != http.StatusPartialContent || !bytes.Equal(rec.Body.Bytes(), content[1048576:3145728]) {
+		t.Fatalf("ServeBlob range mismatch: code=%d len=%d", rec.Code, rec.Body.Len())
+	}
+}
+
+func BenchmarkServeBlob(b *testing.B) {
+	reg := newReg(b)
+	content := make([]byte, 64<<20) // 64 MB
+	digest := digestOf(content)
+	rawSha := strings.TrimPrefix(digest, "sha256:")
+
+	w := do(reg, http.MethodPost, "/v2/org/name/blobs/uploads/?digest="+digest, bytes.NewReader(content))
+	if w.Code != http.StatusCreated {
+		b.Fatalf("upload: %d %s", w.Code, w.Body.String())
+	}
+
+	b.SetBytes(64 << 20)
+	b.ResetTimer()
+
+	b.RunParallel(func(pb *testing.PB) {
+		req := httptest.NewRequest(http.MethodGet, "/blobs/"+rawSha, nil)
+		req.Header.Set("Range", "bytes=0-67108863")
+		for pb.Next() {
+			rec := httptest.NewRecorder()
+			if err := reg.ServeBlob(rec, req, rawSha); err != nil {
+				b.Fatal(err)
+			}
+			if rec.Code != http.StatusPartialContent {
+				b.Fatalf("code: %d", rec.Code)
+			}
+		}
+	})
+}
+
+// deletedOnOpenStore wraps a Store but returns ErrNotFound on Open to simulate
+// an object deleted from the store after StatCached succeeded.
+type deletedOnOpenStore struct {
+	blobstore.Store
+}
+
+func (d *deletedOnOpenStore) Open(ctx context.Context, sha string, offset, length int64) (io.ReadCloser, error) {
+	return nil, blobstore.ErrNotFound
+}
+
+func TestServeBlobNotFoundOnOpen(t *testing.T) {
+	baseReg := newReg(t)
+	content := []byte("hello world")
+	digest := digestOf(content)
+	rawSha := strings.TrimPrefix(digest, "sha256:")
+
+	w := do(baseReg, http.MethodPost, "/v2/org/name/blobs/uploads/?digest="+digest, bytes.NewReader(content))
+	if w.Code != http.StatusCreated {
+		t.Fatalf("upload: %d", w.Code)
+	}
+
+	reg := New(&deletedOnOpenStore{Store: baseReg.Store()})
+	req := httptest.NewRequest(http.MethodGet, "/blobs/"+rawSha, nil)
+	rec := httptest.NewRecorder()
+	err := reg.ServeBlob(rec, req, rawSha)
+	if err != nil {
+		t.Fatalf("ServeBlob returned unexpected error: %v", err)
+	}
+	if rec.Code != http.StatusNotFound {
+		t.Fatalf("ServeBlob code = %d, want 404", rec.Code)
+	}
+	if !strings.Contains(rec.Body.String(), "BLOB_UNKNOWN") {
+		t.Fatalf("ServeBlob body %q does not contain BLOB_UNKNOWN", rec.Body.String())
 	}
 }

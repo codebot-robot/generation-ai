@@ -87,6 +87,10 @@ The manifest carries placeholders for the image and the bucket; the
 server refuses to start if the bucket is not reachable with the pod's
 identity, so a wrong name fails at rollout, not on the first upload.
 
+### Production Resource Sizing
+
+The default `k8s/manifest.yaml` requests 2 CPUs, allowing it to schedule cleanly on single-node test clusters (such as kind). In high-throughput production environments with GCS where modelstore serves multi-gigabyte/sec concurrent range reads across multiple executors, TLS decryption becomes CPU-intensive (~2-4 GB/s per core). For production clusters sustaining >5 GB/s throughput, increase the container request to 4 CPUs (`requests: {cpu: "4", memory: 2Gi}`) to avoid TLS decryption throttling.
+
 **Upgrading from the StatefulSet / CRD version.** Earlier manifests ran
 modelstore as a StatefulSet with a PVC and kept an index in a `Model`
 CRD. `kubectl apply` removes neither; delete them first:
@@ -123,6 +127,40 @@ runs the import and follows it.
 `modelstore upload --model-name org/name --model-dir DIR [--tag latest]`
 hashes every file, pushes the blobs the registry does not have, and
 writes the manifest and tag through the registry API.
+
+### Profiling and Benchmarking
+
+`modelstore` supports serving standard `net/http/pprof` endpoints when started with
+`--pprof-addr` (e.g. `--pprof-addr=localhost:6060`; disabled by default so profiling
+is not exposed on the service port).
+
+With the pprof listener bound to localhost on the pod, forward the port to your workstation:
+
+```sh
+kubectl port-forward -n modelstore deployment/modelstore 6060:6060
+```
+
+Then capture profiles or heap dumps directly:
+
+```sh
+# Fetch a 30s CPU profile
+curl -o cpu.pprof http://localhost:6060/debug/pprof/profile?seconds=30
+go tool pprof -http=:8081 cpu.pprof
+
+# Inspect active goroutines and heap allocations
+curl http://localhost:6060/debug/pprof/goroutine?debug=1
+curl http://localhost:6060/debug/pprof/heap
+```
+
+To benchmark blob read throughput with 16 and 64 concurrent readers:
+
+```sh
+# Run 16 GB read benchmark against a modelstore blob
+./bench.sh http://modelstore.modelstore/blobs/<sha256>
+
+# Run directly against GCS to compare line rates (token passed via environment variable)
+TOKEN=$(gcloud auth print-access-token) ./bench.sh https://storage.googleapis.com/<bucket>/_blobs/<sha256>
+```
 
 ## What comes next
 

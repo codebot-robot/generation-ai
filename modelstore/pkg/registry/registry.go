@@ -219,12 +219,38 @@ func (reg *Registry) handleBlob(w http.ResponseWriter, r *http.Request, name, di
 	return reg.fail(w, http.StatusMethodNotAllowed, "UNSUPPORTED", "%s not supported on blobs", r.Method)
 }
 
+// Bounded buffer pool for blob streaming to avoid per-chunk allocations on multi-GB
+// model reads while enforcing a strict memory ceiling (64 * 256 KiB = 16 MiB).
+const (
+	copyBufSize = 256 << 10 // 256 KiB
+	maxCopyBufs = 64        // cap at 64 concurrent buffers
+)
+
+var copyBufPool = func() chan []byte {
+	ch := make(chan []byte, maxCopyBufs)
+	for i := 0; i < maxCopyBufs; i++ {
+		ch <- make([]byte, copyBufSize)
+	}
+	return ch
+}()
+
+func copyN(dst io.Writer, src io.Reader, n int64, buf []byte) (int64, error) {
+	written, err := io.CopyBuffer(dst, io.LimitReader(src, n), buf)
+	if written == n {
+		return n, nil
+	}
+	if written < n && err == nil {
+		err = io.EOF
+	}
+	return written, err
+}
+
 // ServeBlob answers GET/HEAD for one blob by its hex sha256, with
 // single-range Range support (executors read one tensor per request).
 // A missing blob is a 404 in the registry's error format.
 func (reg *Registry) ServeBlob(w http.ResponseWriter, r *http.Request, sha string) error {
 	ctx := r.Context()
-	size, err := reg.store.Stat(ctx, sha)
+	size, err := reg.store.StatCached(ctx, sha)
 	if errors.Is(err, blobstore.ErrNotFound) {
 		return reg.fail(w, http.StatusNotFound, "BLOB_UNKNOWN", "blob sha256:%s unknown", sha)
 	}
@@ -254,6 +280,9 @@ func (reg *Registry) ServeBlob(w http.ResponseWriter, r *http.Request, sha strin
 		return nil
 	}
 	rc, err := reg.store.Open(ctx, sha, offset, length)
+	if errors.Is(err, blobstore.ErrNotFound) {
+		return reg.fail(w, http.StatusNotFound, "BLOB_UNKNOWN", "blob sha256:%s unknown", sha)
+	}
 	if err != nil {
 		return fmt.Errorf("open blob %s: %w", sha, err)
 	}
@@ -263,8 +292,19 @@ func (reg *Registry) ServeBlob(w http.ResponseWriter, r *http.Request, sha strin
 		}
 	}()
 	w.WriteHeader(status)
-	_, err = io.CopyN(w, rc, length)
-	return err
+	if length < copyBufSize {
+		_, err = io.CopyN(w, rc, length)
+		return err
+	}
+	select {
+	case buf := <-copyBufPool:
+		defer func() { copyBufPool <- buf }()
+		_, err = copyN(w, rc, length, buf)
+		return err
+	default:
+		_, err = io.CopyN(w, rc, length)
+		return err
+	}
 }
 
 // parseRange handles a single byte range: bytes=a-b, bytes=a-, bytes=-n.

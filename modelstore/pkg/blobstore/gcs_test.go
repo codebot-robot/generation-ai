@@ -21,10 +21,16 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"net/http"
+	"net/http/httptest"
 	"os"
 	"strings"
+	"sync/atomic"
 	"testing"
 	"time"
+
+	"cloud.google.com/go/storage"
+	"google.golang.org/api/option"
 )
 
 // TestGCS runs against a real bucket when MODELSTORE_TEST_BUCKET is set
@@ -115,5 +121,134 @@ func TestGCS(t *testing.T) {
 		if err := store.client.Bucket(store.bucket).Object(name).Delete(ctx); err != nil {
 			t.Logf("cleanup %s: %v", name, err)
 		}
+	}
+}
+
+func TestGCSSizeCache(t *testing.T) {
+	g := &GCS{}
+	sha := strings.Repeat("a", 64)
+	g.sizeCache.Store(sha, int64(123456))
+	size, err := g.StatCached(t.Context(), sha)
+	if err != nil {
+		t.Fatalf("StatCached: %v", err)
+	}
+	if size != 123456 {
+		t.Fatalf("StatCached size = %d, want 123456", size)
+	}
+}
+
+func TestGCSTransportConfiguration(t *testing.T) {
+	tr := newGCSTransport()
+	if tr.ForceAttemptHTTP2 {
+		t.Errorf("ForceAttemptHTTP2 should be false")
+	}
+	if tr.TLSNextProto == nil || len(tr.TLSNextProto) != 0 {
+		t.Errorf("TLSNextProto should be empty non-nil map to disable HTTP/2")
+	}
+	if tr.MaxIdleConnsPerHost < 256 {
+		t.Errorf("MaxIdleConnsPerHost = %d, want >= 256", tr.MaxIdleConnsPerHost)
+	}
+	if tr.MaxConnsPerHost != 256 {
+		t.Errorf("MaxConnsPerHost = %d, want 256", tr.MaxConnsPerHost)
+	}
+}
+
+func TestGCSSizeCacheInvalidationOnDelete(t *testing.T) {
+	var objectExists atomic.Bool
+	objectExists.Store(true)
+	const blobContent = "test blob content for gcs cache invalidation"
+	const blobSize = int64(len(blobContent))
+
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if !objectExists.Load() {
+			w.WriteHeader(http.StatusNotFound)
+			_, _ = w.Write([]byte(`{"error":{"code":404,"message":"Not Found"}}`))
+			return
+		}
+		if r.URL.Query().Get("alt") == "media" {
+			w.Header().Set("Content-Length", fmt.Sprintf("%d", blobSize))
+			w.WriteHeader(http.StatusOK)
+			_, _ = w.Write([]byte(blobContent))
+			return
+		}
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusOK)
+		_, _ = w.Write([]byte(fmt.Sprintf(`{"name":"_blobs/test","size":"%d"}`, blobSize)))
+	}))
+	defer srv.Close()
+
+	ctx := t.Context()
+	client, err := storage.NewClient(ctx,
+		option.WithoutAuthentication(),
+		option.WithEndpoint(srv.URL+"/storage/v1/"),
+	)
+	if err != nil {
+		t.Fatalf("creating storage client: %v", err)
+	}
+	defer client.Close()
+
+	g := &GCS{
+		client: client,
+		bucket: "test-bucket",
+	}
+	sha := strings.Repeat("b", 64)
+
+	// 1. Initial authoritative Stat populates sizeCache
+	size, err := g.Stat(ctx, sha)
+	if err != nil {
+		t.Fatalf("Stat initial: %v", err)
+	}
+	if size != blobSize {
+		t.Fatalf("Stat size = %d, want %d", size, blobSize)
+	}
+	if val, ok := g.sizeCache.Load(sha); !ok || val.(int64) != blobSize {
+		t.Fatalf("sizeCache after Stat: ok=%v val=%v", ok, val)
+	}
+
+	// 2. Blob is deleted out of band
+	objectExists.Store(false)
+
+	// Authoritative Stat must NOT answer from cache, should return ErrNotFound and evict from cache
+	_, err = g.Stat(ctx, sha)
+	if !errors.Is(err, ErrNotFound) {
+		t.Fatalf("authoritative Stat after delete: got %v, want ErrNotFound", err)
+	}
+	if _, ok := g.sizeCache.Load(sha); ok {
+		t.Fatalf("sizeCache still contains %s after authoritative Stat returned ErrNotFound", sha)
+	}
+
+	// StatCached now also fails cleanly because cache is empty
+	if _, err := g.StatCached(ctx, sha); !errors.Is(err, ErrNotFound) {
+		t.Fatalf("StatCached after eviction: got %v, want ErrNotFound", err)
+	}
+
+	// 3. Re-create blob, populate cache via StatCached
+	objectExists.Store(true)
+	size, err = g.StatCached(ctx, sha)
+	if err != nil || size != blobSize {
+		t.Fatalf("StatCached re-populate: size=%d err=%v", size, err)
+	}
+	if _, ok := g.sizeCache.Load(sha); !ok {
+		t.Fatalf("sizeCache missing after StatCached re-populate")
+	}
+
+	// 4. Delete blob again out of band
+	objectExists.Store(false)
+
+	// Open should fail with ErrNotFound AND delete cache entry
+	rc, err := g.Open(ctx, sha, 0, -1)
+	if !errors.Is(err, ErrNotFound) {
+		if rc != nil {
+			_ = rc.Close()
+		}
+		t.Fatalf("Open after delete: got %v, want ErrNotFound", err)
+	}
+	if _, ok := g.sizeCache.Load(sha); ok {
+		t.Fatalf("sizeCache still contains %s after Open encountered ErrObjectNotExist", sha)
+	}
+
+	// Subsequent StatCached must now return ErrNotFound
+	if _, err := g.StatCached(ctx, sha); !errors.Is(err, ErrNotFound) {
+		t.Fatalf("StatCached after Open eviction: got %v, want ErrNotFound", err)
 	}
 }
