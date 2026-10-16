@@ -310,6 +310,7 @@ class Engine:
         self._decode_run = self._decode
         if self.compile_decode:
             strip_asserts(self._decode)
+            ops.prepare_compile()
             self._decode_run = torch.compile(self._decode, **compile_options(self.device))
 
     def _reset_state(self, session):

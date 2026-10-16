@@ -25,9 +25,9 @@ on the same bytes, so the result does not depend on the placement.
 
 Each engine owns what it placed (an External) and makes it the ops'
 source only while it runs a graph; the exporter only records the shape
-information tracing needs. The ops are tagged cudagraph_unsafe: they do
-host work and host-device copies, so inductor partitions the graph
-around them and captures CUDA graphs for the dense segments between.
+information tracing needs. The two ops that do host work are tagged
+cudagraph_unsafe and, for torch.compile, kept out of the compiled graph
+(prepare_compile), so CUDA graphs cover the dense segments between.
 """
 
 import contextlib
@@ -124,7 +124,7 @@ def _(indices, table):
     return indices.new_empty(tuple(indices.shape) + (ENGRAM_DIM[table],), dtype=torch.bfloat16)
 
 
-@custom_op("vxpu::fp8_linear", mutates_args=(), tags=(torch.Tag.cudagraph_unsafe,))
+@custom_op("vxpu::fp8_linear", mutates_args=())  # pure tensor work on every device: capturable
 def fp8_linear(x: torch.Tensor, weight: torch.Tensor, scale: torch.Tensor) -> torch.Tensor:
     """The fork's fp8 linear: x [..., K] bf16, weight [N, K] fp8 with
     [N/32, K/32] e8m0 block scales -> [..., N] in x's dtype. The
@@ -150,3 +150,14 @@ def fp8_linear(x: torch.Tensor, weight: torch.Tensor, scale: torch.Tensor) -> to
 @fp8_linear.register_fake
 def _(x, weight, scale):
     return x.new_empty(tuple(x.shape[:-1]) + (weight.shape[0],))
+
+def prepare_compile():
+    """Before torch.compile of a graph that calls these ops: the two that do
+    host work (the experts on the CPU, the n-gram rows from a file) must
+    break the compiled graph rather than be captured into a CUDA graph,
+    which would replay without them. Inductor's partitioning did not keep
+    them out on its own (the tag notwithstanding), so dynamo is told to
+    leave them in eager: ~40 breaks per decode step, each segment its own
+    graph. fp8_linear is pure tensor work and stays inside."""
+    import torch._dynamo
+    torch._dynamo.disallow_in_graph([torch.ops.vxpu.moe_experts.default, torch.ops.vxpu.engram_rows.default])
