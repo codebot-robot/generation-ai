@@ -152,9 +152,13 @@ def set_external(model, on):
             ops.ENGRAM_DIM[layer.layer_id] = layer.engram.embed.dim
 
 
-def external_spec(model, view):
+def external_spec(model, view, args):
     """What the graphs call out for, from the checkpoint view: per layer,
-    the expert banks (stacked specs) and the engram table (tensor names)."""
+    the expert banks (stacked specs) and the engram table (tensor names).
+    Complete or an error: the graphs no longer reference these tensors,
+    so the classifier's unbound check does not see a checkpoint that
+    lacks them, and the failure would otherwise arrive on the executor
+    after the whole fetch."""
     import re
     direct, merged = view
     experts, engram = {}, {}
@@ -163,12 +167,25 @@ def external_spec(model, view):
         m = bank.match(key)
         if m:
             experts.setdefault(m.group(1), {})[m.group(2)] = spec
+    problems = []
     for layer in model.layers:
+        want = {n for n, p in layer.ffn.named_parameters() if re.fullmatch(r"w[123](_scale)?", n)}
+        got = experts.get(str(layer.layer_id), {})
+        for name in sorted(want - set(got)):
+            problems.append(f"layers.{layer.layer_id}.ffn.{name}: no expert tensors in the checkpoint")
+        for name, spec in got.items():
+            if len(spec["parts"]) != args.n_routed_experts:
+                problems.append(f"layers.{layer.layer_id}.ffn.{name}: {len(spec['parts'])} of {args.n_routed_experts} experts")
         if layer.engram is not None:
             prefix = f"layers.{layer.layer_id}.engram.embed."
+            if prefix + "weight" not in direct or prefix + "scale" not in direct:
+                problems.append(f"{prefix}weight/scale: not in the checkpoint")
+                continue
             engram[str(layer.layer_id)] = {"weight": direct[prefix + "weight"], "scale": direct[prefix + "scale"],
                                            "num_embeddings": layer.engram.embed.num_embeddings,
                                            "dim": layer.engram.embed.dim}
+    if problems:
+        raise RuntimeError(f"external tensors missing from the checkpoint (artifact would be incomplete): {problems[:5]}")
     return {"experts": experts, "engram": engram}
 
 

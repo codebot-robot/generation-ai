@@ -539,7 +539,7 @@ def export_deepseek_v41(repo_id, out_dir, manifest, max_cache_len, revision):
         raise RuntimeError(f"unbound tensors (artifact would be incomplete): {unbound}")
     # The graphs call out for the expert banks and the n-gram tables
     # (ops.py); the engine fetches them from these specs and places them.
-    external = ds.external_spec(model, view)
+    external = ds.external_spec(model, view, args)
     binding = {"bound": bound, "derived": derived, "state": state,
                "stacked": stacked, "aliases": aliases, "unused": unused,
                "constant": constant, "external": external,

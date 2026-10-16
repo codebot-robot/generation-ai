@@ -173,6 +173,10 @@ class Engine:
                 spec, self.manifest["tensors"], self.manifest["files"], cas_dir)
             self.shared[fqn] = tensor.to(device)
             self.bytes_fetched += downloaded
+        # What the graphs call out for (ops.py), owned here: it is freed
+        # with the engine and seen by the ops only while this engine runs
+        # a graph (external_scope).
+        self.external = ops.External()
         if self.binding.get("external"):
             self._bind_external(self.binding["external"], cas_dir)
         for fqn in self.binding["derived"]:
@@ -222,14 +226,20 @@ class Engine:
                     mmap_path=os.path.join(mm, f"experts.{layer}.{name}") if mm else None)
                 banks[name] = tensor
                 self.bytes_fetched += downloaded
-            ops.EXPERTS[int(layer)] = ds.host_experts(int(layer), args, banks)
+            self.external.experts[int(layer)] = ds.host_experts(int(layer), args, banks)
         for layer, spec in external.get("engram", {}).items():
             weight, downloaded = fetch_tensor(self.manifest["tensors"][spec["weight"]], self.manifest["files"], cas_dir, mmap_dir=mm)
             self.bytes_fetched += downloaded
             scale, downloaded = fetch_tensor(self.manifest["tensors"][spec["scale"]], self.manifest["files"], cas_dir, mmap_dir=mm)
             self.bytes_fetched += downloaded
-            ops.ENGRAM[int(layer)] = ds.host_engram(int(layer), spec["num_embeddings"], spec["dim"], weight, scale)
+            self.external.engram[int(layer)] = ds.host_engram(int(layer), spec["num_embeddings"], spec["dim"], weight, scale)
             ops.ENGRAM_DIM[int(layer)] = spec["dim"]
+
+    def external_scope(self):
+        """The context in which this engine's graphs must run: the ops
+        answer from this engine's external tensors. generate() enters it;
+        a caller invoking the programs directly (a per-layer probe) must."""
+        return ops.bound(self.external)
 
     def _generation_config(self):
         """The model's generation_config.json as a dict (may be empty).
@@ -428,6 +438,12 @@ class Engine:
 
     def _generate_locked(self, session, ids, max_new_tokens, params,
                          extra_eos_ids=(), logits_sink=None):
+        with self.external_scope():
+            yield from self._generate_scoped(session, ids, max_new_tokens, params,
+                                             extra_eos_ids, logits_sink)
+
+    def _generate_scoped(self, session, ids, max_new_tokens, params,
+                         extra_eos_ids, logits_sink):
         self._bind(session["state"])
         total_len = len(ids)
         if total_len == 0:
