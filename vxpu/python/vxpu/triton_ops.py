@@ -149,7 +149,7 @@ if triton is not None:
     def _linear_f32_kernel(x_ptr, w_ptr, y_ptr, N, K, BN: tl.constexpr, BK: tl.constexpr):
         pid = tl.program_id(0)
         m = tl.program_id(1)
-        rows = pid * BN + tl.arange(0, BN)
+        rows = pid.to(tl.int64) * BN + tl.arange(0, BN)  # int64: weights past 2^31 elements
         live = rows < N
         acc = tl.zeros((BN, BK), dtype=tl.float32)
         for k0 in range(0, K, BK):
@@ -167,8 +167,11 @@ def linear_f32(x, weight, block_n=16, block_k=512):
     the few rows of a decode step: each row reads the whole weight."""
     M, K = x.shape
     N = weight.shape[0]
+    if weight.dim() != 2 or weight.shape[1] != K:
+        raise ValueError(f"linear_f32: x {tuple(x.shape)} and weight {tuple(weight.shape)} disagree on K")
     x = x.float().contiguous()
     y = torch.empty(M, N, dtype=torch.float32, device=x.device)
     if M and N:
-        _linear_f32_kernel[(triton.cdiv(N, block_n), M)](x, weight.contiguous(), y, N, K, BN=block_n, BK=block_k)
+        with torch.cuda.device(x.device):  # Triton launches on the current device
+            _linear_f32_kernel[(triton.cdiv(N, block_n), M)](x, weight.contiguous(), y, N, K, BN=block_n, BK=block_k)
     return y

@@ -158,7 +158,9 @@ def _set_head(head, on):
     checkpoint's bf16 (the fork widens it to fp32 at construction, which
     the engine would then hold and read at twice the bytes)."""
     if on and not hasattr(head, "_vxpu_weight"):
-        head._vxpu_weight = head.weight
+        # kept outside the module's parameters, so the fp32 original is not
+        # lifted into the exported graphs as a second, unused head
+        head.__dict__["_vxpu_weight"] = head.weight
         w = head.weight
         head.weight = torch.nn.Parameter(torch.empty(w.shape, dtype=torch.bfloat16, device=w.device),
                                          requires_grad=False)

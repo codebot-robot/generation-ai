@@ -55,6 +55,9 @@ class External:
         # by the weight's storage address (see fp8_linear): engine-owned so
         # the copies go with the engine, and shared by its two graphs
         self.bf16 = {}
+        # bf16 weights widened to fp32 once where no kernel reads bf16
+        # directly (the output head off the Triton path, see head_linear)
+        self.f32 = {}
         # pinned host buffers for the expert op's device crossings in decode
         # (see _to_host and _to_device), reused call to call
         self.pinned = {}
@@ -295,8 +298,9 @@ def head_linear(x: torch.Tensor, weight: torch.Tensor) -> torch.Tensor:
     weight held in the checkpoint's bf16. Widening bf16 to fp32 is exact,
     so the products are the reference's; on a GPU one Triton kernel reads
     the bf16 bytes and accumulates in fp32 (a different summation order:
-    equal to fp32 rounding), elsewhere torch's fp32 linear over the
-    widened weight, a slice of rows at a time (bit-identical)."""
+    equal to fp32 rounding), elsewhere torch's fp32 linear over an fp32
+    copy of the weight, widened once and kept by the engine, as it held
+    the fork's fp32 weight before (bit-identical)."""
     lead = tuple(x.shape[:-1])
     x2 = x.reshape(-1, x.shape[-1])
     if x.is_meta:
@@ -304,11 +308,24 @@ def head_linear(x: torch.Tensor, weight: torch.Tensor) -> torch.Tensor:
     if x.is_cuda and triton_ops.available() and weight.dtype == torch.bfloat16 and x2.shape[0] <= 8:
         y = triton_ops.linear_f32(x2, weight)
     else:
-        xf = x2.float()
-        rows = 1 << 15  # the widened copy is made a slice at a time, not 2.6 GB at once
-        y = torch.cat([torch.nn.functional.linear(xf, weight[r:r + rows].float())
-                       for r in range(0, weight.shape[0], rows)], dim=-1)
+        y = torch.nn.functional.linear(x2.float(), _f32_weight(weight))
     return y.reshape(lead + (weight.shape[0],))
+
+
+def _f32_weight(weight):
+    """weight widened to fp32 once, kept in the active engine's External
+    (keyed by storage address, like the bf16 copies); without an engine
+    bound, widened for this call only."""
+    if weight.dtype == torch.float32:
+        return weight
+    ext = getattr(_active, "external", None)
+    key = (weight.untyped_storage().data_ptr(), weight.storage_offset(), tuple(weight.shape))
+    if ext is not None and key in ext.f32:
+        return ext.f32[key]
+    w = weight.float()
+    if ext is not None:
+        ext.f32[key] = w
+    return w
 
 
 @head_linear.register_fake
