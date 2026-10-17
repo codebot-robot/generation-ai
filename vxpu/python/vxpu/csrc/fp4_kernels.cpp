@@ -91,7 +91,12 @@ int64_t kernel_threads() {
 void parallel_range(int64_t n, int64_t grain, const std::function<void(int64_t, int64_t)>& fn) {
   if (n <= 0) return;
   int64_t threads = kernel_threads();
-  int64_t chunks = std::min(n / std::max<int64_t>(grain, 1), threads * 4);
+  // 16 chunks per thread, taken dynamically: a fused expert phase is a
+  // few hundred microseconds over ~800 work items, and with 4 chunks per
+  // thread the last chunk (tens of microseconds) left the other threads
+  // waiting at the phase's end; finer chunks cut the decode step's expert
+  // time by about 4% on a 48-core node
+  int64_t chunks = std::min(n / std::max<int64_t>(grain, 1), threads * 16);
   if (chunks <= 1) { fn(0, n); return; }
   const int64_t step = (n + chunks - 1) / chunks;
 #if defined(_OPENMP)
