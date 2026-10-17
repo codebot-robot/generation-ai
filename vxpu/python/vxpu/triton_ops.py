@@ -190,7 +190,7 @@ if triton is not None:
                          BN: tl.constexpr, BK: tl.constexpr):
         pid = tl.program_id(0)
         m = tl.program_id(1)
-        rows = pid * BN + tl.arange(0, BN)
+        rows = pid.to(tl.int64) * BN + tl.arange(0, BN)  # int64: weights past 2^31 elements
         live = rows < N
         g = (pid * BN) // R  # BN divides R: one group per program
         xb = x_ptr + m * XS + g * K
@@ -202,12 +202,15 @@ if triton is not None:
             kb = k0 // 32 + tl.arange(0, BK // 32)
             e = tl.load(s_ptr + (rows // 32)[:, None] * KS + kb[None, :],
                         mask=live[:, None] & (kb < KS)[None, :], other=127).to(tl.int32)
-            # e8m0: 2^(e-127) from the exponent bits; e = 0 is 2^-127, below fp32's normal range
+            # e8m0: 2^(e-127) from the exponent bits; e = 0 is 2^-127, below
+            # fp32's normal range; e = 255 is the format's NaN
             sc = tl.where(e == 0, 5.877471754111438e-39, (e << 23).to(tl.float32, bitcast=True))
+            sc = tl.where(e == 255, float("nan"), sc)
             w = tl.reshape(tl.reshape(w.to(tl.float32), (BN, BK // 32, 32)) * sc[:, :, None], (BN, BK))
             x = tl.load(xb + ks, mask=kin, other=0.0).to(tl.float32)
             acc += w * x[None, :]
-        tl.store(y_ptr + m * N + rows, tl.sum(acc, axis=1), mask=live)
+        # rounded to the output's dtype at the store: no separate cast kernel
+        tl.store(y_ptr + m * N + rows, tl.sum(acc, axis=1).to(y_ptr.dtype.element_ty), mask=live)
 
 
 def _gemv_blocks(K):
@@ -232,11 +235,17 @@ def fp8_gemv(x, weight, scale, group_rows=None, out_dtype=torch.bfloat16, block_
     R = group_rows or N
     if block_n is None or block_k is None:
         block_n, block_k = _gemv_blocks(K)
-    if N % R or R % block_n or x.shape[1] != (N // R) * K or K % 32 or block_k % 32:
+    if N % R or R % block_n or x.shape[1] != (N // R) * K or K % 32 or N % 32 or block_k % 32:
         raise ValueError(f"fp8_gemv: x {tuple(x.shape)}, weight {tuple(weight.shape)}, group_rows {group_rows}")
-    y = torch.empty(M, N, dtype=torch.float32, device=x.device)
+    # the kernel reads the scales as one byte per 32x32 block
+    if (weight.dtype != torch.float8_e4m3fn or scale.dtype != torch.float8_e8m0fnu
+            or tuple(scale.shape) != (N // 32, K // 32)):
+        raise ValueError(f"fp8_gemv: weight {weight.dtype} {tuple(weight.shape)} needs e8m0 scales "
+                         f"[{N // 32}, {K // 32}], got {scale.dtype} {tuple(scale.shape)}")
+    y = torch.empty(M, N, dtype=out_dtype, device=x.device)
     if M and N:
-        _fp8_gemv_kernel[(triton.cdiv(N, block_n), M)](
-            x.contiguous(), weight.contiguous(), scale.contiguous().view(torch.uint8), y, N, K,
-            x.shape[1], R, scale.shape[1], BN=block_n, BK=block_k)
-    return y.to(out_dtype)
+        with torch.cuda.device(x.device):  # Triton launches on the current device
+            _fp8_gemv_kernel[(triton.cdiv(N, block_n), M)](
+                x.contiguous(), weight.contiguous(), scale.contiguous().view(torch.uint8), y, N, K,
+                x.shape[1], R, scale.shape[1], BN=block_n, BK=block_k)
+    return y
