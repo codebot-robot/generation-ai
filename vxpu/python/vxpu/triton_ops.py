@@ -32,6 +32,13 @@ layer. hc_split_sinkhorn below does it in one kernel per call, with the
 same operations in the same order (sums over four elements may round
 differently from torch's, so it matches to rounding, not bitwise).
 
+The output head is a matrix-vector product with fp32 accumulation over
+a bf16 checkpoint weight; the fork declares the weight fp32, so it was
+held widened and read at twice the bytes (2.6 GB a token for
+DeepSeek-V4.1-Flash). linear_f32 reads the bf16 weight and accumulates
+in fp32: the same products (bf16 to fp32 is exact), summed in a
+different order, so it matches to fp32 rounding.
+
 ``available()`` is False without Triton or a GPU; callers keep the aten
 path then.
 """
@@ -135,3 +142,36 @@ def hc_split_sinkhorn(mixes, hc_scale, hc_base, hc_mult, sinkhorn_iters, eps):
             _hc_sinkhorn_kernel[(T,)](m, hc_scale.float().contiguous(), hc_base.float().contiguous(),
                                       pre, post, comb, float(eps), HC=hc, ITERS=sinkhorn_iters)
     return pre.view(*lead, hc), post.view(*lead, hc), comb.view(*lead, hc, hc)
+
+
+if triton is not None:
+    @triton.jit
+    def _linear_f32_kernel(x_ptr, w_ptr, y_ptr, N, K, BN: tl.constexpr, BK: tl.constexpr):
+        pid = tl.program_id(0)
+        m = tl.program_id(1)
+        rows = pid.to(tl.int64) * BN + tl.arange(0, BN)  # int64: weights past 2^31 elements
+        live = rows < N
+        acc = tl.zeros((BN, BK), dtype=tl.float32)
+        for k0 in range(0, K, BK):
+            ks = k0 + tl.arange(0, BK)
+            kin = ks < K
+            w = tl.load(w_ptr + rows[:, None] * K + ks[None, :], mask=live[:, None] & kin[None, :], other=0.0)
+            x = tl.load(x_ptr + m * K + ks, mask=kin, other=0.0)
+            acc += w.to(tl.float32) * x[None, :]
+        tl.store(y_ptr + m * N + rows, tl.sum(acc, axis=1), mask=live)
+
+
+def linear_f32(x, weight, block_n=16, block_k=512):
+    """x [M, K] (any float dtype, taken as fp32) times weight [N, K]
+    (bf16, read as is) transposed -> fp32 [M, N], fp32 accumulation. For
+    the few rows of a decode step: each row reads the whole weight."""
+    M, K = x.shape
+    N = weight.shape[0]
+    if weight.dim() != 2 or weight.shape[1] != K:
+        raise ValueError(f"linear_f32: x {tuple(x.shape)} and weight {tuple(weight.shape)} disagree on K")
+    x = x.float().contiguous()
+    y = torch.empty(M, N, dtype=torch.float32, device=x.device)
+    if M and N:
+        with torch.cuda.device(x.device):  # Triton launches on the current device
+            _linear_f32_kernel[(triton.cdiv(N, block_n), M)](x, weight.contiguous(), y, N, K, BN=block_n, BK=block_k)
+    return y

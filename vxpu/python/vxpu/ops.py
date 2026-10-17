@@ -55,6 +55,9 @@ class External:
         # by the weight's storage address (see fp8_linear): engine-owned so
         # the copies go with the engine, and shared by its two graphs
         self.bf16 = {}
+        # bf16 weights widened to fp32 once where no kernel reads bf16
+        # directly (the output head off the Triton path, see head_linear)
+        self.f32 = {}
         # pinned host buffers for the expert op's device crossings in decode
         # (see _to_host and _to_device), reused call to call
         self.pinned = {}
@@ -287,6 +290,48 @@ def _(mixes, hc_scale, hc_base, hc_mult, sinkhorn_iters, eps):
 @fp8_linear.register_fake
 def _(x, weight, scale):
     return x.new_empty(tuple(x.shape[:-1]) + (weight.shape[0],))
+
+@custom_op("vxpu::head_linear", mutates_args=())  # pure tensor work: capturable
+def head_linear(x: torch.Tensor, weight: torch.Tensor) -> torch.Tensor:
+    """The output head: x [..., K] times weight [N, K] transposed, in fp32
+    (the fork's F.linear(x.float(), weight) with its fp32 weight), for a
+    weight held in the checkpoint's bf16. Widening bf16 to fp32 is exact,
+    so the products are the reference's; on a GPU one Triton kernel reads
+    the bf16 bytes and accumulates in fp32 (a different summation order:
+    equal to fp32 rounding), elsewhere torch's fp32 linear over an fp32
+    copy of the weight, widened once and kept by the engine, as it held
+    the fork's fp32 weight before (bit-identical)."""
+    lead = tuple(x.shape[:-1])
+    x2 = x.reshape(-1, x.shape[-1])
+    if x.is_meta:
+        return x.new_empty(lead + (weight.shape[0],), dtype=torch.float32)
+    if x.is_cuda and triton_ops.available() and weight.dtype == torch.bfloat16 and x2.shape[0] <= 8:
+        y = triton_ops.linear_f32(x2, weight)
+    else:
+        y = torch.nn.functional.linear(x2.float(), _f32_weight(weight))
+    return y.reshape(lead + (weight.shape[0],))
+
+
+def _f32_weight(weight):
+    """weight widened to fp32 once, kept in the active engine's External
+    (keyed by storage address, like the bf16 copies); without an engine
+    bound, widened for this call only."""
+    if weight.dtype == torch.float32:
+        return weight
+    ext = getattr(_active, "external", None)
+    key = (weight.untyped_storage().data_ptr(), weight.storage_offset(), tuple(weight.shape))
+    if ext is not None and key in ext.f32:
+        return ext.f32[key]
+    w = weight.float()
+    if ext is not None:
+        ext.f32[key] = w
+    return w
+
+
+@head_linear.register_fake
+def _(x, weight):
+    return x.new_empty(tuple(x.shape[:-1]) + (weight.shape[0],), dtype=torch.float32)
+
 
 def prepare_compile():
     """Before torch.compile of a graph that calls these ops: the two that do
