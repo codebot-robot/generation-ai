@@ -45,7 +45,7 @@ import time
 
 import torch
 
-from vxpu import experts_cpu, segments
+from vxpu import experts_cpu, kernels, segments
 from vxpu.engine import Engine, SamplingParams
 
 LAYER = re.compile(r"layers\.\d+")
@@ -57,7 +57,7 @@ def main():
     p.add_argument("--device", default="cuda")
     p.add_argument("--ids-from", help="a vxpu-vectors file whose first prompt is used")
     p.add_argument("--ids", help="comma-separated token ids")
-    p.add_argument("--steps", type=int, default=16, help="decode steps per measured session")
+    p.add_argument("--steps", type=int, default=16, help="tokens generated per measured session")
     p.add_argument("--warmup-sessions", type=int, default=3)
     p.add_argument("--clean-sessions", type=int, default=5)
     p.add_argument("--top", type=int, default=8, help="dense segments to list")
@@ -73,8 +73,9 @@ def main():
 
     t0 = time.time()
     say = lambda m: print(f"[attribute {time.time() - t0:6.0f}s] {m}", flush=True)  # noqa: E731
-    os.environ.setdefault("VXPU_COMPILE_MODE", "reduce-overhead")
-    say(f"loading {args.artifact} on {args.device}")
+    # the engine's own compile mode (CUDA graphs for the split decode on
+    # CUDA); VXPU_COMPILE_MODE in the environment still overrides
+    say(f"loading {args.artifact} on {args.device} (VXPU_COMPILE_MODE={os.environ.get('VXPU_COMPILE_MODE', 'engine default')})")
     eng = Engine(args.artifact, device=args.device, compile_decode=True)
     if eng._decode_split is None:
         raise SystemExit("the decode graph is not split (VXPU_SPLIT_DECODE=0?)")
@@ -107,7 +108,8 @@ def main():
                       else "engram" if "vxpu.engram_rows.default" in targets else "dense")
         original[name] = sub
     seg_time, seg_calls = collections.Counter(), collections.Counter()
-    sync = torch.cuda.synchronize if args.device.startswith("cuda") else (lambda: None)
+    # the engine's device, which need not be the process's current one
+    sync = (lambda: torch.cuda.synchronize(args.device)) if args.device.startswith("cuda") else (lambda: None)
 
     class Timed(torch.nn.Module):
         def __init__(self, name, sub):
@@ -142,7 +144,11 @@ def main():
         for name, sub in original.items():
             split._modules[name] = sub
 
-    steps = args.steps - 1  # the first token comes from the prefill
+    # decode steps that actually ran: the calls of any dense segment (each
+    # step calls every segment once; a session can also stop early, on EOS
+    # or a full cache, so --steps is not the count)
+    steps = max(seg_calls[n] for n in seg_calls if kind[n] == "dense")
+    res["decode_steps"] = steps
     by_kind = collections.Counter()
     for name, t in seg_time.items():
         by_kind[kind[name]] += t * 1e3 / steps
@@ -150,7 +156,12 @@ def main():
     res["experts_routing_body_ms"] = body["routing body"] * 1e3 / steps
     say("per decode step: " + ", ".join(f"{k} {v:.1f} ms" for k, v in by_kind.most_common())
         + f" (instrumented step {res['instrumented_ms_per_token']:.1f} ms)")
-    say(f"experts: routing body {res['experts_routing_body_ms']:.1f} ms of {by_kind['experts']:.1f} ms in the op")
+    if "routing body" in body:
+        say(f"experts: routing body {res['experts_routing_body_ms']:.1f} ms of {by_kind['experts']:.1f} ms in the op")
+    else:  # the op took the module's own routing (kernels off or unavailable, or other banks)
+        res["experts_routing_body_ms"] = None
+        say(f"experts: not on the fused-kernel path (kernels: {kernels.why_not() or 'switched off, or not applicable to these banks'}); "
+            f"{by_kind['experts']:.1f} ms in the op")
 
     dense = sorted(((seg_time[n] * 1e3 / max(1, seg_calls[n]), n) for n in seg_time if kind[n] == "dense"), reverse=True)
     res["dense_segments"] = []
