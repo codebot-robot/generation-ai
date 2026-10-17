@@ -1,0 +1,43 @@
+{
+  "clean_ms_per_token": 47.3,
+  "clean_best_ms_per_token": 47.0,
+  "clean_sessions_ms_per_token": [47.0, 47.1, 47.3, 47.4, 47.6],
+  "decode_steps": 16,
+  "instrumented_ms_per_token": 51.0,
+  "per_step_ms": {
+    "dense": 22.5,
+    "experts": 24.3,
+    "engram": 0.5
+  },
+  "experts_routing_body_ms": 20.3,
+  "dense_segments": [
+    {
+      "segment": "submod_0",
+      "ms": 7.10,
+      "nodes": 45,
+      "ops": [["mul", 15], ["add", 12], ["sin", 4], ["cos", 4], ["silu", 4]],
+      "modules": [["layers.N.self_attn", 25], ["layers.N.mlp", 20]]
+    },
+    {
+      "segment": "submod_2",
+      "ms": 6.20,
+      "nodes": 38,
+      "ops": [["matmul", 10], ["add", 10], ["mul", 8]],
+      "modules": [["layers.N.mlp", 38]]
+    },
+    {
+      "segment": "submod_1",
+      "ms": 4.90,
+      "nodes": 28,
+      "ops": [["rms_norm", 8], ["mul", 8], ["add", 6]],
+      "modules": [["layers.N.input_layernorm", 14], ["layers.N.post_attention_layernorm", 14]]
+    },
+    {
+      "segment": "submod_3",
+      "ms": 4.30,
+      "nodes": 24,
+      "ops": [["cat", 6], ["slice", 6], ["view", 6]],
+      "modules": [["layers.N.self_attn.rotary_emb", 24]]
+    }
+  ]
+}

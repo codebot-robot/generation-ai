@@ -1,0 +1,9 @@
+{
+  "label": "Triton fp8 GEMV",
+  "commit": "4a3ce9f",
+  "artifact": "deepseek-v41-flash-fp8",
+  "hardware": "NVIDIA RTX PRO 6000",
+  "date": "2026-10-17T17:00:00Z",
+  "notes": "fp8 weight read directly on GPU via Triton GEMV (47.3 -> 45.4 ms/token)",
+  "reference": "../reference_vectors.json"
+}

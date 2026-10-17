@@ -1,0 +1,9 @@
+{
+  "label": "DeepSeek-V4.1-Flash baseline",
+  "commit": "be206b6",
+  "artifact": "deepseek-v41-flash-fp8",
+  "hardware": "NVIDIA RTX PRO 6000",
+  "date": "2026-10-17T12:00:00Z",
+  "notes": "Eager host ops via dispatcher (48 kernel threads)",
+  "reference": "../reference_vectors.json"
+}

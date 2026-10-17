@@ -1,0 +1,33 @@
+{
+  "reference": "reference_vectors.json",
+  "candidate": "vectors.json",
+  "ok": true,
+  "rows": [
+    {
+      "prompt": "sky",
+      "status": "ok",
+      "same_prompt": true,
+      "tokens_equal": true,
+      "tokens_ok": true,
+      "flip": null,
+      "compared": "7/7",
+      "max_logit_diff": 0.003,
+      "max_logit_rel": 0.0001,
+      "ref_ms_per_token": 120.5,
+      "ms_per_token": 45.4
+    },
+    {
+      "prompt": "kubernetes",
+      "status": "ok",
+      "same_prompt": true,
+      "tokens_equal": true,
+      "tokens_ok": true,
+      "flip": null,
+      "compared": "6/6",
+      "max_logit_diff": 0.002,
+      "max_logit_rel": 0.0001,
+      "ref_ms_per_token": 122.0,
+      "ms_per_token": 45.3
+    }
+  ]
+}

@@ -1,0 +1,9 @@
+{
+  "label": "Direct host ops",
+  "commit": "c65da3c",
+  "artifact": "deepseek-v41-flash-fp8",
+  "hardware": "NVIDIA RTX PRO 6000",
+  "date": "2026-10-17T14:30:00Z",
+  "notes": "Eager host-op segments call implementation directly (51.1 -> 47.3 ms/token)",
+  "reference": "../reference_vectors.json"
+}
