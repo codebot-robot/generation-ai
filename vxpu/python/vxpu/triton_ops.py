@@ -46,7 +46,7 @@ if triton is not None:
     @triton.jit
     def _act_quant_dequant_kernel(x_ptr, y_ptr, n_groups, G: tl.constexpr):
         pid = tl.program_id(0)
-        g = pid * G + tl.arange(0, G)
+        g = pid.to(tl.int64) * G + tl.arange(0, G)  # int64: offsets of activations past 2^31 elements
         live = g < n_groups
         offs = g[:, None] * 32 + tl.arange(0, 32)[None, :]
         x = tl.load(x_ptr + offs, mask=live[:, None], other=0.0).to(tl.float32)
