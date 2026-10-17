@@ -50,6 +50,7 @@
 #include <atomic>
 #include <cstdlib>
 #include <cstring>
+#include <limits>
 #include <vector>
 
 #if defined(__aarch64__)
@@ -123,6 +124,7 @@ const int8_t kFp4x2[16] = {0, 1, 2, 3, 4, 6, 8, 12, 0, -1, -2, -3, -4, -6, -8, -
 // below fp32's normal range and goes through ldexp.
 inline float e8m0(uint8_t e) {
   if (e == 0) return std::ldexp(1.0f, -127);
+  if (e == 0xFF) return std::numeric_limits<float>::quiet_NaN();  // the format's NaN, as torch decodes it
   const uint32_t bits = uint32_t(e) << 23;
   float f;
   std::memcpy(&f, &bits, 4);
@@ -399,6 +401,11 @@ void fp4_dequant_into(const torch::Tensor& w, const torch::Tensor& scale, int64_
 
 torch::Tensor fp4_dequant(torch::Tensor w, torch::Tensor scale, int64_t e) {
   TORCH_CHECK(w.dtype() == torch::kUInt8 && w.dim() == 3 && w.is_contiguous(), "w must be contiguous uint8 [E, N, K/2]");
+  TORCH_CHECK(scale.dtype() == torch::kFloat8_e8m0fnu && scale.dim() == 3 && scale.is_contiguous(),
+              "scale must be contiguous e8m0 [E, N, K/32]");
+  TORCH_CHECK(scale.size(0) == w.size(0) && scale.size(1) == w.size(1) && scale.size(2) * 16 == w.size(2),
+              "scale and w disagree on E, N or K");
+  TORCH_CHECK(w.device().is_cpu() && scale.device().is_cpu(), "CPU tensors only");
   TORCH_CHECK(e >= 0 && e < w.size(0), "expert index out of range");
   const int64_t N = w.size(1), K = w.size(2) * 2;
   auto out = torch::empty({N, K}, w.options().dtype(torch::kBFloat16));
@@ -414,6 +421,8 @@ torch::Tensor fp4_grouped_mm(torch::Tensor x, torch::Tensor w, torch::Tensor sca
   auto offc = offs.contiguous();
   const int32_t* offp = offc.data_ptr<int32_t>();
   TORCH_CHECK(E == 0 || offp[E - 1] == M, "offs must end at M");
+  for (int64_t e = 0; e < E; ++e)
+    TORCH_CHECK(offp[e] >= (e ? offp[e - 1] : 0), "offs must be non-decreasing and start at or above 0");
   // one decode buffer, reused for every expert (a fresh allocation per
   // expert would pay its page faults every time)
   auto we = torch::empty({N, x.size(1)}, x.options());
@@ -433,8 +442,9 @@ torch::Tensor fp4_grouped_mm(torch::Tensor x, torch::Tensor w, torch::Tensor sca
 
 // ---------------------------------------------------------------- fp8 dense
 
-// e4m3fn byte -> fp32 (no infinities; 0x7F/0xFF are NaN and never occur in weights)
+// e4m3fn byte -> fp32 (no infinities; 0x7F/0xFF are NaN, decoded as NaN as torch does)
 inline float e4m3(uint8_t b) {
+  if ((b & 0x7F) == 0x7F) return std::numeric_limits<float>::quiet_NaN();
   const uint32_t sign = uint32_t(b & 0x80) << 24;
   const uint32_t exp = (b >> 3) & 0xF, man = b & 7;
   uint32_t bits;
@@ -461,7 +471,10 @@ inline __m512 e4m3_avx512(__m128i bytes16) {
   __m512 sub = _mm512_mul_ps(_mm512_cvtepi32_ps(man), _mm512_set1_ps(1.0f / 512.0f));
   __mmask16 is_sub = _mm512_cmpeq_epi32_mask(exp, _mm512_setzero_si512());
   __m512 val = _mm512_mask_blend_ps(is_sub, _mm512_castsi512_ps(normal), sub);
-  return _mm512_castsi512_ps(_mm512_or_si512(_mm512_castps_si512(val), sign));
+  val = _mm512_castsi512_ps(_mm512_or_si512(_mm512_castps_si512(val), sign));
+  // exponent 15 with mantissa 7 is the format's NaN (0x7F / 0xFF)
+  const __mmask16 is_nan = _mm512_cmpeq_epi32_mask(_mm512_and_si512(b, _mm512_set1_epi32(0x7F)), _mm512_set1_epi32(0x7F));
+  return _mm512_mask_blend_ps(is_nan, val, _mm512_set1_ps(std::numeric_limits<float>::quiet_NaN()));
 }
 
 // x[K] fp32 dot one fp8 row with its K/32 block scales (row n's scales)
