@@ -55,6 +55,9 @@ class External:
         # by the weight's storage address (see fp8_linear): engine-owned so
         # the copies go with the engine, and shared by its two graphs
         self.bf16 = {}
+        # pinned host buffers for the expert op's device crossings in decode
+        # (see _to_host and _to_device), reused call to call
+        self.pinned = {}
 
 
 # layer id -> row width, for shape inference while tracing (set by the exporter)
@@ -97,7 +100,14 @@ def moe_experts(x_in: torch.Tensor, weights: torch.Tensor, indices: torch.Tensor
         return x_in.new_empty((x_in.shape[0], x_in.shape[1]), dtype=torch.float32)
     moe = _current("experts", layer)
     host = moe.w1.device
-    x, w, i = x_in.to(host), weights.to(host), indices.to(host)
+    # decode-sized inputs cross through the engine's pinned buffers; a
+    # prefill keeps plain copies (its crossing is noise against its compute,
+    # and pinned buffers sized for the longest prompt would stay pinned)
+    crossing = x_in.device.type == "cuda" and host.type == "cpu" and x_in.shape[0] <= PINNED_MAX_ROWS
+    if crossing:
+        x, w, i = _to_host(x_in, weights, indices)
+    else:
+        x, w, i = x_in.to(host), weights.to(host), indices.to(host)
     if experts_cpu.applicable(moe):
         # the fused fp4 kernels (csrc/): same routings, no dequantized copy
         y = experts_cpu.forward_batched(moe, x, w, i) if x.shape[0] == 1 else experts_cpu.forward_grouped(moe, x, w, i)
@@ -105,7 +115,47 @@ def moe_experts(x_in: torch.Tensor, weights: torch.Tensor, indices: torch.Tensor
         y = moe._forward_batched(x, w, i)
     else:
         y = moe._forward_grouped(x, w, i)
-    return y.to(x_in.device)
+    return _to_device(y, x_in.device) if crossing else y.to(x_in.device)
+
+
+# inputs of up to this many token rows cross through pinned buffers
+PINNED_MAX_ROWS = 8
+
+
+def _pinned(name, like):
+    """A pinned host tensor shaped and typed like `like`, kept by the bound
+    engine (the op has already required one) and reused call to call;
+    regrown when a call needs more, at most PINNED_MAX_ROWS rows."""
+    table = _active.external.pinned
+    nbytes = like.numel() * like.element_size()
+    buf = table.get(name)
+    if buf is None or buf.numel() < nbytes:
+        buf = table[name] = torch.empty(max(nbytes, 1 << 16), dtype=torch.uint8, pin_memory=True)
+    return buf[:nbytes].view(like.dtype).view(like.shape)
+
+
+def _to_host(x_in, weights, indices):
+    """The expert op's three inputs to the host with one synchronize:
+    three asynchronous copies into pinned buffers, then the stream waits
+    once. Three .to("cpu") calls are three synchronizing pageable copies,
+    about 28 us a layer against about 13."""
+    out = []
+    for name, t in (("x", x_in), ("w", weights), ("i", indices)):
+        host = _pinned(name, t)
+        host.copy_(t, non_blocking=True)
+        out.append(host)
+    torch.cuda.current_stream(x_in.device).synchronize()
+    return tuple(out)
+
+
+def _to_device(y, device):
+    """The result back without blocking: staged in a pinned buffer and
+    copied asynchronously on the current stream. The buffer is reused by
+    the next call only after that call's input copy has synchronized the
+    same stream, by which point this copy has completed."""
+    host = _pinned("y", y)
+    host.copy_(y)
+    return host.to(device, non_blocking=True)
 
 
 @moe_experts.register_fake
