@@ -72,5 +72,8 @@ def act_quant_dequant(x):
     y = torch.empty(xc.shape, dtype=torch.bfloat16, device=x.device)
     n_groups = xc.numel() // 32
     G = 16
-    _act_quant_dequant_kernel[(triton.cdiv(n_groups, G),)](xc, y, n_groups, G=G)
+    # Triton launches on the current device; make that the tensors' device
+    # (an engine on cuda:1 with the process's current device still 0)
+    with torch.cuda.device(x.device):
+        _act_quant_dequant_kernel[(triton.cdiv(n_groups, G),)](xc, y, n_groups, G=G)
     return y
