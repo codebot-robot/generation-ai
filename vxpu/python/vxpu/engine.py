@@ -44,6 +44,8 @@ import torch
 
 from . import ops, segments  # noqa: F401  (registers vxpu::* before a graph that calls them is loaded)
 from .plan import Plan
+from .plan import record as plan_record
+from .telemetry import Recorder, segment_info
 from .rehydrate import (derived_tensor, fetch_stacked, fetch_tensor,
                         load_program, share_state, strip_asserts)
 
@@ -328,6 +330,7 @@ class Engine:
                 self._decode_split = segments.compile_segments(
                     self._decode, self.device, mode, opts.get("options"),
                     split_compile=self.plan["split_compile"], direct=self.plan["direct_host_ops"])
+                self._segment_info = segment_info(self._decode_split.split)
                 total, compiled = self._decode_split.vxpu_segments
                 print(f"[vxpu] decode graph split into {total} segments, {compiled} compiled", flush=True)
                 self._decode_run = self._decode_split
@@ -491,7 +494,7 @@ class Engine:
         }
 
     def generate(self, session_id, input_ids, max_new_tokens, params,
-                 extra_eos_ids=(), logits_sink=None):
+                 extra_eos_ids=(), logits_sink=None, telemetry=False):
         """transformers' generate() loop, streamed.
 
         Yields dicts {"token_ids": [...], "done": bool, ...}; the last
@@ -500,13 +503,15 @@ class Engine:
         serially anyway). ``logits_sink(position, logits)``, if given,
         sees the next-token logits (a 1-D tensor) before each pick,
         position 0 being the first generated token; used to record
-        test vectors.
+        test vectors. ``telemetry=True`` records this call's execution
+        (telemetry.py) and returns it on the final event as
+        ``"telemetry"``; nothing is recorded otherwise.
         """
         with self._lock:
             session = self._session(session_id)
             yield from self._generate_locked(
                 session, list(input_ids), max_new_tokens, params,
-                extra_eos_ids, logits_sink)
+                extra_eos_ids, logits_sink, telemetry)
 
     def _session(self, session_id):
         if session_id not in self.sessions:
@@ -514,13 +519,26 @@ class Engine:
         return self.sessions[session_id]
 
     def _generate_locked(self, session, ids, max_new_tokens, params,
-                         extra_eos_ids=(), logits_sink=None):
-        with self.external_scope():
-            yield from self._generate_scoped(session, ids, max_new_tokens, params,
-                                             extra_eos_ids, logits_sink)
+                         extra_eos_ids=(), logits_sink=None, telemetry=False):
+        recorder = None
+        if telemetry:
+            recorder = Recorder(self.device, getattr(self, "_segment_info", None)
+                                if self._decode_split is not None else None)
+            self.external.telemetry = recorder
+            if self._decode_split is not None:
+                self._decode_split.set_recorder(recorder)
+        try:
+            with self.external_scope():
+                yield from self._generate_scoped(session, ids, max_new_tokens, params,
+                                                 extra_eos_ids, logits_sink, recorder)
+        finally:
+            if recorder is not None:
+                self.external.telemetry = None
+                if self._decode_split is not None:
+                    self._decode_split.set_recorder(None)
 
     def _generate_scoped(self, session, ids, max_new_tokens, params,
-                         extra_eos_ids, logits_sink):
+                         extra_eos_ids, logits_sink, recorder=None):
         self._bind(session["state"])
         total_len = len(ids)
         if total_len == 0:
@@ -583,6 +601,9 @@ class Engine:
                                             device=self.device))
         prefill_s = time.perf_counter() - prefill_started
         cached = session["cached_ids"] = list(ids)
+        if recorder is not None:
+            recorder.prefill_ms = prefill_s * 1e3
+            recorder.phase = "decode"
 
         # The returned sequence matches transformers: the end-of-turn
         # id that stops generation is included (and counted) but, as
@@ -602,6 +623,7 @@ class Engine:
                 break
             if len(cached) >= self.max_cache_len:
                 break
+            step_started = time.perf_counter() if recorder is not None else 0.0
             logits = self._decode_run(
                 input_ids=torch.tensor([[next_id]], device=self.device),
                 cache_position=torch.tensor([len(cached)],
@@ -610,9 +632,11 @@ class Engine:
             if logits_sink is not None:
                 logits_sink(step + 1, logits[0, -1])
             next_id = sampler.pick(logits[0, -1], cached)
+            if recorder is not None:
+                recorder.step_ms.append((time.perf_counter() - step_started) * 1e3)
         loop_s = time.perf_counter() - loop_started
 
-        yield {
+        done = {
             "token_ids": [],
             "done": True,
             "finish_reason": finish_reason,
@@ -623,6 +647,9 @@ class Engine:
             "ms_per_token": round(
                 loop_s / max(len(token_ids), 1) * 1e3, 1),
         }
+        if recorder is not None:
+            done["telemetry"] = recorder.result(plan_record(self.explain()))
+        yield done
 
 
 class SamplingParams:

@@ -137,15 +137,51 @@ class Split(torch.nn.Module):
         super().__init__()
         self.split = split
         self.vxpu_segments = (total, compiled)
+        self.recorder = None
+        self._unwrapped = None
+
+    def set_recorder(self, recorder):
+        """Time every segment into recorder (telemetry.Recorder) until
+        called with None. Each segment is wrapped while a recorder is set
+        and unwrapped after, so a step without telemetry runs exactly the
+        unwrapped module."""
+        names = [name for name, _ in segments_of(self.split)] if self._unwrapped is None else list(self._unwrapped)
+        if recorder is not None and self._unwrapped is None:
+            self._unwrapped = {name: self.split._modules[name] for name in names}
+            for index, name in enumerate(names):
+                self.split._modules[name] = _Recorded(self._unwrapped[name], index, recorder)
+        elif recorder is None and self._unwrapped is not None:
+            for name, sub in self._unwrapped.items():
+                self.split._modules[name] = sub
+            self._unwrapped = None
+        self.recorder = recorder
 
     def forward(self, *args, **kwargs):
         # One call is one decode step: a CUDA-graph replay reuses its output
         # buffers, so mark the step boundary (earlier steps' outputs may be
         # recycled from here) and hand back a copy of what the caller keeps.
         torch.compiler.cudagraph_mark_step_begin()
+        recorder = self.recorder
+        if recorder is not None:
+            recorder.begin_step()
         out = self.split(*args, **kwargs)
+        if recorder is not None:
+            recorder.end_step()
         out = out[0] if isinstance(out, (tuple, list)) and len(out) == 1 else out
         return out.clone() if isinstance(out, torch.Tensor) else out
+
+
+class _Recorded(torch.nn.Module):
+    """A segment that tells the recorder when it has been issued."""
+
+    def __init__(self, sub, index, recorder):
+        super().__init__()
+        self.sub, self.index, self.recorder = sub, index, recorder
+
+    def forward(self, *args, **kwargs):
+        out = self.sub(*args, **kwargs)
+        self.recorder.after_segment(self.index)
+        return out
 
 
 def call_host_ops_directly(sub):

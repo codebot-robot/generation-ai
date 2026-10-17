@@ -329,6 +329,7 @@ def record_vxpu_engine(model, revision, prompts, settings, artifact, device="cpu
         _progress(prompt, new, stats.get("ms_per_token") if stats else None)
     with open(os.path.join(artifact, "binding.json")) as f:
         binding = json.load(f)
+    from .plan import record as plan_record
     producer = {"kind": "vxpu-engine", **_versions(device),
                 "compile": compile_decode,
                 "binding": {k: len(binding.get(k, [])) for k in
@@ -337,16 +338,6 @@ def record_vxpu_engine(model, revision, prompts, settings, artifact, device="cpu
                 "plan": plan_record(engine.explain())}
     return _document(model, revision, engine.config, producer, settings, out)
 
-
-def plan_record(explained):
-    """The parts of an engine's plan (plan.Plan.explain) a vectors file
-    keeps: each choice's value and the implementations each op ran, so a
-    recording says which physical plan produced it."""
-    return {"choices": {k: c["value"] for k, c in explained["choices"].items()},
-            "selected": {op: sorted({s["impl"] for s in row["selected"]}) for op, row in explained["ops"].items()},
-            "numerics": {op: sorted({i["numerics"] for i in row["implementations"]
-                                     if i["name"] in {s["impl"] for s in row["selected"]}})
-                         for op, row in explained["ops"].items()}}
 
 
 def record_vxpu_router(model, revision, prompts, settings, artifact, router=None):

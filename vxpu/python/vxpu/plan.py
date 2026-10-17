@@ -347,6 +347,17 @@ class Plan:
         return "\n".join(lines)
 
 
+def record(explained):
+    """The compact form of an explain() a result keeps (vectors files,
+    telemetry): each choice's value, the implementations each op ran and
+    their numerics classes, so a result says which plan produced it."""
+    return {"choices": {k: c["value"] for k, c in explained["choices"].items()},
+            "selected": {op: sorted({s["impl"] for s in row["selected"]}) for op, row in explained["ops"].items()},
+            "numerics": {op: sorted({i["numerics"] for i in row["implementations"]
+                                     if i["name"] in {s["impl"] for s in row["selected"]}})
+                         for op, row in explained["ops"].items()}}
+
+
 _default = {}
 
 

@@ -32,6 +32,7 @@ cudagraph_unsafe and, for torch.compile, kept out of the compiled graph
 
 import contextlib
 import threading
+import time
 
 import torch
 from torch.library import custom_op
@@ -61,6 +62,8 @@ class External:
         # the engine's physical plan (plan.Plan): which implementation of
         # each op runs here; ops called with no engine bound use a default
         self.plan = None
+        # a telemetry.Recorder while a generate call asked for telemetry
+        self.telemetry = None
         # pinned host buffers for the expert op's device crossings in decode
         # (see _to_host and _to_device), reused call to call
         self.pinned = {}
@@ -117,14 +120,34 @@ def moe_experts(x_in: torch.Tensor, weights: torch.Tensor, indices: torch.Tensor
     # prefill keeps plain copies (its crossing is noise against its compute,
     # and pinned buffers sized for the longest prompt would stay pinned)
     crossing = x_in.device.type == "cuda" and host.type == "cpu" and x_in.shape[0] <= PINNED_MAX_ROWS
+    rec = _recorder()
+    t0 = time.perf_counter() if rec is not None else 0.0
     if crossing:
         x, w, i = _to_host(x_in, weights, indices)
     else:
         x, w, i = x_in.to(host), weights.to(host), indices.to(host)
     rows = x.shape[0]
     impl = _plan(host.type).select("vxpu::moe_experts", host.type, key=f"rows={rows}", moe=moe, rows=rows)
+    if rec is None:
+        y = impl.fn(moe, x, w, i)
+        return _to_device(y, x_in.device) if crossing else y.to(x_in.device)
+    t1 = time.perf_counter()
     y = impl.fn(moe, x, w, i)
-    return _to_device(y, x_in.device) if crossing else y.to(x_in.device)
+    t2 = time.perf_counter()
+    out = _to_device(y, x_in.device) if crossing else y.to(x_in.device)
+    t3 = time.perf_counter()
+    # wait_to_host includes waiting for the GPU's preceding work (the copy
+    # synchronizes the stream): on the hybrid placement, the CPU idle while
+    # the GPU finishes the segment before
+    rec.host_op("moe_experts", wait_to_host_ms=(t1 - t0) * 1e3, impl_ms=(t2 - t1) * 1e3, to_device_ms=(t3 - t2) * 1e3)
+    rec.selected_experts(layer, i.flatten().tolist())
+    return out
+
+
+def _recorder():
+    """The telemetry recorder of the engine running a graph, if it asked for one."""
+    ext = getattr(_active, "external", None)
+    return getattr(ext, "telemetry", None) if ext is not None else None
 
 
 def _cpu_experts(plan, moe=None, **_):
@@ -215,7 +238,13 @@ def engram_rows(indices: torch.Tensor, table: int) -> torch.Tensor:
     embed = _current("engram", table)
     host = embed.weight.device
     impl = _plan(host.type).select("vxpu::engram_rows", host.type)
-    return impl.fn(embed, indices.to(host)).to(indices.device)
+    rec = _recorder()
+    if rec is None:
+        return impl.fn(embed, indices.to(host)).to(indices.device)
+    t0 = time.perf_counter()
+    out = impl.fn(embed, indices.to(host)).to(indices.device)
+    rec.host_op("engram_rows", total_ms=(time.perf_counter() - t0) * 1e3)
+    return out
 
 
 @implementation("vxpu::engram_rows", "host-lookup", ("cpu", "cuda"), "bit-identical",
