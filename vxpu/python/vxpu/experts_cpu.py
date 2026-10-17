@@ -17,15 +17,19 @@
 The same routings as the fork's ``MoE._forward_batched`` (decode: gather
 the chosen experts) and ``_forward_grouped`` (prefill: tokens sorted by
 expert), with the three matmuls over packed fp4 banks done by the
-kernels in csrc/ instead of a dequantized copy; the nonlinear part
-between them (``_ffn``: clamps, SiLU, routing weight, input
-requantization) is the module's own method, unchanged. Dequantization
-is exact either way, so the two paths differ only in fp32 accumulation
-order.
+kernels in csrc/ instead of a dequantized copy. In decode the whole
+step is one C++ call (fp4_moe_decode), which also does the nonlinear
+part between the matmuls (the module's ``_ffn``: clamps, SiLU, routing
+weight, input requantization) with the reference's rounding points; in
+prefill, and with VXPU_FUSED_EXPERTS=0, ``_ffn`` is the module's own
+method. Dequantization is exact either way, so the paths differ only in
+fp32 accumulation order.
 
 Only fp4 banks with e8m0 scales are handled here; a module whose banks
 are something else keeps its own paths.
 """
+
+import os
 
 import torch
 
@@ -40,8 +44,17 @@ def applicable(moe):
 
 
 def forward_batched(moe, x_in, weights, indices):
-    """Decode routing on the kernels; mirrors MoE._forward_batched."""
+    """Decode routing on the kernels; mirrors MoE._forward_batched.
+
+    One C++ call (fp4_moe_decode) runs the whole step, the fork's _ffn
+    included, when the extension has it; VXPU_FUSED_EXPERTS=0 keeps the
+    three kernel calls with the module's own _ffn between them."""
     k = kernels.load()
+    if hasattr(k, "fp4_moe_decode") and os.environ.get("VXPU_FUSED_EXPERTS", "1").lower() not in ("0", "off", "false"):
+        sel = (indices - moe.experts_start_idx).to(torch.int64)
+        return k.fp4_moe_decode(x_in.contiguous(), weights.float().contiguous(), sel.contiguous(),
+                                moe.w1, moe.w1_scale, moe.w3, moe.w3_scale, moe.w2, moe.w2_scale,
+                                float(moe.swiglu_limit))
     n, topk = indices.shape
     sel = (indices - moe.experts_start_idx).flatten().to(torch.int64)
     xi = x_in.repeat_interleave(topk, dim=0).contiguous()  # [n * topk, dim]
