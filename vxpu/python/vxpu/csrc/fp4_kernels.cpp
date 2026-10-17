@@ -626,12 +626,18 @@ torch::Tensor fp8_linear(torch::Tensor x, torch::Tensor w, torch::Tensor scale) 
 torch::Tensor fp4_moe_decode(torch::Tensor x_in, torch::Tensor weights, torch::Tensor indices,
                              torch::Tensor w1, torch::Tensor s1, torch::Tensor w3, torch::Tensor s3,
                              torch::Tensor w2, torch::Tensor s2, double swiglu_limit) {
+  // every bank checked in full: the kernel walks each with contiguous
+  // strides and reads the scales as raw bytes
   check_bank(x_in, w1, s1);
-  TORCH_CHECK(w3.sizes() == w1.sizes() && s3.sizes() == s1.sizes(), "w1 and w3 disagree");
-  TORCH_CHECK(w2.dtype() == torch::kUInt8 && w2.dim() == 3 && w2.is_contiguous() && s2.is_contiguous(), "w2 must be contiguous packed fp4");
+  check_bank(x_in, w3, s3);
+  TORCH_CHECK(w3.sizes() == w1.sizes(), "w1 and w3 disagree");
   const int64_t n = x_in.size(0), K = x_in.size(1), E = w1.size(0), I = w1.size(1);
-  TORCH_CHECK(w2.size(0) == E && w2.size(1) == K && w2.size(2) * 2 == I && s2.size(2) * 32 == I, "w2 shape");
   TORCH_CHECK(I % 32 == 0, "the expert's inner size must be a multiple of 32");
+  TORCH_CHECK(w2.dtype() == torch::kUInt8 && w2.dim() == 3 && w2.is_contiguous(), "w2 must be contiguous uint8 [E, K, I/2]");
+  TORCH_CHECK(s2.dtype() == torch::kFloat8_e8m0fnu && s2.dim() == 3 && s2.is_contiguous(), "s2 must be contiguous e8m0 [E, K, I/32]");
+  TORCH_CHECK(w2.size(0) == E && w2.size(1) == K && w2.size(2) * 2 == I, "w2 must be [E, K, I/2]");
+  TORCH_CHECK(s2.size(0) == E && s2.size(1) == K && s2.size(2) * 32 == I, "s2 must be [E, K, I/32]");
+  TORCH_CHECK(w2.device().is_cpu() && s2.device().is_cpu(), "CPU tensors only");
   auto wc = weights.to(torch::kFloat32).contiguous();
   auto ic = indices.to(torch::kInt64).contiguous();
   TORCH_CHECK(wc.dim() == 2 && wc.size(0) == n && ic.sizes() == wc.sizes(), "weights and indices must be [n, topk]");
