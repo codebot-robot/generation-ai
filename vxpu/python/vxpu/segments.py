@@ -28,9 +28,12 @@ CUDA with CUDA graphs, one per segment). The segments are the same
 boundaries an ahead-of-time compile (AOTInductor) or a runtime in
 another language would use: segment, mailbox, segment.
 
-The engine swaps per-session cache tensors into its graphs by name;
-after a split the top-level module reads them (under their original
-names) and hands them to the segments, so bind_state swaps them there.
+The split is made from a graph already bound to the engine's caches:
+split_module keeps every attribute read in the top-level graph, under
+its original name, and passes the tensors to the segments as arguments.
+The compiled segments need those addresses fixed, so the engine keeps
+that one state bound and copies sessions in and out of it (Engine._bind)
+rather than re-pointing the graph.
 """
 
 import os
@@ -140,7 +143,7 @@ def compile_segments(gm, device, mode, options=None):
     split, host = split_at_host_ops(gm)
     compiled = 0
     for name, sub in segments_of(split):
-        if name in host or os.environ.get("VXPU_SPLIT_COMPILE", "1") in ("0", "off"):
+        if name in host or os.environ.get("VXPU_SPLIT_COMPILE", "1").lower() in ("0", "off", "false"):
             continue  # VXPU_SPLIT_COMPILE=0: the split alone, segments eager (a check of the cut)
         kwargs = {"mode": mode}
         if options:
@@ -148,37 +151,3 @@ def compile_segments(gm, device, mode, options=None):
         setattr(split, name, torch.compile(sub, **kwargs))
         compiled += 1
     return Split(split, len(host) + compiled, compiled)
-
-
-def _bind_one(module, fqn, tensor):
-    """Point module's attribute fqn (a registered buffer or a plain tensor
-    attribute, as export leaves lifted constants) at tensor, if it has one."""
-    parent, name = fqn.rsplit(".", 1) if "." in fqn else ("", fqn)
-    try:
-        target = module.get_submodule(parent) if parent else module
-    except AttributeError:
-        return False
-    if name in target._buffers:
-        target._buffers[name] = tensor
-        return True
-    if isinstance(target.__dict__.get(name), torch.Tensor):
-        setattr(target, name, tensor)
-        return True
-    return False
-
-
-def bind_state(split, state):
-    """Bind each (fqn -> tensor) where the split module reads it.
-
-    split_module keeps every attribute read (get_attr) in the top-level
-    graph, under its original name, and passes the tensors into the
-    segments as arguments; so the top level is where a session's caches
-    must be swapped in. Segments are covered too, in case a future cut
-    moves an attribute inside one."""
-    root = getattr(split, "split", split)
-    for fqn, tensor in state.items():
-        _bind_one(root, fqn, tensor)
-    for name, sub in segments_of(root):
-        inner = getattr(sub, "_orig_mod", sub)  # a compiled segment wraps the module
-        for fqn, tensor in state.items():
-            _bind_one(inner, fqn, tensor)

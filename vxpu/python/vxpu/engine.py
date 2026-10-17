@@ -316,9 +316,14 @@ class Engine:
             opts = compile_options(self.device)
             if segments.enabled():
                 # cut at the host ops; each dense segment its own compiled
-                # unit (a CUDA graph on CUDA), the host ops eager between
+                # unit (a CUDA graph on CUDA), the host ops eager between.
+                # CUDA graphs are what the split is for, so on CUDA the
+                # segments default to reduce-overhead; VXPU_COMPILE_MODE
+                # still overrides.
+                mode = os.environ.get("VXPU_COMPILE_MODE") or (
+                    "reduce-overhead" if str(self.device).startswith("cuda") else opts.get("mode", "default"))
                 self._decode_split = segments.compile_segments(
-                    self._decode, self.device, opts.get("mode", "default"), opts.get("options"))
+                    self._decode, self.device, mode, opts.get("options"))
                 total, compiled = self._decode_split.vxpu_segments
                 print(f"[vxpu] decode graph split into {total} segments, {compiled} compiled", flush=True)
                 self._decode_run = self._decode_split
@@ -373,8 +378,6 @@ class Engine:
         state = {**state, **{alias: state[canonical]
                              for alias, canonical in self.aliases.items()
                              if canonical in state}}
-        if getattr(self, "_decode_split", None) is not None:
-            segments.bind_state(self._decode_split, state)
         for module in (self._prefill, self._decode):
             for fqn, tensor in state.items():
                 parent, name = (fqn.rsplit(".", 1) if "." in fqn
