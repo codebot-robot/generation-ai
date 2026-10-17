@@ -58,7 +58,11 @@ def functionalize_host_outputs(gm):
     its inputs, so every segment after an expert call ran uncaptured.
     The rewrite is exact: the out-of-place op computes the same values,
     and later readers of the original tensor read the new one, as they
-    would have read the mutated one. Returns the number of nodes rewritten."""
+    would have read the mutated one. That holds only for readers of the
+    tensor itself: a view of it taken before the in-place op would keep
+    the old values. So an output with such a view is left as it is (and
+    reported): the segment that mutates it then runs uncaptured, which
+    costs speed, never correctness. Returns the number of nodes rewritten."""
     order = {n: i for i, n in enumerate(gm.graph.nodes)}
     host = {n for n in gm.graph.nodes if n.op == "call_function" and str(n.target) in HOST_OPS}
     rewritten = 0
@@ -72,6 +76,11 @@ def functionalize_host_outputs(gm):
             continue
         functional = getattr(getattr(torch.ops.aten, packet[:-1]), overload)
         base = node.args[0]
+        early_views = [u for u in base.users if u is not node and order.get(u, -1) < order[node] and _aliases(u)]
+        if early_views:
+            print(f"[vxpu] left {node.name} in place: {base.name} has a view taken before it "
+                  f"({early_views[0].name}); that segment will not be a CUDA graph", flush=True)
+            continue
         with gm.graph.inserting_before(node):
             replacement = gm.graph.call_function(functional, node.args, node.kwargs)
         replacement.meta = dict(node.meta)
@@ -85,6 +94,12 @@ def functionalize_host_outputs(gm):
         gm.graph.lint()
         gm.recompile()
     return rewritten
+
+
+def _aliases(node):
+    """Whether node's result aliases an input (a view), per its schema."""
+    schema = getattr(node.target, "_schema", None) if node.op == "call_function" else None
+    return schema is not None and any(r.alias_info is not None for r in schema.returns)
 
 
 def split_at_host_ops(gm):
@@ -138,16 +153,39 @@ class Split(torch.nn.Module):
         return out.clone() if isinstance(out, torch.Tensor) else out
 
 
+def call_host_ops_directly(sub):
+    """In an eager host-op segment, call each host op's Python
+    implementation instead of going through the dispatcher: the segment
+    is never traced again, and torch.library's custom-op wrapper costs
+    tens of microseconds a call, forty-odd calls a decode step.
+    VXPU_DIRECT_HOST_OPS=0 keeps the dispatcher."""
+    if os.environ.get("VXPU_DIRECT_HOST_OPS", "1").lower() in ("0", "off", "false"):
+        return
+    from . import ops
+    direct = {"vxpu.moe_experts.default": ops.moe_experts._init_fn,
+              "vxpu.engram_rows.default": ops.engram_rows._init_fn}
+    changed = False
+    for node in sub.graph.nodes:
+        if node.op == "call_function" and str(node.target) in direct:
+            node.target = direct[str(node.target)]
+            changed = True
+    if changed:
+        sub.recompile()
+
+
 def compile_segments(gm, device, mode, options=None):
     """The module split at its host ops with every dense segment compiled."""
     split, host = split_at_host_ops(gm)
     compiled = 0
     for name, sub in segments_of(split):
-        if name in host or os.environ.get("VXPU_SPLIT_COMPILE", "1").lower() in ("0", "off", "false"):
+        if name in host:
+            call_host_ops_directly(sub)
+            continue
+        if os.environ.get("VXPU_SPLIT_COMPILE", "1").lower() in ("0", "off", "false"):
             continue  # VXPU_SPLIT_COMPILE=0: the split alone, segments eager (a check of the cut)
         kwargs = {"mode": mode}
         if options:
             kwargs["options"] = options
         setattr(split, name, torch.compile(sub, **kwargs))
         compiled += 1
-    return Split(split, len(host) + compiled, compiled)
+    return Split(split, len(segments_of(split)), compiled)  # every segment, compiled or not
