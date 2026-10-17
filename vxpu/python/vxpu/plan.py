@@ -157,18 +157,26 @@ class Impl:
     when: str                 # human description of when it applies
     applies: object = None    # applies(plan, **ctx) -> bool, beyond the device check
     reference: bool = False   # the reference computation: always applicable, on any device
+    host: bool = False        # runs where its data lives on the host (the expert banks, the n-gram tables)
 
 
 REGISTRY = collections.defaultdict(list)  # op -> [Impl], in preference order
 
 
-def implementation(op, name, devices, numerics, when, applies=None, reference=False):
+def implementation(op, name, devices, numerics, when, applies=None, reference=False, host=False):
     """Register fn as an implementation of op. Registration order is the
-    preference order: the first one that applies is selected."""
+    preference order: the first one that applies is selected. host=True
+    marks an op that runs where its data is (on the host for host-placed
+    banks and tables), whatever the engine's device."""
     def register(fn):
-        REGISTRY[op].append(Impl(op, name, fn, tuple(devices), numerics, when, applies, reference))
+        REGISTRY[op].append(Impl(op, name, fn, tuple(devices), numerics, when, applies, reference, host))
         return fn
     return register
+
+
+def _available(impl, device_type):
+    """Whether impl can run for an engine on device_type."""
+    return impl.reference or device_type in impl.devices or (impl.host and "cpu" in impl.devices)
 
 
 @dataclasses.dataclass
@@ -259,7 +267,7 @@ class Plan:
     # ---- dispatch
 
     def candidates(self, op, device_type):
-        return [impl for impl in REGISTRY[op] if impl.reference or device_type in impl.devices]
+        return [impl for impl in REGISTRY[op] if _available(impl, device_type)]
 
     def select(self, op, device_type, key=None, **ctx):
         """The implementation of op to run for this call: the first
@@ -288,7 +296,7 @@ class Plan:
             table[op] = {
                 "implementations": [
                     {"name": i.name, "devices": list(i.devices), "numerics": i.numerics, "when": i.when,
-                     "on_this_device": i.reference or self.device_type in i.devices}
+                     "on_this_device": _available(i, self.device_type)}
                     for i in REGISTRY[op]],
                 "selected": selections.get(op, []),
             }

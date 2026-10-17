@@ -136,27 +136,27 @@ def _cpu_experts(plan, moe=None, **_):
 # own routings (the reference computation).
 @implementation("vxpu::moe_experts", "cpu-fused", ("cpu",), "rounding",
                 "decode (one token), kernels on, fused experts on: one C++ call per layer",
-                applies=lambda plan, rows=0, **ctx: rows == 1 and plan["fused_experts"] and _cpu_experts(plan, **ctx))
+                applies=lambda plan, rows=0, **ctx: rows == 1 and plan["fused_experts"] and _cpu_experts(plan, **ctx), host=True)
 def _moe_cpu_fused(moe, x, w, i):
     return experts_cpu.forward_batched(moe, x, w, i, fused=True)
 
 
 @implementation("vxpu::moe_experts", "cpu-three-call", ("cpu",), "rounding",
                 "decode (one token), kernels on, fused experts off: three kernel calls with the module's SwiGLU between",
-                applies=lambda plan, rows=0, **ctx: rows == 1 and _cpu_experts(plan, **ctx))
+                applies=lambda plan, rows=0, **ctx: rows == 1 and _cpu_experts(plan, **ctx), host=True)
 def _moe_cpu_three_call(moe, x, w, i):
     return experts_cpu.forward_batched(moe, x, w, i, fused=False)
 
 
 @implementation("vxpu::moe_experts", "cpu-grouped", ("cpu",), "rounding",
                 "prefill (several tokens), kernels on: each expert decoded once, torch's GEMM over its tokens",
-                applies=lambda plan, rows=0, **ctx: rows > 1 and _cpu_experts(plan, **ctx))
+                applies=lambda plan, rows=0, **ctx: rows > 1 and _cpu_experts(plan, **ctx), host=True)
 def _moe_cpu_grouped(moe, x, w, i):
     return experts_cpu.forward_grouped(moe, x, w, i)
 
 
 @implementation("vxpu::moe_experts", "reference", ("cpu", "cuda"), "bit-identical",
-                "the module's own routings (batched for one token, grouped for more)", reference=True)
+                "the module's own routings (batched for one token, grouped for more)", reference=True, host=True)
 def _moe_reference(moe, x, w, i):
     return moe._forward_batched(x, w, i) if x.shape[0] == 1 else moe._forward_grouped(x, w, i)
 
@@ -219,7 +219,7 @@ def engram_rows(indices: torch.Tensor, table: int) -> torch.Tensor:
 
 
 @implementation("vxpu::engram_rows", "host-lookup", ("cpu", "cuda"), "bit-identical",
-                "the module's own lookup, on the table's device (RAM or a memory-mapped file)", reference=True)
+                "the module's own lookup, on the table's device (RAM or a memory-mapped file)", reference=True, host=True)
 def _engram_lookup(embed, indices):
     return embed.lookup(indices)
 
