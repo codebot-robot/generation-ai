@@ -288,6 +288,34 @@ def _(mixes, hc_scale, hc_base, hc_mult, sinkhorn_iters, eps):
 def _(x, weight, scale):
     return x.new_empty(tuple(x.shape[:-1]) + (weight.shape[0],))
 
+@custom_op("vxpu::head_linear", mutates_args=())  # pure tensor work: capturable
+def head_linear(x: torch.Tensor, weight: torch.Tensor) -> torch.Tensor:
+    """The output head: x [..., K] times weight [N, K] transposed, in fp32
+    (the fork's F.linear(x.float(), weight) with its fp32 weight), for a
+    weight held in the checkpoint's bf16. Widening bf16 to fp32 is exact,
+    so the products are the reference's; on a GPU one Triton kernel reads
+    the bf16 bytes and accumulates in fp32 (a different summation order:
+    equal to fp32 rounding), elsewhere torch's fp32 linear over the
+    widened weight, a slice of rows at a time (bit-identical)."""
+    lead = tuple(x.shape[:-1])
+    x2 = x.reshape(-1, x.shape[-1])
+    if x.is_meta:
+        return x.new_empty(lead + (weight.shape[0],), dtype=torch.float32)
+    if x.is_cuda and triton_ops.available() and weight.dtype == torch.bfloat16 and x2.shape[0] <= 8:
+        y = triton_ops.linear_f32(x2, weight)
+    else:
+        xf = x2.float()
+        rows = 1 << 15  # the widened copy is made a slice at a time, not 2.6 GB at once
+        y = torch.cat([torch.nn.functional.linear(xf, weight[r:r + rows].float())
+                       for r in range(0, weight.shape[0], rows)], dim=-1)
+    return y.reshape(lead + (weight.shape[0],))
+
+
+@head_linear.register_fake
+def _(x, weight):
+    return x.new_empty(tuple(x.shape[:-1]) + (weight.shape[0],), dtype=torch.float32)
+
+
 def prepare_compile():
     """Before torch.compile of a graph that calls these ops: the two that do
     host work (the experts on the CPU, the n-gram rows from a file) must

@@ -32,6 +32,7 @@ import contextlib
 import json
 import os
 import sys
+import types
 
 import torch
 
@@ -144,11 +145,37 @@ def _hc_sinkhorn_op(mixes, hc_scale, hc_base, hc_mult=4, sinkhorn_iters=20, eps=
     return torch.ops.vxpu.hc_sinkhorn(mixes, hc_scale, hc_base, hc_mult, sinkhorn_iters, eps)
 
 
+def _head_forward(self, x, full_logits=False):
+    """ParallelHead.forward (single process) with the linear as
+    vxpu::head_linear over the bf16 weight."""
+    if not full_logits:
+        x = x[:, -1]
+    return torch.ops.vxpu.head_linear(x, self.weight)
+
+
+def _set_head(head, on):
+    """The output head traced as vxpu::head_linear with its weight in the
+    checkpoint's bf16 (the fork widens it to fp32 at construction, which
+    the engine would then hold and read at twice the bytes)."""
+    if on and not hasattr(head, "_vxpu_weight"):
+        head._vxpu_weight = head.weight
+        w = head.weight
+        head.weight = torch.nn.Parameter(torch.empty(w.shape, dtype=torch.bfloat16, device=w.device),
+                                         requires_grad=False)
+        head.forward = types.MethodType(_head_forward, head)
+    elif not on and hasattr(head, "_vxpu_weight"):
+        head.weight = head._vxpu_weight
+        del head._vxpu_weight
+        del head.forward
+
+
 def set_external(model, on):
     """Route the expert evaluation and the n-gram lookups of every layer
     through the vxpu ops (see ops.py), or back to the module's own paths.
     The exporter traces with them on, so the graphs carry calls instead of
-    the banks and tables; the engine answers the calls."""
+    the banks and tables; the engine answers the calls. The dense fp8
+    linears, the hyper-connection mixing and the output head become ops
+    too, for their device kernels."""
     from . import ops
     ds = _fork()
     ds.linear_fn = torch.ops.vxpu.fp8_linear if on else None  # every dense fp8 linear
@@ -157,6 +184,8 @@ def set_external(model, on):
     if not hasattr(ds, "_vxpu_hc_split_sinkhorn"):
         ds._vxpu_hc_split_sinkhorn = ds.hc_split_sinkhorn
     ds.hc_split_sinkhorn = _hc_sinkhorn_op if on else ds._vxpu_hc_split_sinkhorn
+    if getattr(ds, "world_size", 1) == 1:
+        _set_head(model.head, on)
     for layer in model.layers:
         layer.ffn.experts_fn = torch.ops.vxpu.moe_experts if on else None
         if layer.engram is not None:
