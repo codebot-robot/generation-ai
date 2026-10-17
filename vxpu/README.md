@@ -101,7 +101,10 @@ transformers' `grouped_mm` routing, decode its `batched_mm` routing; both
 static-shape, both the sparse computation it runs eagerly). Weights stay
 fp8 in memory and are dequantized during compute, so the executor needs
 the checkpoint's size, not the bf16 size, and the same artifact runs on
-a CPU node or a GPU. Nothing is re-quantized: the user's
+a CPU node or a GPU. (One exception trades memory for speed only where
+memory allows: on a GPU, the DeepSeek fork's dense fp8 linears keep a
+bf16 copy of each weight while at least `VXPU_BF16_CACHE_HEADROOM_GB`,
+default 4, stays free; `VXPU_BF16_WEIGHT_CACHE=0` turns that off.) Nothing is re-quantized: the user's
 `from_pretrained(repo)` is the model-maker's checkpoint, bit for bit.
 Upstream transformers has no fp8 path off the GPU (its forward is CUDA
 kernels only), which is why this needs the fork in `third_party/`.

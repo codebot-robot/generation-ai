@@ -31,6 +31,7 @@ cudagraph_unsafe and, for torch.compile, kept out of the compiled graph
 """
 
 import contextlib
+import os
 import threading
 
 import torch
@@ -134,8 +135,9 @@ def fp8_linear(x: torch.Tensor, weight: torch.Tensor, scale: torch.Tensor) -> to
     [N/32, K/32] e8m0 block scales -> [..., N] in x's dtype. The
     activation is quantized per 32-block (the fork's act_quant) as the
     reference does; on the CPU the fused kernel reads the fp8 weight once
-    (one token: a GEMV per row; more: decode once and GEMM), elsewhere
-    the fork's own fp8_gemm."""
+    (one token: a GEMV per row; more: decode once and GEMM); on a GPU a
+    bf16 copy of the weight, made once and kept while memory allows
+    (_bf16_weight); elsewhere the fork's own fp8_gemm."""
     if x.is_meta:
         return x.new_empty(tuple(x.shape[:-1]) + (weight.shape[0],))
     k = kernels.load() if x.device.type == "cpu" else None
@@ -161,7 +163,10 @@ def fp8_linear(x: torch.Tensor, weight: torch.Tensor, scale: torch.Tensor) -> to
 
 def _bf16_weight(weight, scale):
     """weight [N, K] fp8 with [N/32, K/32] e8m0 block scales as bf16 (exact),
-    cached in the active engine's External when there is one."""
+    cached in the active engine's External when there is one and the copy
+    leaves enough device memory free (_may_cache_bf16). A weight that is
+    not cached is dequantized again on its next call: slower, but an
+    engine whose fp8 weights fit always runs."""
     ext = getattr(_active, "external", None)
     key = (weight.untyped_storage().data_ptr(), weight.storage_offset(), tuple(weight.shape))
     if ext is not None and key in ext.bf16:
@@ -169,9 +174,38 @@ def _bf16_weight(weight, scale):
     N, K = weight.shape
     w = (weight.to(torch.bfloat16).view(N // 32, 32, K // 32, 32)
          * scale.to(torch.bfloat16).view(N // 32, 1, K // 32, 1)).view(N, K)
-    if ext is not None:
+    if ext is not None and _may_cache_bf16(ext, w):
         ext.bf16[key] = w
     return w
+
+
+# device memory the bf16 copies must leave free for activations, caches,
+# CUDA graph pools and the compiler's workspace
+BF16_CACHE_HEADROOM_BYTES = int(float(os.environ.get("VXPU_BF16_CACHE_HEADROOM_GB", "4")) * 1e9)
+
+
+def _may_cache_bf16(ext, w):
+    """Whether to keep w (a bf16 copy just made): the copies double the
+    dense weights' footprint, which is the difference between fitting a
+    card and not. VXPU_BF16_WEIGHT_CACHE=0 never keeps them; otherwise a
+    copy is kept while free device memory (the driver's plus torch's
+    reserved-but-unused) stays above the headroom. The first refusal is
+    reported once; later weights keep the per-call path."""
+    if os.environ.get("VXPU_BF16_WEIGHT_CACHE", "1").lower() in ("0", "off", "false"):
+        return False
+    if not w.is_cuda:
+        return True
+    free, _ = torch.cuda.mem_get_info(w.device)
+    free += torch.cuda.memory_reserved(w.device) - torch.cuda.memory_allocated(w.device)
+    if free >= BF16_CACHE_HEADROOM_BYTES:
+        return True
+    if not getattr(ext, "bf16_full", False):
+        ext.bf16_full = True
+        held = sum(t.numel() * t.element_size() for t in ext.bf16.values())
+        print(f"[vxpu] bf16 weight cache stopped at {held / 1e9:.1f} GB ({len(ext.bf16)} weights): less than "
+              f"{BF16_CACHE_HEADROOM_BYTES / 1e9:.1f} GB of device memory would remain; the other fp8 linears "
+              f"dequantize per call", flush=True)
+    return False
 
 
 @fp8_linear.register_fake
