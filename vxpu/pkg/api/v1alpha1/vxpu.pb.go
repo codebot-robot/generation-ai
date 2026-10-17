@@ -405,7 +405,12 @@ type GenerateRequest struct {
 	// Additional ids that end generation, on top of the model's own.
 	EosTokenId []int32 `protobuf:"varint,9,rep,packed,name=eos_token_id,json=eosTokenId,proto3" json:"eos_token_id,omitempty"`
 	// Seed for the executor's sampler; unset means unseeded.
-	Seed          *uint64 `protobuf:"varint,10,opt,name=seed,proto3,oneof" json:"seed,omitempty"`
+	Seed *uint64 `protobuf:"varint,10,opt,name=seed,proto3,oneof" json:"seed,omitempty"`
+	// Return the executor's internal execution telemetry for this call
+	// (segment and host-op timings, expert selections, the plan; JSON in
+	// GenerateResponse.telemetry_json on the final message). For tuning
+	// execution plans; nothing is recorded when unset.
+	Telemetry     *bool `protobuf:"varint,11,opt,name=telemetry,proto3,oneof" json:"telemetry,omitempty"`
 	unknownFields protoimpl.UnknownFields
 	sizeCache     protoimpl.SizeCache
 }
@@ -510,6 +515,13 @@ func (x *GenerateRequest) GetSeed() uint64 {
 	return 0
 }
 
+func (x *GenerateRequest) GetTelemetry() bool {
+	if x != nil && x.Telemetry != nil {
+		return *x.Telemetry
+	}
+	return false
+}
+
 // GenerateResponse streams newly generated ids as they are produced.
 // The final message has done=true and carries the statistics.
 type GenerateResponse struct {
@@ -525,8 +537,11 @@ type GenerateResponse struct {
 	Generated       int32   `protobuf:"varint,6,opt,name=generated,proto3" json:"generated,omitempty"`
 	PrefillMs       float32 `protobuf:"fixed32,7,opt,name=prefill_ms,json=prefillMs,proto3" json:"prefill_ms,omitempty"`
 	MsPerToken      float32 `protobuf:"fixed32,8,opt,name=ms_per_token,json=msPerToken,proto3" json:"ms_per_token,omitempty"`
-	unknownFields   protoimpl.UnknownFields
-	sizeCache       protoimpl.SizeCache
+	// On the final message when the request set telemetry: the executor's
+	// execution telemetry as JSON (format "vxpu-telemetry/1").
+	TelemetryJson string `protobuf:"bytes,9,opt,name=telemetry_json,json=telemetryJson,proto3" json:"telemetry_json,omitempty"`
+	unknownFields protoimpl.UnknownFields
+	sizeCache     protoimpl.SizeCache
 }
 
 func (x *GenerateResponse) Reset() {
@@ -615,6 +630,13 @@ func (x *GenerateResponse) GetMsPerToken() float32 {
 	return 0
 }
 
+func (x *GenerateResponse) GetTelemetryJson() string {
+	if x != nil {
+		return x.TelemetryJson
+	}
+	return ""
+}
+
 var File_proto_vxpu_proto protoreflect.FileDescriptor
 
 const file_proto_vxpu_proto_rawDesc = "" +
@@ -646,7 +668,7 @@ const file_proto_vxpu_proto_rawDesc = "" +
 	"\n" +
 	"prefill_ms\x18\x05 \x01(\x02R\tprefillMs\x12 \n" +
 	"\fms_per_token\x18\x06 \x01(\x02R\n" +
-	"msPerToken\"\xc9\x03\n" +
+	"msPerToken\"\xfa\x03\n" +
 	"\x0fGenerateRequest\x12\x1d\n" +
 	"\n" +
 	"session_id\x18\x01 \x01(\tR\tsessionId\x12\x1b\n" +
@@ -660,7 +682,8 @@ const file_proto_vxpu_proto_rawDesc = "" +
 	"\feos_token_id\x18\t \x03(\x05R\n" +
 	"eosTokenId\x12\x17\n" +
 	"\x04seed\x18\n" +
-	" \x01(\x04H\x06R\x04seed\x88\x01\x01B\x11\n" +
+	" \x01(\x04H\x06R\x04seed\x88\x01\x01\x12!\n" +
+	"\ttelemetry\x18\v \x01(\bH\aR\ttelemetry\x88\x01\x01B\x11\n" +
 	"\x0f_max_new_tokensB\f\n" +
 	"\n" +
 	"_do_sampleB\x0e\n" +
@@ -668,7 +691,9 @@ const file_proto_vxpu_proto_rawDesc = "" +
 	"\x06_top_kB\b\n" +
 	"\x06_top_pB\x15\n" +
 	"\x13_repetition_penaltyB\a\n" +
-	"\x05_seed\"\x97\x02\n" +
+	"\x05_seedB\f\n" +
+	"\n" +
+	"_telemetry\"\xbe\x02\n" +
 	"\x10GenerateResponse\x12\x1b\n" +
 	"\ttoken_ids\x18\x01 \x03(\x05R\btokenIds\x12\x12\n" +
 	"\x04done\x18\x02 \x01(\bR\x04done\x12#\n" +
@@ -679,7 +704,8 @@ const file_proto_vxpu_proto_rawDesc = "" +
 	"\n" +
 	"prefill_ms\x18\a \x01(\x02R\tprefillMs\x12 \n" +
 	"\fms_per_token\x18\b \x01(\x02R\n" +
-	"msPerToken2\xfd\x01\n" +
+	"msPerToken\x12%\n" +
+	"\x0etelemetry_json\x18\t \x01(\tR\rtelemetryJson2\xfd\x01\n" +
 	"\bExecutor\x12>\n" +
 	"\tLoadModel\x12\x16.vxpu.LoadModelRequest\x1a\x17.vxpu.LoadModelResponse\"\x00\x12A\n" +
 	"\n" +

@@ -103,7 +103,7 @@ class Session:
     def generate_ids(self, input_ids, max_new_tokens=None, do_sample=None,
                      temperature=None, top_k=None, top_p=None,
                      repetition_penalty=None, eos_token_id=(), seed=None,
-                     timeout=None):
+                     timeout=None, telemetry=False):
         """transformers' generate() over the wire, streamed.
 
         ``input_ids`` is the complete prompt as a list of ints (the
@@ -111,7 +111,9 @@ class Session:
         time; after the stream ends, ``self.last`` holds the final
         statistics (finish_reason, prefilled_tokens, timings).
         Parameters left as None follow the model's generation_config,
-        exactly as model.generate(input_ids) would.
+        exactly as model.generate(input_ids) would. ``telemetry=True``
+        asks the executor for its execution telemetry, which arrives as
+        ``self.last.telemetry`` (a dict, format vxpu-telemetry/1).
         """
         request = vxpu_pb2.GenerateRequest(
             session_id=self.session_id,
@@ -128,6 +130,8 @@ class Session:
                             ("seed", seed)):
             if value is not None:
                 setattr(request, name, value)
+        if telemetry:
+            request.telemetry = True
         self.last = None
         try:
             for response in self.client.stub.Generate(
@@ -164,6 +168,8 @@ class GenerateStats:
         self.generated = response.generated
         self.prefill_ms = response.prefill_ms
         self.ms_per_token = response.ms_per_token
+        # the executor's execution telemetry, when the request asked for it
+        self.telemetry = json.loads(response.telemetry_json) if response.telemetry_json else None
 
     def __repr__(self):
         return (f"GenerateStats(finish_reason={self.finish_reason!r}, "

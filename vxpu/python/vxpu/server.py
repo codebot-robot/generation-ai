@@ -245,7 +245,8 @@ class ExecutorServicer(vxpu_pb2_grpc.ExecutorServicer):
         try:
             for chunk in engine.generate(
                     request.session_id, list(request.input_ids),
-                    max_new_tokens, params, list(request.eos_token_id)):
+                    max_new_tokens, params, list(request.eos_token_id),
+                    telemetry=request.HasField("telemetry") and request.telemetry):
                 if not context.is_active():
                     return
                 self._touch()  # a long stream is not idle
@@ -257,7 +258,9 @@ class ExecutorServicer(vxpu_pb2_grpc.ExecutorServicer):
                         prefilled_tokens=chunk["prefilled_tokens"],
                         generated=chunk["generated"],
                         prefill_ms=float(chunk["prefill_ms"]),
-                        ms_per_token=float(chunk["ms_per_token"]))
+                        ms_per_token=float(chunk["ms_per_token"]),
+                        telemetry_json=(json.dumps(chunk["telemetry"])
+                                        if chunk.get("telemetry") else ""))
                 else:
                     yield vxpu_pb2.GenerateResponse(
                         token_ids=chunk["token_ids"])

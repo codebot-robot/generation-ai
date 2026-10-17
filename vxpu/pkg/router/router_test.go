@@ -258,21 +258,27 @@ func TestGetOrStartPod_RecreatesMismatchedPod(t *testing.T) {
 // fakeExecutor is an in-process executor that streams a fixed reply.
 type fakeExecutor struct {
 	pb.UnimplementedExecutorServer
-	gotSession string
-	gotIDs     []int32
-	gotTopK    *int32
+	gotSession   string
+	gotIDs       []int32
+	gotTopK      *int32
+	gotTelemetry bool
 }
 
 func (f *fakeExecutor) Generate(req *pb.GenerateRequest, stream grpc.ServerStreamingServer[pb.GenerateResponse]) error {
 	f.gotSession = req.SessionId
 	f.gotIDs = req.InputIds
 	f.gotTopK = req.TopK
+	f.gotTelemetry = req.GetTelemetry()
 	for _, id := range []int32{7, 8, 9} {
 		if err := stream.Send(&pb.GenerateResponse{TokenIds: []int32{id}}); err != nil {
 			return err
 		}
 	}
-	return stream.Send(&pb.GenerateResponse{Done: true, FinishReason: "eos", Generated: 3})
+	final := &pb.GenerateResponse{Done: true, FinishReason: "eos", Generated: 3}
+	if req.GetTelemetry() {
+		final.TelemetryJson = `{"format": "vxpu-telemetry/1"}`
+	}
+	return stream.Send(final)
 }
 
 func TestGenerate_ProxiesStreamToExecutor(t *testing.T) {
@@ -313,9 +319,10 @@ func TestGenerate_ProxiesStreamToExecutor(t *testing.T) {
 		t.Fatal(err)
 	}
 	defer conn.Close()
-	topK, maxNew := int32(5), int32(3)
+	topK, maxNew, telemetry := int32(5), int32(3), true
 	stream, err := pb.NewExecutorClient(conn).Generate(ctx, &pb.GenerateRequest{
 		SessionId: modelKey + ":s3", InputIds: []int32{1, 2, 3}, MaxNewTokens: &maxNew, TopK: &topK,
+		Telemetry: &telemetry,
 	})
 	if err != nil {
 		t.Fatal(err)
@@ -340,6 +347,14 @@ func TestGenerate_ProxiesStreamToExecutor(t *testing.T) {
 	}
 	if done == nil || done.FinishReason != "eos" || done.Generated != 3 {
 		t.Errorf("final message not forwarded: %+v", done)
+	}
+	// execution telemetry rides on the stream: the request's flag reaches
+	// the executor and the final message's JSON reaches the client
+	if !executor.gotTelemetry {
+		t.Errorf("executor should see the telemetry request")
+	}
+	if done == nil || done.TelemetryJson == "" {
+		t.Errorf("telemetry not forwarded on the final message: %+v", done)
 	}
 	if executor.gotSession != "s3" {
 		t.Errorf("executor should see the backend session id, got %q", executor.gotSession)
