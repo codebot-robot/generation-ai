@@ -112,10 +112,17 @@ if triton is not None:
         tl.store(comb_ptr + t * HC * HC + ij, c)
 
 
+def hc_split_sinkhorn_supported(hc_mult):
+    """The kernel's blocks are hc wide, and Triton needs power-of-two block
+    shapes; other widths take the aten path."""
+    return hc_mult > 0 and hc_mult & (hc_mult - 1) == 0
+
+
 def hc_split_sinkhorn(mixes, hc_scale, hc_base, hc_mult, sinkhorn_iters, eps):
     """The fork's hc_split_sinkhorn for CUDA tensors, one kernel per call:
     mixes [..., (2 + hc) * hc] -> pre [..., hc], post [..., hc],
-    comb [..., hc, hc] (fp32), comb made doubly stochastic."""
+    comb [..., hc, hc] (fp32), comb made doubly stochastic. hc must be a
+    power of two (hc_split_sinkhorn_supported)."""
     hc = hc_mult
     lead = mixes.shape[:-1]
     m = mixes.float().reshape(-1, (2 + hc) * hc).contiguous()
@@ -124,6 +131,7 @@ def hc_split_sinkhorn(mixes, hc_scale, hc_base, hc_mult, sinkhorn_iters, eps):
     post = torch.empty(T, hc, dtype=torch.float32, device=mixes.device)
     comb = torch.empty(T, hc, hc, dtype=torch.float32, device=mixes.device)
     if T:
-        _hc_sinkhorn_kernel[(T,)](m, hc_scale.float().contiguous(), hc_base.float().contiguous(),
-                                  pre, post, comb, float(eps), HC=hc, ITERS=sinkhorn_iters)
+        with torch.cuda.device(mixes.device):  # Triton launches on the current device
+            _hc_sinkhorn_kernel[(T,)](m, hc_scale.float().contiguous(), hc_base.float().contiguous(),
+                                      pre, post, comb, float(eps), HC=hc, ITERS=sinkhorn_iters)
     return pre.view(*lead, hc), post.view(*lead, hc), comb.view(*lead, hc, hc)

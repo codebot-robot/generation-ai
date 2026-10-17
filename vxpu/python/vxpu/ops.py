@@ -219,7 +219,7 @@ def hc_sinkhorn(mixes: torch.Tensor, hc_scale: torch.Tensor, hc_base: torch.Tens
     """The fork's hyper-connection mixing (hc_split_sinkhorn): pre, post and
     the doubly stochastic comb from the mixes. One Triton kernel on a GPU;
     the fork's own function everywhere else (so the CPU is bit-identical)."""
-    if mixes.is_cuda and triton_ops.available():
+    if mixes.is_cuda and triton_ops.available() and triton_ops.hc_split_sinkhorn_supported(hc_mult):
         return triton_ops.hc_split_sinkhorn(mixes, hc_scale, hc_base, hc_mult, sinkhorn_iters, eps)
     import kernel_aten as ka
     pre, post, comb = ka.hc_split_sinkhorn(mixes, hc_scale, hc_base, hc_mult, sinkhorn_iters, eps)
