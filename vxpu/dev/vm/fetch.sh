@@ -36,8 +36,8 @@ import json, sys
 manifest, bucket, work = sys.argv[1:]
 m = json.load(open(manifest))
 with open(f"{work}/urls.txt", "w") as f:
-    for sha in m["files"]:
-        f.write(f"gs://{bucket}/_blobs/{sha}\n")
+    for sha, entry in m["files"].items():
+        f.write(f"gs://{bucket}/_blobs/{sha} {entry['size']}\n")
 for sha, entry in m["files"].items():
     entry["source"] = f"file:///mnt/ssd/blobs/{sha}"
 json.dump(m, open(f"{work}/manifest.json", "w"))
@@ -45,14 +45,24 @@ print(f"{len(m['files'])} files, {sum(e['size'] for e in m['files'].values()) / 
 PY
 
 vm_scp "$work/urls.txt" /tmp/vxpu-urls.txt
+# a blob is present when its file has the manifest's size; the copy's
+# failure, or any blob still missing after it, stops the script before
+# the artifact is staged
 vm_ssh 'set -e
-missing=$(while read -r url; do [ -f "/mnt/ssd/blobs/${url##*/}" ] || echo "$url"; done < /tmp/vxpu-urls.txt)
-if [ -n "$missing" ]; then
+missing() { while read -r url size; do f="/mnt/ssd/blobs/${url##*/}"; [ -f "$f" ] && [ "$(stat -c %s "$f")" = "$size" ] || echo "$url"; done < /tmp/vxpu-urls.txt; }
+todo=$(missing)
+if [ -n "$todo" ]; then
   start=$(date +%s)
-  echo "$missing" | gcloud storage cp -I /mnt/ssd/blobs/ 2>&1 | grep -v "^Copying" || true
+  if ! echo "$todo" | gcloud storage cp -I /mnt/ssd/blobs/ > /tmp/vxpu-cp.log 2>&1; then
+    grep -v "^Copying" /tmp/vxpu-cp.log | tail -20 >&2
+    echo "gcloud storage cp failed (log: /tmp/vxpu-cp.log on the VM)" >&2
+    exit 1
+  fi
   echo "fetched in $(( $(date +%s) - start )) s"
 fi
-echo "on local SSD: $(du -sh /mnt/ssd/blobs | cut -f1) in $(ls /mnt/ssd/blobs | wc -l) files"'
+still=$(missing)
+if [ -n "$still" ]; then echo "$(echo "$still" | wc -l) blobs missing or short after the copy, e.g. $(echo "$still" | head -1)" >&2; exit 1; fi
+echo "on local SSD: $(du -sh /mnt/ssd/blobs | cut -f1) in $(ls /mnt/ssd/blobs | wc -l) files, all present"'
 
 for f in binding.json prefill.pt2 decode.pt2; do vm_scp "$ART/$f" "/mnt/ssd/artifact/$f"; done
 vm_scp "$work/manifest.json" /mnt/ssd/artifact/manifest.json

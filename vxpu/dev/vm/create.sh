@@ -16,6 +16,8 @@
 # Create the dev VM in the first zone with capacity: a g4-standard-96
 # (two RTX PRO 6000, 368 GB of RAM) with eight local SSDs, Spot unless
 # ON_DEMAND=1. Writes the zone to $ZONE_FILE for the other scripts.
+# The VM's credentials are read-only storage (SCOPES overrides): the
+# scripts only read the bucket, and the VM loads pickled artifacts.
 
 set -uo pipefail
 . "$(dirname "$0")/common.sh"
@@ -29,10 +31,18 @@ args=(--project "$PROJECT" --machine-type "$MACHINE"
       --accelerator "type=nvidia-rtx-pro-6000,count=$GPUS" --maintenance-policy TERMINATE
       --image-project deeplearning-platform-release --image-family common-cu129-ubuntu-2404-nvidia-580
       --boot-disk-type hyperdisk-balanced --boot-disk-size 300GB
-      --scopes cloud-platform --labels purpose=vxpu-dev)
+      --scopes "${SCOPES:-storage-ro}" --labels purpose=vxpu-dev)
 for _ in $(seq "$LOCAL_SSDS"); do args+=(--local-ssd=interface=NVME); done
 if [ -n "${SERVICE_ACCOUNT:-}" ]; then args+=(--service-account "$SERVICE_ACCOUNT"); fi
 if [ -z "${ON_DEMAND:-}" ]; then args+=(--provisioning-model SPOT --instance-termination-action STOP); fi
+
+# one VM per name: a re-run (or a Spot VM stopped by preemption) must not
+# leave a second billed VM behind in another zone
+existing=$(gcloud compute instances list --project "$PROJECT" --filter="name=$VM" --format="value(zone.basename(),status)")
+if [ -n "$existing" ]; then
+  echo "$VM already exists ($existing): use it (ZONE=... or $ZONE_FILE), delete it with delete.sh, or set VM=..." >&2
+  exit 1
+fi
 
 for z in $ZONES; do
   echo "trying $z"

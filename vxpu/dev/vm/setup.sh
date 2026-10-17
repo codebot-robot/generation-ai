@@ -28,14 +28,27 @@ DEEPSEEK_REPO=$(pin DEEPSEEK_V41_REPO)
 DEEPSEEK_COMMIT=$(pin DEEPSEEK_V41_COMMIT)
 echo "torch $TORCH, transformers $TRANSFORMERS_COMMIT, deepseek_v41 $DEEPSEEK_COMMIT"
 
-# local SSDs as one volume
+# local SSDs as one volume. The members are GCE's local NVMe SSDs by
+# their stable names (never a device-name glob, which can sweep in an
+# attached data disk); an array that survived a reboot is reassembled and
+# mounted, never re-created or reformatted.
 vm_ssh 'set -e
 if ! mountpoint -q /mnt/ssd; then
-  devs=$(ls /dev/nvme*n1 | grep -v nvme0n1)
-  sudo mdadm --create /dev/md0 --level=0 --raid-devices=$(echo $devs | wc -w) $devs --run >/dev/null 2>&1
-  sudo mkfs.ext4 -q -F -E lazy_itable_init=1,lazy_journal_init=1 /dev/md0
+  devs=$(ls /dev/disk/by-id/google-local-nvme-ssd-* 2>/dev/null | grep -v -- "-part" || true)
+  if [ -z "$devs" ]; then echo "no local SSDs under /dev/disk/by-id/google-local-nvme-ssd-*" >&2; exit 1; fi
+  md=$(sudo mdadm --detail --scan 2>/dev/null | awk "{print \$2}" | head -1)
+  first=$(echo $devs | cut -d" " -f1)
+  if [ -z "$md" ] && sudo mdadm --examine "$first" >/dev/null 2>&1; then
+    sudo mdadm --assemble /dev/md0 $devs
+    md=/dev/md0
+  fi
+  if [ -z "$md" ]; then
+    sudo mdadm --create /dev/md0 --level=0 --raid-devices=$(echo $devs | wc -w) $devs --run
+    sudo mkfs.ext4 -q -E lazy_itable_init=1,lazy_journal_init=1 /dev/md0
+    md=/dev/md0
+  fi
   sudo mkdir -p /mnt/ssd
-  sudo mount -o noatime /dev/md0 /mnt/ssd
+  sudo mount -o noatime "$md" /mnt/ssd
   sudo chown "$USER" /mnt/ssd
 fi
 mkdir -p /mnt/ssd/blobs /mnt/ssd/src /mnt/ssd/artifact

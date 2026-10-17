@@ -29,12 +29,18 @@ zone() {
   return 1
 }
 
+# The zone is resolved before gcloud runs: a failing $(zone) inside the
+# gcloud command's arguments would not stop it.
 vm_ssh() {  # vm_ssh 'command'
-  gcloud compute ssh "$VM" --zone "$(zone)" --project "$PROJECT" --quiet --command "$1"
+  local z
+  z=$(zone) || return 1
+  gcloud compute ssh "$VM" --zone "$z" --project "$PROJECT" --quiet --command "$1"
 }
 
 vm_scp() {  # vm_scp LOCAL REMOTE
-  gcloud compute scp "$1" "$VM:$2" --zone "$(zone)" --project "$PROJECT" --quiet
+  local z
+  z=$(zone) || return 1
+  gcloud compute scp "$1" "$VM:$2" --zone "$z" --project "$PROJECT" --quiet
 }
 
 # The executor image's pins, so the VM runs what the cluster runs.

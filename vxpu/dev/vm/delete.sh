@@ -18,6 +18,7 @@
 set -euo pipefail
 . "$(dirname "$0")/common.sh"
 
-gcloud compute instances delete "$VM" --zone "$(zone)" --project "$PROJECT" --quiet
+z=$(zone)
+gcloud compute instances delete "$VM" --zone "$z" --project "$PROJECT" --quiet
 rm -f "$ZONE_FILE"
 echo "deleted $VM"

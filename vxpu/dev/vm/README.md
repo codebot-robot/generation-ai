@@ -48,7 +48,14 @@ defaults.
   set): `gcloud storage buckets add-iam-policy-binding gs://BUCKET
   --member=serviceAccount:SA --role=roles/storage.objectViewer`.
 - Local SSD contents are lost when the VM stops (and when Spot
-  preempts it); `fetch.sh` again takes minutes.
+  preempts it): after a restart run `setup.sh` (it rebuilds the volume
+  and the environment) and then `fetch.sh` (minutes from a bucket in the
+  same region). A plain reboot keeps the SSDs; `setup.sh` reassembles
+  the array without reformatting it.
+- `create.sh` refuses to run when a VM named `$VM` already exists in any
+  zone, so a re-run cannot leave a second billed VM behind.
+- The VM runs with read-only storage scope (`SCOPES` overrides): the
+  scripts only read the bucket, and the VM loads pickled artifacts.
 - The environment follows the executor image: torch and the forks of
   transformers and the DeepSeek reference code at the commits
   `vxpu/images/executor/Dockerfile` pins, from the checkout the scripts
