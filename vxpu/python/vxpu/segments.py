@@ -58,7 +58,11 @@ def functionalize_host_outputs(gm):
     its inputs, so every segment after an expert call ran uncaptured.
     The rewrite is exact: the out-of-place op computes the same values,
     and later readers of the original tensor read the new one, as they
-    would have read the mutated one. Returns the number of nodes rewritten."""
+    would have read the mutated one. That holds only for readers of the
+    tensor itself: a view of it taken before the in-place op would keep
+    the old values. So an output with such a view is left as it is (and
+    reported): the segment that mutates it then runs uncaptured, which
+    costs speed, never correctness. Returns the number of nodes rewritten."""
     order = {n: i for i, n in enumerate(gm.graph.nodes)}
     host = {n for n in gm.graph.nodes if n.op == "call_function" and str(n.target) in HOST_OPS}
     rewritten = 0
@@ -72,6 +76,11 @@ def functionalize_host_outputs(gm):
             continue
         functional = getattr(getattr(torch.ops.aten, packet[:-1]), overload)
         base = node.args[0]
+        early_views = [u for u in base.users if u is not node and order.get(u, -1) < order[node] and _aliases(u)]
+        if early_views:
+            print(f"[vxpu] left {node.name} in place: {base.name} has a view taken before it "
+                  f"({early_views[0].name}); that segment will not be a CUDA graph", flush=True)
+            continue
         with gm.graph.inserting_before(node):
             replacement = gm.graph.call_function(functional, node.args, node.kwargs)
         replacement.meta = dict(node.meta)
@@ -85,6 +94,12 @@ def functionalize_host_outputs(gm):
         gm.graph.lint()
         gm.recompile()
     return rewritten
+
+
+def _aliases(node):
+    """Whether node's result aliases an input (a view), per its schema."""
+    schema = getattr(node.target, "_schema", None) if node.op == "call_function" else None
+    return schema is not None and any(r.alias_info is not None for r in schema.returns)
 
 
 def split_at_host_ops(gm):
@@ -173,4 +188,4 @@ def compile_segments(gm, device, mode, options=None):
             kwargs["options"] = options
         setattr(split, name, torch.compile(sub, **kwargs))
         compiled += 1
-    return Split(split, len(host) + compiled, compiled)
+    return Split(split, len(segments_of(split)), compiled)  # every segment, compiled or not
