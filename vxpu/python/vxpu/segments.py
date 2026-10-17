@@ -36,17 +36,12 @@ that one state bound and copies sessions in and out of it (Engine._bind)
 rather than re-pointing the graph.
 """
 
-import os
 
 import torch
 from torch.fx.passes.split_module import split_module
 
 HOST_OPS = ("vxpu.moe_experts.default", "vxpu.engram_rows.default")
 
-
-def enabled():
-    v = os.environ.get("VXPU_SPLIT_DECODE", "1").lower()
-    return v not in ("0", "off", "false")
 
 
 def functionalize_host_outputs(gm):
@@ -157,10 +152,8 @@ def call_host_ops_directly(sub):
     """In an eager host-op segment, call each host op's Python
     implementation instead of going through the dispatcher: the segment
     is never traced again, and torch.library's custom-op wrapper costs
-    tens of microseconds a call, forty-odd calls a decode step.
-    VXPU_DIRECT_HOST_OPS=0 keeps the dispatcher."""
-    if os.environ.get("VXPU_DIRECT_HOST_OPS", "1").lower() in ("0", "off", "false"):
-        return
+    tens of microseconds a call, forty-odd calls a decode step (the
+    plan's direct_host_ops; VXPU_DIRECT_HOST_OPS=0 keeps the dispatcher)."""
     from . import ops
     direct = {"vxpu.moe_experts.default": ops.moe_experts._init_fn,
               "vxpu.engram_rows.default": ops.engram_rows._init_fn}
@@ -173,16 +166,21 @@ def call_host_ops_directly(sub):
         sub.recompile()
 
 
-def compile_segments(gm, device, mode, options=None):
-    """The module split at its host ops with every dense segment compiled."""
+def compile_segments(gm, device, mode, options=None, split_compile=True, direct=True):
+    """The module split at its host ops with every dense segment compiled
+    (split_compile=False: the split alone, segments eager, a check of the
+    cut) and the host-op segments calling their implementations directly
+    (direct=False: through torch's dispatcher). The engine passes its
+    plan's choices."""
     split, host = split_at_host_ops(gm)
     compiled = 0
     for name, sub in segments_of(split):
         if name in host:
-            call_host_ops_directly(sub)
+            if direct:
+                call_host_ops_directly(sub)
             continue
-        if os.environ.get("VXPU_SPLIT_COMPILE", "1").lower() in ("0", "off", "false"):
-            continue  # VXPU_SPLIT_COMPILE=0: the split alone, segments eager (a check of the cut)
+        if not split_compile:
+            continue
         kwargs = {"mode": mode}
         if options:
             kwargs["options"] = options

@@ -54,7 +54,8 @@ def load():
     with _lock:
         if _module is not None or _error is not None:
             return _module
-        if os.environ.get("VXPU_KERNELS", "").lower() in ("0", "off", "false", "aten"):
+        from .plan import env_flag
+        if not env_flag("VXPU_KERNELS", True, extra_false=("aten",))[0]:
             _error = "disabled by VXPU_KERNELS"
             return None
         try:

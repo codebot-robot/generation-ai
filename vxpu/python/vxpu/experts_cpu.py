@@ -29,7 +29,6 @@ Only fp4 banks with e8m0 scales are handled here; a module whose banks
 are something else keeps its own paths.
 """
 
-import os
 
 import torch
 
@@ -43,14 +42,15 @@ def applicable(moe):
             and moe.w1_scale is not None and moe.w1_scale.dtype == torch.float8_e8m0fnu)
 
 
-def forward_batched(moe, x_in, weights, indices):
+def forward_batched(moe, x_in, weights, indices, fused=True):
     """Decode routing on the kernels; mirrors MoE._forward_batched.
 
     One C++ call (fp4_moe_decode) runs the whole step, the fork's _ffn
-    included, when the extension has it; VXPU_FUSED_EXPERTS=0 keeps the
-    three kernel calls with the module's own _ffn between them."""
+    included, when the extension has it; fused=False (the plan's
+    fused_experts choice, VXPU_FUSED_EXPERTS=0) keeps the three kernel
+    calls with the module's own _ffn between them."""
     k = kernels.load()
-    if hasattr(k, "fp4_moe_decode") and os.environ.get("VXPU_FUSED_EXPERTS", "1").lower() not in ("0", "off", "false"):
+    if fused and hasattr(k, "fp4_moe_decode"):
         sel = (indices - moe.experts_start_idx).to(torch.int64)
         return k.fp4_moe_decode(x_in.contiguous(), weights.float().contiguous(), sel.contiguous(),
                                 moe.w1, moe.w1_scale, moe.w3, moe.w3_scale, moe.w2, moe.w2_scale,
