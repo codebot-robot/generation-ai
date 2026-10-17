@@ -39,6 +39,13 @@ DeepSeek-V4.1-Flash). linear_f32 reads the bf16 weight and accumulates
 in fp32: the same products (bf16 to fp32 is exact), summed in a
 different order, so it matches to fp32 rounding.
 
+The dense fp8 linears of a decode step are matrix-vector products, so
+their cost is the weight bytes read. fp8_gemv reads the fp8 weight and
+its e8m0 32x32 block scales directly (half the bytes of a bf16 copy),
+scales in registers and accumulates in fp32. With group_rows it is
+block-diagonal: groups of rows each read their own slice of x (the
+fork's grouped output projection, wo_a).
+
 ``available()`` is False without Triton or a GPU; callers keep the aten
 path then.
 """
@@ -175,3 +182,61 @@ def linear_f32(x, weight, block_n=16, block_k=512):
         with torch.cuda.device(x.device):  # Triton launches on the current device
             _linear_f32_kernel[(triton.cdiv(N, block_n), M)](x, weight.contiguous(), y, N, K, BN=block_n, BK=block_k)
     return y
+
+
+if triton is not None:
+    @triton.jit
+    def _fp8_gemv_kernel(x_ptr, w_ptr, s_ptr, y_ptr, N, K, XS, R, KS,
+                         BN: tl.constexpr, BK: tl.constexpr):
+        pid = tl.program_id(0)
+        m = tl.program_id(1)
+        rows = pid * BN + tl.arange(0, BN)
+        live = rows < N
+        g = (pid * BN) // R  # BN divides R: one group per program
+        xb = x_ptr + m * XS + g * K
+        acc = tl.zeros((BN, BK), dtype=tl.float32)
+        for k0 in range(0, K, BK):
+            ks = k0 + tl.arange(0, BK)
+            kin = ks < K
+            w = tl.load(w_ptr + rows[:, None] * K + ks[None, :], mask=live[:, None] & kin[None, :], other=0.0)
+            kb = k0 // 32 + tl.arange(0, BK // 32)
+            e = tl.load(s_ptr + (rows // 32)[:, None] * KS + kb[None, :],
+                        mask=live[:, None] & (kb < KS)[None, :], other=127).to(tl.int32)
+            # e8m0: 2^(e-127) from the exponent bits; e = 0 is 2^-127, below fp32's normal range
+            sc = tl.where(e == 0, 5.877471754111438e-39, (e << 23).to(tl.float32, bitcast=True))
+            w = tl.reshape(tl.reshape(w.to(tl.float32), (BN, BK // 32, 32)) * sc[:, :, None], (BN, BK))
+            x = tl.load(xb + ks, mask=kin, other=0.0).to(tl.float32)
+            acc += w * x[None, :]
+        tl.store(y_ptr + m * N + rows, tl.sum(acc, axis=1), mask=live)
+
+
+def _gemv_blocks(K):
+    """Block shape for fp8_gemv: 8 rows per program and the widest K step
+    that divides K, measured best or within 3% of best for every
+    DeepSeek-V4.1-Flash dense shape (inside a CUDA graph, cache-cold
+    weights); a 1024 step lost at K = 8192."""
+    for bk in (1024, 512, 256, 128):
+        if K % bk == 0 and not (bk == 1024 and K >= 8192):
+            return 8, bk
+    return 8, 32
+
+
+def fp8_gemv(x, weight, scale, group_rows=None, out_dtype=torch.bfloat16, block_n=None, block_k=None):
+    """x [M, G*K] times weight [N, K] (fp8 e4m3 with [N/32, K/32] e8m0
+    block scales) transposed -> [M, N] in out_dtype, fp32 accumulation.
+    With group_rows R, rows n read x[:, g*K:(g+1)*K] for g = n // R (a
+    block-diagonal weight, G = N / R groups); otherwise G = 1. For the
+    few rows of a decode step: each row of x reads the whole weight."""
+    M = x.shape[0]
+    N, K = weight.shape
+    R = group_rows or N
+    if block_n is None or block_k is None:
+        block_n, block_k = _gemv_blocks(K)
+    if N % R or R % block_n or x.shape[1] != (N // R) * K or K % 32 or block_k % 32:
+        raise ValueError(f"fp8_gemv: x {tuple(x.shape)}, weight {tuple(weight.shape)}, group_rows {group_rows}")
+    y = torch.empty(M, N, dtype=torch.float32, device=x.device)
+    if M and N:
+        _fp8_gemv_kernel[(triton.cdiv(N, block_n), M)](
+            x.contiguous(), weight.contiguous(), scale.contiguous().view(torch.uint8), y, N, K,
+            x.shape[1], R, scale.shape[1], BN=block_n, BK=block_k)
+    return y.to(out_dtype)
