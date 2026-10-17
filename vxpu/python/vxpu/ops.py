@@ -55,8 +55,8 @@ class External:
         # by the weight's storage address (see fp8_linear): engine-owned so
         # the copies go with the engine, and shared by its two graphs
         self.bf16 = {}
-        # pinned host buffers for the expert op's device crossings (see
-        # _ExpertCrossing), reused call to call
+        # pinned host buffers for the expert op's device crossings in decode
+        # (see _to_host and _to_device), reused call to call
         self.pinned = {}
 
 
@@ -100,7 +100,10 @@ def moe_experts(x_in: torch.Tensor, weights: torch.Tensor, indices: torch.Tensor
         return x_in.new_empty((x_in.shape[0], x_in.shape[1]), dtype=torch.float32)
     moe = _current("experts", layer)
     host = moe.w1.device
-    crossing = x_in.device.type == "cuda" and host.type == "cpu"
+    # decode-sized inputs cross through the engine's pinned buffers; a
+    # prefill keeps plain copies (its crossing is noise against its compute,
+    # and pinned buffers sized for the longest prompt would stay pinned)
+    crossing = x_in.device.type == "cuda" and host.type == "cpu" and x_in.shape[0] <= PINNED_MAX_ROWS
     if crossing:
         x, w, i = _to_host(x_in, weights, indices)
     else:
@@ -115,11 +118,15 @@ def moe_experts(x_in: torch.Tensor, weights: torch.Tensor, indices: torch.Tensor
     return _to_device(y, x_in.device) if crossing else y.to(x_in.device)
 
 
+# inputs of up to this many token rows cross through pinned buffers
+PINNED_MAX_ROWS = 8
+
+
 def _pinned(name, like):
     """A pinned host tensor shaped and typed like `like`, kept by the bound
-    engine and reused call to call (regrown when a call needs more)."""
-    table = getattr(_active, "external", None)
-    table = table.pinned if table is not None else {}
+    engine (the op has already required one) and reused call to call;
+    regrown when a call needs more, at most PINNED_MAX_ROWS rows."""
+    table = _active.external.pinned
     nbytes = like.numel() * like.element_size()
     buf = table.get(name)
     if buf is None or buf.numel() < nbytes:
