@@ -80,9 +80,9 @@ TOKENIZER_FILES = ("tokenizer.json", "tokenizer_config.json",
 
 def external_files_dir(external_dir, manifest):
     """Where an artifact's memory-mapped external tensors live under the
-    plan's external_dir (None: none). The files are keyed by the model's
-    manifest, so two artifacts of one checkpoint share them and another
-    checkpoint cannot. The engine and a node server use the same."""
+    plan's external_dir (None: none). The engine and a node server use
+    the same. The files are keyed by the model's manifest, so two
+    artifacts of one checkpoint share them and another checkpoint cannot."""
     if not external_dir:
         return None
     return os.path.join(external_dir, hashlib.sha256(json.dumps(
@@ -258,11 +258,11 @@ class Engine:
         # in place), so a session costs cache memory, not a weight copy.
         self.shared = {}
         self.bytes_fetched = 0
+        self.external_bytes_fetched = 0
         self._timing_bound = 0.0
         self._timing_banks = 0.0
         self._timing_stacked = 0.0
         self._timing_graph = 0.0
-
         # What the graphs call out for (ops.py), owned here: it is freed
         # with the engine and seen by the ops only while this engine runs
         # a graph (external_scope).
@@ -476,6 +476,7 @@ class Engine:
             layers=local_experts, stop_event=stop_event)
         with self._lock:
             self.bytes_fetched += downloaded
+            self.external_bytes_fetched += downloaded
         if stop_event is not None and stop_event.is_set():
             return None, None
 
@@ -489,11 +490,13 @@ class Engine:
             weight, downloaded = fetch_tensor(self.manifest["tensors"][spec["weight"]], self.manifest["files"], cas_dir, mmap_dir=mm)
             with self._lock:
                 self.bytes_fetched += downloaded
+                self.external_bytes_fetched += downloaded
             if stop_event is not None and stop_event.is_set():
                 return None, None
             scale, downloaded = fetch_tensor(self.manifest["tensors"][spec["scale"]], self.manifest["files"], cas_dir, mmap_dir=mm)
             with self._lock:
                 self.bytes_fetched += downloaded
+                self.external_bytes_fetched += downloaded
             if mm:  # memory-mapped, read row by row at random: no readahead (#364)
                 advise_random(weight)
                 advise_random(scale)
