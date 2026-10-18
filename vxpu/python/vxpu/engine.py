@@ -267,19 +267,25 @@ class Engine:
             ops.ENGRAM_DIM[int(layer)] = spec["dim"]
 
     def _place_hot_experts(self, path):
-        """Hold the placement's hot experts on the GPU (experts_gpu.py)."""
+        """Hold the placement's hot experts on the GPUs (experts_gpu.py)."""
         from . import experts_gpu
-        placement = experts_gpu.load_placement(path)
-        count = held = 0
+        gpus = experts_gpu.load_placement(path)
+        devices = experts_gpu.devices_for(self.device)
+        if len(gpus) > len(devices):
+            raise ValueError(f"placement {path} names {len(gpus)} GPUs; {len(devices)} are visible")
         for layer, moe in self.external.experts.items():
-            ids = placement.get(layer)
-            if ids:
-                moe._vxpu_hot = experts_gpu.HotExperts(moe, ids, self.device)
-                count += moe._vxpu_hot.count
-                held += moe._vxpu_hot.bytes
+            by_device = [(dev, gpu.get(layer)) for dev, gpu in zip(devices, gpus)]
+            if any(ids for _, ids in by_device):
+                moe._vxpu_hot = experts_gpu.Residency(moe, by_device)
+        placed = [m._vxpu_hot for m in self.external.experts.values() if getattr(m, "_vxpu_hot", None)]
         total = sum(m.n_local_experts for m in self.external.experts.values())
-        msg = (f"hot experts on {self.device}: {count} of {total} ({held / 1e9:.1f} GB), "
-               f"in {sum(1 for m in self.external.experts.values() if getattr(m, '_vxpu_hot', None))} layers")
+        per_device = []
+        for dev in devices:
+            pools = [p for r in placed for p in r.pools if p.device == dev]
+            if pools:
+                per_device.append(f"{dev} {sum(p.count for p in pools)} ({sum(p.bytes for p in pools) / 1e9:.1f} GB)")
+        msg = (f"hot experts on {', '.join(per_device)}: {sum(r.count for r in placed)} of {total}, "
+               f"in {len(placed)} layers")
         print(f"[vxpu] {msg}", flush=True)
         self.plan.note(msg)
 

@@ -1041,9 +1041,9 @@ def _check_chat_telemetry(artifact):
 def _check_gpu_experts(model, prompts, settings, artifact, workdir):
     """On a GPU: the hot experts' kernels (triton_ops.fp4_experts_decode)
     against the module's own arithmetic on random fp4 banks, then the tiny
-    DeepSeek with half of every layer's experts placed on the GPU
-    (experts_gpu.py) against the same model computing them all on the
-    CPU (a different summation order: the rounding class, so a near tie
+    DeepSeek with half of every layer's experts placed on the GPUs (split
+    between two where there are two; experts_gpu.py) against the same
+    model computing them all on the CPU (a different summation order: the rounding class, so a near tie
     may flip). Skipped without CUDA and Triton."""
     import torch
     from . import triton_ops
@@ -1087,7 +1087,12 @@ def _check_gpu_experts(model, prompts, settings, artifact, workdir):
         print("gpu experts check: the model places no experts externally; kernels checked only")
         return True
     n = len(next(iter(next(iter(experts.values())).values()))["parts"])
-    placement = {"format": "vxpu-placement/1", "layers": {layer: list(range(0, n, 2)) for layer in experts}}
+    # half of every layer's experts on the GPUs: with two, alternating
+    # between them, so every layer has pools on both
+    gpus = min(torch.cuda.device_count(), 2)
+    held = list(range(0, n, 2))
+    placement = {"format": "vxpu-placement/2",
+                 "gpus": [{"layers": {layer: held[g::gpus] for layer in experts}} for g in range(gpus)]}
     path = os.path.join(workdir, "placement.json")
     with open(path, "w") as f:
         json.dump(placement, f)
@@ -1109,7 +1114,7 @@ def _check_gpu_experts(model, prompts, settings, artifact, workdir):
         print("gpu experts check: the hot experts' implementation never ran")
         return False
     rows, ok = compare(runs["cpu"], runs["gpu"], strict_tokens=True)
-    print(f"hot experts on the GPU (kernels relative error {rel:.2g}) against all on the CPU:")
+    print(f"hot experts on {gpus} GPU(s) (kernels relative error {rel:.2g}) against all on the CPU:")
     print(table(runs["cpu"], runs["gpu"], rows))
     return ok
 
