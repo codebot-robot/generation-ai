@@ -173,7 +173,8 @@ doesn't understand: `VXPU_KERNELS`, `VXPU_FUSED_EXPERTS`,
 `VXPU_SEGMENT_RUNTIME`, `VXPU_EXPERTS_IN_RAM`, `VXPU_BF16_WEIGHT_CACHE`,
 `VXPU_BF16_CACHE_HEADROOM_GB`; and `VXPU_EXTERNAL_DIR` and `VXPU_AOTI_CACHE_DIR`,
 paths, taken as given. Choosing between plans by cost, and
-deployment hints, come next (#316, #332).
+deployment hints, come next (#316, #332, #349). `python -m vxpu.hardware [--machine NAME] [--json]`
+inspects the machine catalog and current probed hardware.
 
 ## Models by name
 
