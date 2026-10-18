@@ -298,8 +298,9 @@ def record_deepseek_eager(model, revision, prompts, settings):
 
 
 def record_vxpu_engine(model, revision, prompts, settings, artifact, device="cpu",
-                       compile_decode=False):
-    """Candidate: the executor's engine in this process (no cluster)."""
+                       compile_decode=False, telemetry=False):
+    """Candidate: the executor's engine in this process (no cluster).
+    telemetry=True keeps each prompt's execution telemetry with it."""
     import torch
     from .engine import Engine, SamplingParams
     tok = _tokenizer(model, revision, prompts)
@@ -317,7 +318,7 @@ def record_vxpu_engine(model, revision, prompts, settings, artifact, device="cpu
         new, stats = [], None
         for event in engine.generate(sid, ids, settings["new_tokens"],
                                      SamplingParams(do_sample=False),
-                                     logits_sink=sink):
+                                     logits_sink=sink, telemetry=telemetry):
             new.extend(event.get("token_ids", []))
             if event.get("done"):
                 stats = event
@@ -325,7 +326,8 @@ def record_vxpu_engine(model, revision, prompts, settings, artifact, device="cpu
                     "finish": stats.get("finish_reason") if stats else None,
                     "top_logits": top,
                     "prefill_ms": stats.get("prefill_ms") if stats else None,
-                    "ms_per_token": _r(stats.get("ms_per_token")) if stats else None})
+                    "ms_per_token": _r(stats.get("ms_per_token")) if stats else None,
+                    **({"telemetry": stats.get("telemetry")} if telemetry and stats else {})})
         _progress(prompt, new, stats.get("ms_per_token") if stats else None)
     with open(os.path.join(artifact, "binding.json")) as f:
         binding = json.load(f)
@@ -340,14 +342,16 @@ def record_vxpu_engine(model, revision, prompts, settings, artifact, device="cpu
 
 
 
-def record_vxpu_router(model, revision, prompts, settings, artifact, router=None):
+def record_vxpu_router(model, revision, prompts, settings, artifact, router=None, telemetry=False):
     """Candidate: an executor reached through a router (tokens only;
-    the wire carries no logits)."""
+    the wire carries no logits). telemetry=True keeps each prompt's
+    execution telemetry, which rides back on the Generate stream."""
     from .modeling import VxpuModelForCausalLM
     tok = _tokenizer(model, revision, prompts)
     lm = VxpuModelForCausalLM.from_pretrained(
         model, router=router, artifact_dir=artifact, revision=revision,
         progress=lambda *a: None)
+    lm.collect_telemetry = telemetry
     out = []
     try:
         for prompt in _prompt_set(tok, prompts):
@@ -363,7 +367,8 @@ def record_vxpu_router(model, revision, prompts, settings, artifact, router=None
                         "finish": getattr(stats, "finish_reason", None),
                         "top_logits": [],
                         "prefill_ms": getattr(stats, "prefill_ms", None),
-                        "ms_per_token": _r(getattr(stats, "ms_per_token", None))})
+                        "ms_per_token": _r(getattr(stats, "ms_per_token", None)),
+                        **({"telemetry": getattr(stats, "telemetry", None)} if telemetry else {})})
             _progress(prompt, new, getattr(stats, "ms_per_token", None))
     finally:
         lm.close()
@@ -644,7 +649,7 @@ def cmd_record(args):
     elif args.producer == "vxpu-engine":
         doc = record_vxpu_engine(args.model, args.revision, args.prompts, settings,
                                  args.artifact, device=args.device,
-                                 compile_decode=args.compile)
+                                 compile_decode=args.compile, telemetry=args.telemetry)
     elif args.producer == "deepseek-eager":
         doc = record_deepseek_eager(args.model, args.revision, args.prompts, settings)
     elif args.producer == "vllm":
@@ -654,7 +659,7 @@ def cmd_record(args):
                           enforce_eager=args.enforce_eager)
     else:
         doc = record_vxpu_router(args.model, args.revision, args.prompts, settings,
-                                 args.artifact, router=args.router)
+                                 args.artifact, router=args.router, telemetry=args.telemetry)
     with open(args.out, "w") as f:
         json.dump(doc, f, indent=1)
     print(f"{args.out}: {len(doc['prompts'])} prompts by {doc['producer']['kind']}")
@@ -789,6 +794,8 @@ def main(argv=None):
     rec.add_argument("--device", default="cpu", help="transformers / vxpu-engine producers (vllm places itself)")
     rec.add_argument("--dtype", default="auto", help="transformers / vllm model dtype (auto: the config's)")
     rec.add_argument("--compile", action="store_true", help="vxpu-engine: torch.compile the decode graph")
+    rec.add_argument("--telemetry", action="store_true",
+                     help="vxpu-engine / vxpu-router: keep each prompt's execution telemetry (vxpu-telemetry/1)")
     rec.add_argument("--dequantize", action="store_true",
                      help="transformers producer: expand an fp8 checkpoint to bf16 at load")
     rec.add_argument("--max-model-len", type=int, default=None, help="vllm: context length to allocate for")

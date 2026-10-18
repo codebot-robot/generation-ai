@@ -74,7 +74,7 @@ class Recorder:
     def begin_step(self):
         if self.cuda:
             e = torch.cuda.Event(enable_timing=True)
-            e.record()
+            e.record(torch.cuda.current_stream(self.device))  # the engine's device, not the process's current one
             self._step = [e]
         else:
             self._t = time.perf_counter()
@@ -83,7 +83,7 @@ class Recorder:
     def after_segment(self, index):
         if self.cuda:
             e = torch.cuda.Event(enable_timing=True)
-            e.record()
+            e.record(torch.cuda.current_stream(self.device))  # the engine's device, not the process's current one
             self._step.append(e)
         else:
             now = time.perf_counter()
