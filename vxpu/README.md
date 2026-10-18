@@ -175,6 +175,40 @@ doesn't understand: `VXPU_KERNELS`, `VXPU_FUSED_EXPERTS`,
 paths, taken as given. Choosing between plans by cost, and
 deployment hints, come next (#316, #332).
 
+## Models by name
+
+With modelstore deployed, the engine takes a model *name*: it imports
+the weights, compiles the model for its executors, and serves it to any
+gRPC client (Go here; the `vxpu` CLI is one).
+
+```sh
+vxpu register deepseek-ai/DeepSeek-V4.1-Flash           # import + compile, once per commit and executor image
+vxpu ask --model deepseek-ai/DeepSeek-V4.1-Flash "Is the sky blue?"
+```
+
+`RegisterModel` imports the repository into modelstore, then runs a
+compile Job: the executor image's `python -m vxpu.compile`, which
+exports the artifact reading the model through modelstore's Hub API
+(config and safetensors headers only, never the weights) and pushes it
+to modelstore as `vxpu-artifacts/<model>`, tagged with the commit and
+the executor image. The artifact is exported by exactly the torch and
+forks the executors run, on a CPU node. The tag is the catalog entry: a
+model is registered for this engine when the tag exists, so the catalog
+lives in modelstore, not in the router. `NewSession` with a model name
+fetches the artifact from modelstore and loads it the first time
+(`FAILED_PRECONDITION` while it loads, so clients retry); later
+sessions reuse it. Models are any whose architecture the exporter and
+the forks support.
+
+Executors for models served by name can run outside Kubernetes, on
+machines launched for the purpose (a GPU VM from `gcloud`, a Mac)
+running `python -m vxpu.server`: start the router with their addresses,
+`vxpu up --external-executor 10.128.0.5:50051[,...]`. The router dials
+them (on GKE's VPC-native networking a pod reaches a VM's internal IP);
+it places a model on the executor already holding it, else an idle one,
+and reloads a model an executor evicted. Kubernetes keeps the bursty,
+CPU-only work: compile jobs, modelstore, the router.
+
 ## Weights: the store
 
 Weights are pulled from the Hub once and kept in the cluster's weight
