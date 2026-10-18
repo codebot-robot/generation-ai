@@ -43,7 +43,7 @@ def _complete(path, size):
     return os.path.exists(path) and os.path.getsize(path) == size
 
 
-def localize(files, blob_dir, bucket=None, log=print):
+def localize(files, blob_dir, bucket=None, log=lambda msg: print(msg, flush=True)):
     """files is a manifest's {sha256: {"size", "name", "source"}}. Returns
     a copy whose sources are file:// paths under blob_dir for every file
     held locally (after copying the missing ones from bucket, if given),
@@ -84,3 +84,29 @@ def localize(files, blob_dir, bucket=None, log=print):
     if copied:
         log(f"[vxpu] copied {copied} files ({copied_bytes / 1e9:.1f} GB) in {summary['seconds']} s")
     return out, summary
+
+
+def release(files, blob_dir):
+    """Ask the kernel to drop the page cache of the local blob files once
+    the engine has loaded from them: their bytes now live in RAM (the
+    expert banks), on the GPU or in the external tables' own files, so
+    cached blob pages only push out what the engine reads every token
+    (the memory-mapped n-gram tables). Measured on the hero run's VM
+    (380 GB RAM, the experts in RAM): with the 510 GB of blob pages
+    cached after a fresh copy and load, the n-gram lookups took ~90 ms a
+    decode step instead of ~0.5."""
+    released = 0
+    for sha in files:
+        path = os.path.join(blob_dir, sha)
+        try:
+            fd = os.open(path, os.O_RDONLY)
+        except OSError:
+            continue
+        try:
+            os.posix_fadvise(fd, 0, 0, os.POSIX_FADV_DONTNEED)
+            released += 1
+        except (OSError, AttributeError):  # no posix_fadvise (macOS): nothing to release
+            pass
+        finally:
+            os.close(fd)
+    return released
