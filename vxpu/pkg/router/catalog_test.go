@@ -16,6 +16,8 @@ package router
 
 import (
 	"context"
+	"encoding/json"
+	"io"
 	"net"
 	"net/http"
 	"net/http/httptest"
@@ -45,12 +47,63 @@ var testManifest = `{"format":"vxpu-manifest/v1alpha1","source":{"repo":"org/M",
 
 // fakeModelstore serves the routes the catalog uses for one model, org/M.
 type fakeModelstore struct {
-	mu       sync.Mutex
-	compiled bool // the artifact for testCommit exists
+	mu        sync.Mutex
+	compiled  bool              // the artifact for testCommit exists
+	blobs     map[string][]byte // digest -> bytes (registry writes: statistics)
+	manifests map[string][]byte // name:tag -> manifest
+}
+
+// registry serves the generic registry routes statistics use; false if
+// r is not one of them.
+func (f *fakeModelstore) registry(w http.ResponseWriter, r *http.Request) bool {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	if f.blobs == nil {
+		f.blobs, f.manifests = map[string][]byte{}, map[string][]byte{}
+	}
+	path := strings.TrimPrefix(r.URL.Path, "/v2/")
+	if !strings.HasPrefix(path, "vxpu-stats/") {
+		return false
+	}
+	switch {
+	case r.Method == http.MethodPost && strings.HasSuffix(path, "/blobs/uploads/"):
+		body, _ := io.ReadAll(r.Body)
+		f.blobs[r.URL.Query().Get("digest")] = body
+		w.WriteHeader(http.StatusCreated)
+	case r.Method == http.MethodGet && strings.Contains(path, "/blobs/"):
+		_, _ = w.Write(f.blobs[path[strings.LastIndex(path, "/")+1:]])
+	case strings.Contains(path, "/manifests/"):
+		i := strings.Index(path, "/manifests/")
+		key := path[:i] + ":" + path[i+len("/manifests/"):]
+		if r.Method == http.MethodPut {
+			body, _ := io.ReadAll(r.Body)
+			f.manifests[key] = body
+			w.WriteHeader(http.StatusCreated)
+		} else if m, ok := f.manifests[key]; ok {
+			_, _ = w.Write(m)
+		} else {
+			http.NotFound(w, r)
+		}
+	case strings.HasSuffix(path, "/tags/list"):
+		name := strings.TrimSuffix(path, "/tags/list")
+		var tags []string
+		for key := range f.manifests {
+			if n, tag, _ := strings.Cut(key, ":"); n == name {
+				tags = append(tags, tag)
+			}
+		}
+		_ = json.NewEncoder(w).Encode(map[string]any{"name": name, "tags": tags})
+	default:
+		http.NotFound(w, r)
+	}
+	return true
 }
 
 func (f *fakeModelstore) handler(t *testing.T) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if f.registry(w, r) {
+			return
+		}
 		f.mu.Lock()
 		compiled := f.compiled
 		f.mu.Unlock()
@@ -108,6 +161,17 @@ func (e *loadingExecutor) LoadModel(_ context.Context, req *pb.LoadModelRequest)
 	return &pb.LoadModelResponse{Success: true}, nil
 }
 
+const testTelemetry = `{"format":"vxpu-telemetry/1","by_kind_ms_per_step":{"dense":20,"experts":18},` +
+	`"host_ops":{"decode":{"moe_experts":{"impl_ms":15}}},"experts":{"decode":{"0":{"1":5,"2":1},"1":{"3":6}}}}`
+
+func (e *loadingExecutor) Chat(_ context.Context, req *pb.ChatRequest) (*pb.ChatResponse, error) {
+	resp := &pb.ChatResponse{Text: "yes", SessionTokens: 12, NewPromptTokens: 2, Generated: 10, PrefillMs: 5, MsPerToken: 40}
+	if req.GetTelemetry() {
+		resp.TelemetryJson = testTelemetry
+	}
+	return resp, nil
+}
+
 func (e *loadingExecutor) NewSession(context.Context, *pb.NewSessionRequest) (*pb.NewSessionResponse, error) {
 	e.mu.Lock()
 	defer e.mu.Unlock()
@@ -133,7 +197,8 @@ func newCatalogServer(t *testing.T, store *fakeModelstore) (*Server, *fake.Clien
 		clientset: clientset, namespace: "ns", imageName: "registry/vxpu-executor:v42", blobServer: bs,
 		weightStore: weightstore.New(ms.URL), executorPort: 50051,
 		peerToModel: map[string]string{}, externalModel: map[string]string{}, modelEndpoint: map[string]string{},
-		loadedTags: map[string]string{}, compileResources: defaultCompileResources(), compilePoll: 10 * time.Millisecond,
+		loadedTags: map[string]string{}, keyModel: map[string]modelRef{}, compileResources: defaultCompileResources(),
+		compilePoll: 10 * time.Millisecond,
 	}
 	return s, clientset
 }

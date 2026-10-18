@@ -416,6 +416,7 @@ func (s *Server) loadByName(ctx context.Context, model, revision string) (string
 		}
 		s.mu.Lock()
 		s.loadedTags[tag] = key
+		s.keyModel[key] = modelRef{Model: model, Commit: commit, Artifact: repo + ":" + tag}
 		s.mu.Unlock()
 		return key, nil
 	})
