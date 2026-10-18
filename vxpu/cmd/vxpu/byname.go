@@ -18,6 +18,7 @@ import (
 	"context"
 	"flag"
 	"fmt"
+	"os"
 	"strings"
 	"time"
 
@@ -140,5 +141,38 @@ func askByName(ctx context.Context, client pb.ExecutorClient, repo, revision, pr
 	}
 	fmt.Printf("\n>>> %s\n%s\n\n(%d tokens, %.1f ms/token on the executor, %.1fs round trip)\n",
 		prompt, reply.Text, reply.Generated, reply.MsPerToken, time.Since(started).Seconds())
+	return nil
+}
+
+// cmdStats prints the engine's statistics for a model served by name,
+// and with --records writes every stored record (JSON lines; readable by
+// `python -m vxpu.expert_stats`).
+func cmdStats(ctx context.Context, args []string) error {
+	flags := flag.NewFlagSet("stats", flag.ContinueOnError)
+	pod := flags.String("pod", "vxpu-router", "router pod name")
+	routerAddr := flags.String("router", "", "vxpu-router address (e.g. localhost:50051); if set, skips the pod and port-forward")
+	records := flags.String("records", "", "also write every stored record to this file (JSON lines)")
+	if err := flags.Parse(args); err != nil {
+		return err
+	}
+	if flags.NArg() != 1 {
+		return fmt.Errorf("usage: vxpu stats [flags] REPO")
+	}
+	client, done, err := connectRouter(ctx, *routerAddr, *pod, routerSettings{})
+	if err != nil {
+		return err
+	}
+	defer done()
+	resp, err := client.GetModelStats(ctx, &pb.GetModelStatsRequest{Model: flags.Arg(0), Records: *records != ""})
+	if err != nil {
+		return fmt.Errorf("GetModelStats: %w", err)
+	}
+	fmt.Println(resp.SummaryJson)
+	if *records != "" {
+		if err := os.WriteFile(*records, []byte(resp.RecordsJsonl+"\n"), 0o644); err != nil {
+			return err
+		}
+		fmt.Printf("records written to %s\n", *records)
+	}
 	return nil
 }

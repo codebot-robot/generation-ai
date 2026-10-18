@@ -200,6 +200,20 @@ fetches the artifact from modelstore and loads it the first time
 sessions reuse it. Models are any whose architecture the exporter and
 the forks support.
 
+The engine keeps statistics about models served by name: every
+request's tokens, prefill and ms/token, which commit, artifact and
+executor served it, and, for every Nth request (`--telemetry-every` on
+the router, default every one), the executor's execution telemetry
+(segment times, expert selections, the plan). They are stored in
+modelstore (`vxpu-stats/<model>`, a tag per day) and outlive the
+router; telemetry stays internal unless a client asks for it.
+
+```sh
+vxpu stats deepseek-ai/DeepSeek-V4.1-Flash                    # summary
+vxpu stats --records reqs.jsonl deepseek-ai/DeepSeek-V4.1-Flash
+python -m vxpu.expert_stats reqs.jsonl                        # expert usage from what was served
+```
+
 Executors for models served by name can run outside Kubernetes, on
 machines launched for the purpose (a GPU VM from `gcloud`, a Mac)
 running `python -m vxpu.server`: start the router with their addresses,
