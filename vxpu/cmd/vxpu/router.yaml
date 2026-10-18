@@ -33,6 +33,13 @@ metadata:
 rules:
   - apiGroups: [""]
     resources: ["pods"]
+    verbs: ["get", "list", "create", "delete"]
+  # compile jobs for models registered by name, and their logs
+  - apiGroups: [""]
+    resources: ["pods/log"]
+    verbs: ["get"]
+  - apiGroups: ["batch"]
+    resources: ["jobs"]
     verbs: ["get", "create", "delete"]
 ---
 apiVersion: rbac.authorization.k8s.io/v1
@@ -107,6 +114,8 @@ spec:
           value: "ACCELERATOR"
         - name: VXPU_MODELSTORE_URL
           value: "MODELSTORE"
+        - name: VXPU_EXTERNAL_EXECUTORS
+          value: "EXTERNAL_EXECUTORS"
         - name: POD_IP
           valueFrom:
             fieldRef:

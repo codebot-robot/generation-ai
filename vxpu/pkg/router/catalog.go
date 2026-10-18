@@ -1,0 +1,349 @@
+// Copyright 2026 Google LLC
+//
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+//     http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
+
+package router
+
+import (
+	"bufio"
+	"bytes"
+	"context"
+	"crypto/sha256"
+	"encoding/hex"
+	"encoding/json"
+	stderrors "errors"
+	"fmt"
+	"regexp"
+	"strings"
+	"sync"
+	"time"
+
+	"google.golang.org/grpc/codes"
+	"google.golang.org/grpc/status"
+	batchv1 "k8s.io/api/batch/v1"
+	corev1 "k8s.io/api/core/v1"
+	"k8s.io/apimachinery/pkg/api/errors"
+	"k8s.io/apimachinery/pkg/api/resource"
+	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/klog/v2"
+
+	pb "github.com/gke-labs/generation-ai/vxpu/pkg/api/v1alpha1"
+	"github.com/gke-labs/generation-ai/vxpu/pkg/weightstore"
+)
+
+// The model catalog (#357): models served by name.
+//
+// RegisterModel imports a model's weights into modelstore and compiles
+// it for the router's executor image: a Kubernetes Job runs the executor
+// image's `python -m vxpu.compile`, which exports the artifact (reading
+// the model through modelstore's Hub API, never the weights) and pushes
+// it to modelstore as vxpu-artifacts/<model>:<tag>. The tag names the
+// commit and the executor image, so it is the catalog entry: whether a
+// model is registered for this engine is whether the tag exists, and the
+// catalog lives in modelstore, not in the router. NewSession with a model
+// name resolves the tag, fetches the artifact from modelstore and loads
+// it (on an external executor when the router has one, else on an
+// executor pod), once; later sessions reuse it.
+
+// compileMaxCacheLen is the KV cache length artifacts are compiled for.
+const compileMaxCacheLen = 1024
+
+var tagUnsafe = regexp.MustCompile(`[^A-Za-z0-9._-]`)
+
+// artifactTag is the catalog entry for a model commit compiled by an
+// executor image: the commit's first 12 characters and the image's tag
+// (or digest prefix), as a valid registry tag.
+func artifactTag(commit, image string) string {
+	short := commit
+	if len(short) > 12 {
+		short = short[:12]
+	}
+	tag := tagUnsafe.ReplaceAllString(short+"_"+imageTag(image), "-")
+	if len(tag) > 128 {
+		tag = tag[:128]
+	}
+	return tag
+}
+
+// imageTag is an image reference's tag, the first 12 hex digits of its
+// digest, or "latest".
+func imageTag(image string) string {
+	if i := strings.LastIndex(image, "@sha256:"); i >= 0 {
+		digest := image[i+len("@sha256:"):]
+		if len(digest) > 12 {
+			digest = digest[:12]
+		}
+		return digest
+	}
+	if i := strings.LastIndex(image, ":"); i > strings.LastIndex(image, "/") {
+		return image[i+1:]
+	}
+	return "latest"
+}
+
+// defaultCompileResources: export runs on the meta device, so a compile
+// needs little; the request fits a single kind node, and the limit lets a
+// large model's export (real buffers such as rotary tables) burst.
+func defaultCompileResources() corev1.ResourceRequirements {
+	return corev1.ResourceRequirements{
+		Requests: corev1.ResourceList{corev1.ResourceCPU: resource.MustParse("500m"), corev1.ResourceMemory: resource.MustParse("2Gi")},
+		Limits:   corev1.ResourceList{corev1.ResourceMemory: resource.MustParse("32Gi")},
+	}
+}
+
+// flights runs one call per key at a time: concurrent callers with the
+// same key share its result (registering or loading the same model).
+type flights struct {
+	mu    sync.Mutex
+	calls map[string]*flight
+}
+
+type flight struct {
+	done chan struct{}
+	val  any
+	err  error
+}
+
+func (f *flights) do(key string, fn func() (any, error)) (any, error) {
+	f.mu.Lock()
+	if f.calls == nil {
+		f.calls = make(map[string]*flight)
+	}
+	if c, ok := f.calls[key]; ok {
+		f.mu.Unlock()
+		<-c.done
+		return c.val, c.err
+	}
+	c := &flight{done: make(chan struct{})}
+	f.calls[key] = c
+	f.mu.Unlock()
+	c.val, c.err = fn()
+	f.mu.Lock()
+	delete(f.calls, key)
+	f.mu.Unlock()
+	close(c.done)
+	return c.val, c.err
+}
+
+// RegisterModel makes a model servable by name. See the file comment.
+func (s *Server) RegisterModel(ctx context.Context, req *pb.RegisterModelRequest) (*pb.RegisterModelResponse, error) {
+	log := klog.FromContext(ctx)
+	if req.Model == "" || strings.ContainsAny(req.Model, " \t\n") {
+		return nil, status.Errorf(codes.InvalidArgument, "model %q is not a Hugging Face repository id", req.Model)
+	}
+	if s.weightStore == nil {
+		return nil, status.Error(codes.FailedPrecondition, "registering models by name needs modelstore (deploy it, or start the router with --modelstore)")
+	}
+	revision := req.Revision
+	if revision == "" {
+		revision = "main"
+	}
+	log.Info("RegisterModel", "model", req.Model, "revision", revision)
+
+	// The weights first (quick when modelstore already has them): export
+	// reads the model's config and headers from modelstore, and
+	// executors read the weights from it (or its bucket).
+	name, err := s.weightStore.ImportRepo(ctx, req.Model, revision)
+	if err != nil {
+		return nil, status.Errorf(codes.Unavailable, "importing %s into modelstore: %v", req.Model, err)
+	}
+	if _, err := s.weightStore.WaitForImport(ctx, name, 5*time.Second); err != nil {
+		return nil, status.Errorf(codes.Unavailable, "%v", err)
+	}
+	commit, err := s.weightStore.ResolveCommit(ctx, req.Model, revision)
+	if err != nil {
+		return nil, status.Errorf(codes.Internal, "resolving %s@%s: %v", req.Model, revision, err)
+	}
+	repo := weightstore.ArtifactRepository(req.Model)
+	tag := artifactTag(commit, s.imageName)
+	resp := &pb.RegisterModelResponse{Model: req.Model, Revision: revision, Commit: commit, Artifact: repo + ":" + tag}
+
+	exists, err := s.weightStore.ManifestExists(ctx, repo, tag)
+	if err != nil {
+		return nil, status.Errorf(codes.Unavailable, "%v", err)
+	}
+	if !exists {
+		// A compile outlives an impatient client: a retry attaches to it.
+		if _, err := s.flights.do("compile/"+repo+":"+tag, func() (any, error) {
+			return nil, s.runCompileJob(context.WithoutCancel(ctx), req.Model, commit, repo, tag)
+		}); err != nil {
+			return nil, err
+		}
+		resp.Compiled = true
+	}
+	manifest, err := s.weightStore.FetchFile(ctx, repo, tag, "manifest.json")
+	if err != nil {
+		return nil, status.Errorf(codes.Internal, "reading the compiled artifact: %v", err)
+	}
+	if resp.WeightBytes, err = weightBytes(string(manifest)); err != nil {
+		return nil, status.Errorf(codes.Internal, "compiled artifact %s: %v", resp.Artifact, err)
+	}
+	log.Info("Registered model", "model", req.Model, "commit", commit, "artifact", resp.Artifact, "compiled", resp.Compiled)
+	return resp, nil
+}
+
+// runCompileJob runs vxpu.compile for model@commit in a Kubernetes Job
+// (the executor image, on whatever CPU node fits) and waits for it. The
+// Job's name is derived from the artifact, so a second router call (or a
+// restarted router) attaches to a Job already running.
+func (s *Server) runCompileJob(ctx context.Context, model, commit, repo, tag string) error {
+	log := klog.FromContext(ctx)
+	h := sha256.Sum256([]byte(repo + ":" + tag))
+	name := "vxpu-compile-" + hex.EncodeToString(h[:5])
+	backoff, deadline, ttl := int32(1), int64(3600), int32(86400)
+	job := &batchv1.Job{
+		ObjectMeta: metav1.ObjectMeta{Name: name, Namespace: s.namespace, Labels: map[string]string{"app": "vxpu-compile"},
+			Annotations: map[string]string{"vxpu.gke-labs.dev/model": model, "vxpu.gke-labs.dev/artifact": repo + ":" + tag}},
+		Spec: batchv1.JobSpec{
+			BackoffLimit:            &backoff,
+			ActiveDeadlineSeconds:   &deadline,
+			TTLSecondsAfterFinished: &ttl,
+			Template: corev1.PodTemplateSpec{
+				ObjectMeta: metav1.ObjectMeta{Labels: map[string]string{"app": "vxpu-compile", "vxpu.gke-labs.dev/compile": name}},
+				Spec: corev1.PodSpec{
+					RestartPolicy: corev1.RestartPolicyNever,
+					Containers: []corev1.Container{{
+						Name:    "compile",
+						Image:   s.imageName,
+						Command: []string{"python", "-m", "vxpu.compile"},
+						Args: []string{model, "--modelstore", s.weightStore.URL(), "--tag", tag, "--revision", commit,
+							"--max-cache-len", fmt.Sprint(compileMaxCacheLen)},
+						Resources: s.compileResources,
+					}},
+				},
+			},
+		},
+	}
+	if _, err := s.clientset.BatchV1().Jobs(s.namespace).Create(ctx, job, metav1.CreateOptions{}); err != nil && !errors.IsAlreadyExists(err) {
+		return status.Errorf(codes.Internal, "creating compile job: %v", err)
+	}
+	log.Info("Compiling model", "model", model, "commit", commit, "job", name, "artifact", repo+":"+tag)
+	for {
+		current, err := s.clientset.BatchV1().Jobs(s.namespace).Get(ctx, name, metav1.GetOptions{})
+		if err != nil {
+			return status.Errorf(codes.Internal, "reading compile job %s: %v", name, err)
+		}
+		if current.Status.Succeeded > 0 {
+			log.Info("Compile job succeeded", "job", name, "summary", s.compileSummary(ctx, name))
+			return nil
+		}
+		for _, cond := range current.Status.Conditions {
+			if cond.Type == batchv1.JobFailed && cond.Status == corev1.ConditionTrue {
+				return status.Errorf(codes.Internal, "compiling %s failed (job %s: %s): %s", model, name, cond.Reason, s.compileLogTail(ctx, name, 20))
+			}
+		}
+		select {
+		case <-ctx.Done():
+			return status.FromContextError(ctx.Err()).Err()
+		case <-time.After(s.compilePoll):
+		}
+	}
+}
+
+// compileLogTail is the end of the compile job's newest pod's log.
+func (s *Server) compileLogTail(ctx context.Context, job string, lines int64) string {
+	pods, err := s.clientset.CoreV1().Pods(s.namespace).List(ctx, metav1.ListOptions{LabelSelector: "vxpu.gke-labs.dev/compile=" + job})
+	if err != nil || len(pods.Items) == 0 {
+		return fmt.Sprintf("(no pod log: %v)", err)
+	}
+	newest := pods.Items[0]
+	for _, p := range pods.Items[1:] {
+		if p.CreationTimestamp.After(newest.CreationTimestamp.Time) {
+			newest = p
+		}
+	}
+	raw, err := s.clientset.CoreV1().Pods(s.namespace).GetLogs(newest.Name, &corev1.PodLogOptions{TailLines: &lines}).DoRaw(ctx)
+	if err != nil {
+		return fmt.Sprintf("(reading log of %s: %v)", newest.Name, err)
+	}
+	return strings.TrimSpace(string(raw))
+}
+
+// compileSummary is the JSON summary vxpu.compile prints last, if found.
+func (s *Server) compileSummary(ctx context.Context, job string) string {
+	tail := s.compileLogTail(ctx, job, 5)
+	var last string
+	sc := bufio.NewScanner(bytes.NewReader([]byte(tail)))
+	for sc.Scan() {
+		if line := strings.TrimSpace(sc.Text()); strings.HasPrefix(line, "{") && json.Valid([]byte(line)) {
+			last = line
+		}
+	}
+	return last
+}
+
+// loadByName returns the model key of a registered model, loading its
+// compiled artifact on an executor the first time (and again if that
+// executor went away). Unregistered models fail with FAILED_PRECONDITION.
+func (s *Server) loadByName(ctx context.Context, model, revision string) (string, error) {
+	if s.weightStore == nil {
+		return "", status.Error(codes.FailedPrecondition, "models by name need modelstore")
+	}
+	if revision == "" {
+		revision = "main"
+	}
+	commit, err := s.weightStore.ResolveCommit(ctx, model, revision)
+	if stderrors.Is(err, weightstore.ErrNotFound) {
+		return "", status.Errorf(codes.FailedPrecondition, "model %s@%s is not registered: call RegisterModel", model, revision)
+	}
+	if err != nil {
+		return "", status.Errorf(codes.Unavailable, "resolving %s@%s: %v", model, revision, err)
+	}
+	repo := weightstore.ArtifactRepository(model)
+	tag := artifactTag(commit, s.imageName)
+
+	s.mu.RLock()
+	key, loaded := s.loadedTags[tag]
+	s.mu.RUnlock()
+	if loaded {
+		_, err := s.executorEndpoint(ctx, key)
+		if err == nil {
+			return key, nil
+		}
+		klog.FromContext(ctx).Info("Loaded model's executor is gone; loading again", "model", model, "model_key", key, "error", err.Error())
+	}
+	v, err := s.flights.do("load/"+repo+":"+tag, func() (any, error) {
+		exists, err := s.weightStore.ManifestExists(ctx, repo, tag)
+		if err != nil {
+			return "", status.Errorf(codes.Unavailable, "%v", err)
+		}
+		if !exists {
+			return "", status.Errorf(codes.FailedPrecondition, "model %s@%s is not compiled for executor image %s: call RegisterModel", model, revision, s.imageName)
+		}
+		files := map[string][]byte{}
+		for _, f := range []string{"manifest.json", "binding.json", "prefill.pt2", "decode.pt2"} {
+			data, err := s.weightStore.FetchFile(ctx, repo, tag, f)
+			if err != nil {
+				return "", status.Errorf(codes.Internal, "reading artifact %s:%s: %v", repo, tag, err)
+			}
+			files[f] = data
+		}
+		key, err := s.loadArtifact(context.WithoutCancel(ctx), &pb.LoadModelRequest{
+			ManifestJson: string(files["manifest.json"]),
+			BindingJson:  string(files["binding.json"]),
+			PrefillGraph: files["prefill.pt2"],
+			DecodeGraph:  files["decode.pt2"],
+		}, true)
+		if err != nil {
+			return "", err
+		}
+		s.mu.Lock()
+		s.loadedTags[tag] = key
+		s.mu.Unlock()
+		return key, nil
+	})
+	if err != nil {
+		return "", err
+	}
+	return v.(string), nil
+}

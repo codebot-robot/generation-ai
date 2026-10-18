@@ -21,6 +21,7 @@ import (
 	"net"
 	"os"
 	"path/filepath"
+	"strings"
 	"time"
 
 	"google.golang.org/grpc"
@@ -46,6 +47,8 @@ func main() {
 	acceleratorFlag := flag.String("accelerator", "", "GKE accelerator label for the executor pod (e.g., nvidia-l4)")
 	modelstoreFlag := flag.String("modelstore", "",
 		"modelstore URL to keep weights in (default: VXPU_MODELSTORE_URL, else http://modelstore.modelstore if it resolves, else the router caches weights itself)")
+	externalFlag := flag.String("external-executor", "",
+		"comma-separated host:port of executors outside Kubernetes (GPU VMs, Macs) that models registered by name are placed on (default: VXPU_EXTERNAL_EXECUTORS)")
 	flag.Parse()
 
 	ctx := context.Background()
@@ -123,9 +126,21 @@ func main() {
 
 	srv := router.NewServer(clientset, namespace, imageName, accelerator)
 	srv.UseWeightStore(weightstore.Discover(ctx, modelstoreURL))
+	external := *externalFlag
+	if external == "" {
+		external = os.Getenv("VXPU_EXTERNAL_EXECUTORS")
+	}
+	var externalAddrs []string
+	for _, addr := range strings.Split(external, ",") {
+		if addr = strings.TrimSpace(addr); addr != "" {
+			externalAddrs = append(externalAddrs, addr)
+		}
+	}
+	srv.UseExternalExecutors(externalAddrs)
 	pb.RegisterExecutorServer(s, srv)
 
-	log.Info("Starting vxpu-router gRPC server", "port", *portFlag, "namespace", namespace, "image", imageName, "accelerator", accelerator)
+	log.Info("Starting vxpu-router gRPC server", "port", *portFlag, "namespace", namespace, "image", imageName,
+		"accelerator", accelerator, "externalExecutors", externalAddrs)
 	if err := s.Serve(lis); err != nil {
 		log.Error(err, "failed to serve")
 		os.Exit(1)

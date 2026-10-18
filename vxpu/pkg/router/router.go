@@ -64,6 +64,19 @@ type Server struct {
 
 	mu          sync.RWMutex
 	peerToModel map[string]string // maps peer IP:port -> modelKey
+
+	// externalExecutors are executor addresses on machines the router
+	// does not manage (#357: GPU VMs, Macs); models loaded by name go
+	// there when any are configured (external.go).
+	externalExecutors []string
+	// catalog state for models served by name (catalog.go), under mu
+	externalModel map[string]string // external executor address -> model key it holds
+	modelEndpoint map[string]string // model key -> external executor address
+	loadedTags    map[string]string // compiled artifact tag -> model key loaded from it
+	flights       flights
+	// compile job settings (catalog.go)
+	compileResources corev1.ResourceRequirements
+	compilePoll      time.Duration
 }
 
 // errNoExecutor: no executor pod exists for the model on this router
@@ -92,6 +105,12 @@ func NewServer(clientset kubernetes.Interface, namespace, imageName, accelerator
 		peerToModel:  make(map[string]string),
 		blobServer:   bs,
 		executorPort: 50051,
+
+		externalModel:    make(map[string]string),
+		modelEndpoint:    make(map[string]string),
+		loadedTags:       make(map[string]string),
+		compileResources: defaultCompileResources(),
+		compilePoll:      5 * time.Second,
 	}
 	return s
 }
@@ -154,16 +173,13 @@ func (s *Server) rewriteViaWeightStore(ctx context.Context, manifestJSON string)
 // not create pods (only LoadModel does). The caller closes the
 // returned connection.
 func (s *Server) executorClient(ctx context.Context, modelKey string) (pb.ExecutorClient, *grpc.ClientConn, error) {
-	podIP, err := s.getOrStartPod(ctx, modelKey, nil)
-	if stderrors.Is(err, errNoExecutor) {
-		return nil, nil, status.Error(codes.FailedPrecondition, err.Error())
-	}
+	endpoint, err := s.executorEndpoint(ctx, modelKey)
 	if err != nil {
-		return nil, nil, status.Errorf(codes.Internal, "failed to get or start pod: %v", err)
+		return nil, nil, err
 	}
 	maxMsgSize := 128 * 1024 * 1024
 	conn, err := grpc.NewClient(
-		fmt.Sprintf("%s:%d", podIP, s.executorPort),
+		endpoint,
 		grpc.WithTransportCredentials(insecure.NewCredentials()),
 		grpc.WithDefaultCallOptions(
 			grpc.MaxCallRecvMsgSize(maxMsgSize),
@@ -421,15 +437,37 @@ func (s *Server) getOrStartPod(ctx context.Context, modelID string, want *Placem
 }
 
 func (s *Server) LoadModel(ctx context.Context, req *pb.LoadModelRequest) (*pb.LoadModelResponse, error) {
-	log := klog.FromContext(ctx)
+	modelKey := artifactKey(req.ManifestJson)
+	peerKey := getPeerKey(ctx)
+	if peerKey != "unknown" {
+		s.mu.Lock()
+		s.peerToModel[peerKey] = modelKey
+		s.mu.Unlock()
+	}
+	if _, err := s.loadArtifact(ctx, req, false); err != nil {
+		return nil, err
+	}
+	return &pb.LoadModelResponse{Success: true}, nil
+}
 
-	// Derive modelKey from manifest_json (using original ManifestJson for identity)
-	h := sha256.Sum256([]byte(req.ManifestJson))
-	modelKey := hex.EncodeToString(h[:16])
-	log.Info("LoadModel request received", "model_key", modelKey)
+// artifactKey identifies an artifact by its manifest (as shipped).
+func artifactKey(manifestJSON string) string {
+	h := sha256.Sum256([]byte(manifestJSON))
+	return hex.EncodeToString(h[:16])
+}
+
+// loadArtifact makes the artifact's weights reachable (modelstore, or
+// the router's own cache), places an executor for it and ships it there.
+// On an external executor when external is set and the router has any
+// (#357), else on an executor pod the router starts. Returns the model
+// key sessions are routed by.
+func (s *Server) loadArtifact(ctx context.Context, req *pb.LoadModelRequest, external bool) (string, error) {
+	log := klog.FromContext(ctx)
+	modelKey := artifactKey(req.ManifestJson)
+	log.Info("Loading artifact", "model_key", modelKey, "external", external)
 
 	if s.blobServer == nil {
-		return nil, status.Errorf(codes.Internal, "blobserver is not initialized")
+		return "", status.Errorf(codes.Internal, "blobserver is not initialized")
 	}
 
 	// Caching tens of GB outlives impatient clients: a dropped
@@ -440,13 +478,13 @@ func (s *Server) LoadModel(ctx context.Context, req *pb.LoadModelRequest) (*pb.L
 	if s.weightStore != nil {
 		rewrittenManifestJSON, err = s.rewriteViaWeightStore(context.WithoutCancel(ctx), req.ManifestJson)
 		if err != nil {
-			return nil, status.Errorf(codes.Internal, "weight store: %v", err)
+			return "", status.Errorf(codes.Internal, "weight store: %v", err)
 		}
 	} else {
 		rewrittenManifestJSON, err = s.blobServer.CacheAndRewriteManifest(
 			context.WithoutCancel(ctx), req.ManifestJson, getRouterIP())
 		if err != nil {
-			return nil, status.Errorf(codes.Internal, "failed to cache and rewrite manifest: %v", err)
+			return "", status.Errorf(codes.Internal, "failed to cache and rewrite manifest: %v", err)
 		}
 	}
 
@@ -458,29 +496,26 @@ func (s *Server) LoadModel(ctx context.Context, req *pb.LoadModelRequest) (*pb.L
 		DecodeGraph:  req.DecodeGraph,
 	}
 
-	bytes, err := weightBytes(req.ManifestJson)
-	if err != nil {
-		return nil, status.Errorf(codes.InvalidArgument, "invalid manifest: %v", err)
+	var endpoint string
+	if external && len(s.externalExecutors) > 0 {
+		endpoint = s.pickExternalExecutor(modelKey)
+		log.Info("Placing on an external executor", "model_key", modelKey, "address", endpoint)
+	} else {
+		bytes, err := weightBytes(req.ManifestJson)
+		if err != nil {
+			return "", status.Errorf(codes.InvalidArgument, "invalid manifest: %v", err)
+		}
+		placement := PlanPlacement(s.accelerator, bytes)
+		log.Info("Planned executor placement", "model_key", modelKey,
+			"weightBytes", bytes, "accelerator", placement.Accelerator,
+			"cpu", placement.CPU.String(), "memory", placement.Memory.String(),
+			"reason", placement.Reason)
+		podIP, err := s.getOrStartPod(ctx, modelKey, &placement)
+		if err != nil {
+			return "", status.Errorf(codes.Internal, "failed to get or start pod: %v", err)
+		}
+		endpoint = fmt.Sprintf("%s:%d", podIP, s.executorPort)
 	}
-	placement := PlanPlacement(s.accelerator, bytes)
-	log.Info("Planned executor placement", "model_key", modelKey,
-		"weightBytes", bytes, "accelerator", placement.Accelerator,
-		"cpu", placement.CPU.String(), "memory", placement.Memory.String(),
-		"reason", placement.Reason)
-
-	peerKey := getPeerKey(ctx)
-	if peerKey != "unknown" {
-		s.mu.Lock()
-		s.peerToModel[peerKey] = modelKey
-		s.mu.Unlock()
-	}
-
-	podIP, err := s.getOrStartPod(ctx, modelKey, &placement)
-	if err != nil {
-		return nil, status.Errorf(codes.Internal, "failed to get or start pod: %v", err)
-	}
-
-	endpoint := fmt.Sprintf("%s:50051", podIP)
 	maxMsgSize := 128 * 1024 * 1024
 	conn, err := grpc.NewClient(
 		endpoint,
@@ -491,7 +526,7 @@ func (s *Server) LoadModel(ctx context.Context, req *pb.LoadModelRequest) (*pb.L
 		),
 	)
 	if err != nil {
-		return nil, status.Errorf(codes.Internal, "failed to connect to executor: %v", err)
+		return "", status.Errorf(codes.Internal, "failed to connect to executor: %v", err)
 	}
 	defer closeConn(ctx, conn)
 
@@ -511,36 +546,41 @@ func (s *Server) LoadModel(ctx context.Context, req *pb.LoadModelRequest) (*pb.L
 
 	if loadErr != nil {
 		// Propagate backend status error instead of collapsing to codes.Internal
-		return nil, loadErr
+		return "", loadErr
 	}
-
-	log.Info("Successfully loaded model on executor", "model_key", modelKey)
-	return &pb.LoadModelResponse{Success: true}, nil
+	if external && len(s.externalExecutors) > 0 {
+		s.placedExternally(modelKey, endpoint)
+	}
+	log.Info("Successfully loaded model on executor", "model_key", modelKey, "endpoint", endpoint)
+	return modelKey, nil
 }
 
 func (s *Server) NewSession(ctx context.Context, req *pb.NewSessionRequest) (*pb.NewSessionResponse, error) {
 	log := klog.FromContext(ctx)
-	peerKey := getPeerKey(ctx)
-
-	s.mu.RLock()
-	modelKey, exists := s.peerToModel[peerKey]
-	s.mu.RUnlock()
-
-	if !exists {
-		return nil, status.Errorf(codes.FailedPrecondition, "no model has been loaded for this connection")
+	var modelKey string
+	if req.Model != "" {
+		key, err := s.loadByName(ctx, req.Model, req.Revision)
+		if err != nil {
+			return nil, err
+		}
+		modelKey = key
+	} else {
+		peerKey := getPeerKey(ctx)
+		s.mu.RLock()
+		key, exists := s.peerToModel[peerKey]
+		s.mu.RUnlock()
+		if !exists {
+			return nil, status.Errorf(codes.FailedPrecondition, "no model has been loaded for this connection")
+		}
+		modelKey = key
 	}
 
-	log.Info("NewSession request for", "model_key", modelKey)
+	log.Info("NewSession request for", "model_key", modelKey, "model", req.Model)
 
-	podIP, err := s.getOrStartPod(ctx, modelKey, nil)
-	if stderrors.Is(err, errNoExecutor) {
-		return nil, status.Error(codes.FailedPrecondition, err.Error())
-	}
+	endpoint, err := s.executorEndpoint(ctx, modelKey)
 	if err != nil {
-		return nil, status.Errorf(codes.Internal, "failed to get or start pod: %v", err)
+		return nil, err
 	}
-
-	endpoint := fmt.Sprintf("%s:50051", podIP)
 	maxMsgSize := 128 * 1024 * 1024
 	conn, err := grpc.NewClient(
 		endpoint,
@@ -556,7 +596,14 @@ func (s *Server) NewSession(ctx context.Context, req *pb.NewSessionRequest) (*pb
 	defer closeConn(ctx, conn)
 
 	client := pb.NewExecutorClient(conn)
-	sessResp, err := client.NewSession(ctx, req)
+	sessResp, err := client.NewSession(ctx, &pb.NewSessionRequest{})
+	if err != nil && req.Model != "" && status.Code(err) == codes.FailedPrecondition &&
+		strings.Contains(status.Convert(err).Message(), "LoadModel first") {
+		// The executor evicted the model (idle keep-alive) or restarted:
+		// forget where it was, so the caller's retry loads it again.
+		s.forgetModel(modelKey)
+		return nil, status.Errorf(codes.FailedPrecondition, "%s is being reloaded (the executor no longer holds it)", req.Model)
+	}
 	if err != nil {
 		// Propagate the exact backend status (including FAILED_PRECONDITION) instead of collapsing to codes.Internal
 		return nil, err
