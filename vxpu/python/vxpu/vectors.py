@@ -739,6 +739,30 @@ def _check_compile_plan():
         pass
 
 
+def _check_expert_sim():
+    """expert_sim's policies on synthetic traffic whose hot set moves: four
+    requests use experts 0-3, then eight use 4-7, a budget of four. The
+    static placement (from the first four) serves none of the later ones;
+    holding the last request's experts (decay 0) misses only the first;
+    cumulative LFU (decay 1) switches once the new set's counts pass the
+    old; the prefill (here the same experts as the decode) and the oracle
+    serve them all."""
+    from . import expert_sim
+    import collections
+    def req(experts):
+        c = collections.Counter({(0, e): 10 for e in experts})
+        return c, 10, c
+    reqs = [req(range(4))] * 4 + [req(range(4, 8))] * 8
+    def share(policy, **kw):
+        got = expert_sim.simulate(reqs, 4, 4, policy, **kw)
+        return sum(s for s, _ in got) / len(got), sum(m for _, m in got)
+    assert share("static") == (0.0, 0), share("static")
+    assert share("adaptive", decay=0.0) == (7 / 8, 4), share("adaptive", decay=0.0)
+    assert share("adaptive", decay=1.0) == (3 / 8, 4), share("adaptive", decay=1.0)
+    assert share("prefill", prefill_weight=0.75) == (1.0, 4), share("prefill", prefill_weight=0.75)
+    assert share("oracle") == (1.0, 4), share("oracle")
+
+
 def _check_continuation(artifact, ids, new_tokens=4):
     """A session extended by a later turn must see what a fresh session
     given the whole transcript sees. For a model whose prefill graph
@@ -1123,6 +1147,7 @@ def selftest(workdir, settings):
     os.makedirs(workdir, exist_ok=True)
     _check_host_reads(workdir)
     _check_local_blobs_copy(workdir)
+    _check_expert_sim()
     from .export import export_artifact
     from .fixtures import tiny_fp8_moe
     models = [
