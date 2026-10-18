@@ -1233,6 +1233,86 @@ def _check_expert_mailboxes(model, prompts, settings, artifact, plain, workdir):
     return ok
 
 
+def _check_expert_remote(model, prompts, settings, artifact, plain):
+    """Experts answered by another process (expert_server.py): a server
+    holding every other layer's banks, on a local port, and the engine's
+    mailboxes sending it those layers' pairs. The server computes with
+    the same CPU kernels, so tokens and logits must be bit-identical to
+    the plain engine's."""
+    import subprocess
+    import sys
+    import threading
+    with open(os.path.join(artifact, "binding.json")) as f:
+        layers = sorted(int(x) for x in ((json.load(f).get("external") or {}).get("experts") or {}))
+    if not layers:
+        return True
+    served = layers[::2]
+    proc = subprocess.Popen([sys.executable, "-m", "vxpu.expert_server", artifact, "--host", "127.0.0.1",
+                             "--port", "0", "--layers", ",".join(map(str, served))],
+                            stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True)
+    lines, started = [], threading.Event()
+
+    def read():  # the server's output, kept for a failure; the address once it listens
+        for line in proc.stdout:
+            lines.append(line)
+            if "expert server on " in line:
+                started.set()
+        started.set()  # it exited
+
+    threading.Thread(target=read, daemon=True).start()
+    try:
+        started.wait(timeout=300)
+        address = next((ln.split("expert server on ", 1)[1].split()[0].rstrip(":") for ln in lines
+                        if "expert server on " in ln), None)
+        if address is None or ":" not in address:
+            print("expert remote check: the expert server did not start:\n" + "".join(lines[-20:]))
+            return False
+        got = _with_env({"VXPU_EXPERT_MAILBOXES": "1", "VXPU_EXPERT_REMOTE": address, "VXPU_GPU_EXPERTS": None},
+                        record_vxpu_engine, model, "main", prompts, settings, artifact)
+        if not _check_expert_server_errors(address, artifact, served[0]):
+            return False
+    finally:
+        proc.terminate()
+        proc.wait(timeout=30)
+    same = ([p["generated_ids"] for p in got["prompts"]] == [p["generated_ids"] for p in plain["prompts"]]
+            and [p["top_logits"] for p in got["prompts"]] == [p["top_logits"] for p in plain["prompts"]])
+    rows, _ = compare(plain, got, strict_tokens=True)
+    print(f"experts of layers {served} answered by an expert server at {address}, against the plain engine "
+          "(must be bit-identical):")
+    print(table(plain, got, rows))
+    if not same:
+        print("expert remote check: not bit-identical")
+    return same
+
+
+def _check_expert_server_errors(address, artifact, layer):
+    """The expert server refuses a request it cannot serve with a reason
+    the engine hears (a layer it does not hold), then closes; the next
+    request is answered on a new connection."""
+    import torch
+    from . import expert_server, mailboxes
+    with open(os.path.join(artifact, "manifest.json")) as f:
+        owner = mailboxes.RemoteOwner(address, checkpoint=expert_server.checkpoint_id(json.load(f)))
+    experts, _ = expert_server.load(artifact, {layer})
+    moe = experts[layer]
+    x = torch.zeros(1, moe.dim, dtype=torch.bfloat16)
+    one = torch.zeros(1, dtype=torch.long)
+    try:
+        owner.answer(moe, x, one, one + moe.experts_start_idx, torch.ones(1), layer=10_000)
+    except RuntimeError as e:
+        if "not held here" not in str(e):
+            print(f"expert remote check: unexpected refusal: {e}")
+            return False
+    else:
+        print("expert remote check: a request for a layer the server does not hold was answered")
+        return False
+    if owner.answer(moe, x, one, one + moe.experts_start_idx, torch.ones(1), layer=layer).shape != (1, moe.dim):
+        print("expert remote check: no answer after the refused request")
+        return False
+    owner.close()
+    return True
+
+
 def _check_dataflow(model, prompts, settings, artifact, plain):
     """The engine's decode run as a dataflow graph (dataflow.py): the same
     tokens and logits as the plain run, every edge through an inbox. On a
@@ -1357,6 +1437,8 @@ def selftest(workdir, settings):
             failed.append(name + " (dataflow)")
         if name == "tiny-deepseek-v41" and not _check_expert_mailboxes(model, prompts, settings, artifact, got, workdir):
             failed.append(name + " (expert mailboxes)")
+        if name == "tiny-deepseek-v41" and not _check_expert_remote(model, prompts, settings, artifact, got):
+            failed.append(name + " (expert remote)")
         if name == "tiny-llama" and not _check_chat_telemetry(artifact):
             failed.append(name + " (chat telemetry)")
         if name == "tiny-deepseek-v41" and not _check_gpu_experts(model, prompts, settings, artifact, workdir):

@@ -280,6 +280,12 @@ class Plan:
         self._set("expert_mailboxes", on, src, (True, False),
                   "decode's routed experts as mailboxes (mailboxes.py, #372): each (token, k) pair answered by its "
                   "expert's owner (the CPU, a GPU pool), the replies summed in k order whoever answered")
+        remote, src = env_text("VXPU_EXPERT_REMOTE", None)
+        if remote and not self["expert_mailboxes"]:
+            remote, src = None, "requires expert_mailboxes"
+        self._set("expert_remote", remote, src, (),
+                  "expert servers (host:port[,host:port]; expert_server.py) answering the mailboxes of the layers "
+                  "they hold, for the pairs no GPU pool holds")
         on, src = env_flag("VXPU_DATAFLOW", False)
         self._set("dataflow", on, src, (True, False),
                   "run the decode step as a dataflow graph: its segments as nodes, each fired when the inboxes "

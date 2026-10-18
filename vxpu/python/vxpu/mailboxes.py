@@ -34,6 +34,10 @@ The owners:
          of the fused decode kernel, whose sum of one term is the term
   pool   a GPU's slot pool (experts_gpu.Pool, #370): its kernels on its
          side stream, launched before the CPU drains its own
+  remote another process, here or on another machine, holding some
+         layers' banks (expert_server.py): it answers the pairs of those
+         layers that no pool holds, with the same CPU kernels, so its
+         replies are bit-identical to the local CPU's
 
 Which owner holds an expert is the layer's residency, read on every
 call, so experts moving between owners (experts_gpu.Mover, #371) need
@@ -41,6 +45,8 @@ nothing more here. Every owner's work is posted before any reply is
 waited for, so the GPUs and the CPU drain their mailboxes at the same
 time.
 """
+
+import socket
 
 import torch
 
@@ -52,7 +58,7 @@ class CpuOwner:
 
     name = "cpu"
 
-    def answer(self, moe, x, tokens, experts, weights):
+    def answer(self, moe, x, tokens, experts, weights, layer=None):
         """Replies [m, dim] fp32 for m pairs: x [n, dim] on the CPU,
         tokens/experts/weights [m]."""
         k = kernels.load()
@@ -62,13 +68,67 @@ class CpuOwner:
                                 moe.w2, moe.w2_scale, float(moe.swiglu_limit))
 
 
+class RemoteOwner:
+    """Answers from an expert server (expert_server.py) over TCP, with the
+    CpuOwner's interface. Every call is bounded by TIMEOUT_S; a call that
+    fails on the connection reconnects once and is retried, and then the
+    error names the server."""
+
+    TIMEOUT_S = 60
+
+    def __init__(self, address, checkpoint=None):
+        self.address = address
+        self.name = f"remote {address}"
+        self.checkpoint = checkpoint
+        self.sock = None
+        self.layers = self._connect()
+
+    def _connect(self):
+        from . import expert_server as wire
+        host, port = self.address.rsplit(":", 1)
+        self.sock = socket.create_connection((host, int(port)), timeout=self.TIMEOUT_S)
+        self.sock.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
+        wire.send(self.sock, {"op": "hello"})
+        info = wire.recv_header(self.sock)
+        if self.checkpoint is not None and info["checkpoint"] != self.checkpoint:
+            raise ValueError(f"expert server {self.address} holds another checkpoint's experts")
+        return set(info["layers"])
+
+    def answer(self, moe, x, tokens, experts, weights, layer=None):
+        """Replies [m, dim] fp32 for m pairs of `layer`, from the server."""
+        from . import expert_server as wire
+        for attempt in (0, 1):
+            try:
+                if self.sock is None:
+                    self._connect()
+                wire.send(self.sock, {"op": "answer", "layer": layer, "n": x.shape[0], "m": tokens.numel()},
+                          x.to(torch.bfloat16), tokens.to(torch.int32), experts.to(torch.int32),
+                          weights.to(torch.float32))
+                header = wire.recv_header(self.sock)
+                if "error" in header:
+                    self.close()  # the server closes after an error
+                    raise RuntimeError(f"expert server {self.address}: {header['error']}")
+                return wire.recv_tensor(self.sock, torch.bfloat16, (header["m"], moe.dim)).float()
+            except (OSError, ConnectionError) as e:  # timeouts included
+                self.close()
+                if attempt:
+                    raise RuntimeError(f"expert server {self.address}: {e}") from e
+
+    def close(self):
+        if self.sock is not None:
+            self.sock.close()
+            self.sock = None
+
+
 class Layer:
     """One layer's mailboxes: the owners of its experts, and the step's
     dispatch, drain and fixed-order combine."""
 
-    def __init__(self, moe, residency=None, cpu=None):
+    def __init__(self, moe, layer, residency=None, remote=None, cpu=None):
         self.moe = moe
+        self.layer = layer
         self.residency = residency  # experts_gpu.Residency: the GPU pools and what they hold, or None
+        self.remote = remote  # a RemoteOwner holding this layer, answering what no pool holds; or None
         self.cpu = cpu or CpuOwner()
 
     def forward(self, x_in, weights, indices, host_inputs=None):
@@ -98,9 +158,11 @@ class Layer:
         slots = torch.zeros(n, topk, moe.dim, dtype=torch.float32, device=dev)
         if cold.any():
             tokens = torch.arange(n).view(n, 1).expand(n, topk)[cold]
-            answered = self.cpu.answer(moe, x, tokens, i[cold], w[cold])
+            owner = self.remote or self.cpu
+            answered = owner.answer(moe, x, tokens, i[cold], w[cold], layer=self.layer)
+            owner = "remote" if owner is self.remote else owner.name
             slots[cold.to(dev)] = answered.to(dev, non_blocking=True)
-            counts[self.cpu.name] = int(cold.sum())
+            counts[owner] = int(cold.sum())
         for pool, replies in posted:
             if pool.device != dev:  # to the inputs' device: another GPU, or the host for a CPU-placed node
                 with torch.cuda.stream(pool.stream):

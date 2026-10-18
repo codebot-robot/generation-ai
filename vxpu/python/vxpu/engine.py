@@ -34,6 +34,7 @@ has a dynamic sequence dimension and explicit cache positions, so a
 follow-up turn prefills only the tokens beyond the cached prefix.
 """
 
+import collections
 import hashlib
 import json
 import os
@@ -71,6 +72,39 @@ def configure_inductor(plan):
 
 TOKENIZER_FILES = ("tokenizer.json", "tokenizer_config.json",
                    "tokenizer.model", "vocab.json", "spiece.model")
+
+
+def external_files_dir(external_dir, manifest):
+    """Where an artifact's memory-mapped external tensors live under the
+    plan's external_dir (None: none). The files are keyed by the model's
+    manifest, so two artifacts of one checkpoint share them and another
+    checkpoint cannot. The engine and the expert server use the same."""
+    if not external_dir:
+        return None
+    return os.path.join(external_dir, hashlib.sha256(json.dumps(
+        manifest["source"], sort_keys=True).encode()).hexdigest()[:16])
+
+
+def load_expert_layers(manifest, specs_by_layer, args, cas_dir, mmap_root, in_ram, layers=None):
+    """The expert banks of an artifact's layers (binding external.experts;
+    `layers` limits them), each assembled as the model's own MoE module
+    on the host: ({layer: module}, bytes fetched). Memory-mapped from
+    files under mmap_root unless in_ram. The engine and the expert
+    server (expert_server.py) load them the same way."""
+    from . import deepseek_v41 as ds
+    out, fetched = {}, 0
+    for layer, specs in specs_by_layer.items():
+        if layers is not None and int(layer) not in layers:
+            continue
+        banks = {}
+        for name, spec in specs.items():
+            tensor, downloaded = fetch_stacked(
+                spec, manifest["tensors"], manifest["files"], cas_dir,
+                mmap_path=os.path.join(mmap_root, f"experts.{layer}.{name}") if (mmap_root and not in_ram) else None)
+            banks[name] = tensor
+            fetched += downloaded
+        out[int(layer)] = ds.host_experts(int(layer), args, banks)
+    return out, fetched
 
 
 def _has_tokenizer_files(repo):
@@ -233,37 +267,20 @@ class Engine:
         from . import deepseek_v41 as ds
         from . import ops
         args = ds.model_args(self.manifest["source"]["repo"], self.max_cache_len)
-        mm = self.external_dir
-        if mm:
-            # files are keyed by the model's manifest so two artifacts of
-            # one checkpoint share them and another checkpoint cannot
-            mm = os.path.join(mm, hashlib.sha256(json.dumps(
-                self.manifest["source"], sort_keys=True).encode()).hexdigest()[:16])
+        mm = external_files_dir(self.external_dir, self.manifest)
         # The expert banks: memory-mapped files like the tables, or held
         # in RAM outright (the plan's experts_placement; VXPU_EXPERTS_IN_RAM=1)
         # when the node has the 272 GB, so residency is guaranteed rather
         # than left to the page cache; the kernels are memory-bound and
         # want the bytes resident.
-        banks_in_ram = self.plan["experts_placement"] == "ram"
-        for layer, specs in external.get("experts", {}).items():
-            banks = {}
-            for name, spec in specs.items():
-                tensor, downloaded = fetch_stacked(
-                    spec, self.manifest["tensors"], self.manifest["files"], cas_dir,
-                    mmap_path=os.path.join(mm, f"experts.{layer}.{name}") if (mm and not banks_in_ram) else None)
-                banks[name] = tensor
-                self.bytes_fetched += downloaded
-            self.external.experts[int(layer)] = ds.host_experts(int(layer), args, banks)
+        experts, downloaded = load_expert_layers(self.manifest, external.get("experts", {}), args, cas_dir, mm,
+                                                 in_ram=self.plan["experts_placement"] == "ram")
+        self.external.experts.update(experts)
+        self.bytes_fetched += downloaded
         if self.plan["gpu_experts"] and self.external.experts:
             self._place_hot_experts(self.plan["gpu_experts"])
         if self.plan["expert_mailboxes"] and self.external.experts:
-            from . import mailboxes
-            for moe in self.external.experts.values():
-                moe._vxpu_mailboxes = mailboxes.Layer(moe, residency=getattr(moe, "_vxpu_hot", None))
-            self.plan.note(f"expert mailboxes: {len(self.external.experts)} layers, owners cpu"
-                           + "".join(sorted({f", {p.device}" for m in self.external.experts.values()
-                                             for p in (getattr(m, '_vxpu_hot', None).pools
-                                                       if getattr(m, '_vxpu_hot', None) else [])})))
+            self._attach_mailboxes()
         for layer, spec in external.get("engram", {}).items():
             weight, downloaded = fetch_tensor(self.manifest["tensors"][spec["weight"]], self.manifest["files"], cas_dir, mmap_dir=mm)
             self.bytes_fetched += downloaded
@@ -274,6 +291,26 @@ class Engine:
                 advise_random(scale)
             self.external.engram[int(layer)] = ds.host_engram(int(layer), spec["num_embeddings"], spec["dim"], weight, scale)
             ops.ENGRAM_DIM[int(layer)] = spec["dim"]
+
+    def _attach_mailboxes(self):
+        """Decode's experts as mailboxes (mailboxes.py): per layer, the GPU
+        pools of its residency, an expert server holding it (expert_remote)
+        or the CPU here for the rest."""
+        from . import mailboxes
+        from .expert_server import checkpoint_id
+        remotes = [mailboxes.RemoteOwner(a, checkpoint=checkpoint_id(self.manifest))
+                   for a in (self.plan["expert_remote"] or "").split(",") if a]
+        owners = collections.Counter()
+        for layer, moe in self.external.experts.items():
+            remote = next((r for r in remotes if layer in r.layers), None)
+            res = getattr(moe, "_vxpu_hot", None)
+            moe._vxpu_mailboxes = mailboxes.Layer(moe, layer, residency=res, remote=remote)
+            owners[remote.name if remote else "cpu"] += 1
+            for pool in (res.pools if res else []):
+                owners[str(pool.device)] += 1
+        msg = "expert mailboxes, layers per owner: " + ", ".join(f"{k} {v}" for k, v in sorted(owners.items()))
+        print(f"[vxpu] {msg}", flush=True)
+        self.plan.note(msg)
 
     def _place_hot_experts(self, path):
         """Hold the placement's hot experts on the GPUs (experts_gpu.py)."""
