@@ -29,6 +29,7 @@ import struct
 
 import requests
 from huggingface_hub import HfApi, hf_hub_download
+from huggingface_hub import constants as hf_constants
 
 MANIFEST_FORMAT = "vxpu-manifest/v1alpha1"
 
@@ -84,7 +85,7 @@ def build_manifest(repo_id, revision="main"):
         directory = os.path.abspath(repo_id)
         with open(os.path.join(directory, "config.json")) as f:
             config = json.load(f)
-        shards = _local_shards(directory)
+        shards = [(sha, size, name, source, source) for sha, size, name, source in _local_shards(directory)]
         commit_sha, revision = "local", "local"
         repo_id = directory
     else:
@@ -94,16 +95,21 @@ def build_manifest(repo_id, revision="main"):
         with open(hf_hub_download(repo_id, "config.json",
                                   revision=commit_sha)) as f:
             config = json.load(f)
+        # The recorded source is the canonical Hub URL (a weight store
+        # fetches a blob it lacks from there); the headers are read
+        # through the configured endpoint (HF_ENDPOINT), which in a
+        # cluster is modelstore's Hub-compatible API.
+        endpoint = hf_constants.ENDPOINT.rstrip("/")
         shards = [(s.lfs.sha256, s.size, s.rfilename,
-                   f"https://huggingface.co/{repo_id}/resolve/"
-                   f"{commit_sha}/{s.rfilename}")
+                   f"https://huggingface.co/{repo_id}/resolve/{commit_sha}/{s.rfilename}",
+                   f"{endpoint}/{repo_id}/resolve/{commit_sha}/{s.rfilename}")
                   for s in info.siblings if s.rfilename.endswith(".safetensors")]
 
     files, tensors = {}, {}
-    for sha, size, name, source in shards:
+    for sha, size, name, source, read_url in shards:
         files[sha] = {"size": size, "name": name, "source": source}
-        (header_len,) = struct.unpack("<Q", _fetch_range(source, 0, 8))
-        header = json.loads(_fetch_range(source, 8, header_len))
+        (header_len,) = struct.unpack("<Q", _fetch_range(read_url, 0, 8))
+        header = json.loads(_fetch_range(read_url, 8, header_len))
         data_start = 8 + header_len
         for name, meta in header.items():
             if name == "__metadata__":
