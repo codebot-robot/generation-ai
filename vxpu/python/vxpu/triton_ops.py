@@ -352,11 +352,19 @@ if triton is not None:
         return tl.sum(acc, axis=1)
 
     @triton.jit
-    def _fp4_gate_up_kernel(x_ptr, slot_ptr, w1_ptr, s1_ptr, w3_ptr, s3_ptr, g_ptr, u_ptr,
-                            I, K, TOPK, BN: tl.constexpr, BK: tl.constexpr):
+    def _slot(slot_ptr, idx_ptr, start, p, MAPPED: tl.constexpr):
+        """Pair p's slot in the pool: given per pair, or looked up in the
+        pool's slot map (slot_ptr) by the pair's expert (idx_ptr)."""
+        if MAPPED:
+            return tl.load(slot_ptr + (tl.load(idx_ptr + p) - start))
+        return tl.load(slot_ptr + p)
+
+    @triton.jit
+    def _fp4_gate_up_kernel(x_ptr, slot_ptr, idx_ptr, start, w1_ptr, s1_ptr, w3_ptr, s3_ptr, g_ptr, u_ptr,
+                            I, K, TOPK, BN: tl.constexpr, BK: tl.constexpr, MAPPED: tl.constexpr):
         pid = tl.program_id(0)
         p = tl.program_id(1)  # (token, k) pair
-        slot = tl.load(slot_ptr + p)
+        slot = _slot(slot_ptr, idx_ptr, start, p, MAPPED)
         if slot < 0:  # a cold expert: the CPU computes it
             return
         rows = pid * BN + tl.arange(0, BN)
@@ -369,12 +377,13 @@ if triton is not None:
         tl.store(u_ptr + p.to(tl.int64) * I + rows, u.to(tl.bfloat16), mask=live)
 
     @triton.jit
-    def _swiglu_quant_kernel(g_ptr, u_ptr, wt_ptr, slot_ptr, h_ptr, I, limit, G: tl.constexpr):
+    def _swiglu_quant_kernel(g_ptr, u_ptr, wt_ptr, slot_ptr, idx_ptr, start, h_ptr, I, limit, G: tl.constexpr,
+                             MAPPED: tl.constexpr):
         """The fork's _ffn for one pair's 32-blocks: clamps, w * silu(g) * u
         in fp32, rounded to bf16, then act_quant per 32 (fp8 grid, ue8m0
         scales) and dequantized, as _act_quant_dequant_kernel does."""
         p = tl.program_id(1)
-        slot = tl.load(slot_ptr + p)
+        slot = _slot(slot_ptr, idx_ptr, start, p, MAPPED)
         if slot < 0:
             return
         blocks = tl.program_id(0) * G + tl.arange(0, G)
@@ -399,14 +408,16 @@ if triton is not None:
         tl.store(h_ptr + offs, y.to(tl.bfloat16), mask=live[:, None])
 
     @triton.jit
-    def _fp4_down_kernel(h_ptr, slot_ptr, w2_ptr, s2_ptr, d_ptr, D, I, BN: tl.constexpr, BK: tl.constexpr):
+    def _fp4_down_kernel(h_ptr, slot_ptr, idx_ptr, start, w2_ptr, s2_ptr, d_ptr, D, I, BN: tl.constexpr,
+                         BK: tl.constexpr, MAPPED: tl.constexpr):
         pid = tl.program_id(0)
         p = tl.program_id(1)
-        slot = tl.load(slot_ptr + p)
-        if slot < 0:
-            return
+        slot = _slot(slot_ptr, idx_ptr, start, p, MAPPED)
         rows = pid * BN + tl.arange(0, BN)
         live = rows < D
+        if slot < 0:  # not held here: its reply is 0 (the output is not zeroed beforehand)
+            tl.store(d_ptr + p.to(tl.int64) * D + rows, tl.zeros((BN,), dtype=tl.float32), mask=live)
+            return
         bank_rows = slot.to(tl.int64) * D + rows
         d = _fp4_rows_dot(h_ptr + p.to(tl.int64) * I, w2_ptr, s2_ptr, bank_rows, live, I, I // 2, I // 32, BN, BK)
         tl.store(d_ptr + p.to(tl.int64) * D + rows, d.to(tl.bfloat16).to(tl.float32), mask=live)
@@ -419,7 +430,8 @@ def _fp4_block_k(K):
     raise ValueError(f"fp4 experts: K={K} is not a multiple of 32")
 
 
-def fp4_experts_decode(x_in, weights, slots, w1, s1, w3, s3, w2, s2, swiglu_limit, per_pair=False):
+def fp4_experts_decode(x_in, weights, slots, w1, s1, w3, s3, w2, s2, swiglu_limit, per_pair=False,
+                       indices=None, start=0):
     """The routed experts of a few tokens, for the pairs whose expert is
     held on the GPU: x_in [n, K] bf16 (already on the fp8 grid, as the
     module quantizes it), weights [n, topk] fp32, slots [n, topk] int (the
@@ -431,24 +443,72 @@ def fp4_experts_decode(x_in, weights, slots, w1, s1, w3, s3, w2, s2, swiglu_limi
     re-quantized per 32 block, its output rounded to bf16. Returns y
     [n, K] fp32, the sum over the token's held pairs (0 where none), or
     with per_pair=True each pair's reply, [n, topk, K] (0 where not held;
-    mailboxes.py sums them in a fixed order)."""
-    n, topk = slots.shape
+    mailboxes.py sums them in a fixed order). With indices ([n, topk]
+    expert ids), slots is instead the pool's slot map (one entry per
+    expert from `start`), read by the kernels themselves: no lookup
+    launched first."""
+    n, topk = (indices if indices is not None else slots).shape
     K = x_in.shape[1]
     S, I, _ = w1.shape
     pairs = n * topk
     dev = x_in.device
-    sl = slots.to(torch.int32).contiguous().view(-1)
+    mapped = indices is not None
+    sl = slots.contiguous().view(-1) if mapped else slots.to(torch.int32).contiguous().view(-1)
+    idx = indices.contiguous().view(-1) if mapped else sl
     g = torch.empty(pairs, I, dtype=torch.bfloat16, device=dev)
     u = torch.empty(pairs, I, dtype=torch.bfloat16, device=dev)
     h = torch.empty(pairs, I, dtype=torch.bfloat16, device=dev)
-    d = torch.zeros(pairs, K, dtype=torch.float32, device=dev)
+    d = torch.empty(pairs, K, dtype=torch.float32, device=dev)  # the down kernel writes every pair, 0 where not held
     x = x_in.contiguous()
     wt = weights.to(torch.float32).contiguous().view(-1)
     BN = 8
     with torch.cuda.device(dev):
         _fp4_gate_up_kernel[(triton.cdiv(I, BN), pairs)](
-            x, sl, w1, s1.view(torch.uint8), w3, s3.view(torch.uint8), g, u, I, K, topk, BN=BN, BK=_fp4_block_k(K))
-        _swiglu_quant_kernel[(triton.cdiv(I // 32, 16), pairs)](g, u, wt, sl, h, I, float(swiglu_limit), G=16)
+            x, sl, idx, start, w1, s1.view(torch.uint8), w3, s3.view(torch.uint8), g, u, I, K, topk, BN=BN,
+            BK=_fp4_block_k(K), MAPPED=mapped)
+        _swiglu_quant_kernel[(triton.cdiv(I // 32, 16), pairs)](g, u, wt, sl, idx, start, h, I, float(swiglu_limit),
+                                                               G=16, MAPPED=mapped)
         _fp4_down_kernel[(triton.cdiv(K, BN), pairs)](
-            h, sl, w2, s2.view(torch.uint8), d, K, I, BN=BN, BK=_fp4_block_k(I))
+            h, sl, idx, start, w2, s2.view(torch.uint8), d, K, I, BN=BN, BK=_fp4_block_k(I), MAPPED=mapped)
     return d.view(n, topk, K) if per_pair else d.view(n, topk, K).sum(1)
+
+
+if triton is not None:
+    @triton.jit
+    def _combine_kernel(cpu_ptr, loc_ptr, peer_ptr, idx_ptr, loc_map_ptr, peer_map_ptr, y_ptr, start, K,
+                        TOPK: tl.constexpr, HAS_LOC: tl.constexpr, HAS_PEER: tl.constexpr, BK: tl.constexpr):
+        t = tl.program_id(1)
+        offs = tl.program_id(0) * BK + tl.arange(0, BK)
+        live = offs < K
+        acc = tl.zeros((BK,), dtype=tl.float32)
+        for k in tl.static_range(TOPK):
+            p = t * TOPK + k
+            r = tl.load(cpu_ptr + p.to(tl.int64) * K + offs, mask=live, other=0.0)
+            e = tl.load(idx_ptr + p) - start
+            if HAS_PEER:
+                held = tl.load(peer_map_ptr + e) >= 0
+                r = tl.where(held, tl.load(peer_ptr + p.to(tl.int64) * K + offs, mask=live & held, other=0.0), r)
+            if HAS_LOC:
+                held = tl.load(loc_map_ptr + e) >= 0
+                r = tl.where(held, tl.load(loc_ptr + p.to(tl.int64) * K + offs, mask=live & held, other=0.0), r)
+            acc = acc + r  # in k order, from zero: the fused CPU kernel's sum
+        tl.store(y_ptr + t.to(tl.int64) * K + offs, acc, mask=live)
+
+
+def combine_replies(cpu, indices, start, local=None, local_map=None, peer=None, peer_map=None):
+    """One experts node's replies [n, topk, K] fp32 combined into y [n, K]:
+    each pair's reply from the pool on this GPU if its slot map holds the
+    expert, else from the other GPU's if that one does, else the CPU's,
+    summed in k order into fp32 from zero. One kernel; the same sums as
+    mailboxes.Layer's torch.where and adds, in the same order."""
+    n, topk, K = cpu.shape
+    y = torch.empty(n, K, dtype=torch.float32, device=cpu.device)
+    BK = 1024
+    dummy = cpu
+    with torch.cuda.device(cpu.device):
+        _combine_kernel[(triton.cdiv(K, BK), n)](
+            cpu, local if local is not None else dummy, peer if peer is not None else dummy,
+            indices.contiguous().view(-1), local_map if local_map is not None else indices,
+            peer_map if peer_map is not None else indices, y, start, K,
+            TOPK=topk, HAS_LOC=local is not None, HAS_PEER=peer is not None, BK=BK)
+    return y
