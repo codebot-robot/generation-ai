@@ -202,14 +202,22 @@ def call_host_ops_directly(sub):
         sub.recompile()
 
 
-def compile_segments(gm, device, mode, options=None, split_compile=True, direct=True):
+def compile_segments(gm, device, mode, options=None, split_compile=True, direct=True, runtime="jit",
+                     aoti_cache_dir=None):
     """The module split at its host ops with every dense segment compiled
     (split_compile=False: the split alone, segments eager, a check of the
     cut) and the host-op segments calling their implementations directly
-    (direct=False: through torch's dispatcher). The engine passes its
-    plan's choices."""
+    (direct=False: through torch's dispatcher). runtime="aoti" compiles the
+    dense segments with AOTInductor instead and runs them in the engine's
+    own CUDA graphs (aoti.py; the graph must be lowered). The engine passes
+    its plan's choices."""
     split, host = split_at_host_ops(gm)
     compiled = 0
+    packages = pool = None
+    if runtime == "aoti" and split_compile:
+        from . import aoti
+        packages = aoti.Packages(aoti_cache_dir, expected=len(segments_of(split)) - len(host))
+        pool = torch.cuda.graph_pool_handle()  # one memory pool for every segment's graph
     for name, sub in segments_of(split):
         if name in host:
             if direct:
@@ -217,9 +225,15 @@ def compile_segments(gm, device, mode, options=None, split_compile=True, direct=
             continue
         if not split_compile:
             continue
+        if packages is not None:
+            setattr(split, name, aoti.GraphedSegment(name, sub, aoti.static_arguments(split, name), packages, pool))
+            compiled += 1
+            continue
         kwargs = {"mode": mode}
         if options:
             kwargs["options"] = options
         setattr(split, name, torch.compile(sub, **kwargs))
         compiled += 1
-    return Split(split, len(segments_of(split)), compiled)  # every segment, compiled or not
+    out = Split(split, len(segments_of(split)), compiled)  # every segment, compiled or not
+    out.packages = packages
+    return out

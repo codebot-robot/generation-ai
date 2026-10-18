@@ -759,45 +759,56 @@ def _check_telemetry(model, prompts, settings, artifact, plain, workdir):
     return not problems
 
 
-def _check_lowering(model, prompts, settings, artifact):
+def _check_lowering(model, prompts, settings, artifact, workdir):
     """On a GPU: the compiled, split decode with the plan lowered into its
-    segments (lower.py) against the same without, token-exact. The lowered
-    calls run the same kernels, so the vectors must agree. Skipped without
-    CUDA (nothing on the CPU is lowerable)."""
+    segments (lower.py), and with those segments as AOTInductor packages
+    in the engine's own CUDA graphs (aoti.py), each against the plain
+    compiled decode, token-exact. Lowered calls run the same kernels, so
+    the vectors must agree. Each variant must really have run as such
+    (the plan falls back silently when a requirement is missing). Skipped
+    without CUDA or Triton (nothing is lowerable)."""
     import torch
     if not torch.cuda.is_available():
         print("lowering check skipped: no CUDA")
         return True
+    variants = {"compiled": {"VXPU_LOWER_DECODE": "0"},
+                "lowered": {"VXPU_LOWER_DECODE": "1"},
+                "aoti": {"VXPU_SEGMENT_RUNTIME": "aoti", "VXPU_AOTI_CACHE_DIR": os.path.join(workdir, "aoti-cache")}}
     runs = {}
-    for lowered in (False, True):
-        saved = os.environ.get("VXPU_LOWER_DECODE")
-        os.environ["VXPU_LOWER_DECODE"] = "1" if lowered else "0"
+    for label, env in variants.items():
+        saved = {k: os.environ.get(k) for k in env}
+        os.environ.update(env)
         try:
-            runs[lowered] = record_vxpu_engine(model, "main", prompts, settings, artifact, device="cuda",
-                                               compile_decode=True)
+            runs[label] = record_vxpu_engine(model, "main", prompts, settings, artifact, device="cuda",
+                                             compile_decode=True)
         finally:
-            if saved is None:
-                os.environ.pop("VXPU_LOWER_DECODE")
-            else:
-                os.environ["VXPU_LOWER_DECODE"] = saved
-    # the lowered run must have lowered something: with Triton missing or
-    # the split decode off, both runs would be the same decode
+            for k, v in saved.items():
+                if v is None:
+                    os.environ.pop(k)
+                else:
+                    os.environ[k] = v
     from .lower import REPORT_PREFIX
-    plan = runs[True]["producer"]["plan"]
-    if not plan["choices"].get("triton"):
+    if not runs["lowered"]["producer"]["plan"]["choices"].get("triton"):
         print("lowering check skipped: no Triton (nothing is lowerable)")
         return True
-    report = [n for n in plan.get("notes", []) if n.startswith(REPORT_PREFIX)]
-    if not plan["choices"].get("lower_decode") or not report or "lowered " not in report[0][len(REPORT_PREFIX):]:
-        print(f"lowering check: the lowered run lowered nothing (lower_decode={plan['choices'].get('lower_decode')}, "
-              f"report={report})")
-        return False
-    print(report[0])
-    rows, ok = compare(runs[False], runs[True], strict_tokens=True)
-    print("lowered decode against unlowered, cuda:")
-    print(table(runs[False], runs[True], rows))
+    ok = True
+    for label in ("lowered", "aoti"):
+        plan = runs[label]["producer"]["plan"]
+        report = [n for n in plan.get("notes", []) if n.startswith(REPORT_PREFIX)]
+        if not plan["choices"].get("lower_decode") or not report or "lowered " not in report[0][len(REPORT_PREFIX):]:
+            print(f"lowering check: the {label} run lowered nothing (lower_decode="
+                  f"{plan['choices'].get('lower_decode')}, report={report})")
+            ok = False
+            continue
+        if label == "aoti" and plan["choices"].get("segment_runtime") != "aoti":
+            print(f"lowering check: the aoti run ran segment_runtime={plan['choices'].get('segment_runtime')}")
+            ok = False
+            continue
+        rows, same = compare(runs["compiled"], runs[label], strict_tokens=True)
+        print(f"{label} decode against compiled, cuda:")
+        print(table(runs["compiled"], runs[label], rows))
+        ok = ok and same
     return ok
-
 
 def selftest(workdir, settings):
     """The CI tier: tiny models through export, the in-process engine,
@@ -842,7 +853,7 @@ def selftest(workdir, settings):
             failed.append(name)
         if name == "tiny-deepseek-v41" and not _check_telemetry(model, prompts, settings, artifact, got, workdir):
             failed.append(name + " (telemetry)")
-        if name == "tiny-deepseek-v41" and not _check_lowering(model, prompts, settings, artifact):
+        if name == "tiny-deepseek-v41" and not _check_lowering(model, prompts, settings, artifact, workdir):
             failed.append(name + " (lowered)")
     if failed:
         raise SystemExit(f"vectors differ for: {', '.join(failed)}")

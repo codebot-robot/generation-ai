@@ -1,0 +1,172 @@
+# Copyright 2026 Google LLC
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
+
+"""Dense decode segments compiled ahead of time and run in our own CUDA
+graphs (#277).
+
+With the plan lowered into the decode graph (lower.py), a dense segment
+is torch ops and Triton kernels only, so AOTInductor can compile it to a
+package: native code with the kernels inside, no Python at run time. This
+replaces torch.compile for those segments (the plan's segment_runtime =
+aoti):
+
+  build    on a segment's first call, torch.export on the arguments it
+           was called with, then aoti_compile_and_package, in inductor's
+           deterministic mode: no choice that changes numerics is made by
+           timing kernels on the device, so a package computes the same
+           bits whichever machine built it (and costs nothing measurable).
+           Packages are cached on disk under a key of the segment's code,
+           its argument shapes, dtypes and strides, the kernels' source,
+           the torch version, the GPU and the inductor settings that
+           change numerics: the compiled plan, reused by every later load
+           of the same artifact on the same kind of machine
+  graph    the package is loaded single-threaded (the default runner's
+           model pool queries CUDA events, which a capture forbids); the
+           first call runs it eagerly, the second captures it into a CUDA
+           graph and replays it, later calls replay. Every call executes
+           the segment exactly once: segments update the caches in place.
+           Arguments that are the engine's own tensors (weights, the
+           resident state: attributes of the split graph) are passed by
+           address; the others (the step's inputs, other segments'
+           outputs) are copied into the graph's input buffers first.
+
+A replay's outputs are the graph's own buffers, rewritten by the next
+replay of the same segment, one step later: the host ops and the next
+segments read them within the step, and the step's result is cloned
+(segments.Split).
+"""
+
+import hashlib
+import os
+import time
+
+import torch
+
+from . import triton_ops
+
+FORMAT = "vxpu-aoti/1"  # in the cache key: a change here invalidates every package
+NUMERICS_CONFIG = ("deterministic", "prologue_fusion", "emulate_precision_casts")
+
+
+def cache_key(sub, args):
+    """The content key of a segment's package."""
+    h = hashlib.sha256()
+    h.update(FORMAT.encode())
+    h.update(sub.code.encode())
+    for a in args:
+        if isinstance(a, torch.Tensor):
+            h.update(f"T{tuple(a.shape)}{a.stride()}{a.dtype}{a.device.type}".encode())
+        else:
+            h.update(repr(a).encode())
+    import inspect
+    h.update(inspect.getsource(triton_ops).encode())
+    h.update(torch.__version__.encode())
+    import torch._inductor.config as inductor_config
+    for name in NUMERICS_CONFIG:  # inductor settings that change what a package computes
+        h.update(f"{name}={getattr(inductor_config, name, None)}".encode())
+    if torch.cuda.is_available():
+        props = torch.cuda.get_device_properties(torch.cuda.current_device())
+        h.update(f"{props.name} {props.major}.{props.minor}".encode())
+    return h.hexdigest()[:32]
+
+
+class Packages:
+    """The package cache: a directory of <key>.pt2."""
+
+    def __init__(self, cache_dir, expected=0):
+        self.cache_dir = cache_dir
+        self.expected = expected  # segments that will ask: the summary is printed when all have
+        self.built = self.loaded = 0
+        self.build_s = 0.0
+
+    def get(self, name, sub, args):
+        os.makedirs(self.cache_dir, exist_ok=True)
+        import torch._inductor.config as inductor_config
+        with inductor_config.patch(deterministic=True):
+            return self._get(name, sub, args)
+
+    def _get(self, name, sub, args):
+        path = os.path.join(self.cache_dir, cache_key(sub, args) + ".pt2")
+        if os.path.exists(path):
+            self.loaded += 1
+        else:
+            if not self.built:
+                print(f"[vxpu] building AOTInductor packages for the dense segments (once per artifact, plan and "
+                      f"machine; kept in {self.cache_dir})", flush=True)
+            t = time.perf_counter()
+            ep = torch.export.export(sub, tuple(args), strict=False)
+            tmp = f"{path[:-len('.pt2')]}.{os.getpid()}.tmp.pt2"  # aoti_compile_and_package wants .pt2
+            torch._inductor.aoti_compile_and_package(ep, package_path=tmp)
+            os.replace(tmp, path)  # another process building the same key writes the same package
+            self.build_s += time.perf_counter() - t
+            self.built += 1
+        runner = torch._inductor.aoti_load_package(path, run_single_threaded=True)
+        if self.built + self.loaded == self.expected:
+            print(f"[vxpu] AOTInductor segments: {self.loaded} loaded from the cache, {self.built} built"
+                  + (f" in {self.build_s:.0f} s" if self.built else ""), flush=True)
+        return runner
+
+
+class GraphedSegment(torch.nn.Module):
+    """One dense segment: its AOTInductor package, run in a CUDA graph.
+    static[i] marks argument i as the engine's own tensor (same address
+    every call)."""
+
+    def __init__(self, name, sub, static, packages, pool):
+        super().__init__()
+        self.name, self.sub, self.static = name, sub, static
+        self.packages, self.pool = packages, pool
+        self.runner = None
+        self.graph = None
+        self.calls = 0
+
+    @property
+    def _orig_mod(self):
+        """The segment's graph, under the name a compiled module gives it
+        (segments.segments_of, telemetry)."""
+        return self.sub
+
+    def forward(self, *args):
+        self.calls += 1
+        if self.runner is None:
+            self.runner = self.packages.get(self.name, self.sub, args)
+            return self.runner(*args)  # the first call runs eagerly
+        if self.graph is None:
+            return self._capture(args)
+        for i, a in enumerate(args):
+            if not self.static[i] and isinstance(a, torch.Tensor):
+                self.inputs[i].copy_(a)
+        self.graph.replay()
+        return self.outputs
+
+    def _capture(self, args):
+        self.inputs = [a.clone() if not self.static[i] and isinstance(a, torch.Tensor) else a
+                       for i, a in enumerate(args)]
+        torch.cuda.synchronize()
+        self.graph = torch.cuda.CUDAGraph()
+        with torch.cuda.graph(self.graph, pool=self.pool):
+            self.outputs = self.runner(*self.inputs)
+        self.graph.replay()  # capturing executed nothing: this is the call's one execution
+        return self.outputs
+
+
+def static_arguments(split, name):
+    """For the call of submodule `name` in the split graph: which arguments
+    are attributes of the graph (the engine's weights and resident state,
+    the same tensors every call)."""
+    for node in split.graph.nodes:
+        if node.op == "call_module" and node.target == name:
+            return [isinstance(a, torch.fx.Node) and a.op == "get_attr" for a in node.args]
+    raise KeyError(name)

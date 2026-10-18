@@ -263,10 +263,22 @@ class Plan:
         on, src = env_flag("VXPU_DIRECT_HOST_OPS", True)
         self._set("direct_host_ops", on, src, (True, False),
                   "eager host-op segments call the op's implementation directly, not through torch's dispatcher")
+        runtime, rsrc = env_text("VXPU_SEGMENT_RUNTIME", "jit")
+        if runtime not in ("jit", "aoti"):
+            raise ConfigError(f"VXPU_SEGMENT_RUNTIME={runtime!r}: expected jit or aoti")
+        if runtime == "aoti" and not (cuda and self["split_decode"] and self["split_compile"]):
+            runtime, rsrc = "jit", "aoti requires CUDA and a compiled split decode"
         on, src = env_flag("VXPU_LOWER_DECODE", False)
+        if runtime == "aoti":
+            on, src = True, "required by segment_runtime=aoti"
         self._set("lower_decode", on and self["split_decode"], src if self["split_decode"] else "requires split_decode",
                   (True, False), "before compiling, rewrite each dense segment's vxpu op calls into the selected "
                   "implementation, its Triton kernels as torch ops (lower.py): the compiler sees the kernels")
+        self._set("segment_runtime", runtime, rsrc, ("jit", "aoti"),
+                  "how dense segments run: jit (torch.compile, CUDA graphs by its cudagraph trees) or aoti "
+                  "(AOTInductor packages, built once and cached, in the engine's own CUDA graphs; aoti.py)")
+        cache, src = env_text("VXPU_AOTI_CACHE_DIR", os.path.join(os.path.expanduser("~"), ".cache", "vxpu", "aoti"))
+        self._set("aoti_cache_dir", cache, src, (), "where AOTInductor segment packages are kept (the compiled plans)")
 
         # where the external tensors live
         if external_dir:  # an explicit argument wins over the environment, as it always has
@@ -369,7 +381,7 @@ class Plan:
 # choices whose values are paths on the executor's own disk: a record
 # (which leaves the process, on the Generate stream) says only whether
 # they are set
-LOCAL_PATHS = ("external_dir",)
+LOCAL_PATHS = ("external_dir", "aoti_cache_dir")
 
 
 def record(explained):
