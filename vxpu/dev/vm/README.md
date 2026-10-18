@@ -59,7 +59,17 @@ vxpu register deepseek-ai/DeepSeek-V4.1-Flash
 vxpu ask --model deepseek-ai/DeepSeek-V4.1-Flash "Is the sky blue?"
 ```
 
-`executor.sh stop` stops it and `executor.sh log` follows its log. The
+`executor.sh stop` stops it and `executor.sh log` follows its log.
+
+Where SSH to the VM is not possible (a project whose security policy
+removes custom firewall rules, so neither direct SSH nor IAP reaches
+port 22), `boot.sh` does the same without SSH: it uploads the code and a
+bootstrap script to `gs://BUCKET/_dev/$VM/`, sets the VM's startup script
+to run it, and resets the VM; the bootstrap runs the setup
+(`remote/setup-vm.sh`, the steps `setup.sh` runs over SSH) and starts the
+executor as a systemd service, logging to the serial console, which
+`boot.sh` follows until the executor listens. Re-run it after a code
+change; a reset keeps the local SSDs. The
 VM's code comes from `sync.sh`, not an image, so keep it at the commit
 of the executor image the router compiles with.
 
