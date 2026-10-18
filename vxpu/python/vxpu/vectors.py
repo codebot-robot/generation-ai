@@ -1319,6 +1319,42 @@ def _check_expert_server_errors(address, artifact, layer):
     return True
 
 
+def _check_step_graph(model, prompts, settings, artifact, workdir):
+    """On a GPU: the whole decode step in one CUDA graph (stepgraph.py),
+    the AOTInductor segments and the host ops as mailboxes the GPU waits
+    on, against the same dataflow over the same segments run node by
+    node: tokens and logits bit-identical, and the step really captured.
+    Skipped without CUDA."""
+    import torch
+    if not torch.cuda.is_available():
+        print("step graph check skipped: no CUDA")
+        return True
+    base = {"VXPU_DATAFLOW": "1", "VXPU_SEGMENT_RUNTIME": "aoti", "VXPU_AOTI_CACHE_DIR": os.path.join(workdir, "aoti"),
+            "VXPU_DATAFLOW_PLACE": None, "VXPU_EXPERT_MAILBOXES": None, "VXPU_GPU_EXPERTS": None}
+    ref = _with_env({**base, "VXPU_STEP_GRAPH": None}, record_vxpu_engine, model, "main", prompts, settings, artifact,
+                    device="cuda", compile_decode=True)
+    keep = []
+    got = _with_env({**base, "VXPU_STEP_GRAPH": "1"}, record_vxpu_engine, model, "main", prompts, settings, artifact,
+                    device="cuda", compile_decode=True, keep=keep)
+    if not isinstance(getattr(keep[0]._decode_split, "graph", None), torch.cuda.CUDAGraph):
+        print("step graph check: the decode step was never captured")
+        return False
+    same = ([p["generated_ids"] for p in got["prompts"]] == [p["generated_ids"] for p in ref["prompts"]]
+            and [p["top_logits"] for p in got["prompts"]] == [p["top_logits"] for p in ref["prompts"]])
+    rows, _ = compare(ref, got, strict_tokens=True)
+    print("the decode step as one CUDA graph, against the same segments run node by node (must be bit-identical):")
+    print(table(ref, got, rows))
+    import gc
+    worker = keep[0]._decode_split._worker
+    keep.clear()  # the engine dropped: its step graph's host thread must let go of the model
+    gc.collect()
+    worker.join(timeout=10)
+    if worker.is_alive():
+        print("step graph check: the host thread outlived its engine")
+        return False
+    return same
+
+
 def _check_dataflow(model, prompts, settings, artifact, plain):
     """The engine's decode run as a dataflow graph (dataflow.py): the same
     tokens and logits as the plain run, every edge through an inbox. On a
@@ -1445,6 +1481,8 @@ def selftest(workdir, settings):
             failed.append(name + " (expert mailboxes)")
         if name == "tiny-deepseek-v41" and not _check_expert_remote(model, prompts, settings, artifact, got):
             failed.append(name + " (expert remote)")
+        if name == "tiny-deepseek-v41" and not _check_step_graph(model, prompts, settings, artifact, workdir):
+            failed.append(name + " (step graph)")
         if name == "tiny-llama" and not _check_chat_telemetry(artifact):
             failed.append(name + " (chat telemetry)")
         if name == "tiny-deepseek-v41" and not _check_gpu_experts(model, prompts, settings, artifact, workdir):
