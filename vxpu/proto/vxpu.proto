@@ -31,7 +31,16 @@ service Executor {
   // digest identifies the model, and a matching digest reuses the
   // already-loaded engine.
   rpc LoadModel(LoadModelRequest) returns (LoadModelResponse) {}
-  // NewSession allocates fresh per-session state (KV cache).
+  // RegisterModel makes a model servable by name (router only): the
+  // router imports the weights into modelstore and compiles the model
+  // for its executor image (a compile job exporting the artifact into
+  // modelstore), unless that was done before. Blocks until the model is
+  // registered; idempotent.
+  rpc RegisterModel(RegisterModelRequest) returns (RegisterModelResponse) {}
+  // NewSession allocates fresh per-session state (KV cache). With a
+  // model name (router only), the router loads that registered model
+  // if needed; while it loads, NewSession fails with FAILED_PRECONDITION
+  // and the caller retries.
   rpc NewSession(NewSessionRequest) returns (NewSessionResponse) {}
   // Chat runs one conversation turn in a session. Multi-turn reuses
   // the session's cache: only new suffix tokens are prefilled.
@@ -55,7 +64,34 @@ message LoadModelResponse {
   bool success = 1;
 }
 
-message NewSessionRequest {}
+message RegisterModelRequest {
+  // A Hugging Face repository id, e.g. "deepseek-ai/DeepSeek-V4.1-Flash".
+  string model = 1;
+  // Branch, tag or commit; empty means "main".
+  string revision = 2;
+}
+
+message RegisterModelResponse {
+  string model = 1;
+  string revision = 2;
+  // The commit the revision resolved to.
+  string commit = 3;
+  // The compiled artifact in modelstore, as repository:tag.
+  string artifact = 4;
+  // True when this call compiled the model; false when a compiled
+  // artifact for this commit and executor image already existed.
+  bool compiled = 5;
+  // Bytes of weights the artifact references.
+  int64 weight_bytes = 6;
+}
+
+message NewSessionRequest {
+  // A registered model to open the session on (router only); empty
+  // means the model this connection last loaded with LoadModel.
+  string model = 1;
+  // The model's revision; empty means "main".
+  string revision = 2;
+}
 
 message NewSessionResponse {
   string session_id = 1;

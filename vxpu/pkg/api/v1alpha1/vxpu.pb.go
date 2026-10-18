@@ -147,15 +147,163 @@ func (x *LoadModelResponse) GetSuccess() bool {
 	return false
 }
 
+type RegisterModelRequest struct {
+	state protoimpl.MessageState `protogen:"open.v1"`
+	// A Hugging Face repository id, e.g. "deepseek-ai/DeepSeek-V4.1-Flash".
+	Model string `protobuf:"bytes,1,opt,name=model,proto3" json:"model,omitempty"`
+	// Branch, tag or commit; empty means "main".
+	Revision      string `protobuf:"bytes,2,opt,name=revision,proto3" json:"revision,omitempty"`
+	unknownFields protoimpl.UnknownFields
+	sizeCache     protoimpl.SizeCache
+}
+
+func (x *RegisterModelRequest) Reset() {
+	*x = RegisterModelRequest{}
+	mi := &file_proto_vxpu_proto_msgTypes[2]
+	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+	ms.StoreMessageInfo(mi)
+}
+
+func (x *RegisterModelRequest) String() string {
+	return protoimpl.X.MessageStringOf(x)
+}
+
+func (*RegisterModelRequest) ProtoMessage() {}
+
+func (x *RegisterModelRequest) ProtoReflect() protoreflect.Message {
+	mi := &file_proto_vxpu_proto_msgTypes[2]
+	if x != nil {
+		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+		if ms.LoadMessageInfo() == nil {
+			ms.StoreMessageInfo(mi)
+		}
+		return ms
+	}
+	return mi.MessageOf(x)
+}
+
+// Deprecated: Use RegisterModelRequest.ProtoReflect.Descriptor instead.
+func (*RegisterModelRequest) Descriptor() ([]byte, []int) {
+	return file_proto_vxpu_proto_rawDescGZIP(), []int{2}
+}
+
+func (x *RegisterModelRequest) GetModel() string {
+	if x != nil {
+		return x.Model
+	}
+	return ""
+}
+
+func (x *RegisterModelRequest) GetRevision() string {
+	if x != nil {
+		return x.Revision
+	}
+	return ""
+}
+
+type RegisterModelResponse struct {
+	state    protoimpl.MessageState `protogen:"open.v1"`
+	Model    string                 `protobuf:"bytes,1,opt,name=model,proto3" json:"model,omitempty"`
+	Revision string                 `protobuf:"bytes,2,opt,name=revision,proto3" json:"revision,omitempty"`
+	// The commit the revision resolved to.
+	Commit string `protobuf:"bytes,3,opt,name=commit,proto3" json:"commit,omitempty"`
+	// The compiled artifact in modelstore, as repository:tag.
+	Artifact string `protobuf:"bytes,4,opt,name=artifact,proto3" json:"artifact,omitempty"`
+	// True when this call compiled the model; false when a compiled
+	// artifact for this commit and executor image already existed.
+	Compiled bool `protobuf:"varint,5,opt,name=compiled,proto3" json:"compiled,omitempty"`
+	// Bytes of weights the artifact references.
+	WeightBytes   int64 `protobuf:"varint,6,opt,name=weight_bytes,json=weightBytes,proto3" json:"weight_bytes,omitempty"`
+	unknownFields protoimpl.UnknownFields
+	sizeCache     protoimpl.SizeCache
+}
+
+func (x *RegisterModelResponse) Reset() {
+	*x = RegisterModelResponse{}
+	mi := &file_proto_vxpu_proto_msgTypes[3]
+	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+	ms.StoreMessageInfo(mi)
+}
+
+func (x *RegisterModelResponse) String() string {
+	return protoimpl.X.MessageStringOf(x)
+}
+
+func (*RegisterModelResponse) ProtoMessage() {}
+
+func (x *RegisterModelResponse) ProtoReflect() protoreflect.Message {
+	mi := &file_proto_vxpu_proto_msgTypes[3]
+	if x != nil {
+		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+		if ms.LoadMessageInfo() == nil {
+			ms.StoreMessageInfo(mi)
+		}
+		return ms
+	}
+	return mi.MessageOf(x)
+}
+
+// Deprecated: Use RegisterModelResponse.ProtoReflect.Descriptor instead.
+func (*RegisterModelResponse) Descriptor() ([]byte, []int) {
+	return file_proto_vxpu_proto_rawDescGZIP(), []int{3}
+}
+
+func (x *RegisterModelResponse) GetModel() string {
+	if x != nil {
+		return x.Model
+	}
+	return ""
+}
+
+func (x *RegisterModelResponse) GetRevision() string {
+	if x != nil {
+		return x.Revision
+	}
+	return ""
+}
+
+func (x *RegisterModelResponse) GetCommit() string {
+	if x != nil {
+		return x.Commit
+	}
+	return ""
+}
+
+func (x *RegisterModelResponse) GetArtifact() string {
+	if x != nil {
+		return x.Artifact
+	}
+	return ""
+}
+
+func (x *RegisterModelResponse) GetCompiled() bool {
+	if x != nil {
+		return x.Compiled
+	}
+	return false
+}
+
+func (x *RegisterModelResponse) GetWeightBytes() int64 {
+	if x != nil {
+		return x.WeightBytes
+	}
+	return 0
+}
+
 type NewSessionRequest struct {
-	state         protoimpl.MessageState `protogen:"open.v1"`
+	state protoimpl.MessageState `protogen:"open.v1"`
+	// A registered model to open the session on (router only); empty
+	// means the model this connection last loaded with LoadModel.
+	Model string `protobuf:"bytes,1,opt,name=model,proto3" json:"model,omitempty"`
+	// The model's revision; empty means "main".
+	Revision      string `protobuf:"bytes,2,opt,name=revision,proto3" json:"revision,omitempty"`
 	unknownFields protoimpl.UnknownFields
 	sizeCache     protoimpl.SizeCache
 }
 
 func (x *NewSessionRequest) Reset() {
 	*x = NewSessionRequest{}
-	mi := &file_proto_vxpu_proto_msgTypes[2]
+	mi := &file_proto_vxpu_proto_msgTypes[4]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -167,7 +315,7 @@ func (x *NewSessionRequest) String() string {
 func (*NewSessionRequest) ProtoMessage() {}
 
 func (x *NewSessionRequest) ProtoReflect() protoreflect.Message {
-	mi := &file_proto_vxpu_proto_msgTypes[2]
+	mi := &file_proto_vxpu_proto_msgTypes[4]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -180,7 +328,21 @@ func (x *NewSessionRequest) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use NewSessionRequest.ProtoReflect.Descriptor instead.
 func (*NewSessionRequest) Descriptor() ([]byte, []int) {
-	return file_proto_vxpu_proto_rawDescGZIP(), []int{2}
+	return file_proto_vxpu_proto_rawDescGZIP(), []int{4}
+}
+
+func (x *NewSessionRequest) GetModel() string {
+	if x != nil {
+		return x.Model
+	}
+	return ""
+}
+
+func (x *NewSessionRequest) GetRevision() string {
+	if x != nil {
+		return x.Revision
+	}
+	return ""
 }
 
 type NewSessionResponse struct {
@@ -192,7 +354,7 @@ type NewSessionResponse struct {
 
 func (x *NewSessionResponse) Reset() {
 	*x = NewSessionResponse{}
-	mi := &file_proto_vxpu_proto_msgTypes[3]
+	mi := &file_proto_vxpu_proto_msgTypes[5]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -204,7 +366,7 @@ func (x *NewSessionResponse) String() string {
 func (*NewSessionResponse) ProtoMessage() {}
 
 func (x *NewSessionResponse) ProtoReflect() protoreflect.Message {
-	mi := &file_proto_vxpu_proto_msgTypes[3]
+	mi := &file_proto_vxpu_proto_msgTypes[5]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -217,7 +379,7 @@ func (x *NewSessionResponse) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use NewSessionResponse.ProtoReflect.Descriptor instead.
 func (*NewSessionResponse) Descriptor() ([]byte, []int) {
-	return file_proto_vxpu_proto_rawDescGZIP(), []int{3}
+	return file_proto_vxpu_proto_rawDescGZIP(), []int{5}
 }
 
 func (x *NewSessionResponse) GetSessionId() string {
@@ -245,7 +407,7 @@ type ChatRequest struct {
 
 func (x *ChatRequest) Reset() {
 	*x = ChatRequest{}
-	mi := &file_proto_vxpu_proto_msgTypes[4]
+	mi := &file_proto_vxpu_proto_msgTypes[6]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -257,7 +419,7 @@ func (x *ChatRequest) String() string {
 func (*ChatRequest) ProtoMessage() {}
 
 func (x *ChatRequest) ProtoReflect() protoreflect.Message {
-	mi := &file_proto_vxpu_proto_msgTypes[4]
+	mi := &file_proto_vxpu_proto_msgTypes[6]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -270,7 +432,7 @@ func (x *ChatRequest) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use ChatRequest.ProtoReflect.Descriptor instead.
 func (*ChatRequest) Descriptor() ([]byte, []int) {
-	return file_proto_vxpu_proto_rawDescGZIP(), []int{4}
+	return file_proto_vxpu_proto_rawDescGZIP(), []int{6}
 }
 
 func (x *ChatRequest) GetSessionId() string {
@@ -315,7 +477,7 @@ type ChatResponse struct {
 
 func (x *ChatResponse) Reset() {
 	*x = ChatResponse{}
-	mi := &file_proto_vxpu_proto_msgTypes[5]
+	mi := &file_proto_vxpu_proto_msgTypes[7]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -327,7 +489,7 @@ func (x *ChatResponse) String() string {
 func (*ChatResponse) ProtoMessage() {}
 
 func (x *ChatResponse) ProtoReflect() protoreflect.Message {
-	mi := &file_proto_vxpu_proto_msgTypes[5]
+	mi := &file_proto_vxpu_proto_msgTypes[7]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -340,7 +502,7 @@ func (x *ChatResponse) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use ChatResponse.ProtoReflect.Descriptor instead.
 func (*ChatResponse) Descriptor() ([]byte, []int) {
-	return file_proto_vxpu_proto_rawDescGZIP(), []int{5}
+	return file_proto_vxpu_proto_rawDescGZIP(), []int{7}
 }
 
 func (x *ChatResponse) GetText() string {
@@ -417,7 +579,7 @@ type GenerateRequest struct {
 
 func (x *GenerateRequest) Reset() {
 	*x = GenerateRequest{}
-	mi := &file_proto_vxpu_proto_msgTypes[6]
+	mi := &file_proto_vxpu_proto_msgTypes[8]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -429,7 +591,7 @@ func (x *GenerateRequest) String() string {
 func (*GenerateRequest) ProtoMessage() {}
 
 func (x *GenerateRequest) ProtoReflect() protoreflect.Message {
-	mi := &file_proto_vxpu_proto_msgTypes[6]
+	mi := &file_proto_vxpu_proto_msgTypes[8]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -442,7 +604,7 @@ func (x *GenerateRequest) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use GenerateRequest.ProtoReflect.Descriptor instead.
 func (*GenerateRequest) Descriptor() ([]byte, []int) {
-	return file_proto_vxpu_proto_rawDescGZIP(), []int{6}
+	return file_proto_vxpu_proto_rawDescGZIP(), []int{8}
 }
 
 func (x *GenerateRequest) GetSessionId() string {
@@ -546,7 +708,7 @@ type GenerateResponse struct {
 
 func (x *GenerateResponse) Reset() {
 	*x = GenerateResponse{}
-	mi := &file_proto_vxpu_proto_msgTypes[7]
+	mi := &file_proto_vxpu_proto_msgTypes[9]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -558,7 +720,7 @@ func (x *GenerateResponse) String() string {
 func (*GenerateResponse) ProtoMessage() {}
 
 func (x *GenerateResponse) ProtoReflect() protoreflect.Message {
-	mi := &file_proto_vxpu_proto_msgTypes[7]
+	mi := &file_proto_vxpu_proto_msgTypes[9]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -571,7 +733,7 @@ func (x *GenerateResponse) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use GenerateResponse.ProtoReflect.Descriptor instead.
 func (*GenerateResponse) Descriptor() ([]byte, []int) {
-	return file_proto_vxpu_proto_rawDescGZIP(), []int{7}
+	return file_proto_vxpu_proto_rawDescGZIP(), []int{9}
 }
 
 func (x *GenerateResponse) GetTokenIds() []int32 {
@@ -648,8 +810,20 @@ const file_proto_vxpu_proto_rawDesc = "" +
 	"\rprefill_graph\x18\x03 \x01(\fR\fprefillGraph\x12!\n" +
 	"\fdecode_graph\x18\x04 \x01(\fR\vdecodeGraph\"-\n" +
 	"\x11LoadModelResponse\x12\x18\n" +
-	"\asuccess\x18\x01 \x01(\bR\asuccess\"\x13\n" +
-	"\x11NewSessionRequest\"3\n" +
+	"\asuccess\x18\x01 \x01(\bR\asuccess\"H\n" +
+	"\x14RegisterModelRequest\x12\x14\n" +
+	"\x05model\x18\x01 \x01(\tR\x05model\x12\x1a\n" +
+	"\brevision\x18\x02 \x01(\tR\brevision\"\xbc\x01\n" +
+	"\x15RegisterModelResponse\x12\x14\n" +
+	"\x05model\x18\x01 \x01(\tR\x05model\x12\x1a\n" +
+	"\brevision\x18\x02 \x01(\tR\brevision\x12\x16\n" +
+	"\x06commit\x18\x03 \x01(\tR\x06commit\x12\x1a\n" +
+	"\bartifact\x18\x04 \x01(\tR\bartifact\x12\x1a\n" +
+	"\bcompiled\x18\x05 \x01(\bR\bcompiled\x12!\n" +
+	"\fweight_bytes\x18\x06 \x01(\x03R\vweightBytes\"E\n" +
+	"\x11NewSessionRequest\x12\x14\n" +
+	"\x05model\x18\x01 \x01(\tR\x05model\x12\x1a\n" +
+	"\brevision\x18\x02 \x01(\tR\brevision\"3\n" +
 	"\x12NewSessionResponse\x12\x1d\n" +
 	"\n" +
 	"session_id\x18\x01 \x01(\tR\tsessionId\"\x85\x01\n" +
@@ -705,9 +879,10 @@ const file_proto_vxpu_proto_rawDesc = "" +
 	"prefill_ms\x18\a \x01(\x02R\tprefillMs\x12 \n" +
 	"\fms_per_token\x18\b \x01(\x02R\n" +
 	"msPerToken\x12%\n" +
-	"\x0etelemetry_json\x18\t \x01(\tR\rtelemetryJson2\xfd\x01\n" +
+	"\x0etelemetry_json\x18\t \x01(\tR\rtelemetryJson2\xc9\x02\n" +
 	"\bExecutor\x12>\n" +
-	"\tLoadModel\x12\x16.vxpu.LoadModelRequest\x1a\x17.vxpu.LoadModelResponse\"\x00\x12A\n" +
+	"\tLoadModel\x12\x16.vxpu.LoadModelRequest\x1a\x17.vxpu.LoadModelResponse\"\x00\x12J\n" +
+	"\rRegisterModel\x12\x1a.vxpu.RegisterModelRequest\x1a\x1b.vxpu.RegisterModelResponse\"\x00\x12A\n" +
 	"\n" +
 	"NewSession\x12\x17.vxpu.NewSessionRequest\x1a\x18.vxpu.NewSessionResponse\"\x00\x12/\n" +
 	"\x04Chat\x12\x11.vxpu.ChatRequest\x1a\x12.vxpu.ChatResponse\"\x00\x12=\n" +
@@ -725,28 +900,32 @@ func file_proto_vxpu_proto_rawDescGZIP() []byte {
 	return file_proto_vxpu_proto_rawDescData
 }
 
-var file_proto_vxpu_proto_msgTypes = make([]protoimpl.MessageInfo, 8)
+var file_proto_vxpu_proto_msgTypes = make([]protoimpl.MessageInfo, 10)
 var file_proto_vxpu_proto_goTypes = []any{
-	(*LoadModelRequest)(nil),   // 0: vxpu.LoadModelRequest
-	(*LoadModelResponse)(nil),  // 1: vxpu.LoadModelResponse
-	(*NewSessionRequest)(nil),  // 2: vxpu.NewSessionRequest
-	(*NewSessionResponse)(nil), // 3: vxpu.NewSessionResponse
-	(*ChatRequest)(nil),        // 4: vxpu.ChatRequest
-	(*ChatResponse)(nil),       // 5: vxpu.ChatResponse
-	(*GenerateRequest)(nil),    // 6: vxpu.GenerateRequest
-	(*GenerateResponse)(nil),   // 7: vxpu.GenerateResponse
+	(*LoadModelRequest)(nil),      // 0: vxpu.LoadModelRequest
+	(*LoadModelResponse)(nil),     // 1: vxpu.LoadModelResponse
+	(*RegisterModelRequest)(nil),  // 2: vxpu.RegisterModelRequest
+	(*RegisterModelResponse)(nil), // 3: vxpu.RegisterModelResponse
+	(*NewSessionRequest)(nil),     // 4: vxpu.NewSessionRequest
+	(*NewSessionResponse)(nil),    // 5: vxpu.NewSessionResponse
+	(*ChatRequest)(nil),           // 6: vxpu.ChatRequest
+	(*ChatResponse)(nil),          // 7: vxpu.ChatResponse
+	(*GenerateRequest)(nil),       // 8: vxpu.GenerateRequest
+	(*GenerateResponse)(nil),      // 9: vxpu.GenerateResponse
 }
 var file_proto_vxpu_proto_depIdxs = []int32{
 	0, // 0: vxpu.Executor.LoadModel:input_type -> vxpu.LoadModelRequest
-	2, // 1: vxpu.Executor.NewSession:input_type -> vxpu.NewSessionRequest
-	4, // 2: vxpu.Executor.Chat:input_type -> vxpu.ChatRequest
-	6, // 3: vxpu.Executor.Generate:input_type -> vxpu.GenerateRequest
-	1, // 4: vxpu.Executor.LoadModel:output_type -> vxpu.LoadModelResponse
-	3, // 5: vxpu.Executor.NewSession:output_type -> vxpu.NewSessionResponse
-	5, // 6: vxpu.Executor.Chat:output_type -> vxpu.ChatResponse
-	7, // 7: vxpu.Executor.Generate:output_type -> vxpu.GenerateResponse
-	4, // [4:8] is the sub-list for method output_type
-	0, // [0:4] is the sub-list for method input_type
+	2, // 1: vxpu.Executor.RegisterModel:input_type -> vxpu.RegisterModelRequest
+	4, // 2: vxpu.Executor.NewSession:input_type -> vxpu.NewSessionRequest
+	6, // 3: vxpu.Executor.Chat:input_type -> vxpu.ChatRequest
+	8, // 4: vxpu.Executor.Generate:input_type -> vxpu.GenerateRequest
+	1, // 5: vxpu.Executor.LoadModel:output_type -> vxpu.LoadModelResponse
+	3, // 6: vxpu.Executor.RegisterModel:output_type -> vxpu.RegisterModelResponse
+	5, // 7: vxpu.Executor.NewSession:output_type -> vxpu.NewSessionResponse
+	7, // 8: vxpu.Executor.Chat:output_type -> vxpu.ChatResponse
+	9, // 9: vxpu.Executor.Generate:output_type -> vxpu.GenerateResponse
+	5, // [5:10] is the sub-list for method output_type
+	0, // [0:5] is the sub-list for method input_type
 	0, // [0:0] is the sub-list for extension type_name
 	0, // [0:0] is the sub-list for extension extendee
 	0, // [0:0] is the sub-list for field type_name
@@ -757,14 +936,14 @@ func file_proto_vxpu_proto_init() {
 	if File_proto_vxpu_proto != nil {
 		return
 	}
-	file_proto_vxpu_proto_msgTypes[6].OneofWrappers = []any{}
+	file_proto_vxpu_proto_msgTypes[8].OneofWrappers = []any{}
 	type x struct{}
 	out := protoimpl.TypeBuilder{
 		File: protoimpl.DescBuilder{
 			GoPackagePath: reflect.TypeOf(x{}).PkgPath(),
 			RawDescriptor: unsafe.Slice(unsafe.StringData(file_proto_vxpu_proto_rawDesc), len(file_proto_vxpu_proto_rawDesc)),
 			NumEnums:      0,
-			NumMessages:   8,
+			NumMessages:   10,
 			NumExtensions: 0,
 			NumServices:   1,
 		},
