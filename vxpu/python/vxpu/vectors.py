@@ -818,10 +818,52 @@ def _check_lowering(model, prompts, settings, artifact, workdir):
         ok = ok and same
     return ok
 
+def _check_host_reads(workdir):
+    """The n-gram tables' reads (#364): the CPU kernels' gather_rows gives
+    index_select's rows and refuses indices out of range or not on the
+    CPU (it reads them on the host); advise_random takes on a
+    memory-mapped tensor."""
+    import mmap
+    import torch
+    from . import kernels
+    from .rehydrate import advise_random, file_backed
+    k = kernels.load()
+    if k is None or not hasattr(k, "gather_rows"):
+        print("host reads check skipped: no CPU kernels")
+        return
+    table = torch.arange(64 * 24, dtype=torch.int16).view(64, 24)
+    idx = torch.tensor([[3, 63, 0], [17, 17, 5]])
+    if not torch.equal(k.gather_rows(table, idx), table[idx]):
+        raise SystemExit("gather_rows: rows differ from index_select's")
+    for bad in (torch.tensor([64]), torch.tensor([-1])):
+        try:
+            k.gather_rows(table, bad)
+        except RuntimeError as e:
+            if "outside" not in str(e):
+                raise
+        else:
+            raise SystemExit(f"gather_rows accepted index {bad.item()} for a 64-row table")
+    device = "cuda" if torch.cuda.is_available() else "meta"
+    try:
+        k.gather_rows(table, idx.to(device))
+    except RuntimeError as e:
+        if "indices on the CPU" not in str(e):
+            raise
+    else:
+        raise SystemExit(f"gather_rows accepted indices on {device}")
+    path = os.path.join(workdir, "advise-random.bin")
+    mapped, _ = file_backed(path, 1 << 16)
+    if getattr(mmap, "MADV_RANDOM", None) is not None and not advise_random(mapped):
+        raise SystemExit("advise_random: madvise(MADV_RANDOM) was refused on a memory-mapped tensor")
+    print("host reads: gather_rows matches index_select and refuses bad or device indices; MADV_RANDOM taken")
+
+
 def selftest(workdir, settings):
     """The CI tier: tiny models through export, the in-process engine,
     and a transformers reference, token-exact. No cluster."""
     _check_compare()
+    os.makedirs(workdir, exist_ok=True)
+    _check_host_reads(workdir)
     from .export import export_artifact
     from .fixtures import tiny_fp8_moe
     models = [

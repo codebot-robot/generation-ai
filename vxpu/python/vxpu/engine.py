@@ -46,7 +46,7 @@ from . import lower, ops, segments  # noqa: F401  (registers vxpu::* before a gr
 from .plan import Plan
 from .plan import record as plan_record
 from .telemetry import Recorder, segment_info
-from .rehydrate import (derived_tensor, fetch_stacked, fetch_tensor,
+from .rehydrate import (advise_random, derived_tensor, fetch_stacked, fetch_tensor,
                         load_program, share_state, strip_asserts)
 
 
@@ -248,6 +248,9 @@ class Engine:
             self.bytes_fetched += downloaded
             scale, downloaded = fetch_tensor(self.manifest["tensors"][spec["scale"]], self.manifest["files"], cas_dir, mmap_dir=mm)
             self.bytes_fetched += downloaded
+            if mm:  # memory-mapped, read row by row at random: no readahead (#364)
+                advise_random(weight)
+                advise_random(scale)
             self.external.engram[int(layer)] = ds.host_engram(int(layer), spec["num_embeddings"], spec["dim"], weight, scale)
             ops.ENGRAM_DIM[int(layer)] = spec["dim"]
 

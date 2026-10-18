@@ -247,6 +247,23 @@ def engram_rows(indices: torch.Tensor, table: int) -> torch.Tensor:
     return out
 
 
+@implementation("vxpu::engram_rows", "host-parallel", ("cpu",), "bit-identical",
+                "kernels on: the rows gathered by the kernel threads, so a table memory-mapped from SSD reads a "
+                "step's rows concurrently (one page fault per thread, not one after another); dequantized as the "
+                "module does", applies=lambda plan, **_: plan["kernels"] and kernels.load() is not None, host=True)
+def _engram_parallel(embed, indices):
+    k = kernels.load()
+    mask = (indices < embed.vocab_start_idx) | (indices >= embed.vocab_end_idx)
+    local = (indices - embed.vocab_start_idx).masked_fill(mask, 0)
+    # the module's lookup with its two F.embedding gathers made concurrent;
+    # the arithmetic is the module's, so the rows are bit-identical
+    values = k.gather_rows(embed.weight, local)
+    scales = k.gather_rows(embed.scale, local)
+    values = values.float().unflatten(-1, (-1, embed.block_size)) * scales.float().unsqueeze(-1)
+    values = values.flatten(-2).to(torch.bfloat16)
+    return values.masked_fill(mask.unsqueeze(-1), 0)
+
+
 @implementation("vxpu::engram_rows", "host-lookup", ("cpu", "cuda"), "bit-identical",
                 "the module's own lookup, on the table's device (RAM or a memory-mapped file)", reference=True, host=True)
 def _engram_lookup(embed, indices):

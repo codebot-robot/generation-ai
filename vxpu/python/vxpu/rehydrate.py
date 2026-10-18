@@ -95,6 +95,29 @@ def _read_range(url, offset, length, into):
         raise RuntimeError(f"expected {length} bytes, got {got} bytes")
 
 
+def advise_random(tensor):
+    """madvise(MADV_RANDOM) over a memory-mapped tensor's pages: a fault
+    reads just its page, with no readahead. For tables read row by row at
+    random (the n-gram tables, #364), readahead fetches up to 128 KiB per
+    few-hundred-byte row and evicts other rows to hold it. Returns whether
+    the advice was taken (not on platforms without madvise)."""
+    import ctypes
+    import mmap
+    MADV_RANDOM = getattr(mmap, "MADV_RANDOM", None)  # the platform's value, where Python knows one
+    if MADV_RANDOM is None:
+        return False
+    try:
+        libc = ctypes.CDLL(None, use_errno=True)
+        madvise = libc.madvise
+    except (OSError, AttributeError):
+        return False
+    storage = tensor.untyped_storage()
+    addr, length = storage.data_ptr(), storage.nbytes()
+    start = addr - addr % mmap.PAGESIZE
+    madvise.argtypes = (ctypes.c_void_p, ctypes.c_size_t, ctypes.c_int)
+    return madvise(start, length + (addr - start), MADV_RANDOM) == 0
+
+
 def file_backed(path, length):
     """A uint8 tensor of `length` bytes whose storage is the file at
     `path`, memory-mapped shared: writes land in the page cache and reach
