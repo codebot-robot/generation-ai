@@ -33,14 +33,39 @@ its slot there or -1. The kernels take that map as it is, so a pool on
 another GPU runs the same code: the token's activations go there (a few
 KB), its partial sum comes back.
 
-Which experts are hot is a placement, from the engine's own statistics
+Which experts start hot is a placement, from the engine's own statistics
 (`vxpu stats --records` into `python -m vxpu.expert_stats
 --placement-gb`), named by the plan's gpu_experts choice
 (VXPU_GPU_EXPERTS). This is the first placement chosen from the
 statistics the engine keeps (#316, #348).
+
+With gpu_experts_moves, the residency then follows the traffic. Every
+layer scores its experts as the offline simulator found best
+(expert_sim.py, #369): their selections over all the traffic so far
+(seeded with the placement's counts), mixed with the current request's
+own, prefill included, each normalized; a request is concentrated, and
+its prompt says much about its decode. When a cold expert outscores the
+coldest one held, they swap: the held one is unmapped (the CPU computes
+it from the next call), a worker thread copies the newcomer's rows from
+the host banks into the freed slot on a copy stream, and once that copy
+is done the newcomer is mapped. Unmapping, copying and mapping are
+ordered on the pool's stream, so a kernel never reads a slot mid-copy;
+while an expert is in flight, the CPU computes it. A layer plans its
+swaps once per request, on its prefill call: the copies run while the
+prefill computes on the CPU (seconds) and are done before decode starts.
+Moving during decode as well cost DeepSeek more than it gained (copies
+competing for host memory and PCIe with the step, ~2 swaps a step), and
+the simulator credits the gain to the prompt. The number in flight is
+bounded (an expert is ~19 MB on DeepSeek). Off,
+the results depend only on the placement; on, they also depend on the
+traffic before (the split between GPU and CPU changes the summation
+order: the rounding class).
 """
 
 import json
+import queue
+import threading
+import weakref
 
 import torch
 
@@ -89,6 +114,11 @@ class Residency:
             held |= pool.slot_cpu >= 0
         self.held_cpu = held
 
+        self.start = moe.experts_start_idx
+        self.moe = moe
+        self.mover = None  # set by Mover.attach
+        self.held = {e for pool in self.pools for e in pool.experts}  # global ids, for the scoring's lookups
+
     @property
     def count(self):
         return sum(p.count for p in self.pools)
@@ -96,6 +126,200 @@ class Residency:
     @property
     def bytes(self):
         return sum(p.bytes for p in self.pools)
+
+
+# A cold expert replaces the coldest held one when its score is above
+# RATIO times the held one's and the current request selected it at least
+# EVIDENCE times: hysteresis against swapping back and forth. Without the
+# placement's counts, held experts start with PRIOR selections.
+RATIO, EVIDENCE, PRIOR = 1.25, 2, 8.0
+MAX_PLANNED = 32  # swaps a layer queues per plan
+
+
+class Mover:
+    """Moves experts between the host banks and the GPU pools as the hot
+    set drifts (the module docstring): every attached layer's scores and
+    queued swaps, the bound on moves in flight, and the worker thread that
+    copies."""
+
+    def __init__(self, in_flight, request_weight):
+        self.in_flight = in_flight
+        self.request_weight = request_weight
+        self.layers = []
+        self.pending = []  # (res, pool, slot, expert, copied, done): every layer's moves in flight
+        self.queued = []  # layers with swaps planned and not yet started
+        self.active = 0
+        self.started = 0
+        self.completed = 0
+        self.work = queue.Queue()
+        # the worker holds the queue and a weak reference only: the mover
+        # (and through it the pools and banks) is freed with its engine,
+        # and the worker then exits
+        threading.Thread(target=_copy_loop, args=(weakref.ref(self), self.work), name="vxpu-expert-moves",
+                         daemon=True).start()
+
+    def attach(self, res, counts=None):
+        """Score res's experts from counts ({expert: selections}, the
+        placement's history), or PRIOR for each held expert."""
+        n = res.moe.n_local_experts
+        res.mover = self
+        res.long = [0.0] * n  # selections over all the traffic so far
+        if counts:
+            for e, c in counts.items():
+                res.long[int(e) - res.start] = float(c)
+        else:
+            for e in res.held:
+                res.long[e - res.start] = PRIOR
+        res.long_total = sum(res.long)
+        res.incoming = set()  # experts on their way to a slot
+        self._reset(res)
+        self.layers.append(res)
+
+    def begin_request(self):
+        """A new request: its own selections start from nothing."""
+        for res in self.layers:
+            self._reset(res)
+
+    def _reset(self, res):
+        res.req = [0] * res.moe.n_local_experts
+        res.req_total = 0
+        res.calls = 0
+        res.queued = []  # (pool, slot, victim, newcomer) planned
+
+    def observe(self, res, experts):
+        """After a layer's call (prefill or decode): count its selections
+        (experts, global ids), finish every layer's moves whose copies are
+        done, plan this layer's on its first call of the request (the
+        prefill), start what the bound allows from any layer's (a prefill
+        takes each layer once: the moves it plans run while the layers
+        after it compute). Returns (started, completed)."""
+        res.calls += 1
+        for e in experts:
+            res.long[e - res.start] += 1.0
+            res.req[e - res.start] += 1
+        res.long_total += len(experts)
+        res.req_total += len(experts)
+        completed = self._finish()
+        if res.calls == 1:
+            self._plan(res)
+        return self._start(), completed
+
+    def _plan(self, res):
+        w, lt, rt = self.request_weight, res.long_total or 1.0, res.req_total or 1
+        score = [(1 - w) * a / lt + w * b / rt for a, b in zip(res.long, res.req)]
+        cold = sorted((l for l in range(len(score)) if res.req[l] >= EVIDENCE
+                       and l + res.start not in res.held and l + res.start not in res.incoming),
+                      key=lambda l: -score[l])
+        held = sorted(((score[e - res.start], slot, pool, e)
+                       for pool in res.pools for slot, e in enumerate(pool.experts) if e >= 0), key=lambda h: h[0])
+        res.queued = []
+        for l, (s_held, slot, pool, victim) in zip(cold[:MAX_PLANNED], held):
+            if score[l] <= RATIO * s_held:
+                break
+            res.queued.append((pool, slot, victim, l + res.start))
+        if res.queued and res not in self.queued:
+            self.queued.append(res)
+
+    def _start(self):
+        """Start queued swaps, oldest plans first, up to the bound. Every
+        layer's pools on a device share its side stream, so another
+        layer's unmapping is ordered after that layer's last kernels."""
+        started = 0
+        while self.queued and self.active < self.in_flight:
+            res = self.queued[0]
+            if not res.queued:
+                self.queued.pop(0)
+                continue
+            pool, slot, victim, new = res.queued.pop(0)
+            if pool.experts[slot] != victim or new in res.held or new in res.incoming:
+                continue  # stale: an earlier swap changed it
+            # unmap: the CPU computes the victim from the next call on; the
+            # pool's stream orders the unmapping after this call's kernels
+            lv = victim - res.start
+            pool.experts[slot] = -1
+            pool.slot_cpu[lv] = -1
+            res.held_cpu[lv] = False
+            res.held.discard(victim)
+            with torch.cuda.stream(pool.stream):
+                pool.slot_gpu[lv] = -1
+                unmapped = torch.cuda.Event()
+                unmapped.record(pool.stream)
+            copied, done = threading.Event(), torch.cuda.Event()
+            self.pending.append((res, pool, slot, new, copied, done))
+            res.incoming.add(new)
+            self.active += 1
+            self.started += 1
+            started += 1
+            self.work.put((res.moe, pool, slot, new - res.start, unmapped, copied, done))
+        return started
+
+    def _finish(self):
+        completed = 0
+        for move in list(self.pending):
+            res, pool, slot, expert, copied, done = move
+            if not (copied.is_set() and done.query()):  # an event not yet recorded reads as done
+                continue
+            le = expert - res.start
+            with torch.cuda.stream(pool.stream):
+                pool.stream.wait_event(done)
+                pool.slot_gpu[le] = slot
+            pool.slot_cpu[le] = slot
+            pool.experts[slot] = expert
+            res.held_cpu[le] = True
+            res.held.add(expert)
+            res.incoming.discard(expert)
+            self.pending.remove(move)
+            self.active -= 1
+            self.completed += 1
+            completed += 1
+        return completed
+
+
+def _copy_loop(mover, work):
+    """The mover's worker: copies queued swaps' rows from the host banks
+    into their slots, on a copy stream per device. Exits once the mover is
+    gone (it is only weakly referenced) and nothing is queued."""
+    streams = {}
+    while True:
+        try:
+            item = work.get(timeout=1.0)
+        except queue.Empty:
+            if mover() is None:
+                return
+            continue
+        moe, pool, slot, local, unmapped, copied, done = item
+        key = str(pool.device)
+        if key not in streams:
+            streams[key] = torch.cuda.Stream(device=pool.device)
+        stream = streams[key]
+        with torch.cuda.stream(stream):
+            stream.wait_event(unmapped)  # no kernel reads the slot after this
+            for dst, src in ((pool.w1, moe.w1), (pool.s1, moe.w1_scale), (pool.w3, moe.w3),
+                             (pool.s3, moe.w3_scale), (pool.w2, moe.w2), (pool.s2, moe.w2_scale)):
+                dst[slot].copy_(src[local])  # pageable host rows: the driver stages them, on this thread
+            done.record(stream)
+        copied.set()
+        item = moe = pool = None  # hold nothing of the engine's while idle
+
+
+def verify(res):
+    """Every held expert's rows on its GPU equal the host banks' rows, and
+    the slot maps agree with each other: True, or raises. For tests."""
+    moe = res.moe
+    for pool in res.pools:
+        for slot, e in enumerate(pool.experts):
+            if e < 0:
+                continue
+            le = e - res.start
+            assert int(pool.slot_cpu[le]) == slot and int(pool.slot_gpu[le]) == slot and bool(res.held_cpu[le]), \
+                f"expert {e}: slot maps disagree"
+            for dst, src in ((pool.w1, moe.w1), (pool.s1, moe.w1_scale), (pool.w3, moe.w3),
+                             (pool.s3, moe.w3_scale), (pool.w2, moe.w2), (pool.s2, moe.w2_scale)):
+                assert torch.equal(dst[slot].cpu().view(torch.uint8), src[le].view(torch.uint8)), \
+                    f"expert {e}: rows on {pool.device} differ from the host's"
+    held = sum(p.slot_cpu >= 0 for p in res.pools)
+    assert torch.equal(held.bool(), res.held_cpu), "held_cpu disagrees with the pools"
+    return True
 
 
 _streams = {}
@@ -127,3 +351,11 @@ def load_placement(path):
         doc = json.load(f)
     gpus = doc["gpus"] if "gpus" in doc else [doc]
     return [{int(layer): ids for layer, ids in gpu["layers"].items()} for gpu in gpus]
+
+
+def load_counts(path):
+    """{layer: {expert: selections}}, the history a placement was chosen
+    from (its "counts"), or {} when it carries none."""
+    with open(path) as f:
+        doc = json.load(f)
+    return {int(layer): c for layer, c in (doc.get("counts") or {}).items()}

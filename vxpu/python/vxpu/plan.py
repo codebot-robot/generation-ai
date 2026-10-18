@@ -311,6 +311,18 @@ class Plan:
         self._set("gpu_experts", hot, src, (),
                   "a placement file (per GPU, {layer: [expert ids]}, from expert_stats --placement-gb): those experts "
                   "are held on the GPUs and computed there alongside the CPU's (experts_gpu.py)")
+        moves, src = env_number("VXPU_GPU_EXPERTS_MOVES", 0, int, minimum=0)
+        if moves and not hot:
+            moves, src = 0, "needs gpu_experts"
+        self._set("gpu_experts_moves", moves, src, (),
+                  "experts moved between the host and the GPUs at once as the traffic's hot set drifts (0: the "
+                  "placement stays as loaded; results then depend only on the placement, not on earlier traffic)")
+        weight, src = env_number("VXPU_GPU_EXPERTS_REQUEST_WEIGHT", 0.25, float, minimum=0)
+        if weight > 1:
+            raise ValueError(f"VXPU_GPU_EXPERTS_REQUEST_WEIGHT={weight}: a share, at most 1")
+        self._set("gpu_experts_request_weight", weight, src, (),
+                  "with gpu_experts_moves: the current request's own selections' share of an expert's score, the "
+                  "rest all the traffic's (0.25: the best of the offline simulator's, expert_sim.py)")
         in_ram, src = env_flag("VXPU_EXPERTS_IN_RAM", False)
         placement = "ram" if (in_ram or not ext_dir) else "mmap"
         self._set("experts_placement", placement, src if in_ram else ("default" if not ext_dir else "external_dir"),

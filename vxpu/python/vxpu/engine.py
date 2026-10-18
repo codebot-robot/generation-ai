@@ -187,6 +187,7 @@ class Engine:
         # with the engine and seen by the ops only while this engine runs
         # a graph (external_scope).
         self.external = ops.External()
+        self.expert_mover = None  # experts_gpu.Mover, when hot experts move with the traffic
         self.external.plan = self.plan  # the ops dispatch by this engine's plan
         if self.binding.get("external"):
             self._bind_external(self.binding["external"], cas_dir)
@@ -278,6 +279,13 @@ class Engine:
             if any(ids for _, ids in by_device):
                 moe._vxpu_hot = experts_gpu.Residency(moe, by_device)
         placed = [m._vxpu_hot for m in self.external.experts.values() if getattr(m, "_vxpu_hot", None)]
+        if self.plan["gpu_experts_moves"]:
+            self.expert_mover = experts_gpu.Mover(self.plan["gpu_experts_moves"],
+                                                  self.plan["gpu_experts_request_weight"])
+            counts = experts_gpu.load_counts(path)
+            for layer, moe in sorted(self.external.experts.items()):
+                if getattr(moe, "_vxpu_hot", None):
+                    self.expert_mover.attach(moe._vxpu_hot, counts.get(layer))
         total = sum(m.n_local_experts for m in self.external.experts.values())
         per_device = []
         for dev in devices:
@@ -285,7 +293,9 @@ class Engine:
             if pools:
                 per_device.append(f"{dev} {sum(p.count for p in pools)} ({sum(p.bytes for p in pools) / 1e9:.1f} GB)")
         msg = (f"hot experts on {', '.join(per_device)}: {sum(r.count for r in placed)} of {total}, "
-               f"in {len(placed)} layers")
+               f"in {len(placed)} layers" + (f"; moving with the traffic, {self.plan['gpu_experts_moves']} at once, "
+                                             f"request weight {self.plan['gpu_experts_request_weight']:g}"
+                                             if self.expert_mover else ""))
         print(f"[vxpu] {msg}", flush=True)
         self.plan.note(msg)
 
@@ -567,6 +577,8 @@ class Engine:
 
     def _generate_locked(self, session, ids, max_new_tokens, params,
                          extra_eos_ids=(), logits_sink=None, telemetry=False):
+        if self.expert_mover is not None:  # generate and chat: the hot experts follow this request's selections too
+            self.expert_mover.begin_request()
         recorder = None
         if telemetry:
             recorder = Recorder(self.device, getattr(self, "_segment_info", None)
