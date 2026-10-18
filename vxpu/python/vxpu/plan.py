@@ -46,6 +46,7 @@ import argparse
 import collections
 import dataclasses
 import json
+import math
 import os
 import platform
 import threading
@@ -76,17 +77,36 @@ def env_flag(name, default, extra_false=()):
 
 
 def env_number(name, default, kind=float, minimum=None):
-    """A numeric switch; refuses what does not parse. Returns (value, source)."""
+    """A numeric switch; refuses what does not parse. Integers are plain
+    ASCII digits (what C's atol reads the same way: the CPU kernels read
+    VXPU_KERNEL_THREADS themselves); floats must be finite. Returns
+    (value, source)."""
     raw = os.environ.get(name)
     if raw is None or raw == "":
         return default, "default"
+    text = raw.strip()
     try:
-        value = kind(raw)
+        if kind is int and not (text.isascii() and text.lstrip("+").isdigit()):
+            raise ValueError(text)
+        value = kind(text)
     except ValueError:
-        raise ConfigError(f"{name}={raw!r}: expected a {kind.__name__}") from None
+        raise ConfigError(f"{name}={raw!r}: expected {'an integer' if kind is int else 'a number'}") from None
+    if kind is float and not math.isfinite(value):
+        raise ConfigError(f"{name}={raw!r}: must be a finite number")
     if minimum is not None and value < minimum:
         raise ConfigError(f"{name}={raw!r}: must be at least {minimum}")
     return value, "env"
+
+
+def env_choice(name, default, allowed):
+    """A switch with a fixed set of values; refuses anything else.
+    Returns (value, source)."""
+    raw = os.environ.get(name)
+    if raw is None or raw == "":
+        return default, "default"
+    if raw.strip() not in allowed:
+        raise ConfigError(f"{name}={raw!r}: expected one of {', '.join(allowed)}")
+    return raw.strip(), "env"
 
 
 def env_text(name, default):
@@ -224,8 +244,9 @@ class Plan:
         self._set("split_decode", split and bool(compile_decode), src if compile_decode else "requires compile_decode",
                   (True, False), "cut the decode graph at its host ops; each dense segment compiled on its own")
         mode_default = ("reduce-overhead" if split else "max-autotune-no-cudagraphs") if cuda else "default"
-        mode, src = env_text("VXPU_COMPILE_MODE", mode_default)
-        self._set("compile_mode", mode, src, ("reduce-overhead", "max-autotune-no-cudagraphs", "default"),
+        modes = ("reduce-overhead", "max-autotune-no-cudagraphs", "max-autotune", "default")  # torch.compile's
+        mode, src = env_choice("VXPU_COMPILE_MODE", mode_default, modes)
+        self._set("compile_mode", mode, src, modes,
                   "torch.compile mode (reduce-overhead gives each split segment a CUDA graph)")
         on, src = env_flag("VXPU_SPLIT_COMPILE", True)
         self._set("split_compile", on, src, (True, False),
