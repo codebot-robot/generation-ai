@@ -145,8 +145,8 @@ class Split(torch.nn.Module):
         called with None. Each segment is wrapped while a recorder is set
         and unwrapped after, so a step without telemetry runs exactly the
         unwrapped module."""
-        names = [name for name, _ in segments_of(self.split)] if self._unwrapped is None else list(self._unwrapped)
         if recorder is not None and self._unwrapped is None:
+            names = [name for name, _ in segments_of(self.split)]
             self._unwrapped = {name: self.split._modules[name] for name in names}
             for index, name in enumerate(names):
                 self.split._modules[name] = _Recorded(self._unwrapped[name], index, recorder)

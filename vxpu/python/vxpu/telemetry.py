@@ -87,7 +87,7 @@ class Recorder:
             self._step.append(e)
         else:
             now = time.perf_counter()
-            self.seg_ms[index] += (now - self._t) * 1e3
+            self._step.append((index, (now - self._t) * 1e3))  # counted at end_step, if it was a decode step
             self._t = now
 
     def end_step(self):
@@ -99,6 +99,8 @@ class Recorder:
             if len(self._pending) >= DRAIN_EVERY:
                 self.drain()
         else:
+            for index, ms in self._step:
+                self.seg_ms[index] += ms
             self.seg_steps += 1
         self._step = None
 

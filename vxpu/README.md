@@ -152,9 +152,9 @@ measurement says which plan produced it.
 The environment switches are read by one parser, which refuses values it
 doesn't understand: `VXPU_KERNELS`, `VXPU_FUSED_EXPERTS`,
 `VXPU_KERNEL_THREADS`, `VXPU_SPLIT_DECODE`, `VXPU_COMPILE_MODE`,
-`VXPU_SPLIT_COMPILE`, `VXPU_DIRECT_HOST_OPS`, `VXPU_EXTERNAL_DIR`,
-`VXPU_EXPERTS_IN_RAM`, `VXPU_BF16_WEIGHT_CACHE`,
-`VXPU_BF16_CACHE_HEADROOM_GB`. Choosing between plans by cost, and
+`VXPU_SPLIT_COMPILE`, `VXPU_DIRECT_HOST_OPS`, `VXPU_EXPERTS_IN_RAM`,
+`VXPU_BF16_WEIGHT_CACHE`, `VXPU_BF16_CACHE_HEADROOM_GB`; and
+`VXPU_EXTERNAL_DIR`, a path, taken as given. Choosing between plans by cost, and
 deployment hints, come next (#316, #332).
 
 ## Weights: the store
