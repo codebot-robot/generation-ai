@@ -37,6 +37,8 @@ import requests
 import torch
 from torch.export.passes import move_to_device_pass
 
+from . import kernels
+
 DTYPES = {
     "F64": torch.float64, "F32": torch.float32, "F16": torch.float16,
     "BF16": torch.bfloat16, "I64": torch.int64, "I32": torch.int32,
@@ -127,8 +129,13 @@ def fetch_tensor(ref, files, cas_dir=None, mmap_dir=None):
     length = ref["length"]
     key = hashlib.sha256(f"{ref['file_sha256']}:{ref['offset']}:{length}".encode()).hexdigest()
     path = os.path.join(cas_dir, key) if cas_dir else None
+    commit = lambda: None
     if mmap_dir:
-        buf, fresh = file_backed(os.path.join(mmap_dir, key), length)
+        res = file_backed(os.path.join(mmap_dir, key), length)
+        if len(res) == 3:
+            buf, fresh, commit = res
+        else:
+            buf, fresh = res
         if not fresh:
             return buf.view(DTYPES[ref["dtype"]]).view(ref["shape"]), 0
     else:
@@ -141,20 +148,29 @@ def fetch_tensor(ref, files, cas_dir=None, mmap_dir=None):
                 raise RuntimeError(f"cache entry {path} is short")
     else:
         parts = max(1, min(PART_WORKERS, -(-length // PART_BYTES)))
-        if parts == 1:
-            _read_range(url, ref["offset"], length, view)
-        else:
+        if kernels.has_fetch():
             step = -(-length // parts)
-            with ThreadPoolExecutor(max_workers=parts) as pool:
-                futures = [pool.submit(_read_range, url, ref["offset"] + i * step,
-                                       min(step, length - i * step), view[i * step:min(length, (i + 1) * step)])
-                           for i in range(parts) if i * step < length]
-                for f in futures:
-                    f.result()
+            ranges = [
+                (url, ref["offset"] + i * step, min(step, length - i * step), buf, i * step)
+                for i in range(parts) if i * step < length
+            ]
+            kernels.load_fetch().fetch_ranges(ranges)
+        else:
+            if parts == 1:
+                _read_range(url, ref["offset"], length, view)
+            else:
+                step = -(-length // parts)
+                with ThreadPoolExecutor(max_workers=parts) as pool:
+                    futures = [pool.submit(_read_range, url, ref["offset"] + i * step,
+                                           min(step, length - i * step), view[i * step:min(length, (i + 1) * step)])
+                               for i in range(parts) if i * step < length]
+                    for f in futures:
+                        f.result()
         downloaded = length
         if path is not None:
             with open(path, "wb") as f:
                 f.write(view)
+    commit()
     tensor = buf.view(DTYPES[ref["dtype"]]).view(ref["shape"])
     return tensor, downloaded
 
@@ -182,13 +198,18 @@ def fetch_stacked(spec, manifest_tensors, files, cas_dir=None, workers=16, mmap_
     row_shape[cat_dim] = sum(manifest_tensors[n]["shape"][cat_dim] for n in rows[0])
     out_shape = ([len(rows)] if stack else []) + row_shape
     dtype = DTYPES[first["dtype"]]
+    commit = lambda: None
     if mmap_path:
         # the bank lives in a file (see file_backed): assembled once,
         # memory-mapped on every load after
         nbytes = torch.empty(0, dtype=dtype).element_size()
         for d in out_shape:
             nbytes *= d
-        buf, fresh = file_backed(mmap_path, nbytes)
+        res = file_backed(mmap_path, nbytes)
+        if len(res) == 3:
+            buf, fresh, commit = res
+        else:
+            buf, fresh = res
         out = buf.view(dtype).view(out_shape)
         if not fresh:
             return out, 0
@@ -204,18 +225,117 @@ def fetch_stacked(spec, manifest_tensors, files, cas_dir=None, workers=16, mmap_
         for n in row:
             slots.append((r, offset, n))
             offset += manifest_tensors[n]["shape"][cat_dim]
-    downloaded = 0
-    with ThreadPoolExecutor(max_workers=workers) as pool:
-        pending = {}
-        for i, (r, offset, n) in enumerate(slots):
-            pending[i] = pool.submit(fetch_tensor, manifest_tensors[n], files, cas_dir)
-            if len(pending) >= 2 * workers:
-                j = min(pending)
+
+    if kernels.has_fetch():
+        # Check whether any destination slice is non-contiguous
+        needs_staging = False
+        for r, offset, n in slots:
+            target = out[r] if stack else out
+            dest_slice = target.narrow(cat_dim, offset, manifest_tensors[n]["shape"][cat_dim])
+            if not dest_slice.is_contiguous():
+                needs_staging = True
+                break
+
+        if not needs_staging:
+            # All destination slices are contiguous views into `out` (e.g. cat_dim == 0).
+            # Fetch all ranges directly into `out` with no staging memory overhead.
+            fetch_ranges = []
+            post_cas_writes = []
+            downloaded = 0
+            for r, offset, n in slots:
+                ref = manifest_tensors[n]
+                length = ref["length"]
+                key = hashlib.sha256(f"{ref['file_sha256']}:{ref['offset']}:{length}".encode()).hexdigest()
+                path = os.path.join(cas_dir, key) if cas_dir else None
+                target = out[r] if stack else out
+                dest_slice = target.narrow(cat_dim, offset, ref["shape"][cat_dim])
+
+                if path is not None and os.path.exists(path):
+                    with open(path, "rb") as f:
+                        dest_bytes = dest_slice.view(torch.uint8)
+                        if f.readinto(memoryview(dest_bytes.numpy())) != length:
+                            raise RuntimeError(f"cache entry {path} is short")
+                else:
+                    url = files[ref["file_sha256"]]["source"]
+                    fetch_ranges.append((url, ref["offset"], length, dest_slice, 0))
+                    if path is not None:
+                        post_cas_writes.append((dest_slice, path))
+                    downloaded += length
+
+            if fetch_ranges:
+                kernels.load_fetch().fetch_ranges(fetch_ranges, max_concurrent=workers)
+
+            for dest_slice, path in post_cas_writes:
+                with open(path, "wb") as f:
+                    f.write(memoryview(dest_slice.view(torch.uint8).numpy()))
+
+        else:
+            # If any slice is non-contiguous (e.g. cat_dim != 0), fetch in bounded windows
+            # of `workers` parts, copying each window into `out` and releasing staging
+            # tensors before fetching the next window, so assembly memory is not doubled.
+            downloaded = 0
+            for window_start in range(0, len(slots), workers):
+                window_slots = slots[window_start : window_start + workers]
+                fetch_ranges = []
+                window_copies = []
+                for r, offset, n in window_slots:
+                    ref = manifest_tensors[n]
+                    length = ref["length"]
+                    key = hashlib.sha256(f"{ref['file_sha256']}:{ref['offset']}:{length}".encode()).hexdigest()
+                    path = os.path.join(cas_dir, key) if cas_dir else None
+                    target = out[r] if stack else out
+                    dest_slice = target.narrow(cat_dim, offset, ref["shape"][cat_dim])
+
+                    if path is not None and os.path.exists(path):
+                        with open(path, "rb") as f:
+                            if dest_slice.is_contiguous():
+                                dest_bytes = dest_slice.view(torch.uint8)
+                                if f.readinto(memoryview(dest_bytes.numpy())) != length:
+                                    raise RuntimeError(f"cache entry {path} is short")
+                            else:
+                                tmp = torch.empty(dest_slice.shape, dtype=dtype)
+                                tmp_bytes = tmp.view(torch.uint8)
+                                if f.readinto(memoryview(tmp_bytes.numpy())) != length:
+                                    raise RuntimeError(f"cache entry {path} is short")
+                                dest_slice.copy_(tmp)
+                    else:
+                        url = files[ref["file_sha256"]]["source"]
+                        if dest_slice.is_contiguous():
+                            fetch_ranges.append((url, ref["offset"], length, dest_slice, 0))
+                            if path is not None:
+                                window_copies.append((None, dest_slice, path))
+                        else:
+                            tmp = torch.empty(dest_slice.shape, dtype=dtype)
+                            fetch_ranges.append((url, ref["offset"], length, tmp, 0))
+                            window_copies.append((tmp, dest_slice, path))
+                        downloaded += length
+
+                if fetch_ranges:
+                    kernels.load_fetch().fetch_ranges(fetch_ranges, max_concurrent=workers)
+
+                for tmp, dest_slice, path in window_copies:
+                    if tmp is not None:
+                        dest_slice.copy_(tmp)
+                    if path is not None:
+                        with open(path, "wb") as f:
+                            to_write = tmp if tmp is not None else dest_slice
+                            f.write(memoryview(to_write.view(torch.uint8).numpy()))
+
+    else:
+        downloaded = 0
+        with ThreadPoolExecutor(max_workers=workers) as pool:
+            pending = {}
+            for i, (r, offset, n) in enumerate(slots):
+                pending[i] = pool.submit(fetch_tensor, manifest_tensors[n], files, cas_dir)
+                if len(pending) >= 2 * workers:
+                    j = min(pending)
+                    _place_part(out, slots[j], pending.pop(j).result(), cat_dim, stack)
+                    downloaded += _last_bytes
+            for j in sorted(pending):
                 _place_part(out, slots[j], pending.pop(j).result(), cat_dim, stack)
                 downloaded += _last_bytes
-        for j in sorted(pending):
-            _place_part(out, slots[j], pending.pop(j).result(), cat_dim, stack)
-            downloaded += _last_bytes
+
+    commit()
     return out, downloaded
 
 

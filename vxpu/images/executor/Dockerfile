@@ -19,7 +19,7 @@ WORKDIR /app
 # torch JIT-compiles some eager CUDA ops via Triton at runtime,
 # which needs a C compiler even without torch.compile.
 RUN apt-get update && apt-get install -y --no-install-recommends \
-    gcc g++ libc6-dev \
+    gcc g++ libc6-dev libcurl4-openssl-dev \
     && rm -rf /var/lib/apt/lists/*
 
 # torch is pinned to the exporting torch version: serialized
@@ -74,6 +74,6 @@ COPY python/vxpu/ /app/vxpu/
 # sources' hash, so a changed kernel rebuilds at image build time.
 ENV TORCH_EXTENSIONS_DIR=/app/.torch_extensions
 RUN pip install --no-cache-dir ninja \
-    && cd /app && python -c "import vxpu.kernels as k; assert k.available(), k.why_not()"
+    && cd /app && python -c "import vxpu.kernels as k; assert k.available(), k.why_not(); assert k.has_fetch(), k.why_not_fetch()"
 
 ENTRYPOINT ["python", "-m", "vxpu.server"]
