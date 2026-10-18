@@ -168,14 +168,7 @@ def lower(gm, plan):
     return {op: {k: dict(v) for k, v in r.items() if v} for op, r in report.items()}
 
 
-def merge(reports):
-    """Several lower() reports summed into one."""
-    out = collections.defaultdict(lambda: collections.defaultdict(collections.Counter))
-    for report in reports:
-        for op, r in report.items():
-            for k, counts in r.items():
-                out[op][k].update(counts)
-    return {op: {k: dict(v) for k, v in r.items()} for op, r in sorted(out.items())}
+REPORT_PREFIX = "lowered the dense segments' op calls: "
 
 
 def describe(report):
@@ -185,4 +178,4 @@ def describe(report):
         done = ", ".join(f"{n} {impl}" for impl, n in sorted(r.get("lowered", {}).items()))
         kept = ", ".join(f"{n} {impl}" for impl, n in sorted(r.get("kept", {}).items()))
         parts.append(f"{op.split('::')[1]}: " + "; ".join(x for x in (done and f"lowered {done}", kept and f"kept {kept}") if x))
-    return "lowered the dense segments' op calls: " + (" | ".join(parts) or "none")
+    return REPORT_PREFIX + (" | ".join(parts) or "none")

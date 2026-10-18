@@ -780,6 +780,19 @@ def _check_lowering(model, prompts, settings, artifact):
                 os.environ.pop("VXPU_LOWER_DECODE")
             else:
                 os.environ["VXPU_LOWER_DECODE"] = saved
+    # the lowered run must have lowered something: with Triton missing or
+    # the split decode off, both runs would be the same decode
+    from .lower import REPORT_PREFIX
+    plan = runs[True]["producer"]["plan"]
+    if not plan["choices"].get("triton"):
+        print("lowering check skipped: no Triton (nothing is lowerable)")
+        return True
+    report = [n for n in plan.get("notes", []) if n.startswith(REPORT_PREFIX)]
+    if not plan["choices"].get("lower_decode") or not report or "lowered " not in report[0][len(REPORT_PREFIX):]:
+        print(f"lowering check: the lowered run lowered nothing (lower_decode={plan['choices'].get('lower_decode')}, "
+              f"report={report})")
+        return False
+    print(report[0])
     rows, ok = compare(runs[False], runs[True], strict_tokens=True)
     print("lowered decode against unlowered, cuda:")
     print(table(runs[False], runs[True], rows))
