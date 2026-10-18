@@ -729,10 +729,10 @@ def _check_continuation(artifact, ids, new_tokens=4):
 
 def _check_telemetry(model, prompts, settings, artifact, plain, workdir):
     """The engine's execution telemetry, end to end: recording it changes
-    no token; each prompt carries a vxpu-telemetry/1 record whose decode
-    expert counts are the same multiple of the decode steps in every
-    layer (each step routes one token to top-k experts per layer); and
-    expert_stats reads the file."""
+    no token; each prompt carries a vxpu-telemetry/1 record with its
+    prefilled token count and decode expert counts that are the same
+    multiple of the decode steps in every layer (each step routes one
+    token to top-k experts per layer); and expert_stats reads the file."""
     from . import expert_stats
     doc = record_vxpu_engine(model, "main", prompts, settings, artifact, telemetry=True)
     path = os.path.join(workdir, "tiny-deepseek-v41-telemetry.json")
@@ -746,6 +746,8 @@ def _check_telemetry(model, prompts, settings, artifact, plain, workdir):
         if tel.get("format") != "vxpu-telemetry/1":
             problems.append(f"{b['name']}: no telemetry record")
             continue
+        if tel.get("prefill_tokens") != len(b["input_ids"]):  # a fresh session prefills the whole prompt
+            problems.append(f"{b['name']}: prefill_tokens {tel.get('prefill_tokens')} for {len(b['input_ids'])} prompt tokens")
         steps = tel["decode_steps"]
         totals = {sum(c.values()) for c in tel.get("experts", {}).get("decode", {}).values()}
         if not steps or len(totals) != 1 or next(iter(totals)) % steps:

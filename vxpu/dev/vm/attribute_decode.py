@@ -113,7 +113,7 @@ def main():
         + f" (instrumented step {res['instrumented_ms_per_token']:.1f} ms)")
     moe = tel["host_ops"].get("decode", {}).get("moe_experts")
     impls = ", ".join(tel["plan"]["selected"].get("vxpu::moe_experts", [])) or "?"
-    res["experts_routing_body_ms"] = moe["impl_ms"] if moe else None
+    res["experts_impl_ms"] = moe["impl_ms"] if moe else None
     if moe:
         say(f"experts: {moe['impl_ms']:.1f} ms in the implementation ({impls}), {moe['wait_to_host_ms']:.1f} ms "
             f"waiting for the GPU and copying in, {moe['to_device_ms']:.1f} ms copying out, of "

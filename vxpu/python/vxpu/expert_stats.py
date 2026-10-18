@@ -59,20 +59,12 @@ def collect(docs):
     telemetry record found in docs (parsed JSON documents)."""
     out = collections.defaultdict(lambda: collections.defaultdict(collections.Counter))
 
-    def add(tel):
-        for phase, layers in (tel.get("experts") or {}).items():
-            for layer, counts in layers.items():
-                for expert, n in counts.items():
-                    out[phase][int(layer)][int(expert)] += n
-
     for doc in docs:
-        if doc.get("format", "").startswith("vxpu-telemetry/"):
-            add(doc)
-        if isinstance(doc.get("telemetry"), dict):  # attribute_decode.py output
-            add(doc["telemetry"])
-        for prompt in doc.get("prompts", []):  # vectors files
-            if isinstance(prompt.get("telemetry"), dict):
-                add(prompt["telemetry"])
+        for tel in _records(doc):
+            for phase, layers in (tel.get("experts") or {}).items():
+                for layer, counts in layers.items():
+                    for expert, n in counts.items():
+                        out[phase][int(layer)][int(expert)] += n
     return out
 
 
@@ -181,21 +173,21 @@ def report(paths, phase="decode", artifact=None, tokens_per_s=20.0):
     return out, "\n".join(lines)
 
 
+def _records(doc):
+    """The telemetry records in one parsed document (see collect)."""
+    tels = []
+    if doc.get("format", "").startswith("vxpu-telemetry/"):
+        tels.append(doc)
+    if isinstance(doc.get("telemetry"), dict):  # attribute_decode.py output
+        tels.append(doc["telemetry"])
+    tels += [p["telemetry"] for p in doc.get("prompts", []) if isinstance(p.get("telemetry"), dict)]  # vectors
+    return tels
+
+
 def _tokens(docs, phase):
-    """Decode steps (or prompt tokens for prefill) the counts cover."""
-    n = 0
-    for doc in docs:
-        tels = []
-        if doc.get("format", "").startswith("vxpu-telemetry/"):
-            tels.append(doc)
-        if isinstance(doc.get("telemetry"), dict):
-            tels.append(doc["telemetry"])
-        tels += [p["telemetry"] for p in doc.get("prompts", []) if isinstance(p.get("telemetry"), dict)]
-        for tel in tels:
-            n += tel.get("decode_steps", 0) if phase == "decode" else 0
-        if phase == "prefill":
-            n += sum(len(p.get("input_ids", [])) for p in doc.get("prompts", []) if isinstance(p.get("telemetry"), dict))
-    return n
+    """Decode steps (or prefilled prompt tokens) the counts cover."""
+    key = "decode_steps" if phase == "decode" else "prefill_tokens"
+    return sum(tel.get(key) or 0 for doc in docs for tel in _records(doc))
 
 
 def main(argv=None):
