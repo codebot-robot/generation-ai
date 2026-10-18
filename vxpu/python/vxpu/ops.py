@@ -269,10 +269,12 @@ def fp8_linear(x: torch.Tensor, weight: torch.Tensor, scale: torch.Tensor) -> to
     (_bf16_weight); elsewhere the fork's own fp8_gemm."""
     if x.is_meta:
         return x.new_empty(tuple(x.shape[:-1]) + (weight.shape[0],))
+    return select("vxpu::fp8_linear", x, weight, scale).fn(x, weight, scale)
+
+
+def _fp8_linear_context(x, weight, scale):
     rows = x.numel() // x.shape[-1]
-    impl = _plan(x.device.type).select("vxpu::fp8_linear", x.device.type, key=f"{rows}x{x.shape[-1]}->{weight.shape[0]}",
-                                       rows=rows)
-    return impl.fn(x, weight, scale)
+    return x.device.type, f"{rows}x{x.shape[-1]}->{weight.shape[0]}", {"rows": rows}
 
 
 @implementation("vxpu::fp8_linear", "cpu-kernel", ("cpu",), "rounding",
@@ -293,10 +295,10 @@ def _fp8_linear_cpu(x, weight, scale):
 # dequantized once and kept, and torch's GEMM.
 @implementation("vxpu::fp8_linear", "gpu-fp8-gemv", ("cuda",), "rounding",
                 f"Triton, at most {4} rows (decode): the activation quantized by one kernel, the fp8 weight read directly",
-                applies=lambda plan, rows=0, **_: plan["triton"] and rows <= FP8_GEMV_MAX_ROWS)
-def _fp8_linear_gemv(x, weight, scale):
-    xf = triton_ops.act_quant_dequant(x)
-    y = triton_ops.fp8_gemv(xf.reshape(-1, xf.shape[-1]), weight, scale)
+                applies=lambda plan, rows=0, **_: plan["triton"] and rows <= FP8_GEMV_MAX_ROWS, lowerable=True)
+def _fp8_linear_gemv(x, weight, scale, tk=triton_ops):
+    xf = tk.act_quant_dequant(x)
+    y = tk.fp8_gemv(xf.reshape(-1, xf.shape[-1]), weight, scale)
     return y.reshape(tuple(x.shape[:-1]) + (weight.shape[0],)).to(x.dtype)
 
 
@@ -339,23 +341,26 @@ def fp8_grouped_linear(o: torch.Tensor, weight: torch.Tensor, scale: torch.Tenso
     once, as fp8) and longer inputs the bf16 copy and an einsum; elsewhere
     the fork's own computation (bit-identical)."""
     *lead, g, d = o.shape
-    r = weight.shape[0] // g
     if o.is_meta:
-        return o.new_empty(tuple(lead) + (g, r))
+        return o.new_empty(tuple(lead) + (g, weight.shape[0] // g))
+    return select("vxpu::fp8_grouped_linear", o, weight, scale).fn(o, weight, scale)
+
+
+def _grouped_context(o, weight, scale):
+    *lead, g, d = o.shape
+    r = weight.shape[0] // g
     rows = o.numel() // (g * d)
-    impl = _plan(o.device.type).select("vxpu::fp8_grouped_linear", o.device.type, key=f"{rows}x{g}x{d}->{g}x{r}",
-                                       rows=rows)
-    return impl.fn(o, weight, scale)
+    return o.device.type, f"{rows}x{g}x{d}->{g}x{r}", {"rows": rows}
 
 
 @implementation("vxpu::fp8_grouped_linear", "gpu-fp8-gemv", ("cuda",), "rounding",
                 "Triton, at most 4 rows (decode): the grouped fp8 GEMV, the weight read once as fp8",
-                applies=lambda plan, rows=0, **_: plan["triton"] and rows <= FP8_GEMV_MAX_ROWS)
-def _grouped_gemv(o, weight, scale):
+                applies=lambda plan, rows=0, **_: plan["triton"] and rows <= FP8_GEMV_MAX_ROWS, lowerable=True)
+def _grouped_gemv(o, weight, scale, tk=triton_ops):
     *lead, g, d = o.shape
     r = weight.shape[0] // g
     rows = o.numel() // (g * d)
-    y = triton_ops.fp8_gemv(o.reshape(rows, g * d), weight, scale, group_rows=r, out_dtype=o.dtype)
+    y = tk.fp8_gemv(o.reshape(rows, g * d), weight, scale, group_rows=r, out_dtype=o.dtype)
     return y.reshape(tuple(lead) + (g, r))
 
 
@@ -441,16 +446,20 @@ def hc_sinkhorn(mixes: torch.Tensor, hc_scale: torch.Tensor, hc_base: torch.Tens
     """The fork's hyper-connection mixing (hc_split_sinkhorn): pre, post and
     the doubly stochastic comb from the mixes. One Triton kernel on a GPU;
     the fork's own function everywhere else (so the CPU is bit-identical)."""
-    impl = _plan(mixes.device.type).select("vxpu::hc_sinkhorn", mixes.device.type,
-                                           key=f"tokens={mixes.numel() // mixes.shape[-1]} hc={hc_mult}", hc_mult=hc_mult)
+    impl = select("vxpu::hc_sinkhorn", mixes, hc_scale, hc_base, hc_mult, sinkhorn_iters, eps)
     return impl.fn(mixes, hc_scale, hc_base, hc_mult, sinkhorn_iters, eps)
+
+
+def _sinkhorn_context(mixes, hc_scale, hc_base, hc_mult, sinkhorn_iters, eps):
+    return mixes.device.type, f"tokens={mixes.numel() // mixes.shape[-1]} hc={hc_mult}", {"hc_mult": hc_mult}
 
 
 @implementation("vxpu::hc_sinkhorn", "gpu-triton", ("cuda",), "rounding",
                 "Triton, power-of-two width: one kernel per call, the matrix in registers",
-                applies=lambda plan, hc_mult=0, **_: plan["triton"] and triton_ops.hc_split_sinkhorn_supported(hc_mult))
-def _sinkhorn_triton(mixes, hc_scale, hc_base, hc_mult, sinkhorn_iters, eps):
-    return triton_ops.hc_split_sinkhorn(mixes, hc_scale, hc_base, hc_mult, sinkhorn_iters, eps)
+                applies=lambda plan, hc_mult=0, **_: plan["triton"] and triton_ops.hc_split_sinkhorn_supported(hc_mult),
+                lowerable=True)
+def _sinkhorn_triton(mixes, hc_scale, hc_base, hc_mult, sinkhorn_iters, eps, tk=triton_ops):
+    return tk.hc_split_sinkhorn(mixes, hc_scale, hc_base, hc_mult, sinkhorn_iters, eps)
 
 
 @implementation("vxpu::hc_sinkhorn", "reference", ("cpu", "cuda"), "bit-identical",
@@ -483,21 +492,28 @@ def head_linear(x: torch.Tensor, weight: torch.Tensor) -> torch.Tensor:
     equal to fp32 rounding), elsewhere torch's fp32 linear over an fp32
     copy of the weight, widened once and kept by the engine, as it held
     the fork's fp32 weight before (bit-identical)."""
-    lead = tuple(x.shape[:-1])
-    x2 = x.reshape(-1, x.shape[-1])
     if x.is_meta:
-        return x.new_empty(lead + (weight.shape[0],), dtype=torch.float32)
-    impl = _plan(x.device.type).select("vxpu::head_linear", x.device.type,
-                                       key=f"{x2.shape[0]}x{x2.shape[1]}->{weight.shape[0]} {str(weight.dtype)[6:]}",
-                                       rows=x2.shape[0], dtype=weight.dtype)
-    return impl.fn(x2, weight).reshape(lead + (weight.shape[0],))
+        return x.new_empty(tuple(x.shape[:-1]) + (weight.shape[0],), dtype=torch.float32)
+    return _call_head(select("vxpu::head_linear", x, weight).fn, x, weight)
+
+
+def _call_head(fn, x, weight):
+    """head_linear's implementations take the rows as one [rows, K] matrix."""
+    return fn(x.reshape(-1, x.shape[-1]), weight).reshape(tuple(x.shape[:-1]) + (weight.shape[0],))
+
+
+def _head_context(x, weight):
+    rows = x.numel() // x.shape[-1]
+    return (x.device.type, f"{rows}x{x.shape[-1]}->{weight.shape[0]} {str(weight.dtype)[6:]}",
+            {"rows": rows, "dtype": weight.dtype})
 
 
 @implementation("vxpu::head_linear", "gpu-triton-bf16", ("cuda",), "rounding",
                 "Triton, bf16 weight, at most 8 rows: reads the bf16 weight, accumulates in fp32",
-                applies=lambda plan, rows=0, dtype=None, **_: plan["triton"] and dtype == torch.bfloat16 and rows <= 8)
-def _head_triton(x2, weight):
-    return triton_ops.linear_f32(x2, weight)
+                applies=lambda plan, rows=0, dtype=None, **_: plan["triton"] and dtype == torch.bfloat16 and rows <= 8,
+                lowerable=True)
+def _head_triton(x2, weight, tk=triton_ops):
+    return tk.linear_f32(x2, weight)
 
 
 @implementation("vxpu::head_linear", "f32-copy", ("cpu", "cuda"), "bit-identical",
@@ -526,6 +542,31 @@ def _f32_weight(weight):
 @head_linear.register_fake
 def _(x, weight):
     return x.new_empty(tuple(x.shape[:-1]) + (weight.shape[0],), dtype=torch.float32)
+
+
+# per op: its selection context from its arguments (device type, the key
+# recorded with the selection, what the implementations' applies() read);
+# and, where it is not fn(*args), how the op calls the implementation
+SELECTION = {
+    "vxpu::fp8_linear": _fp8_linear_context,
+    "vxpu::fp8_grouped_linear": _grouped_context,
+    "vxpu::hc_sinkhorn": _sinkhorn_context,
+    "vxpu::head_linear": _head_context,
+}
+CALL = {"vxpu::head_linear": _call_head}
+
+
+def select(op, *args, plan=None):
+    """The implementation of op the plan selects for these arguments:
+    tensors when the op runs, fake tensors (shapes only) when the plan's
+    lowering rewrites a graph. plan defaults to the bound engine's."""
+    device_type, key, ctx = SELECTION[op](*args)
+    return (plan or _plan(device_type)).select(op, device_type, key=key, **ctx)
+
+
+def call(op, fn, *args):
+    """op's result from implementation fn, as the op itself calls it."""
+    return CALL[op](fn, *args) if op in CALL else fn(*args)
 
 
 def prepare_compile():

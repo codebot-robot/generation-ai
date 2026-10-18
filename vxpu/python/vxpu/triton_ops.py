@@ -48,7 +48,18 @@ fork's grouped output projection, wo_a).
 
 ``available()`` is False without Triton or a GPU; callers keep the aten
 path then.
+
+Each function also runs traced (traced=True): the kernel launched through
+torch.library's wrap_triton, so a compiler tracing the call (inductor,
+AOTInductor) sees a Triton kernel it can place in its own generated code
+rather than an opaque Python call. The `vxpu_triton::` ops register the
+traced forms, and `lowered` exposes them under this module's names: the
+plan's lowering (lower.py) runs an implementation with it in place of
+this module.
 """
+
+import contextlib
+import types
 
 import torch
 
@@ -61,6 +72,16 @@ except ImportError:  # no Triton: the aten path remains
 
 def available():
     return triton is not None and torch.cuda.is_available()
+
+
+def _launcher(kernel, device, traced):
+    """The kernel to launch and the context to launch it in. Eager, Triton
+    launches on the current device, so that is made the tensors' device (an
+    engine on cuda:1 with the process's current device still 0); traced,
+    the launch goes through wrap_triton and the compiler places it."""
+    if traced:
+        return torch.library.wrap_triton(kernel), contextlib.nullcontext()
+    return kernel, torch.cuda.device(device)
 
 
 if triton is not None:
@@ -84,7 +105,7 @@ if triton is not None:
         tl.store(y_ptr + offs, y.to(tl.bfloat16), mask=live[:, None])
 
 
-def act_quant_dequant(x):
+def act_quant_dequant(x, traced=False):
     """The fork's act_quant (32-element blocks, ue8m0 scales) followed by
     the dequantization, for a CUDA tensor whose last dim is a multiple
     of 32: bf16 values on the fp8 grid times each block's scale."""
@@ -93,10 +114,9 @@ def act_quant_dequant(x):
     y = torch.empty(xc.shape, dtype=torch.bfloat16, device=x.device)
     n_groups = xc.numel() // 32
     G = 16
-    # Triton launches on the current device; make that the tensors' device
-    # (an engine on cuda:1 with the process's current device still 0)
-    with torch.cuda.device(x.device):
-        _act_quant_dequant_kernel[(triton.cdiv(n_groups, G),)](xc, y, n_groups, G=G)
+    kernel, ctx = _launcher(_act_quant_dequant_kernel, x.device, traced)
+    with ctx:
+        kernel[(triton.cdiv(n_groups, G),)](xc, y, n_groups, G=G)
     return y
 
 
@@ -105,16 +125,20 @@ if triton is not None:
     def _hc_sinkhorn_kernel(m_ptr, scale_ptr, base_ptr, pre_ptr, post_ptr, comb_ptr, eps,
                             HC: tl.constexpr, ITERS: tl.constexpr):
         t = tl.program_id(0)
+        # Triton's launcher passes a Python float as fp32, inductor's (the
+        # traced form) as fp64, which would make the arithmetic below fp64:
+        # fix it to fp32 so both forms compute the same bits
+        eps = eps.to(tl.float32)
         W: tl.constexpr = (2 + HC) * HC
         r = tl.arange(0, HC)
         row = m_ptr + t * W
         s0 = tl.load(scale_ptr)
         s1 = tl.load(scale_ptr + 1)
         s2 = tl.load(scale_ptr + 2)
-        pre = tl.sigmoid(tl.load(row + r) * s0 + tl.load(base_ptr + r)) + eps
-        post = 2 * tl.sigmoid(tl.load(row + HC + r) * s1 + tl.load(base_ptr + HC + r))
+        pre = tl.sigmoid(tl.load(row + r).to(tl.float32) * s0 + tl.load(base_ptr + r)) + eps
+        post = 2 * tl.sigmoid(tl.load(row + HC + r).to(tl.float32) * s1 + tl.load(base_ptr + HC + r))
         ij = r[:, None] * HC + r[None, :]
-        c = tl.load(row + 2 * HC + ij) * s2 + tl.load(base_ptr + 2 * HC + ij)
+        c = tl.load(row + 2 * HC + ij).to(tl.float32) * s2 + tl.load(base_ptr + 2 * HC + ij)
         c = tl.exp(c - tl.max(c, axis=1)[:, None])  # softmax over the last dim
         c = c / tl.sum(c, axis=1)[:, None] + eps
         c = c / (tl.sum(c, axis=0)[None, :] + eps)
@@ -132,22 +156,23 @@ def hc_split_sinkhorn_supported(hc_mult):
     return hc_mult > 0 and hc_mult & (hc_mult - 1) == 0
 
 
-def hc_split_sinkhorn(mixes, hc_scale, hc_base, hc_mult, sinkhorn_iters, eps):
+def hc_split_sinkhorn(mixes, hc_scale, hc_base, hc_mult, sinkhorn_iters, eps, traced=False):
     """The fork's hc_split_sinkhorn for CUDA tensors, one kernel per call:
     mixes [..., (2 + hc) * hc] -> pre [..., hc], post [..., hc],
     comb [..., hc, hc] (fp32), comb made doubly stochastic. hc must be a
     power of two (hc_split_sinkhorn_supported)."""
     hc = hc_mult
     lead = mixes.shape[:-1]
-    m = mixes.float().reshape(-1, (2 + hc) * hc).contiguous()
+    m = mixes.reshape(-1, (2 + hc) * hc).contiguous()  # widened in the kernel (see linear_f32)
     T = m.shape[0]
     pre = torch.empty(T, hc, dtype=torch.float32, device=mixes.device)
     post = torch.empty(T, hc, dtype=torch.float32, device=mixes.device)
     comb = torch.empty(T, hc, hc, dtype=torch.float32, device=mixes.device)
     if T:
-        with torch.cuda.device(mixes.device):  # Triton launches on the current device
-            _hc_sinkhorn_kernel[(T,)](m, hc_scale.float().contiguous(), hc_base.float().contiguous(),
-                                      pre, post, comb, float(eps), HC=hc, ITERS=sinkhorn_iters)
+        kernel, ctx = _launcher(_hc_sinkhorn_kernel, mixes.device, traced)
+        with ctx:
+            kernel[(T,)](m, hc_scale.float().contiguous(), hc_base.float().contiguous(),
+                         pre, post, comb, float(eps), HC=hc, ITERS=sinkhorn_iters)
     return pre.view(*lead, hc), post.view(*lead, hc), comb.view(*lead, hc, hc)
 
 
@@ -163,12 +188,12 @@ if triton is not None:
             ks = k0 + tl.arange(0, BK)
             kin = ks < K
             w = tl.load(w_ptr + rows[:, None] * K + ks[None, :], mask=live[:, None] & kin[None, :], other=0.0)
-            x = tl.load(x_ptr + m * K + ks, mask=kin, other=0.0)
+            x = tl.load(x_ptr + m * K + ks, mask=kin, other=0.0).to(tl.float32)
             acc += w.to(tl.float32) * x[None, :]
         tl.store(y_ptr + m * N + rows, tl.sum(acc, axis=1), mask=live)
 
 
-def linear_f32(x, weight, block_n=16, block_k=512):
+def linear_f32(x, weight, block_n=16, block_k=512, traced=False):
     """x [M, K] (any float dtype, taken as fp32) times weight [N, K]
     (bf16, read as is) transposed -> fp32 [M, N], fp32 accumulation. For
     the few rows of a decode step: each row reads the whole weight."""
@@ -176,11 +201,15 @@ def linear_f32(x, weight, block_n=16, block_k=512):
     N = weight.shape[0]
     if weight.dim() != 2 or weight.shape[1] != K:
         raise ValueError(f"linear_f32: x {tuple(x.shape)} and weight {tuple(weight.shape)} disagree on K")
-    x = x.float().contiguous()
+    # x is widened to fp32 in the kernel, not here: traced, a torch-side
+    # cast would let inductor fuse it into x's producer and skip the
+    # rounding to x's dtype that the eager path does
+    x = x.contiguous()
     y = torch.empty(M, N, dtype=torch.float32, device=x.device)
     if M and N:
-        with torch.cuda.device(x.device):  # Triton launches on the current device
-            _linear_f32_kernel[(triton.cdiv(N, block_n), M)](x, weight.contiguous(), y, N, K, BN=block_n, BK=block_k)
+        kernel, ctx = _launcher(_linear_f32_kernel, x.device, traced)
+        with ctx:
+            kernel[(triton.cdiv(N, block_n), M)](x, weight.contiguous(), y, N, K, BN=block_n, BK=block_k)
     return y
 
 
@@ -224,7 +253,7 @@ def _gemv_blocks(K):
     return 8, 32
 
 
-def fp8_gemv(x, weight, scale, group_rows=None, out_dtype=torch.bfloat16, block_n=None, block_k=None):
+def fp8_gemv(x, weight, scale, group_rows=None, out_dtype=torch.bfloat16, block_n=None, block_k=None, traced=False):
     """x [M, G*K] times weight [N, K] (fp8 e4m3 with [N/32, K/32] e8m0
     block scales) transposed -> [M, N] in out_dtype, fp32 accumulation.
     With group_rows R, rows n read x[:, g*K:(g+1)*K] for g = n // R (a
@@ -244,8 +273,47 @@ def fp8_gemv(x, weight, scale, group_rows=None, out_dtype=torch.bfloat16, block_
                          f"[{N // 32}, {K // 32}], got {scale.dtype} {tuple(scale.shape)}")
     y = torch.empty(M, N, dtype=out_dtype, device=x.device)
     if M and N:
-        with torch.cuda.device(x.device):  # Triton launches on the current device
-            _fp8_gemv_kernel[(triton.cdiv(N, block_n), M)](
+        kernel, ctx = _launcher(_fp8_gemv_kernel, x.device, traced)
+        with ctx:
+            kernel[(triton.cdiv(N, block_n), M)](
                 x.contiguous(), weight.contiguous(), scale.contiguous().view(torch.uint8), y, N, K,
                 x.shape[1], R, scale.shape[1], BN=block_n, BK=block_k)
     return y
+
+
+# ---------------------------------------------------------------------------
+# the traced forms, as torch ops (the plan's lowering calls these)
+
+if triton is not None:
+    @torch.library.triton_op("vxpu_triton::act_quant_dequant", mutates_args=())
+    def _act_quant_dequant_op(x: torch.Tensor) -> torch.Tensor:
+        return act_quant_dequant(x, traced=True)
+
+    @torch.library.triton_op("vxpu_triton::hc_split_sinkhorn", mutates_args=())
+    def _hc_split_sinkhorn_op(mixes: torch.Tensor, hc_scale: torch.Tensor, hc_base: torch.Tensor, hc_mult: int,
+                              sinkhorn_iters: int, eps: float) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        return hc_split_sinkhorn(mixes, hc_scale, hc_base, hc_mult, sinkhorn_iters, eps, traced=True)
+
+    @torch.library.triton_op("vxpu_triton::linear_f32", mutates_args=())
+    def _linear_f32_op(x: torch.Tensor, weight: torch.Tensor) -> torch.Tensor:
+        return linear_f32(x, weight, traced=True)
+
+    @torch.library.triton_op("vxpu_triton::fp8_gemv", mutates_args=())
+    def _fp8_gemv_op(x: torch.Tensor, weight: torch.Tensor, scale: torch.Tensor, group_rows: int,
+                     out_dtype: torch.dtype) -> torch.Tensor:
+        return fp8_gemv(x, weight, scale, group_rows or None, out_dtype, traced=True)
+
+
+def _lowered_fp8_gemv(x, weight, scale, group_rows=None, out_dtype=torch.bfloat16):
+    return torch.ops.vxpu_triton.fp8_gemv(x, weight, scale, group_rows or 0, out_dtype)
+
+
+# this module's functions under the same names, through the vxpu_triton ops
+lowered = types.SimpleNamespace(
+    available=available,
+    hc_split_sinkhorn_supported=hc_split_sinkhorn_supported,
+    act_quant_dequant=lambda x: torch.ops.vxpu_triton.act_quant_dequant(x),
+    hc_split_sinkhorn=lambda *a: torch.ops.vxpu_triton.hc_split_sinkhorn(*a),
+    linear_f32=lambda x, weight: torch.ops.vxpu_triton.linear_f32(x, weight),
+    fp8_gemv=_lowered_fp8_gemv,
+)

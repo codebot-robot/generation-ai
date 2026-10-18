@@ -42,7 +42,7 @@ import time
 
 import torch
 
-from . import ops, segments  # noqa: F401  (registers vxpu::* before a graph that calls them is loaded)
+from . import lower, ops, segments  # noqa: F401  (registers vxpu::* before a graph that calls them is loaded)
 from .plan import Plan
 from .plan import record as plan_record
 from .telemetry import Recorder, segment_info
@@ -327,6 +327,11 @@ class Engine:
                 # cut at the host ops; each dense segment its own compiled
                 # unit (a CUDA graph on CUDA: the plan's mode defaults to
                 # reduce-overhead there), the host ops eager between
+                if self.plan["lower_decode"]:
+                    report = lower.lower(self._decode, self.plan)
+                    msg = lower.describe(report)
+                    print(f"[vxpu] {msg}", flush=True)
+                    self.plan.note(msg)
                 self._decode_split = segments.compile_segments(
                     self._decode, self.device, mode, opts.get("options"),
                     split_compile=self.plan["split_compile"], direct=self.plan["direct_host_ops"])

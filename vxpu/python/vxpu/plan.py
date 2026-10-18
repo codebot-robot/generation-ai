@@ -178,18 +178,21 @@ class Impl:
     applies: object = None    # applies(plan, **ctx) -> bool, beyond the device check
     reference: bool = False   # the reference computation: always applicable, on any device
     host: bool = False        # runs where its data lives on the host (the expert banks, the n-gram tables)
+    lowerable: bool = False   # fn(..., tk=triton_ops.lowered) is traceable: the plan's lowering may inline it (lower.py)
 
 
 REGISTRY = collections.defaultdict(list)  # op -> [Impl], in preference order
 
 
-def implementation(op, name, devices, numerics, when, applies=None, reference=False, host=False):
+def implementation(op, name, devices, numerics, when, applies=None, reference=False, host=False, lowerable=False):
     """Register fn as an implementation of op. Registration order is the
     preference order: the first one that applies is selected. host=True
     marks an op that runs where its data is (on the host for host-placed
-    banks and tables), whatever the engine's device."""
+    banks and tables), whatever the engine's device. lowerable=True marks
+    one whose fn takes its Triton kernels as tk= and, given the traced
+    ones, is pure tensor work a compiler can trace through."""
     def register(fn):
-        REGISTRY[op].append(Impl(op, name, fn, tuple(devices), numerics, when, applies, reference, host))
+        REGISTRY[op].append(Impl(op, name, fn, tuple(devices), numerics, when, applies, reference, host, lowerable))
         return fn
     return register
 
@@ -260,6 +263,10 @@ class Plan:
         on, src = env_flag("VXPU_DIRECT_HOST_OPS", True)
         self._set("direct_host_ops", on, src, (True, False),
                   "eager host-op segments call the op's implementation directly, not through torch's dispatcher")
+        on, src = env_flag("VXPU_LOWER_DECODE", False)
+        self._set("lower_decode", on and self["split_decode"], src if self["split_decode"] else "requires split_decode",
+                  (True, False), "before compiling, rewrite each dense segment's vxpu op calls into the selected "
+                  "implementation, its Triton kernels as torch ops (lower.py): the compiler sees the kernels")
 
         # where the external tensors live
         if external_dir:  # an explicit argument wins over the environment, as it always has
@@ -329,7 +336,7 @@ class Plan:
             table[op] = {
                 "implementations": [
                     {"name": i.name, "devices": list(i.devices), "numerics": i.numerics, "when": i.when,
-                     "on_this_device": _available(i, self.device_type)}
+                     "on_this_device": _available(i, self.device_type), "lowerable": i.lowerable}
                     for i in REGISTRY[op]],
                 "selected": selections.get(op, []),
             }
@@ -368,14 +375,16 @@ LOCAL_PATHS = ("external_dir",)
 def record(explained):
     """The compact form of an explain() a result keeps (vectors files,
     telemetry): each choice's value (for a local path, whether it is set),
-    the implementations each op ran and their numerics classes, so a
-    result says which plan produced it."""
+    the implementations each op ran and their numerics classes, and the
+    plan's notes (runtime events: the lowering's report, a bf16 cache that
+    stopped), so a result says which plan produced it."""
     return {"choices": {k: (c["value"] is not None) if k in LOCAL_PATHS else c["value"]
                         for k, c in explained["choices"].items()},
             "selected": {op: sorted({s["impl"] for s in row["selected"]}) for op, row in explained["ops"].items()},
             "numerics": {op: sorted({i["numerics"] for i in row["implementations"]
                                      if i["name"] in {s["impl"] for s in row["selected"]}})
-                         for op, row in explained["ops"].items()}}
+                         for op, row in explained["ops"].items()},
+            "notes": list(explained["notes"])}
 
 
 _default = {}

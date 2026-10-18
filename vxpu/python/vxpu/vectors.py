@@ -759,6 +759,46 @@ def _check_telemetry(model, prompts, settings, artifact, plain, workdir):
     return not problems
 
 
+def _check_lowering(model, prompts, settings, artifact):
+    """On a GPU: the compiled, split decode with the plan lowered into its
+    segments (lower.py) against the same without, token-exact. The lowered
+    calls run the same kernels, so the vectors must agree. Skipped without
+    CUDA (nothing on the CPU is lowerable)."""
+    import torch
+    if not torch.cuda.is_available():
+        print("lowering check skipped: no CUDA")
+        return True
+    runs = {}
+    for lowered in (False, True):
+        saved = os.environ.get("VXPU_LOWER_DECODE")
+        os.environ["VXPU_LOWER_DECODE"] = "1" if lowered else "0"
+        try:
+            runs[lowered] = record_vxpu_engine(model, "main", prompts, settings, artifact, device="cuda",
+                                               compile_decode=True)
+        finally:
+            if saved is None:
+                os.environ.pop("VXPU_LOWER_DECODE")
+            else:
+                os.environ["VXPU_LOWER_DECODE"] = saved
+    # the lowered run must have lowered something: with Triton missing or
+    # the split decode off, both runs would be the same decode
+    from .lower import REPORT_PREFIX
+    plan = runs[True]["producer"]["plan"]
+    if not plan["choices"].get("triton"):
+        print("lowering check skipped: no Triton (nothing is lowerable)")
+        return True
+    report = [n for n in plan.get("notes", []) if n.startswith(REPORT_PREFIX)]
+    if not plan["choices"].get("lower_decode") or not report or "lowered " not in report[0][len(REPORT_PREFIX):]:
+        print(f"lowering check: the lowered run lowered nothing (lower_decode={plan['choices'].get('lower_decode')}, "
+              f"report={report})")
+        return False
+    print(report[0])
+    rows, ok = compare(runs[False], runs[True], strict_tokens=True)
+    print("lowered decode against unlowered, cuda:")
+    print(table(runs[False], runs[True], rows))
+    return ok
+
+
 def selftest(workdir, settings):
     """The CI tier: tiny models through export, the in-process engine,
     and a transformers reference, token-exact. No cluster."""
@@ -802,6 +842,8 @@ def selftest(workdir, settings):
             failed.append(name)
         if name == "tiny-deepseek-v41" and not _check_telemetry(model, prompts, settings, artifact, got, workdir):
             failed.append(name + " (telemetry)")
+        if name == "tiny-deepseek-v41" and not _check_lowering(model, prompts, settings, artifact):
+            failed.append(name + " (lowered)")
     if failed:
         raise SystemExit(f"vectors differ for: {', '.join(failed)}")
     print("selftest ok:", ", ".join(m[0] for m in models))
