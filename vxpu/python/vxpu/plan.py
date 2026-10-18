@@ -210,6 +210,11 @@ class Choice:
 # ---------------------------------------------------------------------------
 # the plan
 
+# input shapes recorded per implementation; later shapes are counted
+# together, so an engine serving many prompt lengths keeps a bounded record
+MAX_SHAPES_RECORDED = 64
+
+
 class Plan:
     """The physical plan of one engine. See the module docstring."""
 
@@ -220,6 +225,7 @@ class Plan:
         self.choices = {}
         self.notes = []
         self._selections = collections.Counter()
+        self._shapes = collections.Counter()  # distinct input shapes recorded per (op, implementation)
         self._lock = threading.Lock()
         cuda = self.device_type == "cuda"
         if triton_available is None:
@@ -298,7 +304,13 @@ class Plan:
             # the reference computation runs anywhere torch does
             if impl.reference or (device_type in impl.devices and (impl.applies is None or impl.applies(self, **ctx))):
                 with self._lock:
-                    self._selections[(op, impl.name, key)] += 1
+                    record = (op, impl.name, key)
+                    if record not in self._selections:
+                        if self._shapes[(op, impl.name)] >= MAX_SHAPES_RECORDED:
+                            record = (op, impl.name, "(other shapes)")
+                        else:
+                            self._shapes[(op, impl.name)] += 1
+                    self._selections[record] += 1
                 return impl
         raise RuntimeError(f"no implementation of {op} for {device_type} ({ctx})")
 
@@ -345,6 +357,17 @@ class Plan:
             lines.append(f"  {op}: {' > '.join(here) or '-'}" + (f"   selected: {', '.join(got)}" if got else ""))
         lines += [f"  note: {n}" for n in e["notes"]]
         return "\n".join(lines)
+
+
+def record(explained):
+    """The compact form of an explain() a result keeps (vectors files,
+    telemetry): each choice's value, the implementations each op ran and
+    their numerics classes, so a result says which plan produced it."""
+    return {"choices": {k: c["value"] for k, c in explained["choices"].items()},
+            "selected": {op: sorted({s["impl"] for s in row["selected"]}) for op, row in explained["ops"].items()},
+            "numerics": {op: sorted({i["numerics"] for i in row["implementations"]
+                                     if i["name"] in {s["impl"] for s in row["selected"]}})
+                         for op, row in explained["ops"].items()}}
 
 
 _default = {}
