@@ -16,8 +16,10 @@ package commands
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"net/http"
+	_ "net/http/pprof"
 	"time"
 
 	"github.com/gke-labs/generation-ai/modelstore/pkg/blobstore"
@@ -35,12 +37,15 @@ type ServeOptions struct {
 	BlobStore string
 	// HFEndpoint is the Hugging Face Hub to import from.
 	HFEndpoint string
+	// PprofAddr is the address to serve net/http/pprof on (off by default).
+	PprofAddr string
 }
 
 func (o *ServeOptions) InitDefaults() {
 	o.Port = "8080"
 	o.BlobStore = "/cache"
 	o.HFEndpoint = "https://huggingface.co"
+	o.PprofAddr = ""
 }
 
 func BuildServeCommand() *cobra.Command {
@@ -61,6 +66,8 @@ func BuildServeCommand() *cobra.Command {
 	cmd.Flags().StringVar(&opt.BlobStore, "cache-dir", opt.BlobStore, "Deprecated alias for --blob-store")
 	cmd.Flags().StringVar(&opt.HFEndpoint, "hf-endpoint", opt.HFEndpoint,
 		"Hugging Face Hub to import from (HF_TOKEN in the environment is sent for gated repositories)")
+	cmd.Flags().StringVar(&opt.PprofAddr, "pprof-addr", opt.PprofAddr,
+		"Address to serve net/http/pprof on (e.g. localhost:6060; disabled by default)")
 	if err := cmd.Flags().MarkDeprecated("cache-dir", "use --blob-store"); err != nil {
 		panic(err) // a typo in the flag name above, caught at startup
 	}
@@ -78,6 +85,25 @@ func RunServe(ctx context.Context, opt *ServeOptions) error {
 	p := proxy.NewProxy(reg, importer.New(store, opt.HFEndpoint))
 
 	log.Info("Starting modelstore", "port", opt.Port, "blobStore", store.String(), "hfEndpoint", opt.HFEndpoint)
+
+	if opt.PprofAddr != "" {
+		pprofServer := &http.Server{
+			Addr:              opt.PprofAddr,
+			Handler:           http.DefaultServeMux,
+			ReadHeaderTimeout: 10 * time.Second,
+		}
+		go func() {
+			log.Info("Starting pprof server", "addr", opt.PprofAddr)
+			if err := pprofServer.ListenAndServe(); err != nil && !errors.Is(err, http.ErrServerClosed) {
+				log.Error(err, "pprof server failed", "addr", opt.PprofAddr)
+			}
+		}()
+		defer func() {
+			if err := pprofServer.Close(); err != nil && !errors.Is(err, http.ErrServerClosed) {
+				log.Error(err, "closing pprof server", "addr", opt.PprofAddr)
+			}
+		}()
+	}
 
 	server := &http.Server{
 		Addr:              ":" + opt.Port,

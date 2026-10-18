@@ -39,8 +39,12 @@ var ErrNotFound = errors.New("blob not found")
 
 // Store is a content-addressed blob store.
 type Store interface {
-	// Stat reports the size of a blob, or ErrNotFound.
+	// Stat reports the size of a blob, or ErrNotFound. It queries the backing
+	// store directly to verify current existence.
 	Stat(ctx context.Context, sha string) (int64, error)
+	// StatCached reports the size of a blob, or ErrNotFound, allowing
+	// implementations to return a cached size on the read serving path.
+	StatCached(ctx context.Context, sha string) (int64, error)
 	// Put stores the bytes of r as the blob sha, verifying the digest;
 	// with sha == "" the blob is named by its content. Returns the
 	// blob's sha and the bytes written. A mismatch leaves no blob.

@@ -68,6 +68,10 @@ func (l *Local) Stat(ctx context.Context, sha string) (int64, error) {
 	return info.Size(), nil
 }
 
+func (l *Local) StatCached(ctx context.Context, sha string) (int64, error) {
+	return l.Stat(ctx, sha)
+}
+
 func (l *Local) Put(ctx context.Context, sha string, r io.Reader) (string, int64, error) {
 	tmp, err := os.CreateTemp(filepath.Join(l.dir, "blobs"), "upload-*")
 	if err != nil {
