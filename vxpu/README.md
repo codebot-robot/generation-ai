@@ -157,12 +157,22 @@ themselves, not an opaque Python call. That is the first step toward
 compiling the segments ahead of time (AOTInductor, #277). A lowered call
 runs the same kernels on the same inputs, so the output is bit-identical.
 
+With `VXPU_SEGMENT_RUNTIME=aoti` (`python/vxpu/aoti.py`, CUDA only, which
+implies lowering), each dense segment is compiled by AOTInductor into a
+package, and the engine runs the packages in its own CUDA graphs instead
+of torch.compile. Packages are built on first use and cached under
+`VXPU_AOTI_CACHE_DIR` (default `~/.cache/vxpu/aoti`), keyed by the
+segment's code, its argument shapes, the kernels' source, the torch
+version and the GPU. A later load of the same artifact on the same kind
+of machine compiles nothing: the cache holds compiled plans.
+
 The environment switches are read by one parser, which refuses values it
 doesn't understand: `VXPU_KERNELS`, `VXPU_FUSED_EXPERTS`,
 `VXPU_KERNEL_THREADS`, `VXPU_SPLIT_DECODE`, `VXPU_COMPILE_MODE`,
 `VXPU_SPLIT_COMPILE`, `VXPU_DIRECT_HOST_OPS`, `VXPU_LOWER_DECODE`,
-`VXPU_EXPERTS_IN_RAM`, `VXPU_BF16_WEIGHT_CACHE`, `VXPU_BF16_CACHE_HEADROOM_GB`;
-and `VXPU_EXTERNAL_DIR`, a path, taken as given. Choosing between plans by cost, and
+`VXPU_SEGMENT_RUNTIME`, `VXPU_EXPERTS_IN_RAM`, `VXPU_BF16_WEIGHT_CACHE`,
+`VXPU_BF16_CACHE_HEADROOM_GB`; and `VXPU_EXTERNAL_DIR` and `VXPU_AOTI_CACHE_DIR`,
+paths, taken as given. Choosing between plans by cost, and
 deployment hints, come next (#316, #332).
 
 ## Weights: the store
