@@ -127,15 +127,22 @@ def analyse(layers, experts, seed=0):
     return rows, overall, overall_even, total
 
 
-def report(paths, phase="decode", artifact=None, tokens_per_s=20.0):
+def load(paths):
+    """The documents in paths: a JSON document per file, or JSON lines (the
+    engine's request records, `vxpu stats --records`)."""
     docs = []
     for path in paths:
         with open(path) as f:
             text = f.read()
         try:
             docs.append(json.loads(text))
-        except json.JSONDecodeError:  # JSON lines: the engine's request records (`vxpu stats --records`)
+        except json.JSONDecodeError:
             docs.extend(json.loads(line) for line in text.splitlines() if line.strip())
+    return docs
+
+
+def report(paths, phase="decode", artifact=None, tokens_per_s=20.0):
+    docs = load(paths)
     counts = collect(docs)
     if phase not in counts:
         raise SystemExit(f"no {phase} expert counts in {', '.join(paths)} (record with telemetry)")
@@ -195,6 +202,25 @@ def _tokens(docs, phase):
     return sum(tel.get(key) or 0 for doc in docs for tel in _records(doc))
 
 
+def placement(counts, per_expert_bytes, budget_bytes):
+    """The hottest experts that fit budget_bytes, chosen across layers by
+    how often they were selected (the most selections served per byte, as
+    every expert costs the same): {"layers": {layer: [ids]}, ...}. The
+    engine holds them on the GPU (experts_gpu.py, VXPU_GPU_EXPERTS)."""
+    if budget_bytes <= 0 or per_expert_bytes <= 0:
+        raise ValueError(f"placement: the budget ({budget_bytes} bytes) and expert size ({per_expert_bytes}) must be positive")
+    ranked = sorted(((n, layer, expert) for layer, c in counts.items() for expert, n in c.items()), reverse=True)
+    k = min(len(ranked), int(budget_bytes // per_expert_bytes))
+    chosen = ranked[:k]
+    layers = collections.defaultdict(list)
+    for _, layer, expert in chosen:
+        layers[layer].append(expert)
+    total = sum(n for n, _, _ in ranked)
+    return {"format": "vxpu-placement/1", "experts": k, "bytes": int(k * per_expert_bytes),
+            "share_of_selections": round(sum(n for n, _, _ in chosen) / total, 4) if total else 0.0,
+            "layers": {str(layer): sorted(ids) for layer, ids in sorted(layers.items())}}
+
+
 def main(argv=None):
     p = argparse.ArgumentParser(description=__doc__.split("\n\n")[0])
     p.add_argument("files", nargs="+", help="vectors files (--telemetry), attribute_decode.py output, or telemetry JSON")
@@ -202,9 +228,21 @@ def main(argv=None):
     p.add_argument("--artifact", help="artifact directory, for expert sizes and storage bandwidth")
     p.add_argument("--tokens-per-s", type=float, default=20.0)
     p.add_argument("--json", help="also write the full report here")
+    p.add_argument("--placement-gb", type=float,
+                   help="with --artifact and --placement-out: choose the hottest experts that fit this many GB on a GPU")
+    p.add_argument("--placement-out", help="where to write the placement (for VXPU_GPU_EXPERTS)")
     args = p.parse_args(argv)
     out, text = report(args.files, args.phase, args.artifact, args.tokens_per_s)
     print(text)
+    if args.placement_gb:
+        if not (args.artifact and args.placement_out):
+            raise SystemExit("--placement-gb needs --artifact (for expert sizes) and --placement-out")
+        per_expert, _ = expert_bytes(args.artifact)
+        plan = placement(collect(load(args.files))[args.phase], per_expert, args.placement_gb * 1e9)
+        with open(args.placement_out, "w") as f:
+            json.dump(plan, f, indent=1)
+        print(f"placement: {plan['experts']} experts ({plan['bytes'] / 1e9:.1f} GB) serving "
+              f"{plan['share_of_selections']:.0%} of the recorded {args.phase} selections -> {args.placement_out}")
     if args.json:
         with open(args.json, "w") as f:
             json.dump(out, f, indent=1)

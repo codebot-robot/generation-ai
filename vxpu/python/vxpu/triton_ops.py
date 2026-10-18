@@ -317,3 +317,136 @@ lowered = types.SimpleNamespace(
     linear_f32=lambda x, weight: torch.ops.vxpu_triton.linear_f32(x, weight),
     fp8_gemv=_lowered_fp8_gemv,
 )
+
+
+# ---------------------------------------------------------------------------
+# routed experts on the GPU (the hot ones; experts_gpu.py)
+
+if triton is not None:
+    @triton.jit
+    def _e2m1(v):
+        """fp4 e2m1 codes (0..15, int32) -> fp32: sign, 2-bit exponent,
+        1-bit mantissa; exponent 0 is subnormal (0 or 0.5)."""
+        sign = tl.where((v & 8) != 0, -1.0, 1.0)
+        e = (v >> 1) & 3
+        m = (v & 1).to(tl.float32)
+        mag = tl.where(e == 0, m * 0.5, (1.0 + m * 0.5) * tl.exp2((e - 1).to(tl.float32)))
+        return sign * mag
+
+    @triton.jit
+    def _fp4_rows_dot(x_ptr, w_ptr, s_ptr, rows, live, K, KB, KS, BN: tl.constexpr, BK: tl.constexpr):
+        """sum over K of x[k] * W[row, k] for rows of an fp4 bank viewed as
+        [S*N, K/2] (rows are absolute: slot * N + row), with e8m0 scales
+        [S*N, K/32]; fp32 accumulation -> [BN]. BK divides K."""
+        acc = tl.zeros((BN, BK), dtype=tl.float32)
+        for k0 in range(0, K, BK):
+            kb = k0 // 2 + tl.arange(0, BK // 2)
+            b = tl.load(w_ptr + rows[:, None] * KB + kb[None, :], mask=live[:, None], other=0).to(tl.int32)
+            w = tl.reshape(tl.join(_e2m1(b & 15), _e2m1(b >> 4)), (BN, BK))  # low nibble first
+            ks = k0 // 32 + tl.arange(0, BK // 32)
+            e = tl.load(s_ptr + rows[:, None] * KS + ks[None, :], mask=live[:, None], other=127).to(tl.int32)
+            sc = tl.where(e == 0, 5.877471754111438e-39, (e << 23).to(tl.float32, bitcast=True))
+            w = tl.reshape(tl.reshape(w, (BN, BK // 32, 32)) * sc[:, :, None], (BN, BK))
+            x = tl.load(x_ptr + k0 + tl.arange(0, BK)).to(tl.float32)
+            acc += w * x[None, :]
+        return tl.sum(acc, axis=1)
+
+    @triton.jit
+    def _fp4_gate_up_kernel(x_ptr, slot_ptr, w1_ptr, s1_ptr, w3_ptr, s3_ptr, g_ptr, u_ptr,
+                            I, K, TOPK, BN: tl.constexpr, BK: tl.constexpr):
+        pid = tl.program_id(0)
+        p = tl.program_id(1)  # (token, k) pair
+        slot = tl.load(slot_ptr + p)
+        if slot < 0:  # a cold expert: the CPU computes it
+            return
+        rows = pid * BN + tl.arange(0, BN)
+        live = rows < I
+        bank_rows = slot.to(tl.int64) * I + rows
+        xrow = x_ptr + (p // TOPK).to(tl.int64) * K
+        g = _fp4_rows_dot(xrow, w1_ptr, s1_ptr, bank_rows, live, K, K // 2, K // 32, BN, BK)
+        u = _fp4_rows_dot(xrow, w3_ptr, s3_ptr, bank_rows, live, K, K // 2, K // 32, BN, BK)
+        tl.store(g_ptr + p.to(tl.int64) * I + rows, g.to(tl.bfloat16), mask=live)
+        tl.store(u_ptr + p.to(tl.int64) * I + rows, u.to(tl.bfloat16), mask=live)
+
+    @triton.jit
+    def _swiglu_quant_kernel(g_ptr, u_ptr, wt_ptr, slot_ptr, h_ptr, I, limit, G: tl.constexpr):
+        """The fork's _ffn for one pair's 32-blocks: clamps, w * silu(g) * u
+        in fp32, rounded to bf16, then act_quant per 32 (fp8 grid, ue8m0
+        scales) and dequantized, as _act_quant_dequant_kernel does."""
+        p = tl.program_id(1)
+        slot = tl.load(slot_ptr + p)
+        if slot < 0:
+            return
+        blocks = tl.program_id(0) * G + tl.arange(0, G)
+        live = blocks < I // 32
+        offs = p.to(tl.int64) * I + blocks[:, None] * 32 + tl.arange(0, 32)[None, :]
+        g = tl.load(g_ptr + offs, mask=live[:, None], other=0.0).to(tl.float32)
+        u = tl.load(u_ptr + offs, mask=live[:, None], other=0.0).to(tl.float32)
+        if limit > 0:
+            u = tl.minimum(tl.maximum(u, -limit), limit)
+            g = tl.minimum(g, limit)
+        w = tl.load(wt_ptr + p).to(tl.float32)
+        h = w * ((g * tl.sigmoid(g)) * u)
+        h = h.to(tl.bfloat16).to(tl.float32)
+        amax = tl.maximum(tl.max(tl.abs(h), axis=1), 1e-4)
+        v = amax / 448.0
+        bits = v.to(tl.int32, bitcast=True)
+        exponent = (bits >> 23) & 0xFF
+        exponent = tl.where((bits & 0x7FFFFF) == 0, exponent, exponent + 1)
+        scale = (exponent << 23).to(tl.float32, bitcast=True)
+        q = tl.minimum(tl.maximum(h / scale[:, None], -448.0), 448.0)
+        y = q.to(tl.float8e4nv).to(tl.float32) * scale[:, None]
+        tl.store(h_ptr + offs, y.to(tl.bfloat16), mask=live[:, None])
+
+    @triton.jit
+    def _fp4_down_kernel(h_ptr, slot_ptr, w2_ptr, s2_ptr, d_ptr, D, I, BN: tl.constexpr, BK: tl.constexpr):
+        pid = tl.program_id(0)
+        p = tl.program_id(1)
+        slot = tl.load(slot_ptr + p)
+        if slot < 0:
+            return
+        rows = pid * BN + tl.arange(0, BN)
+        live = rows < D
+        bank_rows = slot.to(tl.int64) * D + rows
+        d = _fp4_rows_dot(h_ptr + p.to(tl.int64) * I, w2_ptr, s2_ptr, bank_rows, live, I, I // 2, I // 32, BN, BK)
+        tl.store(d_ptr + p.to(tl.int64) * D + rows, d.to(tl.bfloat16).to(tl.float32), mask=live)
+
+
+def _fp4_block_k(K):
+    for bk in (512, 256, 128, 64, 32):
+        if K % bk == 0:
+            return bk
+    raise ValueError(f"fp4 experts: K={K} is not a multiple of 32")
+
+
+def fp4_experts_decode(x_in, weights, slots, w1, s1, w3, s3, w2, s2, swiglu_limit):
+    """The routed experts of a few tokens, for the pairs whose expert is
+    held on the GPU: x_in [n, K] bf16 (already on the fp8 grid, as the
+    module quantizes it), weights [n, topk] fp32, slots [n, topk] int (the
+    expert's slot in the GPU banks, or -1 for experts computed elsewhere),
+    banks w1/w3 [S, I, K/2] and w2 [S, K, I/2] packed fp4 with e8m0
+    scales per 32 along the inner dimension. The arithmetic is the
+    module's _forward_batched per pair: fp32 accumulation rounded to bf16,
+    the clamps, SiLU, the routing weight, the down projection's input
+    re-quantized per 32 block, its output rounded to bf16. Returns y
+    [n, K] fp32, the sum over the token's held pairs (0 where none)."""
+    n, topk = slots.shape
+    K = x_in.shape[1]
+    S, I, _ = w1.shape
+    pairs = n * topk
+    dev = x_in.device
+    sl = slots.to(torch.int32).contiguous().view(-1)
+    g = torch.empty(pairs, I, dtype=torch.bfloat16, device=dev)
+    u = torch.empty(pairs, I, dtype=torch.bfloat16, device=dev)
+    h = torch.empty(pairs, I, dtype=torch.bfloat16, device=dev)
+    d = torch.zeros(pairs, K, dtype=torch.float32, device=dev)
+    x = x_in.contiguous()
+    wt = weights.to(torch.float32).contiguous().view(-1)
+    BN = 8
+    with torch.cuda.device(dev):
+        _fp4_gate_up_kernel[(triton.cdiv(I, BN), pairs)](
+            x, sl, w1, s1.view(torch.uint8), w3, s3.view(torch.uint8), g, u, I, K, topk, BN=BN, BK=_fp4_block_k(K))
+        _swiglu_quant_kernel[(triton.cdiv(I // 32, 16), pairs)](g, u, wt, sl, h, I, float(swiglu_limit), G=16)
+        _fp4_down_kernel[(triton.cdiv(K, BN), pairs)](
+            h, sl, w2, s2.view(torch.uint8), d, K, I, BN=BN, BK=_fp4_block_k(I))
+    return d.view(n, topk, K).sum(1)

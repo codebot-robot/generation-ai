@@ -1038,6 +1038,82 @@ def _check_chat_telemetry(artifact):
     return True
 
 
+def _check_gpu_experts(model, prompts, settings, artifact, workdir):
+    """On a GPU: the hot experts' kernels (triton_ops.fp4_experts_decode)
+    against the module's own arithmetic on random fp4 banks, then the tiny
+    DeepSeek with half of every layer's experts placed on the GPU
+    (experts_gpu.py) against the same model computing them all on the
+    CPU (a different summation order: the rounding class, so a near tie
+    may flip). Skipped without CUDA and Triton."""
+    import torch
+    from . import triton_ops
+    if not triton_ops.available():
+        print("gpu experts check skipped: no CUDA with Triton")
+        return True
+    from .deepseek_v41 import _fork
+    ds = _fork()
+    K, I, S, dev = 256, 128, 4, "cuda"
+    g = torch.Generator(device=dev).manual_seed(0)
+    def bank(n_out, n_in):
+        w = torch.randint(0, 256, (S, n_out, n_in // 2), dtype=torch.uint8, device=dev, generator=g)
+        sc = torch.randint(120, 125, (S, n_out, n_in // 32), dtype=torch.uint8, device=dev, generator=g)
+        return w, sc.view(torch.float8_e8m0fnu)
+    (w1, s1), (w3, s3), (w2, s2) = bank(I, K), bank(I, K), bank(K, I)
+    x = triton_ops.act_quant_dequant(torch.randn(1, K, device=dev, generator=g).to(torch.bfloat16))
+    weights = torch.rand(1, 3, device=dev, generator=g)
+    slots = torch.tensor([[2, -1, 0]], device=dev)
+    y = triton_ops.fp4_experts_decode(x, weights, slots, w1, s1, w3, s3, w2, s2, 10.0)
+
+    class _M:
+        swiglu_limit = 10.0
+        def _quantized_input(self, t):
+            return ds.MoE._quantized_input(self, t)
+    ref = torch.zeros(1, K, device=dev)
+    for k, sl in enumerate(slots[0].tolist()):
+        if sl < 0:
+            continue
+        deq = [ds.MoE._dequant(w[sl:sl + 1], sc[sl:sl + 1]) for w, sc in ((w1, s1), (w3, s3), (w2, s2))]
+        gate, up = (torch.bmm(m, x.view(1, K, 1)).squeeze(-1) for m in deq[:2])
+        h = ds.MoE._ffn(_M(), gate, up, weights[0, k:k + 1])
+        ref[0] += torch.bmm(deq[2], h.unsqueeze(-1)).squeeze(-1).float()[0]
+    rel = ((y - ref).abs().max() / ref.abs().max()).item()
+    if rel > 1e-2:
+        print(f"gpu experts check: the kernels differ from the module's arithmetic (relative {rel:.3g})")
+        return False
+
+    with open(os.path.join(artifact, "binding.json")) as f:
+        experts = (json.load(f).get("external") or {}).get("experts") or {}
+    if not experts:
+        print("gpu experts check: the model places no experts externally; kernels checked only")
+        return True
+    n = len(next(iter(next(iter(experts.values())).values()))["parts"])
+    placement = {"format": "vxpu-placement/1", "layers": {layer: list(range(0, n, 2)) for layer in experts}}
+    path = os.path.join(workdir, "placement.json")
+    with open(path, "w") as f:
+        json.dump(placement, f)
+    runs = {}
+    for label, value in (("cpu", None), ("gpu", path)):
+        saved = os.environ.get("VXPU_GPU_EXPERTS")
+        if value is None:
+            os.environ.pop("VXPU_GPU_EXPERTS", None)
+        else:
+            os.environ["VXPU_GPU_EXPERTS"] = value
+        try:
+            runs[label] = record_vxpu_engine(model, "main", prompts, settings, artifact, device="cuda")
+        finally:
+            if saved is None:
+                os.environ.pop("VXPU_GPU_EXPERTS", None)
+            else:
+                os.environ["VXPU_GPU_EXPERTS"] = saved
+    if "gpu-hot+cpu" not in runs["gpu"]["producer"]["plan"]["selected"].get("vxpu::moe_experts", []):
+        print("gpu experts check: the hot experts' implementation never ran")
+        return False
+    rows, ok = compare(runs["cpu"], runs["gpu"], strict_tokens=True)
+    print(f"hot experts on the GPU (kernels relative error {rel:.2g}) against all on the CPU:")
+    print(table(runs["cpu"], runs["gpu"], rows))
+    return ok
+
+
 def selftest(workdir, settings):
     """The CI tier: tiny models through export, the in-process engine,
     and a transformers reference, token-exact. No cluster."""
@@ -1088,6 +1164,8 @@ def selftest(workdir, settings):
             failed.append(name + " (local weight tier)")
         if name == "tiny-llama" and not _check_chat_telemetry(artifact):
             failed.append(name + " (chat telemetry)")
+        if name == "tiny-deepseek-v41" and not _check_gpu_experts(model, prompts, settings, artifact, workdir):
+            failed.append(name + " (gpu experts)")
         if name == "tiny-deepseek-v41" and not _check_telemetry(model, prompts, settings, artifact, got, workdir):
             failed.append(name + " (telemetry)")
         if name == "tiny-deepseek-v41" and not _check_lowering(model, prompts, settings, artifact, workdir):
