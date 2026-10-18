@@ -27,10 +27,13 @@ are applied (e.g. histc(int) has no CPU kernel; for expert counting it
 is exactly bincount).
 """
 
+import fcntl
 import hashlib
 import math
 import os
+import tempfile
 import threading
+import weakref
 from concurrent.futures import ThreadPoolExecutor
 
 import requests
@@ -97,19 +100,82 @@ def _read_range(url, offset, length, into):
         raise RuntimeError(f"expected {length} bytes, got {got} bytes")
 
 
+def _clean_strays(dirname, basename, exclude=None):
+    try:
+        entries = os.listdir(dirname)
+    except OSError:
+        return
+    for name in entries:
+        if name == basename + ".partial" or name.startswith(basename + ".partial."):
+            file_path = os.path.join(dirname, name)
+            if exclude and os.path.abspath(file_path) == os.path.abspath(exclude):
+                continue
+            try:
+                sfd = os.open(file_path, os.O_RDWR)
+                try:
+                    fcntl.flock(sfd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                    os.remove(file_path)
+                except (BlockingIOError, OSError):
+                    pass
+                finally:
+                    os.close(sfd)
+            except OSError:
+                try:
+                    os.remove(file_path)
+                except OSError:
+                    pass
+
+
 def file_backed(path, length):
     """A uint8 tensor of `length` bytes whose storage is the file at
     `path`, memory-mapped shared: writes land in the page cache and reach
     the file, reads come from the page cache or the disk. A tensor placed
     this way costs no committed memory; the kernel keeps the hot pages
     resident and evicts the rest, which is the RAM-over-SSD tier of
-    hierarchical placement. A complete file of the right size is reused."""
-    os.makedirs(os.path.dirname(path), exist_ok=True)
+    hierarchical placement. A complete file of the right size is reused.
+
+    When `fresh` is True, storage is created under an exclusive temporary
+    name in the same directory; call `commit()` once the tensor is filled
+    to fsync the data, atomically replace it to `path`, and fsync the
+    directory.
+    """
+    dirname = os.path.dirname(path) or "."
+    basename = os.path.basename(path)
+    os.makedirs(dirname, exist_ok=True)
     fresh = not (os.path.exists(path) and os.path.getsize(path) == length)
-    if fresh:
-        with open(path, "wb") as f:
-            f.truncate(length)
-    return torch.from_file(path, shared=True, size=length, dtype=torch.uint8), fresh
+    if not fresh:
+        _clean_strays(dirname, basename)
+        return torch.from_file(path, shared=True, size=length, dtype=torch.uint8), False, lambda: None
+
+    _clean_strays(dirname, basename)
+    fd, tmp = tempfile.mkstemp(dir=dirname, prefix=basename + ".partial.")
+    try:
+        fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except OSError:
+        pass
+    os.ftruncate(fd, length)
+    tensor = torch.from_file(tmp, shared=True, size=length, dtype=torch.uint8)
+    fin = weakref.finalize(tensor, os.close, fd)
+
+    def commit():
+        if os.path.exists(tmp):
+            try:
+                os.fsync(fd)
+            except OSError:
+                pass
+            finally:
+                fin()
+            os.replace(tmp, path)
+            dir_fd = os.open(dirname, os.O_RDONLY | getattr(os, "O_DIRECTORY", 0))
+            try:
+                os.fsync(dir_fd)
+            except OSError:
+                pass
+            finally:
+                os.close(dir_fd)
+            _clean_strays(dirname, basename)
+
+    return tensor, True, commit
 
 
 def fetch_tensor(ref, files, cas_dir=None, mmap_dir=None):
@@ -129,8 +195,9 @@ def fetch_tensor(ref, files, cas_dir=None, mmap_dir=None):
     length = ref["length"]
     key = hashlib.sha256(f"{ref['file_sha256']}:{ref['offset']}:{length}".encode()).hexdigest()
     path = os.path.join(cas_dir, key) if cas_dir else None
+    commit = lambda: None
     if mmap_dir:
-        buf, fresh = file_backed(os.path.join(mmap_dir, key), length)
+        buf, fresh, commit = file_backed(os.path.join(mmap_dir, key), length)
         if not fresh:
             return buf.view(DTYPES[ref["dtype"]]).view(ref["shape"]), 0
     else:
@@ -165,6 +232,7 @@ def fetch_tensor(ref, files, cas_dir=None, mmap_dir=None):
         if path is not None:
             with open(path, "wb") as f:
                 f.write(view)
+    commit()
     tensor = buf.view(DTYPES[ref["dtype"]]).view(ref["shape"])
     return tensor, downloaded
 
@@ -192,13 +260,14 @@ def fetch_stacked(spec, manifest_tensors, files, cas_dir=None, workers=16, mmap_
     row_shape[cat_dim] = sum(manifest_tensors[n]["shape"][cat_dim] for n in rows[0])
     out_shape = ([len(rows)] if stack else []) + row_shape
     dtype = DTYPES[first["dtype"]]
+    commit = lambda: None
     if mmap_path:
         # the bank lives in a file (see file_backed): assembled once,
         # memory-mapped on every load after
         nbytes = torch.empty(0, dtype=dtype).element_size()
         for d in out_shape:
             nbytes *= d
-        buf, fresh = file_backed(mmap_path, nbytes)
+        buf, fresh, commit = file_backed(mmap_path, nbytes)
         out = buf.view(dtype).view(out_shape)
         if not fresh:
             return out, 0
@@ -325,6 +394,7 @@ def fetch_stacked(spec, manifest_tensors, files, cas_dir=None, workers=16, mmap_
         for j in sorted(pending):
             _place_part(out, slots[j], pending.pop(j).result(), cat_dim, stack)
             downloaded += _last_bytes
+    commit()
     return out, downloaded
 
 
