@@ -65,6 +65,13 @@ of the executor image the router compiles with.
 
 ## Notes
 
+- The scripts reach the VM over SSH through IAP, which works from any
+  network: `create.sh` tags the VM `vxpu-dev`, and the project needs a
+  firewall rule allowing tcp:22 from IAP's range to that tag, once:
+  `gcloud compute firewall-rules create vxpu-dev-iap-ssh --network
+  default --allow tcp:22 --source-ranges 35.235.240.0/20 --target-tags
+  vxpu-dev` (IAP still requires IAM permission on the VM).
+
 - The bucket must be readable by the VM's service account (the
   project's default compute service account unless `SERVICE_ACCOUNT` is
   set): `gcloud storage buckets add-iam-policy-binding gs://BUCKET

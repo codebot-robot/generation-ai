@@ -34,13 +34,13 @@ zone() {
 vm_ssh() {  # vm_ssh 'command'
   local z
   z=$(zone) || return 1
-  gcloud compute ssh "$VM" --zone "$z" --project "$PROJECT" --quiet --command "$1"
+  gcloud compute ssh "$VM" --zone "$z" --project "$PROJECT" --tunnel-through-iap --quiet --command "$1"
 }
 
 vm_scp() {  # vm_scp LOCAL REMOTE
   local z
   z=$(zone) || return 1
-  gcloud compute scp "$1" "$VM:$2" --zone "$z" --project "$PROJECT" --quiet
+  gcloud compute scp "$1" "$VM:$2" --zone "$z" --project "$PROJECT" --tunnel-through-iap --quiet
 }
 
 # The executor image's pins, so the VM runs what the cluster runs.
