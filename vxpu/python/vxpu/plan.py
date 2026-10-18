@@ -49,6 +49,7 @@ import json
 import math
 import os
 import platform
+import tempfile
 import threading
 
 # ---------------------------------------------------------------------------
@@ -275,7 +276,9 @@ class Plan:
         self._set("segment_runtime", runtime, rsrc, ("jit", "aoti"),
                   "how dense segments run: jit (torch.compile, CUDA graphs by its cudagraph trees) or aoti "
                   "(AOTInductor packages, built once and cached, in the engine's own CUDA graphs; aoti.py)")
-        cache, src = env_text("VXPU_AOTI_CACHE_DIR", os.path.join(os.path.expanduser("~"), ".cache", "vxpu", "aoti"))
+        home = os.path.expanduser("~")
+        base = os.path.join(home, ".cache") if home != "~" else tempfile.gettempdir()  # no HOME: not a relative "~"
+        cache, src = env_text("VXPU_AOTI_CACHE_DIR", os.path.join(base, "vxpu", "aoti"))
         self._set("aoti_cache_dir", cache, src, (), "where AOTInductor segment packages are kept (the compiled plans)")
 
         # where the external tensors live

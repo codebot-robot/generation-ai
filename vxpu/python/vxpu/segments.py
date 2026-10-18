@@ -234,6 +234,4 @@ def compile_segments(gm, device, mode, options=None, split_compile=True, direct=
             kwargs["options"] = options
         setattr(split, name, torch.compile(sub, **kwargs))
         compiled += 1
-    out = Split(split, len(segments_of(split)), compiled)  # every segment, compiled or not
-    out.packages = packages
-    return out
+    return Split(split, len(segments_of(split)), compiled)  # every segment, compiled or not

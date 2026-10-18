@@ -86,18 +86,24 @@ class Packages:
     """The package cache: a directory of <key>.pt2."""
 
     def __init__(self, cache_dir, expected=0):
-        self.cache_dir = cache_dir
+        # made and probed here, while the engine loads, so a directory that
+        # cannot be written fails the load, not the first request
+        self.cache_dir = os.path.abspath(cache_dir)
+        os.makedirs(self.cache_dir, exist_ok=True)
+        probe = os.path.join(self.cache_dir, f".probe.{os.getpid()}")
+        with open(probe, "w"):
+            pass
+        os.remove(probe)
         self.expected = expected  # segments that will ask: the summary is printed when all have
         self.built = self.loaded = 0
         self.build_s = 0.0
 
-    def get(self, name, sub, args):
-        os.makedirs(self.cache_dir, exist_ok=True)
+    def get(self, sub, args):
         import torch._inductor.config as inductor_config
         with inductor_config.patch(deterministic=True):
-            return self._get(name, sub, args)
+            return self._get(sub, args)
 
-    def _get(self, name, sub, args):
+    def _get(self, sub, args):
         path = os.path.join(self.cache_dir, cache_key(sub, args) + ".pt2")
         if os.path.exists(path):
             self.loaded += 1
@@ -130,7 +136,6 @@ class GraphedSegment(torch.nn.Module):
         self.packages, self.pool = packages, pool
         self.runner = None
         self.graph = None
-        self.calls = 0
 
     @property
     def _orig_mod(self):
@@ -139,9 +144,8 @@ class GraphedSegment(torch.nn.Module):
         return self.sub
 
     def forward(self, *args):
-        self.calls += 1
         if self.runner is None:
-            self.runner = self.packages.get(self.name, self.sub, args)
+            self.runner = self.packages.get(self.sub, args)
             return self.runner(*args)  # the first call runs eagerly
         if self.graph is None:
             return self._capture(args)
@@ -152,14 +156,17 @@ class GraphedSegment(torch.nn.Module):
         return self.outputs
 
     def _capture(self, args):
-        self.inputs = [a.clone() if not self.static[i] and isinstance(a, torch.Tensor) else a
-                       for i, a in enumerate(args)]
+        inputs = [a.clone() if not self.static[i] and isinstance(a, torch.Tensor) else a
+                  for i, a in enumerate(args)]
         torch.cuda.synchronize()
-        self.graph = torch.cuda.CUDAGraph()
-        with torch.cuda.graph(self.graph, pool=self.pool):
-            self.outputs = self.runner(*self.inputs)
-        self.graph.replay()  # capturing executed nothing: this is the call's one execution
-        return self.outputs
+        graph = torch.cuda.CUDAGraph()
+        with torch.cuda.graph(graph, pool=self.pool):
+            outputs = self.runner(*inputs)
+        # kept only once captured: a capture that fails (out of memory, say)
+        # leaves the segment as it was, and the next call tries again
+        self.inputs, self.outputs, self.graph = inputs, outputs, graph
+        graph.replay()  # capturing executed nothing: this is the call's one execution
+        return outputs
 
 
 def static_arguments(split, name):

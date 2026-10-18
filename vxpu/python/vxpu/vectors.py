@@ -771,9 +771,14 @@ def _check_lowering(model, prompts, settings, artifact, workdir):
     if not torch.cuda.is_available():
         print("lowering check skipped: no CUDA")
         return True
-    variants = {"compiled": {"VXPU_LOWER_DECODE": "0"},
-                "lowered": {"VXPU_LOWER_DECODE": "1"},
-                "aoti": {"VXPU_SEGMENT_RUNTIME": "aoti", "VXPU_AOTI_CACHE_DIR": os.path.join(workdir, "aoti-cache")}}
+    # every switch the variants depend on is pinned, so none is inherited
+    # from the environment the selftest runs in
+    split = {"VXPU_SPLIT_DECODE": "1", "VXPU_SPLIT_COMPILE": "1"}
+    variants = {"compiled": {**split, "VXPU_SEGMENT_RUNTIME": "jit", "VXPU_LOWER_DECODE": "0"},
+                "lowered": {**split, "VXPU_SEGMENT_RUNTIME": "jit", "VXPU_LOWER_DECODE": "1"},
+                "aoti": {**split, "VXPU_SEGMENT_RUNTIME": "aoti", "VXPU_LOWER_DECODE": "1",
+                         "VXPU_AOTI_CACHE_DIR": os.path.join(workdir, "aoti-cache")}}
+    intended = {"compiled": (False, "jit"), "lowered": (True, "jit"), "aoti": (True, "aoti")}  # lower_decode, runtime
     runs = {}
     for label, env in variants.items():
         saved = {k: os.environ.get(k) for k in env}
@@ -792,16 +797,19 @@ def _check_lowering(model, prompts, settings, artifact, workdir):
         print("lowering check skipped: no Triton (nothing is lowerable)")
         return True
     ok = True
+    for label, (lowered, runtime) in intended.items():  # each run must have run as intended
+        choices = runs[label]["producer"]["plan"]["choices"]
+        got = (bool(choices.get("lower_decode")), choices.get("segment_runtime"))
+        if got != (lowered, runtime):
+            print(f"lowering check: the {label} run ran lower_decode={got[0]}, segment_runtime={got[1]}")
+            ok = False
+    if not ok:
+        return False
     for label in ("lowered", "aoti"):
         plan = runs[label]["producer"]["plan"]
         report = [n for n in plan.get("notes", []) if n.startswith(REPORT_PREFIX)]
-        if not plan["choices"].get("lower_decode") or not report or "lowered " not in report[0][len(REPORT_PREFIX):]:
-            print(f"lowering check: the {label} run lowered nothing (lower_decode="
-                  f"{plan['choices'].get('lower_decode')}, report={report})")
-            ok = False
-            continue
-        if label == "aoti" and plan["choices"].get("segment_runtime") != "aoti":
-            print(f"lowering check: the aoti run ran segment_runtime={plan['choices'].get('segment_runtime')}")
+        if not report or "lowered " not in report[0][len(REPORT_PREFIX):]:
+            print(f"lowering check: the {label} run lowered nothing (report={report})")
             ok = False
             continue
         rows, same = compare(runs["compiled"], runs[label], strict_tokens=True)
