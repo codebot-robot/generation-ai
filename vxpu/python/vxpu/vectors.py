@@ -301,10 +301,13 @@ def record_deepseek_eager(model, revision, prompts, settings):
 
 
 def record_vxpu_engine(model, revision, prompts, settings, artifact, device="cpu",
-                       compile_decode=False, telemetry=False, keep=None, prepare=None):
+                       compile_decode=False, telemetry=None, keep=None, prepare=None):
     """Candidate: the executor's engine in this process (no cluster).
-    telemetry=True keeps each prompt's execution telemetry with it; keep,
-    a list, receives the engine (for checks of its state afterwards)."""
+    With ``telemetry="summary"``, each prompt carries its execution
+    telemetry. With ``telemetry="trace"``, it also records ordered
+    expert traces. keep, a list, receives the engine (for checks of its
+    state afterwards)."""
+    import torch
     from .engine import Engine, SamplingParams
     tok = _tokenizer(model, revision, prompts)
     engine = Engine(artifact, device=device, compile_decode=compile_decode)
@@ -350,10 +353,11 @@ def record_vxpu_engine(model, revision, prompts, settings, artifact, device="cpu
 
 
 def record_vxpu_router(model, revision, prompts, settings, artifact,
-                       router=None, router_admin=None, telemetry=False):
+                       router=None, router_admin=None, telemetry=None):
     """Candidate: an executor reached through a router (tokens only;
-    the wire carries no logits). telemetry=True keeps each prompt's
-    execution telemetry, through an internal Execute call on the router's admin port."""
+    the wire carries no logits). With ``telemetry="summary"``, each prompt
+    carries its execution telemetry, through an internal Execute call on the router's admin port.
+    With ``telemetry="trace"``, it also records ordered expert traces."""
     from .modeling import VxpuModelForCausalLM
     tok = _tokenizer(model, revision, prompts)
     admin_forward = None
@@ -816,30 +820,69 @@ def _check_continuation(artifact, ids, new_tokens=4):
 
 
 def _check_telemetry(model, prompts, settings, artifact, plain, workdir):
-    """The engine's execution telemetry, end to end: recording it changes
-    no token; each prompt carries a vxpu-telemetry/1 record with its
-    prefilled token count and decode expert counts that are the same
-    multiple of the decode steps in every layer (each step routes one
-    token to top-k experts per layer); and expert_stats reads the file."""
+    """Check the engine's execution telemetry end to end. Recording it
+    changes no token. Each prompt carries a vxpu-telemetry/1 record
+    with its prefill token count and its decode expert counts. With
+    ``telemetry="trace"``, the record also lists each decode step's
+    expert selections, which add up to the decode counts. Plain telemetry
+    has no trace. expert_stats can read the file."""
+    import collections
     from . import expert_stats
-    doc = record_vxpu_engine(model, "main", prompts, settings, artifact, telemetry=True)
+    from .engine import SamplingParams
+    keep = []
+    doc_plain = record_vxpu_engine(model, "main", prompts, settings, artifact, telemetry="summary", keep=keep)
+    doc_trace = record_vxpu_engine(model, "main", prompts, settings, artifact, telemetry="trace")
     path = os.path.join(workdir, "tiny-deepseek-v41-telemetry.json")
     with open(path, "w") as f:
-        json.dump(doc, f, indent=1)
+        json.dump(doc_trace, f, indent=1)
     problems = []
-    for a, b in zip(plain["prompts"], doc["prompts"]):
+
+    # Check that invalid telemetry modes are rejected.
+    engine = keep[0]
+    sid = engine.new_session()
+    ids = list(plain["prompts"][0]["input_ids"])
+    for bad_mode in ("invalid", "Trace", 1, True, False):
+        try:
+            for _ in engine.generate(sid, ids, 1, SamplingParams(do_sample=False), telemetry=bad_mode):
+                pass
+            problems.append(f"engine.generate: accepted invalid telemetry={bad_mode!r}")
+        except ValueError:
+            pass
+
+    # Check telemetry="summary" adds nothing to expert_trace
+    for a, b in zip(plain["prompts"], doc_plain["prompts"]):
         tel = b.get("telemetry") or {}
         if a["generated_ids"] != b["generated_ids"]:
             problems.append(f"{b['name']}: tokens changed with telemetry on")
+        if "expert_trace" in tel:
+            problems.append(f"{b['name']}: telemetry='summary' should not include expert_trace")
+
+    # Check telemetry="trace"
+    for a, b in zip(plain["prompts"], doc_trace["prompts"]):
+        tel = b.get("telemetry") or {}
+        if a["generated_ids"] != b["generated_ids"]:
+            problems.append(f"{b['name']}: tokens changed with telemetry='trace'")
         if tel.get("format") != "vxpu-telemetry/1":
             problems.append(f"{b['name']}: no telemetry record")
             continue
         if tel.get("prefill_tokens") != len(b["input_ids"]):  # a fresh session prefills the whole prompt
             problems.append(f"{b['name']}: prefill_tokens {tel.get('prefill_tokens')} for {len(b['input_ids'])} prompt tokens")
         steps = tel["decode_steps"]
-        totals = {sum(c.values()) for c in tel.get("experts", {}).get("decode", {}).values()}
+        decode_counts = tel.get("experts", {}).get("decode", {})
+        totals = {sum(c.values()) for c in decode_counts.values()}
         if not steps or len(totals) != 1 or next(iter(totals)) % steps:
             problems.append(f"{b['name']}: decode expert counts {sorted(totals)} for {steps} decode steps")
+        trace = tel.get("expert_trace")
+        if not trace:
+            problems.append(f"{b['name']}: no expert_trace in telemetry='trace'")
+        else:
+            for l, steps_list in trace.items():
+                if len(steps_list) != steps:
+                    problems.append(f"{b['name']}: layer {l} trace has {len(steps_list)} steps for {steps} decode steps")
+                trace_counts = collections.Counter(e for step in steps_list for e in step)
+                expected_counts = {int(k): v for k, v in decode_counts.get(l, {}).items()}
+                if dict(trace_counts) != expected_counts:
+                    problems.append(f"{b['name']}: layer {l} trace counts do not match decode expert counts")
     _, text = expert_stats.report([path])
     print(text)
     for p in problems:
@@ -1195,7 +1238,7 @@ def _check_chat_telemetry(artifact):
     the router records it for models served by name."""
     from .engine import Engine
     engine = Engine(artifact)
-    reply = engine.chat(engine.new_session(), "Is the sky blue?", max_new_tokens=4, telemetry=True)
+    reply = engine.chat(engine.new_session(), "Is the sky blue?", max_new_tokens=4, telemetry="summary")
     tel = reply.get("telemetry") or {}
     if tel.get("format") != "vxpu-telemetry/1" or tel.get("decode_steps", 0) < 1:
         print(f"chat telemetry check: no telemetry record in the reply ({sorted(reply)})")
@@ -1223,7 +1266,7 @@ def _check_admin_telemetry():
 
     class FakeExecutor(vxpu_pb2_grpc.ExecutorServicer):
         def Execute(self, request, context):
-            has_tel = request.HasField("telemetry") and request.telemetry
+            has_tel = request.telemetry != vxpu_pb2.TELEMETRY_NONE
             tel_json = json.dumps({"format": "vxpu-telemetry/1", "ok": True}) if has_tel else ""
             yield vxpu_pb2.ExecuteResponse(
                 response=vxpu_pb2.GenerateResponse(token_ids=[20]))
@@ -1250,7 +1293,7 @@ def _check_admin_telemetry():
             print("admin telemetry check: generate_ids unexpected reply")
             return False
         # execute_ids hits Executor admin listener, with telemetry
-        e_tokens = list(sess.execute_ids([1, 2], telemetry=True))
+        e_tokens = list(sess.execute_ids([1, 2], telemetry="summary"))
         if e_tokens != [20] or sess.last.telemetry.get("format") != "vxpu-telemetry/1":
             print("admin telemetry check: execute_ids missing telemetry")
             return False
@@ -1339,7 +1382,7 @@ def _check_gpu_experts(model, prompts, settings, artifact, workdir):
     runs["cpu"] = _with_env({"VXPU_GPU_EXPERTS": None}, record_vxpu_engine,
                             model, "main", prompts, settings, artifact, device="cuda")
     runs["gpu"] = _with_env({"VXPU_GPU_EXPERTS": path}, record_vxpu_engine,
-                            model, "main", prompts, settings, artifact, device="cuda", telemetry=True)
+                            model, "main", prompts, settings, artifact, device="cuda", telemetry="summary")
     if not any(n.startswith("hot experts on") for n in runs["gpu"]["producer"]["plan"].get("notes", [])):
         print("gpu experts check: the placement was not applied")
         return False
@@ -1367,7 +1410,7 @@ def _check_expert_moves(model, prompts, settings, artifact, workdir, runs, gpus,
     keep = []
     moved = _with_env({"VXPU_GPU_EXPERTS": path, "VXPU_GPU_EXPERTS_MOVES": "2"},
                       record_vxpu_engine, model, "main", prompts, settings, artifact, device="cuda",
-                      telemetry=True, keep=keep)
+                      telemetry="summary", keep=keep)
     mover = keep[0].expert_mover
     recorded = sum(p["telemetry"]["host_ops"].get("decode", {}).get("moe_experts", {}).get("moves_completed", 0.0)
                    for p in moved["prompts"])
@@ -1491,10 +1534,10 @@ def _check_step_graph_pools(model, prompts, settings, artifact, workdir):
     base = {"VXPU_DATAFLOW": "1", "VXPU_SEGMENT_RUNTIME": "aoti", "VXPU_AOTI_CACHE_DIR": os.path.join(workdir, "aoti"),
             "VXPU_DATAFLOW_PLACE": None, "VXPU_EXPERT_MAILBOXES": "1", "VXPU_GPU_EXPERTS": path}
     ref = _with_env({**base, "VXPU_STEP_GRAPH": None}, record_vxpu_engine, model, "main", prompts, settings, artifact,
-                    device="cuda", compile_decode=True, telemetry=True)
+                    device="cuda", compile_decode=True, telemetry="summary")
     keep = []
     got = _with_env({**base, "VXPU_STEP_GRAPH": "1"}, record_vxpu_engine, model, "main", prompts, settings, artifact,
-                    device="cuda", compile_decode=True, telemetry=True, keep=keep)
+                    device="cuda", compile_decode=True, telemetry="summary", keep=keep)
     same = ([p["generated_ids"] for p in got["prompts"]] == [p["generated_ids"] for p in ref["prompts"]]
             and [p["top_logits"] for p in got["prompts"]] == [p["top_logits"] for p in ref["prompts"]])
     rows, _ = compare(ref, got, strict_tokens=True)
@@ -2268,8 +2311,8 @@ def main(argv=None):
     rec.add_argument("--device", default="cpu", help="transformers / vxpu-engine producers (vllm places itself)")
     rec.add_argument("--dtype", default="auto", help="transformers / vllm model dtype (auto: the config's)")
     rec.add_argument("--compile", action="store_true", help="vxpu-engine: torch.compile the decode graph")
-    rec.add_argument("--telemetry", action="store_true",
-                     help="vxpu-engine / vxpu-router: keep each prompt's execution telemetry (vxpu-telemetry/1)")
+    rec.add_argument("--telemetry", choices=["summary", "trace"], default=None,
+                     help="vxpu-engine / vxpu-router: keep execution telemetry ('summary') or with ordered expert traces ('trace')")
     rec.add_argument("--dequantize", action="store_true",
                      help="transformers producer: expand an fp8 checkpoint to bf16 at load")
     rec.add_argument("--max-model-len", type=int, default=None, help="vllm: context length to allocate for")

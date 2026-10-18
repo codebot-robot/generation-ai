@@ -678,7 +678,7 @@ func (s *Server) NewSession(ctx context.Context, req *pb.NewSessionRequest) (*pb
 
 // proxyChat forwards a ChatRequest to the executor via ExecuteChat, sampling telemetry
 // for stats if configured.
-func (s *Server) proxyChat(ctx context.Context, modelKey, backendSessionID string, chatReq *pb.ChatRequest, telemetry *bool) (*pb.ExecuteChatResponse, error) {
+func (s *Server) proxyChat(ctx context.Context, modelKey, backendSessionID string, chatReq *pb.ChatRequest, telemetry pb.Telemetry) (*pb.ExecuteChatResponse, error) {
 	client, conn, err := s.executorClient(ctx, modelKey)
 	if err != nil {
 		return nil, err
@@ -691,10 +691,9 @@ func (s *Server) proxyChat(ctx context.Context, modelKey, backendSessionID strin
 	}
 	backend.Request.SessionId = backendSessionID
 	ref, executor, recorded := s.statsTarget(modelKey)
-	asked := backend.GetTelemetry()
+	asked := backend.GetTelemetry() != pb.Telemetry_TELEMETRY_NONE
 	if recorded && !asked && s.stats.sampleTelemetry() {
-		on := true
-		backend.Telemetry = &on
+		backend.Telemetry = pb.Telemetry_TELEMETRY_SUMMARY
 	}
 	resp, err := client.ExecuteChat(ctx, backend)
 	if err != nil || !recorded {
@@ -722,7 +721,7 @@ func (s *Server) Chat(ctx context.Context, req *pb.ChatRequest) (*pb.ChatRespons
 	if err != nil {
 		return nil, err
 	}
-	resp, err := s.proxyChat(ctx, modelKey, backendSessionID, req, nil)
+	resp, err := s.proxyChat(ctx, modelKey, backendSessionID, req, pb.Telemetry_TELEMETRY_NONE)
 	if err != nil {
 		return nil, err
 	}
@@ -747,7 +746,7 @@ func (s *Server) ExecuteChat(ctx context.Context, req *pb.ExecuteChatRequest) (*
 	if err != nil {
 		return nil, err
 	}
-	if !req.GetTelemetry() {
+	if req.GetTelemetry() == pb.Telemetry_TELEMETRY_NONE {
 		resp.TelemetryJson = ""
 	}
 	return resp, nil
@@ -755,7 +754,7 @@ func (s *Server) ExecuteChat(ctx context.Context, req *pb.ExecuteChatRequest) (*
 
 // proxyGenerate forwards a GenerateRequest to the executor via Execute, sampling telemetry
 // for stats if configured, and yielding each ExecuteResponse to send.
-func (s *Server) proxyGenerate(ctx context.Context, modelKey, backendSessionID string, genReq *pb.GenerateRequest, telemetry *bool, send func(*pb.ExecuteResponse) error) error {
+func (s *Server) proxyGenerate(ctx context.Context, modelKey, backendSessionID string, genReq *pb.GenerateRequest, telemetry pb.Telemetry, send func(*pb.ExecuteResponse) error) error {
 	client, conn, err := s.executorClient(ctx, modelKey)
 	if err != nil {
 		return err
@@ -768,10 +767,9 @@ func (s *Server) proxyGenerate(ctx context.Context, modelKey, backendSessionID s
 	}
 	backend.Request.SessionId = backendSessionID
 	ref, executor, recorded := s.statsTarget(modelKey)
-	asked := backend.GetTelemetry()
+	asked := backend.GetTelemetry() != pb.Telemetry_TELEMETRY_NONE
 	if recorded && !asked && s.stats.sampleTelemetry() {
-		on := true
-		backend.Telemetry = &on
+		backend.Telemetry = pb.Telemetry_TELEMETRY_SUMMARY
 	}
 	upstream, err := client.Execute(ctx, backend)
 	if err != nil {
@@ -811,7 +809,7 @@ func (s *Server) Generate(req *pb.GenerateRequest, stream grpc.ServerStreamingSe
 	if err != nil {
 		return err
 	}
-	return s.proxyGenerate(ctx, modelKey, backendSessionID, req, nil, func(resp *pb.ExecuteResponse) error {
+	return s.proxyGenerate(ctx, modelKey, backendSessionID, req, pb.Telemetry_TELEMETRY_NONE, func(resp *pb.ExecuteResponse) error {
 		return stream.Send(resp.GetResponse())
 	})
 }
@@ -831,7 +829,7 @@ func (s *Server) Execute(req *pb.ExecuteRequest, stream grpc.ServerStreamingServ
 	if err != nil {
 		return err
 	}
-	asked := req.GetTelemetry()
+	asked := req.GetTelemetry() != pb.Telemetry_TELEMETRY_NONE
 	return s.proxyGenerate(ctx, modelKey, backendSessionID, reqInner, req.Telemetry, func(resp *pb.ExecuteResponse) error {
 		if !asked {
 			resp.TelemetryJson = ""

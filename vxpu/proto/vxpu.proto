@@ -160,6 +160,15 @@ message NewSessionResponse {
   string session_id = 1;
 }
 
+// What execution telemetry an executor records for a call.
+enum Telemetry {
+  TELEMETRY_NONE = 0;
+  // Segment and host-op timings, expert counts, and the plan.
+  TELEMETRY_SUMMARY = 1;
+  // The summary, plus each decode step's expert selections in order.
+  TELEMETRY_TRACE = 2;
+}
+
 message ChatRequest {
   string session_id = 1;
   string text = 2;
@@ -185,8 +194,8 @@ message ChatResponse {
 // ExecuteChatRequest is the internal chat request passed to executors.
 message ExecuteChatRequest {
   ChatRequest request = 1;
-  // Return the executor's execution telemetry for this turn.
-  optional bool telemetry = 2;
+  // What execution telemetry this turn records.
+  Telemetry telemetry = 2;
 }
 
 // ExecuteChatResponse is the internal chat response from executors.
@@ -238,11 +247,11 @@ message GenerateResponse {
 // ExecuteRequest is the internal execution request passed to executors.
 message ExecuteRequest {
   GenerateRequest request = 1;
-  // Return the executor's internal execution telemetry for this call
-  // (segment and host-op timings, expert selections, the plan; JSON in
+  // What execution telemetry this call records (segment and host-op
+  // timings, expert selections, the plan; JSON in
   // ExecuteResponse.telemetry_json on the final message). For tuning
-  // execution plans; nothing is recorded when unset.
-  optional bool telemetry = 2;
+  // execution plans; nothing is recorded with TELEMETRY_NONE.
+  Telemetry telemetry = 2;
 }
 
 // ExecuteResponse streams newly generated ids as they are produced by

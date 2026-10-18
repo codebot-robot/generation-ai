@@ -223,7 +223,7 @@ func (e *loadingExecutor) ExecuteChat(_ context.Context, req *pb.ExecuteChatRequ
 	resp := &pb.ExecuteChatResponse{
 		Response: &pb.ChatResponse{Text: "yes", SessionTokens: 12, NewPromptTokens: 2, Generated: 10, PrefillMs: 5, MsPerToken: 40},
 	}
-	if req.GetTelemetry() {
+	if req.GetTelemetry() != pb.Telemetry_TELEMETRY_NONE {
 		resp.TelemetryJson = testTelemetry
 	}
 	return resp, nil
