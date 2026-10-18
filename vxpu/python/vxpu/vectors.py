@@ -727,6 +727,38 @@ def _check_continuation(artifact, ids, new_tokens=4):
     print(f"  continuation ok: {len(turn2)}-token second turn matches a fresh session")
 
 
+def _check_telemetry(model, prompts, settings, artifact, plain, workdir):
+    """The engine's execution telemetry, end to end: recording it changes
+    no token; each prompt carries a vxpu-telemetry/1 record with its
+    prefilled token count and decode expert counts that are the same
+    multiple of the decode steps in every layer (each step routes one
+    token to top-k experts per layer); and expert_stats reads the file."""
+    from . import expert_stats
+    doc = record_vxpu_engine(model, "main", prompts, settings, artifact, telemetry=True)
+    path = os.path.join(workdir, "tiny-deepseek-v41-telemetry.json")
+    with open(path, "w") as f:
+        json.dump(doc, f, indent=1)
+    problems = []
+    for a, b in zip(plain["prompts"], doc["prompts"]):
+        tel = b.get("telemetry") or {}
+        if a["generated_ids"] != b["generated_ids"]:
+            problems.append(f"{b['name']}: tokens changed with telemetry on")
+        if tel.get("format") != "vxpu-telemetry/1":
+            problems.append(f"{b['name']}: no telemetry record")
+            continue
+        if tel.get("prefill_tokens") != len(b["input_ids"]):  # a fresh session prefills the whole prompt
+            problems.append(f"{b['name']}: prefill_tokens {tel.get('prefill_tokens')} for {len(b['input_ids'])} prompt tokens")
+        steps = tel["decode_steps"]
+        totals = {sum(c.values()) for c in tel.get("experts", {}).get("decode", {}).values()}
+        if not steps or len(totals) != 1 or next(iter(totals)) % steps:
+            problems.append(f"{b['name']}: decode expert counts {sorted(totals)} for {steps} decode steps")
+    _, text = expert_stats.report([path])
+    print(text)
+    for p in problems:
+        print("telemetry check:", p)
+    return not problems
+
+
 def selftest(workdir, settings):
     """The CI tier: tiny models through export, the in-process engine,
     and a transformers reference, token-exact. No cluster."""
@@ -768,6 +800,8 @@ def selftest(workdir, settings):
         print(table(ref, got, rows))
         if not ok:
             failed.append(name)
+        if name == "tiny-deepseek-v41" and not _check_telemetry(model, prompts, settings, artifact, got, workdir):
+            failed.append(name + " (telemetry)")
     if failed:
         raise SystemExit(f"vectors differ for: {', '.join(failed)}")
     print("selftest ok:", ", ".join(m[0] for m in models))

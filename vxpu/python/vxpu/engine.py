@@ -603,6 +603,7 @@ class Engine:
         cached = session["cached_ids"] = list(ids)
         if recorder is not None:
             recorder.prefill_ms = prefill_s * 1e3
+            recorder.prefill_tokens = total_len - start
             recorder.phase = "decode"
 
         # The returned sequence matches transformers: the end-of-turn

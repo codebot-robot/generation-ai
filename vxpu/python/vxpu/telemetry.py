@@ -34,7 +34,7 @@ What it records:
               implementation's own time), to_device (the result back)
   experts     the experts each layer selected, per phase (prefill,
               decode): the statistics for placement and caching (#317)
-  steps       each decode step's wall time
+  steps       each decode step's wall time; the prefill's time and tokens
   plan        the engine's plan (choices and selected implementations)
 
 It is not a profiler and not exported anywhere: it is the executor
@@ -65,6 +65,7 @@ class Recorder:
                         "decode": collections.defaultdict(collections.Counter)}
         self.step_ms = []
         self.prefill_ms = None
+        self.prefill_tokens = None  # prompt tokens this call prefilled (the cached prefix excluded)
         self._pending = []
         self._step = None
         self._t = None
@@ -136,6 +137,8 @@ class Recorder:
         out = {"format": FORMAT, "device": str(self.device), "decode_steps": len(self.step_ms)}
         if self.prefill_ms is not None:
             out["prefill_ms"] = round(self.prefill_ms, 2)
+        if self.prefill_tokens is not None:
+            out["prefill_tokens"] = self.prefill_tokens
         if self.step_ms:
             s = sorted(self.step_ms)
             out["step_ms"] = {"mean": round(sum(s) / len(s), 3), "p50": round(s[len(s) // 2], 3),
