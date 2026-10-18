@@ -35,12 +35,19 @@ void ensure_curl_init() {
   });
 }
 
+struct ScatterSegment {
+  torch::Tensor tensor;  // Retain tensor reference while fetching
+  char* dest_ptr{nullptr};  // nullptr means gap/skip
+  int64_t length{0};
+};
+
 struct RangeTask {
   std::string url;
   int64_t file_offset{0};
   int64_t length{0};
-  torch::Tensor tensor;  // Retain tensor reference while fetching
-  char* dest_ptr{nullptr};
+  std::vector<ScatterSegment> segments;
+  size_t seg_index{0};
+  int64_t seg_offset{0};
   int64_t bytes_written{0};
   int retries{0};
   std::chrono::steady_clock::time_point retry_after{};
@@ -60,12 +67,26 @@ struct RangeTask {
 size_t write_callback(char* ptr, size_t size, size_t nmemb, void* userdata) {
   size_t total = size * nmemb;
   RangeTask* task = static_cast<RangeTask*>(userdata);
-  if (task->bytes_written + static_cast<int64_t>(total) > task->length) {
-    task->error_msg = "server sent more than " + std::to_string(task->length) + " bytes";
-    return 0;  // abort transfer with CURLE_WRITE_ERROR
+  size_t chunk_pos = 0;
+  while (chunk_pos < total) {
+    if (task->seg_index >= task->segments.size()) {
+      task->error_msg = "server sent more than " + std::to_string(task->length) + " bytes";
+      return 0;  // abort transfer with CURLE_WRITE_ERROR
+    }
+    auto& seg = task->segments[task->seg_index];
+    int64_t rem = seg.length - task->seg_offset;
+    size_t take = std::min<size_t>(total - chunk_pos, rem);
+    if (seg.dest_ptr) {
+      std::memcpy(seg.dest_ptr + task->seg_offset, ptr + chunk_pos, take);
+    }
+    task->seg_offset += take;
+    chunk_pos += take;
+    task->bytes_written += take;
+    if (task->seg_offset == seg.length) {
+      task->seg_index++;
+      task->seg_offset = 0;
+    }
   }
-  std::memcpy(task->dest_ptr + task->bytes_written, ptr, total);
-  task->bytes_written += total;
   return total;
 }
 
@@ -152,30 +173,70 @@ void fetch_ranges(
 
   for (size_t i = 0; i < range_list.size(); ++i) {
     py::handle item = range_list[i];
-    TORCH_CHECK(py::isinstance<py::sequence>(item), "each request must be a tuple or list of 5 elements");
+    TORCH_CHECK(py::isinstance<py::sequence>(item), "each request must be a tuple or list");
     py::sequence seq = item.cast<py::sequence>();
-    TORCH_CHECK(seq.size() == 5, "each request must be (url, offset, length, dest_tensor, dest_offset)");
 
     auto task = std::make_unique<RangeTask>();
-    task->url = seq[0].cast<std::string>();
-    task->file_offset = seq[1].cast<int64_t>();
-    task->length = seq[2].cast<int64_t>();
-    task->tensor = seq[3].cast<torch::Tensor>();
-    int64_t dest_offset = seq[4].cast<int64_t>();
 
-    TORCH_CHECK(task->file_offset >= 0, "offset must be non-negative");
-    TORCH_CHECK(task->length >= 0, "length must be non-negative");
-    TORCH_CHECK(dest_offset >= 0, "dest_offset must be non-negative");
-    TORCH_CHECK(task->tensor.is_contiguous(), "destination tensor must be contiguous");
-    TORCH_CHECK(task->tensor.device().is_cpu(), "destination tensor must be a CPU or pinned tensor");
+    if (seq.size() == 5) {
+      task->url = seq[0].cast<std::string>();
+      task->file_offset = seq[1].cast<int64_t>();
+      task->length = seq[2].cast<int64_t>();
+      torch::Tensor t = seq[3].cast<torch::Tensor>();
+      int64_t dest_offset = seq[4].cast<int64_t>();
 
-    int64_t tensor_bytes = task->tensor.nbytes();
-    TORCH_CHECK(dest_offset + task->length <= tensor_bytes,
-                "destination range [", dest_offset, ", ", dest_offset + task->length,
-                ") exceeds tensor size (", tensor_bytes, " bytes)");
+      TORCH_CHECK(task->file_offset >= 0, "offset must be non-negative");
+      TORCH_CHECK(task->length >= 0, "length must be non-negative");
+      TORCH_CHECK(dest_offset >= 0, "dest_offset must be non-negative");
+      TORCH_CHECK(t.is_contiguous(), "destination tensor must be contiguous");
+      TORCH_CHECK(t.device().is_cpu(), "destination tensor must be a CPU or pinned tensor");
 
-    char* base = reinterpret_cast<char*>(task->tensor.data_ptr());
-    task->dest_ptr = base + dest_offset;
+      int64_t tensor_bytes = t.nbytes();
+      TORCH_CHECK(dest_offset + task->length <= tensor_bytes,
+                  "destination range [", dest_offset, ", ", dest_offset + task->length,
+                  ") exceeds tensor size (", tensor_bytes, " bytes)");
+
+      char* base = reinterpret_cast<char*>(t.data_ptr());
+      task->segments.push_back({t, base + dest_offset, task->length});
+    } else if (seq.size() == 4) {
+      task->url = seq[0].cast<std::string>();
+      task->file_offset = seq[1].cast<int64_t>();
+      task->length = seq[2].cast<int64_t>();
+      TORCH_CHECK(task->file_offset >= 0, "offset must be non-negative");
+      TORCH_CHECK(task->length >= 0, "length must be non-negative");
+
+      py::sequence scat = seq[3].cast<py::sequence>();
+      int64_t total_seg_len = 0;
+      for (size_t s = 0; s < scat.size(); ++s) {
+        py::sequence seg = scat[s].cast<py::sequence>();
+        TORCH_CHECK(seg.size() == 3, "each scatter segment must be (dest_tensor, dest_offset, length)");
+        py::handle h = seg[0];
+        int64_t d_off = seg[1].cast<int64_t>();
+        int64_t s_len = seg[2].cast<int64_t>();
+        TORCH_CHECK(s_len >= 0, "segment length must be non-negative");
+        TORCH_CHECK(d_off >= 0, "dest_offset must be non-negative");
+        total_seg_len += s_len;
+
+        if (h.is_none()) {
+          task->segments.push_back({torch::Tensor(), nullptr, s_len});
+        } else {
+          torch::Tensor t = h.cast<torch::Tensor>();
+          TORCH_CHECK(t.is_contiguous(), "destination tensor must be contiguous");
+          TORCH_CHECK(t.device().is_cpu(), "destination tensor must be a CPU or pinned tensor");
+          int64_t tensor_bytes = t.nbytes();
+          TORCH_CHECK(d_off + s_len <= tensor_bytes,
+                      "destination segment [", d_off, ", ", d_off + s_len,
+                      ") exceeds tensor size (", tensor_bytes, " bytes)");
+          char* base = reinterpret_cast<char*>(t.data_ptr());
+          task->segments.push_back({t, base + d_off, s_len});
+        }
+      }
+      TORCH_CHECK(total_seg_len == task->length,
+                  "scatter list total length (", total_seg_len,
+                  ") does not match request length (", task->length, ")");
+    } else {
+      TORCH_CHECK(false, "each request must be (url, offset, length, scatter_list) or (url, offset, length, dest_tensor, dest_offset)");
+    }
 
     if (task->length > 0) {
       pending.push_back(task.get());
@@ -202,6 +263,8 @@ void fetch_ranges(
 
     auto add_task = [&](RangeTask* task) {
       task->bytes_written = 0;
+      task->seg_index = 0;
+      task->seg_offset = 0;
       task->error_msg.clear();
       init_easy_handle(task, stall_timeout);
       curl_multi_add_handle(multi, task->easy);
