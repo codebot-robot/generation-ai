@@ -263,9 +263,7 @@ class Plan:
         on, src = env_flag("VXPU_DIRECT_HOST_OPS", True)
         self._set("direct_host_ops", on, src, (True, False),
                   "eager host-op segments call the op's implementation directly, not through torch's dispatcher")
-        runtime, rsrc = env_text("VXPU_SEGMENT_RUNTIME", "jit")
-        if runtime not in ("jit", "aoti"):
-            raise ConfigError(f"VXPU_SEGMENT_RUNTIME={runtime!r}: expected jit or aoti")
+        runtime, rsrc = env_choice("VXPU_SEGMENT_RUNTIME", "jit", ("jit", "aoti"))
         if runtime == "aoti" and not (cuda and self["split_decode"] and self["split_compile"]):
             runtime, rsrc = "jit", "aoti requires CUDA and a compiled split decode"
         on, src = env_flag("VXPU_LOWER_DECODE", False)
