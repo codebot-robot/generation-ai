@@ -41,6 +41,28 @@ vxpu/dev/vm/delete.sh
 scripts read it. `VM` (default `vxpu-dev`) and `PROJECT` override the
 defaults.
 
+## As an executor for the router
+
+The VM can also serve models registered by name (`vxpu register`, #357)
+as an external executor: the router in the cluster places models on it
+and dials it on its internal IP (GKE pods and VMs share the project's
+VPC). Its local SSD is its weight tier: the executor reads checkpoint
+files from `/mnt/ssd/blobs` and copies the ones it lacks from the weight
+bucket first (`VXPU_BLOB_DIR`, `VXPU_BLOB_BUCKET`), so no `fetch.sh` is
+needed for models the router sends.
+
+```sh
+vxpu/dev/vm/create.sh && vxpu/dev/vm/setup.sh && vxpu/dev/vm/sync.sh
+vxpu/dev/vm/executor.sh                       # prints ADDRESS
+vxpu up --external-executor ADDRESS           # the router places named models there
+vxpu register deepseek-ai/DeepSeek-V4.1-Flash
+vxpu ask --model deepseek-ai/DeepSeek-V4.1-Flash "Is the sky blue?"
+```
+
+`executor.sh stop` stops it and `executor.sh log` follows its log. The
+VM's code comes from `sync.sh`, not an image, so keep it at the commit
+of the executor image the router compiles with.
+
 ## Notes
 
 - The bucket must be readable by the VM's service account (the
