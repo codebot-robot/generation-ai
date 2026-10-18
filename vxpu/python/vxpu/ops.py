@@ -31,13 +31,13 @@ cudagraph_unsafe and, for torch.compile, kept out of the compiled graph
 """
 
 import contextlib
-import os
 import threading
 
 import torch
 from torch.library import custom_op
 
 from . import experts_cpu, kernels, triton_ops
+from .plan import default_plan, implementation
 
 
 class External:
@@ -58,6 +58,9 @@ class External:
         # bf16 weights widened to fp32 once where no kernel reads bf16
         # directly (the output head off the Triton path, see head_linear)
         self.f32 = {}
+        # the engine's physical plan (plan.Plan): which implementation of
+        # each op runs here; ops called with no engine bound use a default
+        self.plan = None
         # pinned host buffers for the expert op's device crossings in decode
         # (see _to_host and _to_device), reused call to call
         self.pinned = {}
@@ -79,6 +82,13 @@ def bound(external):
         yield
     finally:
         _active.external = previous
+
+
+def _plan(device_type):
+    """The bound engine's plan, or the default plan for device_type."""
+    ext = getattr(_active, "external", None)
+    plan = getattr(ext, "plan", None) if ext is not None else None
+    return plan if plan is not None else default_plan(device_type)
 
 
 def _current(what, key):
@@ -111,14 +121,44 @@ def moe_experts(x_in: torch.Tensor, weights: torch.Tensor, indices: torch.Tensor
         x, w, i = _to_host(x_in, weights, indices)
     else:
         x, w, i = x_in.to(host), weights.to(host), indices.to(host)
-    if experts_cpu.applicable(moe):
-        # the fused fp4 kernels (csrc/): same routings, no dequantized copy
-        y = experts_cpu.forward_batched(moe, x, w, i) if x.shape[0] == 1 else experts_cpu.forward_grouped(moe, x, w, i)
-    elif x.shape[0] == 1:
-        y = moe._forward_batched(x, w, i)
-    else:
-        y = moe._forward_grouped(x, w, i)
+    rows = x.shape[0]
+    impl = _plan(host.type).select("vxpu::moe_experts", host.type, key=f"rows={rows}", moe=moe, rows=rows)
+    y = impl.fn(moe, x, w, i)
     return _to_device(y, x_in.device) if crossing else y.to(x_in.device)
+
+
+def _cpu_experts(plan, moe=None, **_):
+    return plan["kernels"] and experts_cpu.applicable(moe)
+
+
+# The routed experts' implementations, run on the banks' device: the fused
+# fp4 kernels (csrc/; same routings, no dequantized copy), or the module's
+# own routings (the reference computation).
+@implementation("vxpu::moe_experts", "cpu-fused", ("cpu",), "rounding",
+                "decode (one token), kernels on, fused experts on: one C++ call per layer",
+                applies=lambda plan, rows=0, **ctx: rows == 1 and plan["fused_experts"] and _cpu_experts(plan, **ctx), host=True)
+def _moe_cpu_fused(moe, x, w, i):
+    return experts_cpu.forward_batched(moe, x, w, i, fused=True)
+
+
+@implementation("vxpu::moe_experts", "cpu-three-call", ("cpu",), "rounding",
+                "decode (one token), kernels on, fused experts off: three kernel calls with the module's SwiGLU between",
+                applies=lambda plan, rows=0, **ctx: rows == 1 and _cpu_experts(plan, **ctx), host=True)
+def _moe_cpu_three_call(moe, x, w, i):
+    return experts_cpu.forward_batched(moe, x, w, i, fused=False)
+
+
+@implementation("vxpu::moe_experts", "cpu-grouped", ("cpu",), "rounding",
+                "prefill (several tokens), kernels on: each expert decoded once, torch's GEMM over its tokens",
+                applies=lambda plan, rows=0, **ctx: rows > 1 and _cpu_experts(plan, **ctx), host=True)
+def _moe_cpu_grouped(moe, x, w, i):
+    return experts_cpu.forward_grouped(moe, x, w, i)
+
+
+@implementation("vxpu::moe_experts", "reference", ("cpu", "cuda"), "bit-identical",
+                "the module's own routings (batched for one token, grouped for more)", reference=True, host=True)
+def _moe_reference(moe, x, w, i):
+    return moe._forward_batched(x, w, i) if x.shape[0] == 1 else moe._forward_grouped(x, w, i)
 
 
 # inputs of up to this many token rows cross through pinned buffers
@@ -174,7 +214,14 @@ def engram_rows(indices: torch.Tensor, table: int) -> torch.Tensor:
         return indices.new_empty(tuple(indices.shape) + (ENGRAM_DIM[table],), dtype=torch.bfloat16)
     embed = _current("engram", table)
     host = embed.weight.device
-    return embed.lookup(indices.to(host)).to(indices.device)
+    impl = _plan(host.type).select("vxpu::engram_rows", host.type)
+    return impl.fn(embed, indices.to(host)).to(indices.device)
+
+
+@implementation("vxpu::engram_rows", "host-lookup", ("cpu", "cuda"), "bit-identical",
+                "the module's own lookup, on the table's device (RAM or a memory-mapped file)", reference=True, host=True)
+def _engram_lookup(embed, indices):
+    return embed.lookup(indices)
 
 
 @engram_rows.register_fake
@@ -193,39 +240,64 @@ def fp8_linear(x: torch.Tensor, weight: torch.Tensor, scale: torch.Tensor) -> to
     (_bf16_weight); elsewhere the fork's own fp8_gemm."""
     if x.is_meta:
         return x.new_empty(tuple(x.shape[:-1]) + (weight.shape[0],))
-    k = kernels.load() if x.device.type == "cpu" else None
-    if k is not None:
-        # the kernel quantizes the activation itself (the fork's act_quant, fused)
+    rows = x.numel() // x.shape[-1]
+    impl = _plan(x.device.type).select("vxpu::fp8_linear", x.device.type, key=f"{rows}x{x.shape[-1]}->{weight.shape[0]}",
+                                       rows=rows)
+    return impl.fn(x, weight, scale)
+
+
+@implementation("vxpu::fp8_linear", "cpu-kernel", ("cpu",), "rounding",
+                "kernels on: the fused kernel reads the fp8 weight once and quantizes the activation itself",
+                applies=lambda plan, **_: plan["kernels"] and kernels.load() is not None)
+def _fp8_linear_cpu(x, weight, scale):
+    K = x.shape[-1]
+    y = kernels.load().fp8_linear(x.reshape(-1, K).contiguous().to(torch.bfloat16), weight, scale)
+    return y.reshape(tuple(x.shape[:-1]) + (weight.shape[0],)).to(x.dtype)
+
+
+# On a GPU the reference expands the fp8 weight to fp32 on every call, about
+# 15x the cost of the matmul. The quantized activation is exact in bf16, and
+# one Triton kernel computes it (the aten version is a dozen kernels). A
+# decode step's few rows then go through the fp8 GEMV, which reads the fp8
+# weight and its scales directly; longer inputs use a bf16 copy of the
+# weight (fp8 values times a power-of-two block scale are exact in bf16),
+# dequantized once and kept, and torch's GEMM.
+@implementation("vxpu::fp8_linear", "gpu-fp8-gemv", ("cuda",), "rounding",
+                f"Triton, at most {4} rows (decode): the activation quantized by one kernel, the fp8 weight read directly",
+                applies=lambda plan, rows=0, **_: plan["triton"] and rows <= FP8_GEMV_MAX_ROWS)
+def _fp8_linear_gemv(x, weight, scale):
+    xf = triton_ops.act_quant_dequant(x)
+    y = triton_ops.fp8_gemv(xf.reshape(-1, xf.shape[-1]), weight, scale)
+    return y.reshape(tuple(x.shape[:-1]) + (weight.shape[0],)).to(x.dtype)
+
+
+@implementation("vxpu::fp8_linear", "gpu-bf16-copy", ("cuda",), "rounding",
+                "longer inputs (prefill), or no Triton: torch's GEMM over a bf16 copy of the weight, made once and "
+                "kept while memory allows")
+def _fp8_linear_bf16(x, weight, scale):
+    if triton_ops.available():
+        xf = triton_ops.act_quant_dequant(x)
+    else:
+        ds, ka = _fork_kernels()
         K = x.shape[-1]
-        y = k.fp8_linear(x.reshape(-1, K).contiguous().to(torch.bfloat16), weight, scale)
-        return y.reshape(tuple(x.shape[:-1]) + (weight.shape[0],)).to(x.dtype)
+        xq, xs = ka.act_quant(x, ds.fp8_block_size, ds.scale_fmt, ds.scale_dtype)
+        xf = (xq.to(torch.bfloat16).unflatten(-1, (K // 32, 32)) * xs.to(torch.bfloat16).unsqueeze(-1)).flatten(-2)
+    return torch.nn.functional.linear(xf, _bf16_weight(weight, scale)).to(x.dtype)
+
+
+@implementation("vxpu::fp8_linear", "reference", ("cpu", "cuda"), "bit-identical",
+                "the fork's act_quant and fp8_gemm (aten)", reference=True)
+def _fp8_linear_reference(x, weight, scale):
+    ds, ka = _fork_kernels()
+    xq, xs = ka.act_quant(x, ds.fp8_block_size, ds.scale_fmt, ds.scale_dtype)
+    return ka.fp8_gemm(xq, xs, weight, scale, ds.scale_dtype, ds.fp8_block_size).to(x.dtype)
+
+
+def _fork_kernels():
     from .deepseek_v41 import _fork
     ds = _fork()
     import kernel_aten as ka
-    if x.is_cuda:
-        # The reference expands the fp8 weight to fp32 on every call, about
-        # 15x the cost of the matmul on a GPU. The quantized activation is
-        # exact in bf16, and one Triton kernel computes it (the aten version
-        # is a dozen kernels). A decode step's few rows then go through the
-        # fp8 GEMV, which reads the fp8 weight and its scales directly;
-        # longer inputs use a bf16 copy of the weight (fp8 values times a
-        # power-of-two block scale are exact in bf16), dequantized once and
-        # kept, and torch's GEMM.
-        if triton_ops.available():
-            xf = triton_ops.act_quant_dequant(x)
-            if xf.numel() // xf.shape[-1] <= FP8_GEMV_MAX_ROWS:
-                # a decode step: read the fp8 weight itself, half the bytes
-                # of the bf16 copy (the copy is then made only if a longer
-                # input, a prefill, ever comes)
-                y = triton_ops.fp8_gemv(xf.reshape(-1, xf.shape[-1]), weight, scale)
-                return y.reshape(tuple(x.shape[:-1]) + (weight.shape[0],)).to(x.dtype)
-        else:
-            K = x.shape[-1]
-            xq, xs = ka.act_quant(x, ds.fp8_block_size, ds.scale_fmt, ds.scale_dtype)
-            xf = (xq.to(torch.bfloat16).unflatten(-1, (K // 32, 32)) * xs.to(torch.bfloat16).unsqueeze(-1)).flatten(-2)
-        return torch.nn.functional.linear(xf, _bf16_weight(weight, scale)).to(x.dtype)
-    xq, xs = ka.act_quant(x, ds.fp8_block_size, ds.scale_fmt, ds.scale_dtype)
-    return ka.fp8_gemm(xq, xs, weight, scale, ds.scale_dtype, ds.fp8_block_size).to(x.dtype)
+    return ds, ka
 
 
 @custom_op("vxpu::fp8_grouped_linear", mutates_args=())  # pure tensor work: capturable
@@ -242,11 +314,36 @@ def fp8_grouped_linear(o: torch.Tensor, weight: torch.Tensor, scale: torch.Tenso
     if o.is_meta:
         return o.new_empty(tuple(lead) + (g, r))
     rows = o.numel() // (g * d)
-    if o.is_cuda and triton_ops.available():
-        if rows <= FP8_GEMV_MAX_ROWS:
-            y = triton_ops.fp8_gemv(o.reshape(rows, g * d), weight, scale, group_rows=r, out_dtype=o.dtype)
-            return y.reshape(tuple(lead) + (g, r))
-        return torch.einsum("bsgd,grd->bsgr", o, _bf16_weight(weight, scale).view(g, r, d)).contiguous()
+    impl = _plan(o.device.type).select("vxpu::fp8_grouped_linear", o.device.type, key=f"{rows}x{g}x{d}->{g}x{r}",
+                                       rows=rows)
+    return impl.fn(o, weight, scale)
+
+
+@implementation("vxpu::fp8_grouped_linear", "gpu-fp8-gemv", ("cuda",), "rounding",
+                "Triton, at most 4 rows (decode): the grouped fp8 GEMV, the weight read once as fp8",
+                applies=lambda plan, rows=0, **_: plan["triton"] and rows <= FP8_GEMV_MAX_ROWS)
+def _grouped_gemv(o, weight, scale):
+    *lead, g, d = o.shape
+    r = weight.shape[0] // g
+    rows = o.numel() // (g * d)
+    y = triton_ops.fp8_gemv(o.reshape(rows, g * d), weight, scale, group_rows=r, out_dtype=o.dtype)
+    return y.reshape(tuple(lead) + (g, r))
+
+
+@implementation("vxpu::fp8_grouped_linear", "gpu-bf16-copy", ("cuda",), "rounding",
+                "Triton, longer inputs (prefill): an einsum over the cached bf16 copy",
+                applies=lambda plan, **_: plan["triton"])
+def _grouped_bf16(o, weight, scale):
+    *lead, g, d = o.shape
+    r = weight.shape[0] // g
+    return torch.einsum("bsgd,grd->bsgr", o, _bf16_weight(weight, scale).view(g, r, d)).contiguous()
+
+
+@implementation("vxpu::fp8_grouped_linear", "reference", ("cpu", "cuda"), "bit-identical",
+                "the fork's dequantize and einsum", reference=True)
+def _grouped_reference(o, weight, scale):
+    *lead, g, d = o.shape
+    r = weight.shape[0] // g
     from .deepseek_v41 import _fork
     w = _fork()._dequantized(weight, scale).view(g, r, d)
     return torch.einsum("bsgd,grd->bsgr", o, w).contiguous()
@@ -281,32 +378,31 @@ def _bf16_weight(weight, scale):
     return w
 
 
-# device memory the bf16 copies must leave free for activations, caches,
-# CUDA graph pools and the compiler's workspace
-BF16_CACHE_HEADROOM_BYTES = int(float(os.environ.get("VXPU_BF16_CACHE_HEADROOM_GB", "4")) * 1e9)
-
-
 def _may_cache_bf16(ext, w):
     """Whether to keep w (a bf16 copy just made): the copies double the
     dense weights' footprint, which is the difference between fitting a
-    card and not. VXPU_BF16_WEIGHT_CACHE=0 never keeps them; otherwise a
-    copy is kept while free device memory (the driver's plus torch's
-    reserved-but-unused) stays above the headroom. The first refusal is
-    reported once; later weights keep the per-call path."""
-    if os.environ.get("VXPU_BF16_WEIGHT_CACHE", "1").lower() in ("0", "off", "false"):
+    card and not. The plan's bf16_weight_cache=False never keeps them;
+    otherwise a copy is kept while free device memory (the driver's plus
+    torch's reserved-but-unused) stays above the plan's headroom. The first
+    refusal is reported once (and noted in the plan); later weights keep
+    the per-call path."""
+    plan = _plan(w.device.type)
+    if not plan["bf16_weight_cache"]:
         return False
     if not w.is_cuda:
         return True
+    headroom = int(plan["bf16_cache_headroom_gb"] * 1e9)
     free, _ = torch.cuda.mem_get_info(w.device)
     free += torch.cuda.memory_reserved(w.device) - torch.cuda.memory_allocated(w.device)
-    if free >= BF16_CACHE_HEADROOM_BYTES:
+    if free >= headroom:
         return True
     if not getattr(ext, "bf16_full", False):
         ext.bf16_full = True
         held = sum(t.numel() * t.element_size() for t in ext.bf16.values())
-        print(f"[vxpu] bf16 weight cache stopped at {held / 1e9:.1f} GB ({len(ext.bf16)} weights): less than "
-              f"{BF16_CACHE_HEADROOM_BYTES / 1e9:.1f} GB of device memory would remain; the other fp8 linears "
-              f"dequantize per call", flush=True)
+        msg = (f"bf16 weight cache stopped at {held / 1e9:.1f} GB ({len(ext.bf16)} weights): less than "
+               f"{headroom / 1e9:.1f} GB of device memory would remain; the other fp8 linears dequantize per call")
+        print(f"[vxpu] {msg}", flush=True)
+        plan.note(msg)
     return False
 
 
@@ -316,8 +412,21 @@ def hc_sinkhorn(mixes: torch.Tensor, hc_scale: torch.Tensor, hc_base: torch.Tens
     """The fork's hyper-connection mixing (hc_split_sinkhorn): pre, post and
     the doubly stochastic comb from the mixes. One Triton kernel on a GPU;
     the fork's own function everywhere else (so the CPU is bit-identical)."""
-    if mixes.is_cuda and triton_ops.available() and triton_ops.hc_split_sinkhorn_supported(hc_mult):
-        return triton_ops.hc_split_sinkhorn(mixes, hc_scale, hc_base, hc_mult, sinkhorn_iters, eps)
+    impl = _plan(mixes.device.type).select("vxpu::hc_sinkhorn", mixes.device.type,
+                                           key=f"tokens={mixes.numel() // mixes.shape[-1]} hc={hc_mult}", hc_mult=hc_mult)
+    return impl.fn(mixes, hc_scale, hc_base, hc_mult, sinkhorn_iters, eps)
+
+
+@implementation("vxpu::hc_sinkhorn", "gpu-triton", ("cuda",), "rounding",
+                "Triton, power-of-two width: one kernel per call, the matrix in registers",
+                applies=lambda plan, hc_mult=0, **_: plan["triton"] and triton_ops.hc_split_sinkhorn_supported(hc_mult))
+def _sinkhorn_triton(mixes, hc_scale, hc_base, hc_mult, sinkhorn_iters, eps):
+    return triton_ops.hc_split_sinkhorn(mixes, hc_scale, hc_base, hc_mult, sinkhorn_iters, eps)
+
+
+@implementation("vxpu::hc_sinkhorn", "reference", ("cpu", "cuda"), "bit-identical",
+                "the fork's hc_split_sinkhorn (aten)", reference=True)
+def _sinkhorn_reference(mixes, hc_scale, hc_base, hc_mult, sinkhorn_iters, eps):
     import kernel_aten as ka
     pre, post, comb = ka.hc_split_sinkhorn(mixes, hc_scale, hc_base, hc_mult, sinkhorn_iters, eps)
     return pre.contiguous(), post.contiguous(), comb.contiguous()  # outputs must not alias the input
@@ -349,11 +458,24 @@ def head_linear(x: torch.Tensor, weight: torch.Tensor) -> torch.Tensor:
     x2 = x.reshape(-1, x.shape[-1])
     if x.is_meta:
         return x.new_empty(lead + (weight.shape[0],), dtype=torch.float32)
-    if x.is_cuda and triton_ops.available() and weight.dtype == torch.bfloat16 and x2.shape[0] <= 8:
-        y = triton_ops.linear_f32(x2, weight)
-    else:
-        y = torch.nn.functional.linear(x2.float(), _f32_weight(weight))
-    return y.reshape(lead + (weight.shape[0],))
+    impl = _plan(x.device.type).select("vxpu::head_linear", x.device.type,
+                                       key=f"{x2.shape[0]}x{x2.shape[1]}->{weight.shape[0]} {str(weight.dtype)[6:]}",
+                                       rows=x2.shape[0], dtype=weight.dtype)
+    return impl.fn(x2, weight).reshape(lead + (weight.shape[0],))
+
+
+@implementation("vxpu::head_linear", "gpu-triton-bf16", ("cuda",), "rounding",
+                "Triton, bf16 weight, at most 8 rows: reads the bf16 weight, accumulates in fp32",
+                applies=lambda plan, rows=0, dtype=None, **_: plan["triton"] and dtype == torch.bfloat16 and rows <= 8)
+def _head_triton(x2, weight):
+    return triton_ops.linear_f32(x2, weight)
+
+
+@implementation("vxpu::head_linear", "f32-copy", ("cpu", "cuda"), "bit-identical",
+                "torch's fp32 linear over an fp32 copy of the weight, widened once and kept (the fork's computation)",
+                reference=True)
+def _head_f32(x2, weight):
+    return torch.nn.functional.linear(x2.float(), _f32_weight(weight))
 
 
 def _f32_weight(weight):

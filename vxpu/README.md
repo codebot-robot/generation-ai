@@ -125,6 +125,38 @@ integer inputs — to its exact `bincount` equivalent), so one artifact
 serves heterogeneous executors: the graph carries reference semantics;
 each engine adapts it to its hardware.
 
+## The physical plan
+
+The artifact is the logical plan: the model's computation. How to run it
+on a given machine is the executor's choice, recorded in a physical plan
+(`python/vxpu/plan.py`), as a database chooses a plan for a query. Each
+engine builds one at load, from the hardware and the configuration:
+
+- **Hardware:** device, GPU and its memory, CPU, SIMD level, RAM.
+- **Choices:** split decode, compile mode, where the experts live, the
+  GPU's bf16 weight copies, the CPU kernels, and more. Each records its
+  value and where the value came from (default, environment, argument).
+- **Implementations:** for each op the graphs call (`vxpu::fp8_linear`,
+  `vxpu::moe_experts`, ...), the registered implementations in
+  preference order, each with the devices it runs on, when it applies, and
+  its numerics class (bit-identical to the reference computation, or equal
+  to rounding). The ops dispatch through the plan, and the plan records
+  which implementation each input shape got.
+
+The engine logs the plan at load, and `Engine.explain()` returns it.
+`python -m vxpu.plan --artifact DIR --device cuda --compile` explains the
+plan for an artifact without loading weights. `vectors record` and
+`dev/vm/attribute_decode.py` store the plan with their results, so a
+measurement says which plan produced it.
+
+The environment switches are read by one parser, which refuses values it
+doesn't understand: `VXPU_KERNELS`, `VXPU_FUSED_EXPERTS`,
+`VXPU_KERNEL_THREADS`, `VXPU_SPLIT_DECODE`, `VXPU_COMPILE_MODE`,
+`VXPU_SPLIT_COMPILE`, `VXPU_DIRECT_HOST_OPS`, `VXPU_EXTERNAL_DIR`,
+`VXPU_EXPERTS_IN_RAM`, `VXPU_BF16_WEIGHT_CACHE`,
+`VXPU_BF16_CACHE_HEADROOM_GB`. Choosing between plans by cost, and
+deployment hints, come next (#316, #332).
+
 ## Weights: the store
 
 Weights are pulled from the Hub once and kept in the cluster's weight

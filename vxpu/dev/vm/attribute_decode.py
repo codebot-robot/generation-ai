@@ -134,9 +134,9 @@ def main():
     body = collections.Counter()
     routing = experts_cpu.forward_batched
 
-    def timed_routing(*a):
+    def timed_routing(*a, **kw):
         t = time.perf_counter()
-        y = routing(*a)
+        y = routing(*a, **kw)
         body["routing body"] += time.perf_counter() - t
         return y
 
@@ -184,6 +184,7 @@ def main():
                                       "ops": ops.most_common(8), "modules": mods.most_common(4)})
         say(f"  {name}: {ms:.2f} ms, {sum(ops.values())} nodes; ops {ops.most_common(5)}; modules {mods.most_common(3)}")
 
+    res["plan"] = eng.explain()  # the physical plan these numbers measured (plan.py)
     with open(args.out, "w") as f:
         json.dump(res, f, indent=1)
     say(f"wrote {args.out}")

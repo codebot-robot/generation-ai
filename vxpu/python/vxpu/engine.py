@@ -43,6 +43,7 @@ import time
 import torch
 
 from . import ops, segments  # noqa: F401  (registers vxpu::* before a graph that calls them is loaded)
+from .plan import Plan
 from .rehydrate import (derived_tensor, fetch_stacked, fetch_tensor,
                         load_program, share_state, strip_asserts)
 
@@ -58,14 +59,14 @@ def compile_options(device):
     an 8192x8192 fp8 linear from 2.6x slower than bf16 to 1.9x faster,
     at the fp8 bandwidth floor. max-autotune is what enables the GEMM
     templates that fusion needs; it costs compile time once per shape.
-    VXPU_COMPILE_MODE overrides the mode ("default" to skip autotuning).
+    The mode itself is a choice of the engine's plan (plan.Plan:
+    compile_mode, which VXPU_COMPILE_MODE overrides).
     """
     if not str(device).startswith("cuda"):
         return {}
     import torch._inductor.config as inductor_config
     inductor_config.prologue_fusion = True
-    return {"mode": os.environ.get("VXPU_COMPILE_MODE",
-                                   "max-autotune-no-cudagraphs")}
+    return {}
 
 
 
@@ -90,11 +91,14 @@ class Engine:
         self.artifact_dir = artifact_dir
         self.device = device
         self.compile_decode = compile_decode
+        # The physical plan: every choice about how this engine runs the
+        # artifact, made here once and reported by explain() (plan.py).
+        self.plan = Plan(device, compile_decode=compile_decode, external_dir=external_dir)
         # Where the tensors the graphs call out for (expert banks, n-gram
         # tables) are placed: None keeps them in host memory; a directory
         # (local SSD) memory-maps them from files there, the page cache
         # being the RAM tier. VXPU_EXTERNAL_DIR sets it for the executor.
-        self.external_dir = external_dir or os.environ.get("VXPU_EXTERNAL_DIR") or None
+        self.external_dir = self.plan["external_dir"]
         with open(os.path.join(artifact_dir, "manifest.json")) as f:
             self.manifest = json.load(f)
         with open(os.path.join(artifact_dir, "binding.json")) as f:
@@ -177,6 +181,7 @@ class Engine:
         # with the engine and seen by the ops only while this engine runs
         # a graph (external_scope).
         self.external = ops.External()
+        self.external.plan = self.plan  # the ops dispatch by this engine's plan
         if self.binding.get("external"):
             self._bind_external(self.binding["external"], cas_dir)
         for fqn in self.binding["derived"]:
@@ -222,10 +227,11 @@ class Engine:
             mm = os.path.join(mm, hashlib.sha256(json.dumps(
                 self.manifest["source"], sort_keys=True).encode()).hexdigest()[:16])
         # The expert banks: memory-mapped files like the tables, or held
-        # in RAM outright (VXPU_EXPERTS_IN_RAM=1) when the node has the
-        # 272 GB, so residency is guaranteed rather than left to the page
-        # cache; the kernels are memory-bound and want the bytes resident.
-        banks_in_ram = os.environ.get("VXPU_EXPERTS_IN_RAM", "").lower() in ("1", "true", "yes")
+        # in RAM outright (the plan's experts_placement; VXPU_EXPERTS_IN_RAM=1)
+        # when the node has the 272 GB, so residency is guaranteed rather
+        # than left to the page cache; the kernels are memory-bound and
+        # want the bytes resident.
+        banks_in_ram = self.plan["experts_placement"] == "ram"
         for layer, specs in external.get("experts", {}).items():
             banks = {}
             for name, spec in specs.items():
@@ -314,16 +320,14 @@ class Engine:
         if self.compile_decode:
             strip_asserts(self._decode)
             opts = compile_options(self.device)
-            if segments.enabled():
+            mode = self.plan["compile_mode"]
+            if self.plan["split_decode"]:
                 # cut at the host ops; each dense segment its own compiled
-                # unit (a CUDA graph on CUDA), the host ops eager between.
-                # CUDA graphs are what the split is for, so on CUDA the
-                # segments default to reduce-overhead; VXPU_COMPILE_MODE
-                # still overrides.
-                mode = os.environ.get("VXPU_COMPILE_MODE") or (
-                    "reduce-overhead" if str(self.device).startswith("cuda") else opts.get("mode", "default"))
+                # unit (a CUDA graph on CUDA: the plan's mode defaults to
+                # reduce-overhead there), the host ops eager between
                 self._decode_split = segments.compile_segments(
-                    self._decode, self.device, mode, opts.get("options"))
+                    self._decode, self.device, mode, opts.get("options"),
+                    split_compile=self.plan["split_compile"], direct=self.plan["direct_host_ops"])
                 total, compiled = self._decode_split.vxpu_segments
                 print(f"[vxpu] decode graph split into {total} segments, {compiled} compiled", flush=True)
                 self._decode_run = self._decode_split
@@ -339,7 +343,23 @@ class Engine:
                         torch._dynamo.mark_static_address(tensor)
             else:
                 ops.prepare_compile()
-                self._decode_run = torch.compile(self._decode, **opts)
+                self._decode_run = torch.compile(self._decode, mode=mode, **opts)
+        print("[vxpu] " + self.plan.summary(self.plan_ops()).replace("\n", "\n[vxpu] "), flush=True)
+
+    def plan_ops(self):
+        """The vxpu ops this engine's graphs call."""
+        found = set()
+        for module in (self._prefill, self._decode):
+            for node in module.graph.nodes:
+                target = str(node.target)
+                if node.op == "call_function" and target.startswith("vxpu."):
+                    found.add("vxpu::" + target.split(".")[1])
+        return found
+
+    def explain(self):
+        """This engine's physical plan (plan.Plan.explain), limited to the
+        ops its graphs call, with the implementations selected so far."""
+        return self.plan.explain(self.plan_ops())
 
     def _reset_state(self, session):
         """Zero a session's state tensors in place (the graphs stay bound)."""
