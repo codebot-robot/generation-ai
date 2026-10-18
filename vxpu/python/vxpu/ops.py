@@ -122,6 +122,12 @@ def moe_experts(x_in: torch.Tensor, weights: torch.Tensor, indices: torch.Tensor
     crossing = x_in.device.type == "cuda" and host.type == "cpu" and x_in.shape[0] <= PINNED_MAX_ROWS
     rec = _recorder()
     t0 = time.perf_counter() if rec is not None else 0.0
+    boxes = getattr(moe, "_vxpu_mailboxes", None)
+    if boxes is not None and x_in.shape[0] <= PINNED_MAX_ROWS:
+        impl = _plan(host.type).select("vxpu::moe_experts", host.type, key=f"rows={x_in.shape[0]}", moe=moe,
+                                       rows=x_in.shape[0], mailboxes=True)
+        if impl.fn is _moe_mailboxes:
+            return _moe_mailboxes(moe, boxes, x_in, weights, indices, layer, rec, t0, crossing)
     hot = getattr(moe, "_vxpu_hot", None) if crossing else None
     rows = x_in.shape[0]
     impl = _plan(host.type).select("vxpu::moe_experts", host.type, key=f"rows={rows}", moe=moe, rows=rows,
@@ -161,6 +167,31 @@ def _recorder():
 
 def _cpu_experts(plan, moe=None, **_):
     return plan["kernels"] and experts_cpu.applicable(moe)
+
+
+@implementation("vxpu::moe_experts", "mailboxes", ("cpu",), "rounding",
+                "decode: each (token, k) pair answered by its expert's owner (the CPU kernels, a GPU pool) and the "
+                "replies summed in k order, so the sum does not depend on where each expert ran (mailboxes.py)",
+                applies=lambda plan, rows=0, mailboxes=False, **ctx: mailboxes and rows <= PINNED_MAX_ROWS
+                and plan["fused_experts"] and _cpu_experts(plan, **ctx), host=True)
+def _moe_mailboxes(moe, boxes, x_in, weights, indices, layer, rec, t0, crossing):
+    host = _to_host(x_in, weights, indices) if crossing else None
+    t1 = time.perf_counter()
+    y, counts = boxes.forward(x_in, weights, indices, host_inputs=host)
+    t2 = time.perf_counter()
+    res = boxes.residency
+    selected = indices.flatten().tolist() if (rec is not None or (res is not None and res.mover is not None)) else None
+    started = completed = 0
+    if res is not None and res.mover is not None:
+        started, completed = res.mover.observe(res, selected)
+    if rec is not None:
+        t3 = time.perf_counter()
+        gpu = sum(v for k, v in counts.items() if k != "cpu")
+        rec.host_op("moe_experts", wait_to_host_ms=(t1 - t0) * 1e3, impl_ms=(t2 - t1) * 1e3, to_device_ms=(t3 - t2) * 1e3,
+                    gpu_pairs=float(gpu), cpu_pairs=float(counts.get("cpu", 0)),
+                    **({"moves_started": float(started), "moves_completed": float(completed)} if res and res.mover else {}))
+        rec.selected_experts(layer, selected)
+    return y
 
 
 @implementation("vxpu::moe_experts", "gpu-hot+cpu", ("cpu",), "rounding",

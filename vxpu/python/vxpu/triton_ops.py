@@ -419,7 +419,7 @@ def _fp4_block_k(K):
     raise ValueError(f"fp4 experts: K={K} is not a multiple of 32")
 
 
-def fp4_experts_decode(x_in, weights, slots, w1, s1, w3, s3, w2, s2, swiglu_limit):
+def fp4_experts_decode(x_in, weights, slots, w1, s1, w3, s3, w2, s2, swiglu_limit, per_pair=False):
     """The routed experts of a few tokens, for the pairs whose expert is
     held on the GPU: x_in [n, K] bf16 (already on the fp8 grid, as the
     module quantizes it), weights [n, topk] fp32, slots [n, topk] int (the
@@ -429,7 +429,9 @@ def fp4_experts_decode(x_in, weights, slots, w1, s1, w3, s3, w2, s2, swiglu_limi
     module's _forward_batched per pair: fp32 accumulation rounded to bf16,
     the clamps, SiLU, the routing weight, the down projection's input
     re-quantized per 32 block, its output rounded to bf16. Returns y
-    [n, K] fp32, the sum over the token's held pairs (0 where none)."""
+    [n, K] fp32, the sum over the token's held pairs (0 where none), or
+    with per_pair=True each pair's reply, [n, topk, K] (0 where not held;
+    mailboxes.py sums them in a fixed order)."""
     n, topk = slots.shape
     K = x_in.shape[1]
     S, I, _ = w1.shape
@@ -449,4 +451,4 @@ def fp4_experts_decode(x_in, weights, slots, w1, s1, w3, s3, w2, s2, swiglu_limi
         _swiglu_quant_kernel[(triton.cdiv(I // 32, 16), pairs)](g, u, wt, sl, h, I, float(swiglu_limit), G=16)
         _fp4_down_kernel[(triton.cdiv(K, BN), pairs)](
             h, sl, w2, s2.view(torch.uint8), d, K, I, BN=BN, BK=_fp4_block_k(I))
-    return d.view(n, topk, K).sum(1)
+    return d.view(n, topk, K) if per_pair else d.view(n, topk, K).sum(1)
