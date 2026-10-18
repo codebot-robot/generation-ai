@@ -1,0 +1,86 @@
+# Copyright 2026 Google LLC
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
+
+"""The executor machine's local weight tier (#357).
+
+An executor on a machine of its own (a GPU VM, a Mac) keeps weights on
+its local disk, one file per checkpoint file named by its sha256: the
+machine's persistent cache, which survives executor restarts and serves
+the next load of any model sharing those files. The plan's blob_dir
+(VXPU_BLOB_DIR) is the directory; blob_bucket (VXPU_BLOB_BUCKET,
+gs://BUCKET) is the weight bucket modelstore keeps (gs://BUCKET/_blobs/
+<sha256>), from which missing files are copied first (`gcloud storage
+cp`, in parallel, at the machine's network speed: ~510 GB in ~5 minutes
+in-region). The manifest's sources are then pointed at the local files,
+so rehydration reads local disk.
+
+Without a bucket, files not already local keep their manifest sources
+(modelstore, through the router's rewrite). A copy lands under
+blob_dir/.incoming/<pid>/ and is renamed into place only once its size
+matches the manifest, so an interrupted copy is never mistaken for a
+complete file.
+"""
+
+import os
+import shutil
+import subprocess
+import time
+
+
+def _complete(path, size):
+    return os.path.exists(path) and os.path.getsize(path) == size
+
+
+def localize(files, blob_dir, bucket=None, log=print):
+    """files is a manifest's {sha256: {"size", "name", "source"}}. Returns
+    a copy whose sources are file:// paths under blob_dir for every file
+    held locally (after copying the missing ones from bucket, if given),
+    and a summary {"local", "copied", "copied_bytes", "seconds"}."""
+    os.makedirs(blob_dir, exist_ok=True)
+    missing = [sha for sha, entry in files.items() if not _complete(os.path.join(blob_dir, sha), entry["size"])]
+    copied, copied_bytes, started = 0, 0, time.time()
+    if missing and bucket:
+        incoming = os.path.join(blob_dir, ".incoming", str(os.getpid()))
+        os.makedirs(incoming, exist_ok=True)
+        try:
+            urls = "".join(f"{bucket.rstrip('/')}/_blobs/{sha}\n" for sha in missing)
+            total = sum(files[sha]["size"] for sha in missing)
+            log(f"[vxpu] copying {len(missing)} weight files ({total / 1e9:.1f} GB) from {bucket} to {blob_dir}")
+            result = subprocess.run(["gcloud", "storage", "cp", "-I", incoming + "/"], input=urls, text=True,
+                                    capture_output=True)
+            if result.returncode != 0:
+                tail = "\n".join(line for line in result.stderr.splitlines() if not line.startswith("Copying"))[-2000:]
+                raise RuntimeError(f"gcloud storage cp from {bucket} failed: {tail}")
+            for sha in missing:
+                src = os.path.join(incoming, sha)
+                if _complete(src, files[sha]["size"]):
+                    os.replace(src, os.path.join(blob_dir, sha))
+                    copied += 1
+                    copied_bytes += files[sha]["size"]
+        finally:
+            shutil.rmtree(incoming, ignore_errors=True)
+    out, local = {}, 0
+    for sha, entry in files.items():
+        path = os.path.join(blob_dir, sha)
+        if _complete(path, entry["size"]):
+            out[sha] = {**entry, "source": "file://" + os.path.abspath(path)}
+            local += 1
+        else:
+            out[sha] = dict(entry)
+    summary = {"local": local, "files": len(files), "copied": copied, "copied_bytes": copied_bytes,
+               "seconds": round(time.time() - started, 1)}
+    if copied:
+        log(f"[vxpu] copied {copied} files ({copied_bytes / 1e9:.1f} GB) in {summary['seconds']} s")
+    return out, summary

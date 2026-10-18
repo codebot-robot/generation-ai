@@ -287,6 +287,12 @@ class Plan:
         else:
             ext_dir, src = env_text("VXPU_EXTERNAL_DIR", None)
         self._set("external_dir", ext_dir, src, (), "directory for memory-mapped external tensors")
+        blob_dir, src = env_text("VXPU_BLOB_DIR", None)
+        self._set("blob_dir", blob_dir, src, (),
+                  "this machine's local weight tier: checkpoint files by sha256, read instead of their sources (localblobs.py)")
+        bucket, src = env_text("VXPU_BLOB_BUCKET", None)
+        self._set("blob_bucket", bucket, src, (),
+                  "the weight bucket (gs://BUCKET, modelstore's layout) that fills blob_dir with files it lacks")
         in_ram, src = env_flag("VXPU_EXPERTS_IN_RAM", False)
         placement = "ram" if (in_ram or not ext_dir) else "mmap"
         self._set("experts_placement", placement, src if in_ram else ("default" if not ext_dir else "external_dir"),
@@ -382,7 +388,7 @@ class Plan:
 # choices whose values are paths on the executor's own disk: a record
 # (which leaves the process, on the Generate stream) says only whether
 # they are set
-LOCAL_PATHS = ("external_dir", "aoti_cache_dir")
+LOCAL_PATHS = ("external_dir", "aoti_cache_dir", "blob_dir", "blob_bucket")
 
 
 def record(explained):

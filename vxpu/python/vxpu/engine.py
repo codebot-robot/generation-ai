@@ -103,6 +103,13 @@ class Engine:
         self.external_dir = self.plan["external_dir"]
         with open(os.path.join(artifact_dir, "manifest.json")) as f:
             self.manifest = json.load(f)
+        # this machine's local weight tier: read checkpoint files from local
+        # disk, copying the missing ones from the weight bucket first
+        if self.plan["blob_dir"]:
+            from . import localblobs
+            self.manifest["files"], summary = localblobs.localize(
+                self.manifest["files"], self.plan["blob_dir"], self.plan["blob_bucket"])
+            print(f"[vxpu] local weight tier: {summary['local']} of {summary['files']} files on local disk", flush=True)
         with open(os.path.join(artifact_dir, "binding.json")) as f:
             self.binding = json.load(f)
         if cas_dir:

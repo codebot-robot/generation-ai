@@ -858,6 +858,39 @@ def _check_host_reads(workdir):
     print("host reads: gather_rows matches index_select and refuses bad or device indices; MADV_RANDOM taken")
 
 
+def _check_local_blobs(model, prompts, settings, artifact, plain, workdir):
+    """The executor machine's local weight tier (localblobs.py): with the
+    checkpoint's files in a blob directory, named by sha256, every source
+    points there and the engine's tokens are unchanged."""
+    import shutil
+    from . import localblobs
+    with open(os.path.join(artifact, "manifest.json")) as f:
+        files = json.load(f)["files"]
+    blob_dir = os.path.join(workdir, "blobs")
+    os.makedirs(blob_dir, exist_ok=True)
+    for sha, entry in files.items():
+        shutil.copyfile(entry["source"][len("file://"):], os.path.join(blob_dir, sha))
+    local, summary = localblobs.localize(files, blob_dir)
+    if summary["local"] != len(files) or any(not e["source"].startswith("file://" + os.path.abspath(blob_dir))
+                                             for e in local.values()):
+        print(f"local blobs check: sources not localized: {summary}")
+        return False
+    saved = os.environ.get("VXPU_BLOB_DIR")
+    os.environ["VXPU_BLOB_DIR"] = blob_dir
+    try:
+        got = record_vxpu_engine(model, "main", prompts, settings, artifact)
+    finally:
+        if saved is None:
+            os.environ.pop("VXPU_BLOB_DIR")
+        else:
+            os.environ["VXPU_BLOB_DIR"] = saved
+    if [p["generated_ids"] for p in got["prompts"]] != [p["generated_ids"] for p in plain["prompts"]]:
+        print("local blobs check: tokens changed when reading from the local weight tier")
+        return False
+    print(f"local weight tier: {summary['local']} files read from {blob_dir}, tokens unchanged")
+    return True
+
+
 def selftest(workdir, settings):
     """The CI tier: tiny models through export, the in-process engine,
     and a transformers reference, token-exact. No cluster."""
@@ -901,6 +934,8 @@ def selftest(workdir, settings):
         print(table(ref, got, rows))
         if not ok:
             failed.append(name)
+        if name == "tiny-fp8-moe" and not _check_local_blobs(model, prompts, settings, artifact, got, workdir):
+            failed.append(name + " (local weight tier)")
         if name == "tiny-deepseek-v41" and not _check_telemetry(model, prompts, settings, artifact, got, workdir):
             failed.append(name + " (telemetry)")
         if name == "tiny-deepseek-v41" and not _check_lowering(model, prompts, settings, artifact, workdir):
