@@ -15,6 +15,7 @@
 package e2e
 
 import (
+	"context"
 	"fmt"
 	"os"
 	"os/exec"
@@ -205,6 +206,21 @@ spec:
       targetPort: 50051
 `
 
+// dumpByNameState prints what testByName's commands depend on: the
+// router, the compile Jobs and their pods, the external executor and
+// modelstore, with the events of both namespaces.
+func dumpByNameState(h *Harness) {
+	state, _ := exec.Command("kubectl", "get", "jobs,pods", "-A", "-o", "wide").CombinedOutput()
+	fmt.Fprintf(os.Stderr, "jobs and pods:\n%s\n", state)
+	fmt.Fprintf(os.Stderr, "router logs:\n%s\n", h.GetPodLogs("app=vxpu-router", "default"))
+	fmt.Fprintf(os.Stderr, "compile pods:\n%s\n", h.GetPodYaml("app=vxpu-compile", "default"))
+	fmt.Fprintf(os.Stderr, "compile logs:\n%s\n", h.GetPodLogs("app=vxpu-compile", "default"))
+	fmt.Fprintf(os.Stderr, "external executor logs:\n%s\n", h.GetPodLogs("app=vxpu-external-executor", "default"))
+	fmt.Fprintf(os.Stderr, "modelstore logs:\n%s\n", h.GetPodLogs("app=modelstore", "modelstore"))
+	fmt.Fprintf(os.Stderr, "events (default):\n%s\n", h.GetEvents("default"))
+	fmt.Fprintf(os.Stderr, "events (modelstore):\n%s\n", h.GetEvents("modelstore"))
+}
+
 // testByName registers a model by name (the router imports it into
 // modelstore and compiles it in a Job with the executor image) and asks
 // it a question by name, served by an external executor (#357).
@@ -228,15 +244,25 @@ func testByName(t *testing.T, h *Harness, gitRoot, vxpuBin string, env []string)
 		t.Fatalf("external executor: %v", err)
 	}
 
+	// Every command is bounded (a register imports the model and compiles
+	// it in a Job: about two minutes in kind), so a hang fails here with the
+	// cluster's state rather than at the test binary's timeout with none.
 	run := func(args ...string) string {
-		c := exec.Command(vxpuBin, args...)
+		ctx, cancel := context.WithTimeout(context.Background(), 12*time.Minute)
+		defer cancel()
+		c := exec.CommandContext(ctx, vxpuBin, args...)
 		c.Env = env
+		// the CLI's kubectl port-forward inherits its output: without a
+		// WaitDelay, CombinedOutput waits for that child after the deadline
+		// has killed the CLI, and the bound never fires
+		c.WaitDelay = 10 * time.Second
 		out, err := c.CombinedOutput()
 		t.Logf("vxpu %s:\n%s", strings.Join(args, " "), out)
 		if err != nil {
-			fmt.Fprintf(os.Stderr, "router logs:\n%s\n", h.GetPodLogs("app=vxpu-router", "default"))
-			fmt.Fprintf(os.Stderr, "compile logs:\n%s\n", h.GetPodLogs("app=vxpu-compile", "default"))
-			fmt.Fprintf(os.Stderr, "external executor logs:\n%s\n", h.GetPodLogs("app=vxpu-external-executor", "default"))
+			if ctx.Err() != nil {
+				err = fmt.Errorf("no answer within 12 minutes: %w", ctx.Err())
+			}
+			dumpByNameState(h)
 			t.Fatalf("vxpu %s: %v", strings.Join(args, " "), err)
 		}
 		return string(out)
