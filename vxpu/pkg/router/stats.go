@@ -47,8 +47,17 @@ import (
 // #337). The router turns telemetry on for sampled requests and keeps the
 // record to itself unless the client asked for it. Records are batched
 // into JSON-lines blobs in modelstore, one tag per UTC day on the
-// repository vxpu-stats/<model>, so they outlive the router; GetModelStats
-// summarises them.
+// repository vxpu-stats/<model> (a day with many batches continues in
+// dYYYYMMDD.1, .2, ...), so they outlive the router; GetModelStats
+// summarises them, reading one batch at a time.
+//
+// Records are buffered per model (by its lowercased name, the
+// repository's) until statsBatch of them or the next statsFlushEvery
+// tick. A write has statsWriteTimeout; after a failed one the model waits
+// (doubling, up to statsRetryMax) before the next attempt, instead of
+// re-uploading its whole buffer on every new record. The router flushes
+// every buffer when it shuts down (FlushStats); a process that dies
+// without shutting down loses what was buffered.
 
 const (
 	requestFormat     = "vxpu-request/1"
@@ -56,7 +65,16 @@ const (
 	statsArtifactType = "application/vnd.gke-labs.vxpu.stats.v1+json"
 	statsBatch        = 50
 	statsFlushEvery   = 30 * time.Second
+	statsWriteTimeout = time.Minute
+	statsRetryMax     = 10 * time.Minute
+	// a day's manifest gains a layer per batch; the registry refuses
+	// manifests over 4 MB, so a busy day continues on a new tag
+	statsMaxLayersPerTag = 2000
 )
+
+// statsRecordsMaxBytes bounds the records GetModelStats returns (gRPC
+// caps a message at 128 MB): the newest that fit, the oldest omitted.
+var statsRecordsMaxBytes = 64 << 20
 
 // modelRef names what serves a model key loaded by name.
 type modelRef struct {
@@ -81,7 +99,12 @@ type requestRecord struct {
 	Telemetry       json.RawMessage `json:"telemetry,omitempty"`
 }
 
-func statsRepository(model string) string { return "vxpu-stats/" + strings.ToLower(model) }
+// statsKey is how statistics name a model: Hub ids are case-insensitive,
+// and the repository is lowercase, so records and flushes for "Org/M"
+// and "org/m" are one model's.
+func statsKey(model string) string { return strings.ToLower(model) }
+
+func statsRepository(model string) string { return "vxpu-stats/" + statsKey(model) }
 
 // statsStore batches records into modelstore.
 type statsStore struct {
@@ -93,8 +116,8 @@ type statsStore struct {
 }
 
 type flushRequest struct {
-	model string
-	done  chan error
+	key  string // statsKey of the model to write now, or "" for every model
+	done chan error
 }
 
 func newStatsStore(ws *weightstore.Client, telemetryEvery int) *statsStore {
@@ -121,9 +144,13 @@ func (st *statsStore) record(ctx context.Context, r requestRecord) {
 }
 
 // flush writes model's buffered records now (GetModelStats does, so a
-// summary includes the latest requests).
+// summary includes the latest requests), or every model's for "".
 func (st *statsStore) flush(ctx context.Context, model string) error {
-	req := flushRequest{model: model, done: make(chan error, 1)}
+	key := ""
+	if model != "" {
+		key = statsKey(model)
+	}
+	req := flushRequest{key: key, done: make(chan error, 1)}
 	select {
 	case st.flushes <- req:
 	case <-ctx.Done():
@@ -139,46 +166,70 @@ func (st *statsStore) flush(ctx context.Context, model string) error {
 
 func (st *statsStore) loop(ctx context.Context) {
 	log := klog.FromContext(ctx)
-	buffered := map[string][]requestRecord{}
-	write := func(model string) error {
-		recs := buffered[model]
+	buffered := map[string][]requestRecord{} // by statsKey
+	retryAt, backoff := map[string]time.Time{}, map[string]time.Duration{}
+	write := func(key string) error {
+		recs := buffered[key]
 		if len(recs) == 0 {
 			return nil
 		}
-		if err := st.write(ctx, model, recs); err != nil {
+		wctx, cancel := context.WithTimeout(ctx, statsWriteTimeout)
+		defer cancel()
+		if err := st.write(wctx, key, recs); err != nil {
 			if len(recs) > 10*statsBatch { // modelstore unreachable for long: keep the newest
-				buffered[model] = recs[len(recs)-10*statsBatch:]
+				buffered[key] = recs[len(recs)-10*statsBatch:]
 			}
+			b := min(max(2*backoff[key], statsFlushEvery), statsRetryMax)
+			backoff[key], retryAt[key] = b, time.Now().Add(b)
 			return err
 		}
-		delete(buffered, model)
+		delete(buffered, key)
+		delete(retryAt, key)
+		delete(backoff, key)
 		return nil
 	}
+	due := func(key string) bool { return !time.Now().Before(retryAt[key]) }
 	tick := time.NewTicker(statsFlushEvery)
 	defer tick.Stop()
 	for {
 		select {
 		case r := <-st.records:
-			buffered[r.Model] = append(buffered[r.Model], r)
-			if len(buffered[r.Model]) >= statsBatch {
-				if err := write(r.Model); err != nil {
-					log.Error(err, "writing statistics", "model", r.Model)
+			key := statsKey(r.Model)
+			buffered[key] = append(buffered[key], r)
+			if len(buffered[key]) >= statsBatch && due(key) {
+				if err := write(key); err != nil {
+					log.Error(err, "writing statistics", "model", key)
 				}
 			}
 		case req := <-st.flushes:
 			for drained := false; !drained; { // records sent before the flush was asked for
 				select {
 				case r := <-st.records:
-					buffered[r.Model] = append(buffered[r.Model], r)
+					key := statsKey(r.Model)
+					buffered[key] = append(buffered[key], r)
 				default:
 					drained = true
 				}
 			}
-			req.done <- write(req.model)
+			// asked for: written now, whatever the backoff
+			if req.key != "" {
+				req.done <- write(req.key)
+				continue
+			}
+			var first error
+			for key := range buffered {
+				if err := write(key); err != nil && first == nil {
+					first = err
+				}
+			}
+			req.done <- first
 		case <-tick.C:
-			for model := range buffered {
-				if err := write(model); err != nil {
-					log.Error(err, "writing statistics", "model", model)
+			for key := range buffered {
+				if !due(key) {
+					continue
+				}
+				if err := write(key); err != nil {
+					log.Error(err, "writing statistics", "model", key)
 				}
 			}
 		}
@@ -200,14 +251,24 @@ func (st *statsStore) write(ctx context.Context, model string, recs []requestRec
 		return err
 	}
 	now := time.Now().UTC()
-	tag := "d" + now.Format("20060102")
-	m, err := st.ws.GetManifest(ctx, name, tag)
-	if err == weightstore.ErrNotFound {
-		m = &weightstore.Manifest{SchemaVersion: 2, MediaType: "application/vnd.oci.image.manifest.v1+json",
-			ArtifactType: statsArtifactType, Config: weightstore.EmptyConfig,
-			Annotations: map[string]string{"vnd.gke-labs.vxpu.model": model}}
-	} else if err != nil {
-		return err
+	day := "d" + now.Format("20060102")
+	var m *weightstore.Manifest
+	tag := day
+	for n := 1; ; n++ {
+		m, err = st.ws.GetManifest(ctx, name, tag)
+		if err == weightstore.ErrNotFound {
+			m = &weightstore.Manifest{SchemaVersion: 2, MediaType: "application/vnd.oci.image.manifest.v1+json",
+				ArtifactType: statsArtifactType, Config: weightstore.EmptyConfig,
+				Annotations: map[string]string{"vnd.gke-labs.vxpu.model": model}}
+			break
+		}
+		if err != nil {
+			return err
+		}
+		if len(m.Layers) < statsMaxLayersPerTag {
+			break
+		}
+		tag = fmt.Sprintf("%s.%d", day, n) // this day's manifest is full: continue on the next
 	}
 	m.Layers = append(m.Layers, weightstore.Layer{MediaType: weightstore.MediaTypeFile, Digest: digest, Size: int64(buf.Len()),
 		Annotations: map[string]string{"org.opencontainers.image.title": "batch-" + strconv.FormatInt(now.UnixNano(), 10) + ".jsonl"}})
@@ -220,6 +281,15 @@ func (s *Server) UseStats(telemetryEvery int) {
 	if s.weightStore != nil {
 		s.stats = newStatsStore(s.weightStore, telemetryEvery)
 	}
+}
+
+// FlushStats writes every model's buffered statistics now: the router
+// calls it when shutting down, so the last requests are not lost.
+func (s *Server) FlushStats(ctx context.Context) error {
+	if s.stats == nil {
+		return nil
+	}
+	return s.stats.flush(ctx, "")
 }
 
 // statsTarget returns what serves modelKey if its requests are recorded.
@@ -250,6 +320,9 @@ func (s *Server) GetModelStats(ctx context.Context, req *pb.GetModelStatsRequest
 	if s.stats == nil {
 		return nil, status.Error(codes.FailedPrecondition, "statistics need modelstore")
 	}
+	if req.Model == "" {
+		return nil, status.Error(codes.InvalidArgument, "which model's statistics?")
+	}
 	if err := s.stats.flush(ctx, req.Model); err != nil {
 		klog.FromContext(ctx).Error(err, "flushing statistics before the summary", "model", req.Model)
 	}
@@ -258,8 +331,10 @@ func (s *Server) GetModelStats(ctx context.Context, req *pb.GetModelStatsRequest
 	if err != nil {
 		return nil, status.Errorf(codes.Unavailable, "%v", err)
 	}
-	sort.Strings(tags)
-	var lines [][]byte
+	sort.Strings(tags) // dYYYYMMDD, dYYYYMMDD.1, ...: oldest first
+	acc := &statsAccumulator{}
+	var kept [][]byte // the newest records, within statsRecordsMaxBytes
+	keptBytes, start, omitted := 0, 0, 0
 	for _, tag := range tags {
 		m, err := s.weightStore.GetManifest(ctx, name, tag)
 		if err != nil {
@@ -273,19 +348,41 @@ func (s *Server) GetModelStats(ctx context.Context, req *pb.GetModelStatsRequest
 			sc := bufio.NewScanner(bytes.NewReader(data))
 			sc.Buffer(make([]byte, 1<<20), 64<<20)
 			for sc.Scan() {
-				if line := bytes.TrimSpace(sc.Bytes()); len(line) > 0 {
-					lines = append(lines, append([]byte(nil), line...))
+				line := bytes.TrimSpace(sc.Bytes())
+				if len(line) == 0 || !acc.add(line) {
+					continue
 				}
+				if !req.Records {
+					continue
+				}
+				kept = append(kept, append([]byte(nil), line...))
+				keptBytes += len(line) + 1
+				for keptBytes > statsRecordsMaxBytes && len(kept)-start > 1 {
+					keptBytes -= len(kept[start]) + 1
+					kept[start] = nil
+					start++
+					omitted++
+				}
+				if start > len(kept)/2 {
+					kept, start = append([][]byte(nil), kept[start:]...), 0
+				}
+			}
+			if err := sc.Err(); err != nil { // the rest of this batch cannot be read
+				acc.skipped++
+				klog.FromContext(ctx).Error(err, "reading a statistics batch", "model", req.Model, "tag", tag, "blob", layer.Digest)
 			}
 		}
 	}
-	summary, err := summarize(req.Model, lines)
+	if acc.skipped > 0 {
+		klog.FromContext(ctx).Info("Skipped unreadable statistics lines", "model", req.Model, "skipped", acc.skipped)
+	}
+	summary, err := acc.summary(req.Model, omitted)
 	if err != nil {
 		return nil, status.Errorf(codes.Internal, "%v", err)
 	}
 	resp := &pb.GetModelStatsResponse{SummaryJson: summary}
 	if req.Records {
-		resp.RecordsJsonl = string(bytes.Join(lines, []byte("\n")))
+		resp.RecordsJsonl = string(bytes.Join(kept[start:], []byte("\n")))
 	}
 	return resp, nil
 }
@@ -306,65 +403,83 @@ func percentile(sorted []float64, p float64) float64 {
 
 func round3(x float64) float64 { return math.Round(x*1000) / 1000 }
 
-// summarize turns records (JSON lines) into a vxpu-model-stats/1 summary.
-func summarize(model string, lines [][]byte) (string, error) {
-	var msPerToken, prefill, promptTokens []float64
-	byRPC, commits, executors := map[string]int{}, map[string]bool{}, map[string]bool{}
-	byKind, moe := map[string]float64{}, map[string]float64{}
-	experts := map[string]map[int64]int64{} // decode: layer -> expert -> count
-	var generated int64
-	var sampled int
-	first, last := "", ""
-	for _, line := range lines {
-		var r requestRecord
-		if err := json.Unmarshal(line, &r); err != nil {
-			return "", fmt.Errorf("record: %w", err)
+// statsAccumulator builds a vxpu-model-stats/1 summary one record at a
+// time, keeping only the aggregates (and three numbers per request for
+// the percentiles), so a model's whole history is never held at once.
+type statsAccumulator struct {
+	requests, sampled, skipped  int
+	msPerToken, prefill, prompt []float64
+	byRPC                       map[string]int
+	commits, executors          map[string]bool
+	byKind, moe                 map[string]float64
+	experts                     map[string]map[int64]int64 // decode: layer -> expert -> count
+	generated                   int64
+	first, last                 string
+}
+
+// add counts one record (a JSON line); false, and counted as skipped, if
+// it is not one (a truncated line, a foreign blob, a later format).
+func (a *statsAccumulator) add(line []byte) bool {
+	var r requestRecord
+	if err := json.Unmarshal(line, &r); err != nil {
+		a.skipped++
+		return false
+	}
+	if a.byRPC == nil {
+		a.byRPC, a.commits, a.executors = map[string]int{}, map[string]bool{}, map[string]bool{}
+		a.byKind, a.moe, a.experts = map[string]float64{}, map[string]float64{}, map[string]map[int64]int64{}
+	}
+	a.requests++
+	if a.first == "" || r.Time < a.first {
+		a.first = r.Time
+	}
+	if r.Time > a.last {
+		a.last = r.Time
+	}
+	a.byRPC[r.RPC]++
+	a.commits[r.Commit] = true
+	a.executors[r.Executor] = true
+	a.generated += int64(r.Generated)
+	if r.Generated > 1 && r.MsPerToken > 0 {
+		a.msPerToken = append(a.msPerToken, float64(r.MsPerToken))
+	}
+	a.prefill = append(a.prefill, float64(r.PrefillMs))
+	a.prompt = append(a.prompt, float64(r.PromptTokens))
+	if len(r.Telemetry) == 0 {
+		return true
+	}
+	var t telemetrySummary
+	if err := json.Unmarshal(r.Telemetry, &t); err != nil {
+		return true
+	}
+	a.sampled++
+	for k, v := range t.ByKind {
+		a.byKind[k] += v
+	}
+	for k, v := range t.HostOps["decode"]["moe_experts"] {
+		a.moe[k] += v
+	}
+	for layer, counts := range t.Experts["decode"] {
+		if a.experts[layer] == nil {
+			a.experts[layer] = map[int64]int64{}
 		}
-		if first == "" || r.Time < first {
-			first = r.Time
-		}
-		if r.Time > last {
-			last = r.Time
-		}
-		byRPC[r.RPC]++
-		commits[r.Commit] = true
-		executors[r.Executor] = true
-		generated += int64(r.Generated)
-		if r.Generated > 1 && r.MsPerToken > 0 {
-			msPerToken = append(msPerToken, float64(r.MsPerToken))
-		}
-		prefill = append(prefill, float64(r.PrefillMs))
-		promptTokens = append(promptTokens, float64(r.PromptTokens))
-		if len(r.Telemetry) == 0 {
-			continue
-		}
-		var t telemetrySummary
-		if err := json.Unmarshal(r.Telemetry, &t); err != nil {
-			continue
-		}
-		sampled++
-		for k, v := range t.ByKind {
-			byKind[k] += v
-		}
-		for k, v := range t.HostOps["decode"]["moe_experts"] {
-			moe[k] += v
-		}
-		for layer, counts := range t.Experts["decode"] {
-			if experts[layer] == nil {
-				experts[layer] = map[int64]int64{}
+		for e, n := range counts {
+			id, err := strconv.ParseInt(e, 10, 64)
+			if err != nil {
+				continue // not an expert index; the record is from another format
 			}
-			for e, n := range counts {
-				id, err := strconv.ParseInt(e, 10, 64)
-				if err != nil {
-					continue // not an expert index; the record is from another format
-				}
-				experts[layer][id] += n
-			}
+			a.experts[layer][id] += n
 		}
 	}
-	sort.Float64s(msPerToken)
-	sort.Float64s(prefill)
-	sort.Float64s(promptTokens)
+	return true
+}
+
+// summary is the vxpu-model-stats/1 summary of what was added; omitted
+// counts records left out of a records listing for its size.
+func (a *statsAccumulator) summary(model string, omitted int) (string, error) {
+	sort.Float64s(a.msPerToken)
+	sort.Float64s(a.prefill)
+	sort.Float64s(a.prompt)
 	mean := func(xs []float64) float64 {
 		if len(xs) == 0 {
 			return 0
@@ -384,24 +499,30 @@ func summarize(model string, lines [][]byte) (string, error) {
 		return out
 	}
 	out := map[string]any{
-		"format": modelStatsFormat, "model": model, "requests": len(lines), "by_rpc": byRPC,
-		"commits": keys(commits), "executors": keys(executors), "first": first, "last": last,
-		"generated_tokens":  generated,
-		"ms_per_token":      map[string]float64{"mean": round3(mean(msPerToken)), "p50": round3(percentile(msPerToken, 0.5)), "p90": round3(percentile(msPerToken, 0.9))},
-		"prefill_ms":        map[string]float64{"p50": round3(percentile(prefill, 0.5)), "p90": round3(percentile(prefill, 0.9))},
-		"prompt_tokens":     map[string]float64{"p50": percentile(promptTokens, 0.5), "max": percentile(promptTokens, 1)},
-		"telemetry_sampled": sampled,
+		"format": modelStatsFormat, "model": model, "requests": a.requests, "by_rpc": a.byRPC,
+		"commits": keys(a.commits), "executors": keys(a.executors), "first": a.first, "last": a.last,
+		"generated_tokens":  a.generated,
+		"ms_per_token":      map[string]float64{"mean": round3(mean(a.msPerToken)), "p50": round3(percentile(a.msPerToken, 0.5)), "p90": round3(percentile(a.msPerToken, 0.9))},
+		"prefill_ms":        map[string]float64{"p50": round3(percentile(a.prefill, 0.5)), "p90": round3(percentile(a.prefill, 0.9))},
+		"prompt_tokens":     map[string]float64{"p50": percentile(a.prompt, 0.5), "max": percentile(a.prompt, 1)},
+		"telemetry_sampled": a.sampled,
 	}
-	if sampled > 0 {
-		for k := range byKind {
-			byKind[k] = round3(byKind[k] / float64(sampled))
+	if a.skipped > 0 {
+		out["skipped_lines"] = a.skipped
+	}
+	if omitted > 0 {
+		out["records_omitted"] = omitted // the oldest, beyond the listing's size limit
+	}
+	if a.sampled > 0 {
+		for k := range a.byKind {
+			a.byKind[k] = round3(a.byKind[k] / float64(a.sampled))
 		}
-		for k := range moe {
-			moe[k] = round3(moe[k] / float64(sampled))
+		for k := range a.moe {
+			a.moe[k] = round3(a.moe[k] / float64(a.sampled))
 		}
-		out["by_kind_ms_per_step"] = byKind
-		out["moe_experts_per_step"] = moe
-		out["experts_decode"] = expertConcentration(experts)
+		out["by_kind_ms_per_step"] = a.byKind
+		out["moe_experts_per_step"] = a.moe
+		out["experts_decode"] = expertConcentration(a.experts)
 	}
 	b, err := json.MarshalIndent(out, "", " ")
 	return string(b), err

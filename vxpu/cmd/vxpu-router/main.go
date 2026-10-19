@@ -20,8 +20,10 @@ import (
 	"fmt"
 	"net"
 	"os"
+	"os/signal"
 	"path/filepath"
 	"strings"
+	"syscall"
 	"time"
 
 	"google.golang.org/grpc"
@@ -152,6 +154,20 @@ func main() {
 	}
 	srv.UseStats(*telemetryEvery)
 	pb.RegisterExecutorServer(s, srv)
+
+	// On SIGTERM (a pod being deleted or redeployed) write the buffered
+	// statistics before exiting, within the pod's grace period.
+	stopping, stopSignals := signal.NotifyContext(ctx, syscall.SIGTERM, os.Interrupt)
+	defer stopSignals()
+	go func() {
+		<-stopping.Done()
+		flushCtx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
+		defer cancel()
+		if err := srv.FlushStats(flushCtx); err != nil {
+			log.Error(err, "flushing statistics on shutdown")
+		}
+		s.Stop()
+	}()
 
 	log.Info("Starting vxpu-router gRPC server", "port", *portFlag, "namespace", namespace, "image", imageName,
 		"accelerator", accelerator, "externalExecutors", externalAddrs)

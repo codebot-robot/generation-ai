@@ -390,6 +390,10 @@ func (s *Server) loadByName(ctx context.Context, model, revision string) (string
 		klog.FromContext(ctx).Info("Loaded model's executor is gone; loading again", "model", model, "model_key", key, "error", err.Error())
 	}
 	v, err := s.flights.do("load/"+repo+":"+tag, func() (any, error) {
+		// the flight is shared: the caller that started it going away
+		// must not fail it for the others, as loadArtifact below already
+		// is not
+		ctx := context.WithoutCancel(ctx)
 		exists, err := s.weightStore.ManifestExists(ctx, repo, tag)
 		if err != nil {
 			return "", status.Errorf(codes.Unavailable, "%v", err)
