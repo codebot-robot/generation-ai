@@ -29,6 +29,7 @@ import struct
 
 import requests
 from huggingface_hub import HfApi, hf_hub_download
+from huggingface_hub import constants as hf_constants
 
 MANIFEST_FORMAT = "vxpu-manifest/v1alpha1"
 
@@ -72,6 +73,26 @@ def _local_shards(directory):
     return shards
 
 
+def is_commit(ref):
+    """Whether ref is a Hub commit (40 hex digits), which names fixed bytes,
+    rather than a ref such as "main" that moves."""
+    return isinstance(ref, str) and len(ref) == 40 and all(c in "0123456789abcdef" for c in ref)
+
+
+def _hub_source(repo_id, commit, filename, endpoint):
+    """(recorded source, URL to read) for one of a Hub repository's files.
+    The canonical Hub URL is recorded for a commit: a weight store fetches
+    a blob it lacks from there, and only a commit names fixed bytes. When
+    the endpoint names no commit (modelstore holding a model it did not
+    import from the Hub answers with the ref it was asked for), the source
+    is the endpoint that was read, not a Hub URL for bytes that may never
+    have been on the Hub."""
+    read = f"{endpoint}/{repo_id}/resolve/{commit}/{filename}"
+    if is_commit(commit):
+        return f"https://huggingface.co/{repo_id}/resolve/{commit}/{filename}", read
+    return read, read
+
+
 def build_manifest(repo_id, revision="main"):
     """Build a manifest for a Hugging Face model repo, or for a local
     checkpoint directory (file:// sources; sha256 computed here).
@@ -84,9 +105,10 @@ def build_manifest(repo_id, revision="main"):
         directory = os.path.abspath(repo_id)
         with open(os.path.join(directory, "config.json")) as f:
             config = json.load(f)
-        shards = _local_shards(directory)
+        shards = [(sha, size, name, source, source) for sha, size, name, source in _local_shards(directory)]
         commit_sha, revision = "local", "local"
         repo_id = directory
+        pinned = False
     else:
         info = HfApi().model_info(repo_id, revision=revision,
                                   files_metadata=True)
@@ -94,16 +116,19 @@ def build_manifest(repo_id, revision="main"):
         with open(hf_hub_download(repo_id, "config.json",
                                   revision=commit_sha)) as f:
             config = json.load(f)
-        shards = [(s.lfs.sha256, s.size, s.rfilename,
-                   f"https://huggingface.co/{repo_id}/resolve/"
-                   f"{commit_sha}/{s.rfilename}")
+        # The headers are read through the configured endpoint
+        # (HF_ENDPOINT), which in a cluster is modelstore's Hub-compatible
+        # API; what is recorded as each file's source is _hub_source's.
+        endpoint = hf_constants.ENDPOINT.rstrip("/")
+        pinned = is_commit(commit_sha)
+        shards = [(s.lfs.sha256, s.size, s.rfilename) + _hub_source(repo_id, commit_sha, s.rfilename, endpoint)
                   for s in info.siblings if s.rfilename.endswith(".safetensors")]
 
     files, tensors = {}, {}
-    for sha, size, name, source in shards:
+    for sha, size, name, source, read_url in shards:
         files[sha] = {"size": size, "name": name, "source": source}
-        (header_len,) = struct.unpack("<Q", _fetch_range(source, 0, 8))
-        header = json.loads(_fetch_range(source, 8, header_len))
+        (header_len,) = struct.unpack("<Q", _fetch_range(read_url, 0, 8))
+        header = json.loads(_fetch_range(read_url, 8, header_len))
         data_start = 8 + header_len
         for name, meta in header.items():
             if name == "__metadata__":
@@ -119,7 +144,7 @@ def build_manifest(repo_id, revision="main"):
 
     return {
         "format": MANIFEST_FORMAT,
-        "source": {"repo": repo_id, "revision": revision, "commit_sha": commit_sha},
+        "source": {"repo": repo_id, "revision": revision, "commit_sha": commit_sha, "commit_pinned": pinned},
         "config": config,
         "files": files,
         "tensors": tensors,
