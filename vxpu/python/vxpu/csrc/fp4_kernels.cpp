@@ -738,12 +738,44 @@ bool has_neon() {
 #endif
 }
 
+// Rows of a 2-D table, gathered by index into a new tensor, one row per
+// task across the kernel threads. For a table memory-mapped from local SSD
+// (the n-gram tables, #364) a row not in the page cache is a page fault
+// that blocks only the thread copying it, so the step's reads proceed
+// concurrently instead of one after another: the SSDs serve ~1.3M random
+// 4 KiB reads a second with many in flight, ~13k one at a time.
+torch::Tensor gather_rows(const torch::Tensor& table, const torch::Tensor& indices) {
+  TORCH_CHECK(table.dim() == 2 && table.is_contiguous() && table.device().is_cpu(),
+              "gather_rows: a contiguous 2-D CPU table");
+  // the indices are read on the host below: a device tensor's address would be dereferenced here
+  TORCH_CHECK(indices.device().is_cpu(), "gather_rows: indices on the CPU (got ", indices.device(), ")");
+  const auto idx = indices.to(torch::kLong).contiguous().view(-1);
+  const int64_t n = idx.numel(), rows = table.size(0);
+  const int64_t row_bytes = table.size(1) * table.element_size();
+  const int64_t* ix = idx.data_ptr<int64_t>();
+  for (int64_t i = 0; i < n; ++i) {
+    TORCH_CHECK(ix[i] >= 0 && ix[i] < rows, "gather_rows: index ", ix[i], " outside [0, ", rows, ")");
+  }
+  auto out = torch::empty({n, table.size(1)}, table.options());
+  const char* src = static_cast<const char*>(table.data_ptr());
+  char* dst = static_cast<char*>(out.data_ptr());
+  parallel_range(n, 1, [&](int64_t i0, int64_t i1) {
+    for (int64_t i = i0; i < i1; ++i) {
+      std::memcpy(dst + i * row_bytes, src + ix[i] * row_bytes, row_bytes);
+    }
+  });
+  auto shape = indices.sizes().vec();
+  shape.push_back(table.size(1));
+  return out.view(shape);
+}
+
 PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
   m.def("fp4_gather_mm", &fp4_gather_mm, "x[M,K] bf16 x packed fp4 experts sel[M] -> bf16 [M,N]");
   m.def("fp4_grouped_mm", &fp4_grouped_mm, "x[M,K] bf16 (sorted by expert, offs[E]) x packed fp4 experts -> bf16 [M,N]");
   m.def("fp4_dequant", &fp4_dequant, "one expert of a packed bank -> bf16 [N,K]");
   m.def("fp4_moe_decode", &fp4_moe_decode, "one decode layer's routed experts: gate/up, SwiGLU, act_quant, down, sum -> fp32 [n, K]");
   m.def("fp8_linear", &fp8_linear, "x[M,K] bf16 (quantized per 32-block inside, as the fork's act_quant) x fp8 [N,K] with e8m0 32x32 block scales -> bf16 [M,N]");
+  m.def("gather_rows", &gather_rows, "rows of a 2-D table by index, copied concurrently (page faults overlap) -> [*indices.shape, cols]");
   m.def("has_avx512", &has_avx512, "whether the AVX-512 paths are in use");
   m.def("has_neon", &has_neon, "whether the NEON paths are in use");
 }
