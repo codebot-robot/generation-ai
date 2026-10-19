@@ -416,3 +416,30 @@ func TestRegisterModel_ReplacesFinishedCompileJob(t *testing.T) {
 		t.Errorf("the model should have been compiled again, got %+v", resp)
 	}
 }
+
+func TestRegisterModel_UnschedulableCompile(t *testing.T) {
+	s, clientset := newCatalogServer(t, &fakeModelstore{})
+	s.compileUnschedulable = 20 * time.Millisecond
+	ctx := t.Context()
+	name := compileJobName(weightstore.ArtifactRepository("org/M"), artifactTag(testCommit, s.imageName))
+	// the "cluster": the compile job's pod finds no node with the CPU it asks for
+	go func() {
+		for {
+			if _, err := clientset.BatchV1().Jobs("ns").Get(ctx, name, metav1.GetOptions{}); err == nil {
+				pod := &corev1.Pod{
+					ObjectMeta: metav1.ObjectMeta{Name: name + "-x", Namespace: "ns", Labels: map[string]string{"vxpu.gke-labs.dev/compile": name}},
+					Status: corev1.PodStatus{Phase: corev1.PodPending, Conditions: []corev1.PodCondition{{
+						Type: corev1.PodScheduled, Status: corev1.ConditionFalse, Reason: corev1.PodReasonUnschedulable,
+						Message: "0/1 nodes are available: 1 Insufficient cpu.", LastTransitionTime: metav1.Now()}}},
+				}
+				_, _ = clientset.CoreV1().Pods("ns").Create(ctx, pod, metav1.CreateOptions{})
+				return
+			}
+			time.Sleep(5 * time.Millisecond)
+		}
+	}()
+	_, err := s.RegisterModel(ctx, &pb.RegisterModelRequest{Model: "org/M"})
+	if status.Code(err) != codes.ResourceExhausted || !strings.Contains(status.Convert(err).Message(), "Insufficient cpu") {
+		t.Fatalf("RegisterModel with an unschedulable compile pod: got %v, want RESOURCE_EXHAUSTED with the scheduler's reason", err)
+	}
+}

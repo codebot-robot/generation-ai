@@ -251,6 +251,9 @@ func (s *Server) runCompileJob(ctx context.Context, model, commit, repo, tag str
 				return status.Errorf(codes.Internal, "compiling %s failed (job %s: %s): %s", model, name, cond.Reason, s.compileLogTail(ctx, name, 20))
 			}
 		}
+		if why, stuck := s.compileUnschedulableFor(ctx, name); stuck {
+			return status.Errorf(codes.ResourceExhausted, "compiling %s: job %s's pod cannot be scheduled: %s", model, name, why)
+		}
 		select {
 		case <-ctx.Done():
 			return status.FromContextError(ctx.Err()).Err()
@@ -325,6 +328,26 @@ func jobFinished(job *batchv1.Job) bool {
 		}
 	}
 	return false
+}
+
+// compileUnschedulableFor reports whether the compile job's pod has been
+// unschedulable (no node with the resources it requests) for longer than
+// s.compileUnschedulable, and the scheduler's reason. Otherwise the Job
+// would wait out its hour-long deadline in silence.
+func (s *Server) compileUnschedulableFor(ctx context.Context, job string) (string, bool) {
+	pods, err := s.clientset.CoreV1().Pods(s.namespace).List(ctx, metav1.ListOptions{LabelSelector: "vxpu.gke-labs.dev/compile=" + job})
+	if err != nil {
+		return "", false
+	}
+	for _, p := range pods.Items {
+		for _, c := range p.Status.Conditions {
+			if c.Type == corev1.PodScheduled && c.Status == corev1.ConditionFalse && c.Reason == corev1.PodReasonUnschedulable &&
+				time.Since(c.LastTransitionTime.Time) > s.compileUnschedulable {
+				return c.Message, true
+			}
+		}
+	}
+	return "", false
 }
 
 // compileLogTail is the end of the compile job's newest pod's log.

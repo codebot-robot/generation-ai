@@ -82,6 +82,9 @@ type Server struct {
 	// compile job settings (catalog.go)
 	compileResources corev1.ResourceRequirements
 	compilePoll      time.Duration
+	// compileUnschedulable is how long a compile pod may stay unschedulable
+	// before RegisterModel gives up and says why
+	compileUnschedulable time.Duration
 }
 
 // errNoExecutor: no executor pod exists for the model on this router
@@ -111,12 +114,13 @@ func NewServer(clientset kubernetes.Interface, namespace, imageName, accelerator
 		blobServer:   bs,
 		executorPort: 50051,
 
-		externalModel:    make(map[string]string),
-		modelEndpoint:    make(map[string]string),
-		loadedTags:       make(map[string]string),
-		keyModel:         make(map[string]modelRef),
-		compileResources: defaultCompileResources(),
-		compilePoll:      5 * time.Second,
+		externalModel:        make(map[string]string),
+		modelEndpoint:        make(map[string]string),
+		loadedTags:           make(map[string]string),
+		keyModel:             make(map[string]modelRef),
+		compileResources:     defaultCompileResources(),
+		compilePoll:          5 * time.Second,
+		compileUnschedulable: 5 * time.Minute,
 	}
 	return s
 }

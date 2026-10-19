@@ -243,6 +243,11 @@ func testByName(t *testing.T, h *Harness, gitRoot, vxpuBin string, env []string)
 	h.RunCommand("kubectl", "rollout", "restart", "deployment/modelstore", "-n", "modelstore")
 	h.RunCommand("kubectl", "rollout", "status", "deployment/modelstore", "-n", "modelstore", "--timeout=300s")
 
+	// The first part's in-cluster executor still holds its CPU request: on
+	// a single kind node the compile Job's pod then never schedules.
+	if out, err := exec.Command("kubectl", "delete", "pod", "-l", "app=vxpu-executor", "-n", "default", "--wait").CombinedOutput(); err != nil {
+		t.Logf("deleting the in-cluster executors (best effort): %v: %s", err, out)
+	}
 	h.DeletePod("vxpu-external-executor", "default")
 	h.KubectlApplyContent("external-executor", externalExecutorManifest)
 	if err := h.WaitForPodReady("vxpu-external-executor", "default", 5*time.Minute); err != nil {
