@@ -21,6 +21,7 @@ import (
 
 	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/status"
+	"strings"
 )
 
 // External executors (#357): executor servers on machines the router does
@@ -35,6 +36,16 @@ import (
 // UseExternalExecutors sets the external executors' addresses (host:port).
 func (s *Server) UseExternalExecutors(addrs []string) {
 	s.externalExecutors = append([]string(nil), addrs...)
+}
+
+// UseExternalModelstoreURL sets the address external executors fetch
+// weights from: modelstore as reachable from outside the cluster (an
+// internal load balancer, say). Unset, they are given the router's own
+// modelstore URL, which suits executors that can resolve it (in the
+// cluster) or that copy weights from the bucket themselves
+// (VXPU_BLOB_BUCKET, localblobs.py).
+func (s *Server) UseExternalModelstoreURL(url string) {
+	s.externalModelstoreURL = strings.TrimRight(url, "/")
 }
 
 // pickExternalExecutor chooses where model modelKey goes: the executor

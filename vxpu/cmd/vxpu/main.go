@@ -203,6 +203,8 @@ func cmdUp(ctx context.Context, args []string) error {
 		"modelstore URL to keep weights in (empty: the router finds modelstore.modelstore if deployed, else caches weights itself)")
 	externalExecutors := flags.String("external-executor", os.Getenv("VXPU_EXTERNAL_EXECUTORS"),
 		"comma-separated executor addresses outside Kubernetes (GPU VMs, Macs) that models registered by name are placed on")
+	externalModelstore := flags.String("modelstore-external-url", os.Getenv("VXPU_MODELSTORE_EXTERNAL_URL"),
+		"modelstore's address for external executors, which cannot resolve its in-cluster Service (empty: they get --modelstore's URL)")
 	if err := flags.Parse(args); err != nil {
 		return err
 	}
@@ -229,9 +231,12 @@ func cmdUp(ctx context.Context, args []string) error {
 		if !set["external-executor"] {
 			*externalExecutors = current.externalExecutors
 		}
+		if !set["modelstore-external-url"] {
+			*externalModelstore = current.externalModelstore
+		}
 	}
 	if err := ensurePod(ctx, *pod, routerSettings{image: *image, executorImage: *executorImage, accelerator: *accelerator,
-		modelstore: *modelstore, externalExecutors: *externalExecutors}, true); err != nil {
+		modelstore: *modelstore, externalExecutors: *externalExecutors, externalModelstore: *externalModelstore}, true); err != nil {
 		return fmt.Errorf("ensuring router pod: %w", err)
 	}
 	fmt.Printf("router %s is ready\n", *pod)
@@ -270,6 +275,7 @@ func cmdDown(ctx context.Context, args []string) error {
 type routerSettings struct {
 	image, executorImage, accelerator, modelstore string
 	externalExecutors                             string // comma-separated host:port
+	externalModelstore                            string // modelstore's URL for external executors
 }
 
 // podSettings reads a running router's image, executor image and
@@ -281,7 +287,8 @@ func podSettings(ctx context.Context, pod string) (*routerSettings, error) {
 			`{.spec.containers[0].env[?(@.name=="VXPU_EXECUTOR_IMAGE")].value}{"\t"}`+
 			`{.spec.containers[0].env[?(@.name=="VXPU_ACCELERATOR")].value}{"\t"}`+
 			`{.spec.containers[0].env[?(@.name=="VXPU_MODELSTORE_URL")].value}{"\t"}`+
-			`{.spec.containers[0].env[?(@.name=="VXPU_EXTERNAL_EXECUTORS")].value}`).CombinedOutput()
+			`{.spec.containers[0].env[?(@.name=="VXPU_EXTERNAL_EXECUTORS")].value}{"\t"}`+
+			`{.spec.containers[0].env[?(@.name=="VXPU_MODELSTORE_EXTERNAL_URL")].value}`).CombinedOutput()
 	if err != nil {
 		return nil, fmt.Errorf("kubectl get pod %s: %w: %s", pod, err,
 			strings.TrimSpace(string(out)))
@@ -296,6 +303,9 @@ func podSettings(ctx context.Context, pod string) (*routerSettings, error) {
 	}
 	if len(fields) > 4 {
 		settings.externalExecutors = fields[4]
+	}
+	if len(fields) > 5 {
+		settings.externalModelstore = fields[5]
 	}
 	return settings, nil
 }
@@ -345,8 +355,9 @@ func ensurePod(ctx context.Context, pod string, want routerSettings, reconfigure
 		fmt.Printf("using router %s as it is (run `vxpu up` to change its image or accelerator)\n", pod)
 		return waitReady(ctx, pod)
 	}
-	fmt.Printf("applying router %s (image %s, executor-image %s, accelerator %s, modelstore %q, external executors %q)\n",
-		pod, image, executorImage, accelerator, want.modelstore, want.externalExecutors)
+	fmt.Printf("applying router %s (image %s, executor-image %s, accelerator %s, modelstore %q, external executors %q, "+
+		"modelstore for them %q)\n", pod, image, executorImage, accelerator, want.modelstore, want.externalExecutors,
+		want.externalModelstore)
 	manifest := strings.NewReplacer(
 		`"NAME"`, fmt.Sprintf("%q", pod),
 		`"IMAGE"`, fmt.Sprintf("%q", image),
@@ -354,6 +365,7 @@ func ensurePod(ctx context.Context, pod string, want routerSettings, reconfigure
 		`"ACCELERATOR"`, fmt.Sprintf("%q", accelerator),
 		`"MODELSTORE"`, fmt.Sprintf("%q", want.modelstore),
 		`"EXTERNAL_EXECUTORS"`, fmt.Sprintf("%q", want.externalExecutors),
+		`"MODELSTORE_EXTERNAL_URL"`, fmt.Sprintf("%q", want.externalModelstore),
 	).Replace(routerManifest)
 	if err := kubectlApply(ctx, manifest); err != nil {
 		// Pods are immutable apart from a few fields; recreate.

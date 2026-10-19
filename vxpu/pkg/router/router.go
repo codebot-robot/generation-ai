@@ -73,7 +73,10 @@ type Server struct {
 	externalModel map[string]string // external executor address -> model key it holds
 	modelEndpoint map[string]string // model key -> external executor address
 	loadedTags    map[string]string // compiled artifact tag -> model key loaded from it
-	flights       flights
+	// externalModelstoreURL is modelstore's address for external executors
+	// (VMs outside the cluster, which cannot resolve its Service), when set
+	externalModelstoreURL string
+	flights               flights
 	// compile job settings (catalog.go)
 	compileResources corev1.ResourceRequirements
 	compilePoll      time.Duration
@@ -129,7 +132,7 @@ func (s *Server) UseWeightStore(ws *weightstore.Client) {
 // and tensors are raw JSON, so every byte the router does not touch is
 // reproduced verbatim (a generic decode would turn 30.0 into 30, which
 // transformers rejects where it expects a float).
-func (s *Server) rewriteViaWeightStore(ctx context.Context, manifestJSON string) (string, error) {
+func (s *Server) rewriteViaWeightStore(ctx context.Context, manifestJSON string, external bool) (string, error) {
 	var manifest pb.Manifest
 	if err := json.Unmarshal([]byte(manifestJSON), &manifest); err != nil {
 		return "", fmt.Errorf("parsing manifest: %w", err)
@@ -155,8 +158,14 @@ func (s *Server) rewriteViaWeightStore(ctx context.Context, manifestJSON string)
 			errs = append(errs, r.err.Error())
 			continue
 		}
+		url := r.url
+		if external && s.externalModelstoreURL != "" {
+			// an executor outside the cluster cannot reach modelstore's
+			// Service: the same blob at the address it can reach
+			url = s.externalModelstoreURL + strings.TrimPrefix(url, s.weightStore.URL())
+		}
 		file := manifest.Files[r.sha]
-		file.Source = r.url
+		file.Source = url
 		manifest.Files[r.sha] = file
 	}
 	if len(errs) > 0 {
@@ -476,7 +485,8 @@ func (s *Server) loadArtifact(ctx context.Context, req *pb.LoadModelRequest, ext
 	var rewrittenManifestJSON string
 	var err error
 	if s.weightStore != nil {
-		rewrittenManifestJSON, err = s.rewriteViaWeightStore(context.WithoutCancel(ctx), req.ManifestJson)
+		rewrittenManifestJSON, err = s.rewriteViaWeightStore(context.WithoutCancel(ctx), req.ManifestJson,
+			external && len(s.externalExecutors) > 0)
 		if err != nil {
 			return "", status.Errorf(codes.Internal, "weight store: %v", err)
 		}
@@ -603,6 +613,15 @@ func (s *Server) NewSession(ctx context.Context, req *pb.NewSessionRequest) (*pb
 		// forget where it was, so the caller's retry loads it again.
 		s.forgetModel(modelKey)
 		return nil, status.Errorf(codes.FailedPrecondition, "%s is being reloaded (the executor no longer holds it)", req.Model)
+	}
+	if err != nil && req.Model != "" && status.Code(err) == codes.Internal &&
+		strings.Contains(status.Convert(err).Message(), "model load failed") {
+		// The executor's asynchronous load failed (it keeps answering so
+		// until it is asked to load again): forget the placement, so the
+		// next request by name loads the model again.
+		s.forgetModel(modelKey)
+		return nil, status.Errorf(codes.Unavailable, "%s failed to load on its executor; the next request loads it again: %s",
+			req.Model, status.Convert(err).Message())
 	}
 	if err != nil {
 		// Propagate the exact backend status (including FAILED_PRECONDITION) instead of collapsing to codes.Internal

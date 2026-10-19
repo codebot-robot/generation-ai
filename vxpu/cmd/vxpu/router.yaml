@@ -116,6 +116,8 @@ spec:
           value: "MODELSTORE"
         - name: VXPU_EXTERNAL_EXECUTORS
           value: "EXTERNAL_EXECUTORS"
+        - name: VXPU_MODELSTORE_EXTERNAL_URL
+          value: "MODELSTORE_EXTERNAL_URL"
         - name: POD_IP
           valueFrom:
             fieldRef:

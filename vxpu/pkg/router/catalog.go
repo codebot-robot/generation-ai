@@ -61,23 +61,27 @@ const compileMaxCacheLen = 1024
 var tagUnsafe = regexp.MustCompile(`[^A-Za-z0-9._-]`)
 
 // artifactTag is the catalog entry for a model commit compiled by an
-// executor image: the commit's first 12 characters and the image's tag
-// (or digest prefix), as a valid registry tag.
+// executor image: the commit's first 12 characters and imageKey, as a
+// valid registry tag.
 func artifactTag(commit, image string) string {
 	short := commit
 	if len(short) > 12 {
 		short = short[:12]
 	}
-	tag := tagUnsafe.ReplaceAllString(short+"_"+imageTag(image), "-")
+	tag := tagUnsafe.ReplaceAllString(short+"_"+imageKey(image), "-")
 	if len(tag) > 128 {
 		tag = tag[:128]
 	}
 	return tag
 }
 
-// imageTag is an image reference's tag, the first 12 hex digits of its
-// digest, or "latest".
-func imageTag(image string) string {
+// imageKey names the executor image in the catalog: the first 12 hex
+// digits of its digest when the reference has one, else its repository's
+// last path element and tag ("vxpu-executor-v34"). Only a digest names
+// fixed contents: a tag such as :latest that is rebuilt keeps its key, so
+// artifacts compiled by the previous build are reused (the router warns
+// at startup when the image is not pinned by digest).
+func imageKey(image string) string {
 	if i := strings.LastIndex(image, "@sha256:"); i >= 0 {
 		digest := image[i+len("@sha256:"):]
 		if len(digest) > 12 {
@@ -85,10 +89,16 @@ func imageTag(image string) string {
 		}
 		return digest
 	}
+	repo, tag := image, "latest"
 	if i := strings.LastIndex(image, ":"); i > strings.LastIndex(image, "/") {
-		return image[i+1:]
+		repo, tag = image[:i], image[i+1:]
 	}
-	return "latest"
+	return repo[strings.LastIndex(repo, "/")+1:] + "-" + tag
+}
+
+// PinnedByDigest reports whether an image reference names a digest.
+func PinnedByDigest(image string) bool {
+	return strings.Contains(image, "@sha256:")
 }
 
 // defaultCompileResources: export runs on the meta device, so a compile
@@ -198,8 +208,7 @@ func (s *Server) RegisterModel(ctx context.Context, req *pb.RegisterModelRequest
 // restarted router) attaches to a Job already running.
 func (s *Server) runCompileJob(ctx context.Context, model, commit, repo, tag string) error {
 	log := klog.FromContext(ctx)
-	h := sha256.Sum256([]byte(repo + ":" + tag))
-	name := "vxpu-compile-" + hex.EncodeToString(h[:5])
+	name := compileJobName(repo, tag)
 	backoff, deadline, ttl := int32(1), int64(3600), int32(86400)
 	job := &batchv1.Job{
 		ObjectMeta: metav1.ObjectMeta{Name: name, Namespace: s.namespace, Labels: map[string]string{"app": "vxpu-compile"},
@@ -224,8 +233,8 @@ func (s *Server) runCompileJob(ctx context.Context, model, commit, repo, tag str
 			},
 		},
 	}
-	if _, err := s.clientset.BatchV1().Jobs(s.namespace).Create(ctx, job, metav1.CreateOptions{}); err != nil && !errors.IsAlreadyExists(err) {
-		return status.Errorf(codes.Internal, "creating compile job: %v", err)
+	if err := s.createCompileJob(ctx, job); err != nil {
+		return err
 	}
 	log.Info("Compiling model", "model", model, "commit", commit, "job", name, "artifact", repo+":"+tag)
 	for {
@@ -248,6 +257,74 @@ func (s *Server) runCompileJob(ctx context.Context, model, commit, repo, tag str
 		case <-time.After(s.compilePoll):
 		}
 	}
+}
+
+// compileJobName names the compile Job after the artifact it produces, so
+// a second router call (or a restarted router) attaches to it.
+func compileJobName(repo, tag string) string {
+	h := sha256.Sum256([]byte(repo + ":" + tag))
+	return "vxpu-compile-" + hex.EncodeToString(h[:5])
+}
+
+// createCompileJob creates the compile Job, or attaches to one already
+// running under its name. The caller only compiles when the artifact is
+// missing, so a Job of that name that has already finished is stale: a
+// failure that should be retried, or a success whose artifact has since
+// left modelstore. It is deleted and the Job created again, rather than
+// its outcome answering every register until its TTL expires.
+func (s *Server) createCompileJob(ctx context.Context, job *batchv1.Job) error {
+	jobs := s.clientset.BatchV1().Jobs(s.namespace)
+	for attempt := 0; ; attempt++ {
+		_, err := jobs.Create(ctx, job, metav1.CreateOptions{})
+		if err == nil {
+			return nil
+		}
+		if !errors.IsAlreadyExists(err) {
+			return status.Errorf(codes.Internal, "creating compile job: %v", err)
+		}
+		current, err := jobs.Get(ctx, job.Name, metav1.GetOptions{})
+		if errors.IsNotFound(err) {
+			continue // deleted in between: create it
+		}
+		if err != nil {
+			return status.Errorf(codes.Internal, "reading compile job %s: %v", job.Name, err)
+		}
+		if !jobFinished(current) {
+			return nil // running: attach
+		}
+		if attempt > 0 {
+			return status.Errorf(codes.Internal, "compile job %s finished again before it could be replaced", job.Name)
+		}
+		klog.FromContext(ctx).Info("Replacing a finished compile job: the artifact it was for is missing", "job", job.Name,
+			"succeeded", current.Status.Succeeded)
+		background := metav1.DeletePropagationBackground
+		if err := jobs.Delete(ctx, job.Name, metav1.DeleteOptions{PropagationPolicy: &background}); err != nil && !errors.IsNotFound(err) {
+			return status.Errorf(codes.Internal, "deleting finished compile job %s: %v", job.Name, err)
+		}
+		for {
+			if _, err := jobs.Get(ctx, job.Name, metav1.GetOptions{}); errors.IsNotFound(err) {
+				break
+			}
+			select {
+			case <-ctx.Done():
+				return status.FromContextError(ctx.Err()).Err()
+			case <-time.After(s.compilePoll):
+			}
+		}
+	}
+}
+
+// jobFinished reports whether a Job has completed or failed.
+func jobFinished(job *batchv1.Job) bool {
+	if job.Status.Succeeded > 0 {
+		return true
+	}
+	for _, cond := range job.Status.Conditions {
+		if (cond.Type == batchv1.JobFailed || cond.Type == batchv1.JobComplete) && cond.Status == corev1.ConditionTrue {
+			return true
+		}
+	}
+	return false
 }
 
 // compileLogTail is the end of the compile job's newest pod's log.

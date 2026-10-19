@@ -206,8 +206,16 @@ running `python -m vxpu.server`: start the router with their addresses,
 `vxpu up --external-executor 10.128.0.5:50051[,...]`. The router dials
 them (on GKE's VPC-native networking a pod reaches a VM's internal IP);
 it places a model on the executor already holding it, else an idle one,
-and reloads a model an executor evicted. Kubernetes keeps the bursty,
-CPU-only work: compile jobs, modelstore, the router.
+and reloads a model an executor evicted, or whose load failed. Kubernetes
+keeps the bursty, CPU-only work: compile jobs, modelstore, the router.
+
+A machine outside the cluster cannot resolve modelstore's Service. Either
+let it copy weights from the bucket itself (the executor's
+`VXPU_BLOB_BUCKET`, its local weight tier), or tell the router where it
+can reach modelstore: `vxpu up --modelstore-external-url
+http://10.128.0.9:8080` (an internal load balancer, say). The executor
+image keys compiled artifacts (`vxpu register`): pin it by digest, since
+a rebuilt tag such as `:latest` reuses what the previous build compiled.
 
 ## Weights: the store
 

@@ -47,6 +47,8 @@ func main() {
 	acceleratorFlag := flag.String("accelerator", "", "GKE accelerator label for the executor pod (e.g., nvidia-l4)")
 	modelstoreFlag := flag.String("modelstore", "",
 		"modelstore URL to keep weights in (default: VXPU_MODELSTORE_URL, else http://modelstore.modelstore if it resolves, else the router caches weights itself)")
+	externalModelstoreFlag := flag.String("modelstore-external-url", "",
+		"modelstore's address for external executors, which cannot resolve its in-cluster Service (default: VXPU_MODELSTORE_EXTERNAL_URL; unset, they get --modelstore's URL)")
 	externalFlag := flag.String("external-executor", "",
 		"comma-separated host:port of executors outside Kubernetes (GPU VMs, Macs) that models registered by name are placed on (default: VXPU_EXTERNAL_EXECUTORS)")
 	flag.Parse()
@@ -137,6 +139,15 @@ func main() {
 		}
 	}
 	srv.UseExternalExecutors(externalAddrs)
+	externalMS := *externalModelstoreFlag
+	if externalMS == "" {
+		externalMS = os.Getenv("VXPU_MODELSTORE_EXTERNAL_URL")
+	}
+	srv.UseExternalModelstoreURL(externalMS)
+	if !router.PinnedByDigest(imageName) {
+		log.Info("The executor image is not pinned by digest: compiled artifacts are keyed by its tag, so a rebuilt "+
+			"tag reuses artifacts the previous build compiled", "image", imageName)
+	}
 	pb.RegisterExecutorServer(s, srv)
 
 	log.Info("Starting vxpu-router gRPC server", "port", *portFlag, "namespace", namespace, "image", imageName,
