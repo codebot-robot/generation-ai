@@ -29,7 +29,8 @@ The model is read from modelstore through its Hub-compatible API
 (HF_ENDPOINT); the router imports the weights there first. The tag is
 the router's catalog entry: it names the model revision and the
 executor image, and the manifest's annotations record the source model,
-revision and commit, and the compiler's versions.
+revision and commit (when the endpoint names one), and the compiler's
+versions.
 
     python -m vxpu.compile REPO --modelstore URL --tag TAG [--revision main] [--max-cache-len 1024]
 
@@ -81,18 +82,19 @@ def main(argv=None):
     from .export import export_artifact
 
     name = modelstore.artifact_repository(args.repo_id)
-    if not modelstore.TAG_RE.match(args.tag):
+    if not modelstore.TAG_RE.fullmatch(args.tag):
         raise SystemExit(f"--tag {args.tag!r} is not a valid tag")
     with tempfile.TemporaryDirectory(prefix="vxpu-compile-") as out:
         manifest, binding = export_artifact(args.repo_id, out, args.max_cache_len, args.revision)
         source = manifest["source"]
         annotations = {
-            modelstore.ANNOTATION_HUB_REPO: args.repo_id,
-            modelstore.ANNOTATION_HUB_REVISION: args.revision,
-            modelstore.ANNOTATION_HUB_COMMIT: source.get("commit_sha", ""),
+            modelstore.ANNOTATION_SOURCE_REPO: args.repo_id,
+            modelstore.ANNOTATION_SOURCE_REVISION: args.revision,
             "vnd.gke-labs.vxpu.compiler": json.dumps(compiler_versions(), sort_keys=True),
             "vnd.gke-labs.vxpu.max-cache-len": str(args.max_cache_len),
         }
+        if source.get("commit_pinned"):  # a commit, not a moving ref
+            annotations[modelstore.ANNOTATION_SOURCE_COMMIT] = source["commit_sha"]
         digest = modelstore.push_directory(args.modelstore, name, args.tag, out, annotations)
     summary = {"reference": f"{name}:{args.tag}", "digest": digest, "commit": source.get("commit_sha"),
                "weight_bytes": sum(f["size"] for f in manifest["files"].values()),

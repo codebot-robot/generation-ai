@@ -955,10 +955,32 @@ def _check_local_blobs(model, prompts, settings, artifact, plain, workdir):
     return True
 
 
+def _check_compile_names():
+    """Names a compile writes (compile.py, modelstore.py, manifest.py): a tag
+    must match modelstore's grammar as a whole string (a trailing newline
+    passes a $-anchored match, then modelstore refuses it after the
+    export), and a file's recorded source is the Hub's only for a commit."""
+    from . import manifest, modelstore
+    for good in ("main", "314113f8a7da_hero1", "v1.2-x"):
+        if not modelstore.TAG_RE.fullmatch(good):
+            raise SystemExit(f"tag {good!r} refused")
+    for bad in ("v1\n", "-v1", "a/b", "", "x" * 129):
+        if modelstore.TAG_RE.fullmatch(bad):
+            raise SystemExit(f"tag {bad!r} accepted")
+    commit = "314113f8a7dadb388215396ba5fbee2c610a04d6"
+    src, read = manifest._hub_source("org/m", commit, "a.safetensors", "http://modelstore")
+    if src != f"https://huggingface.co/org/m/resolve/{commit}/a.safetensors" or not read.startswith("http://modelstore/"):
+        raise SystemExit(f"a commit's source should be the Hub's: {src}")
+    src, read = manifest._hub_source("org/m", "main", "a.safetensors", "http://modelstore")
+    if src != read:
+        raise SystemExit(f"a moving ref's source should be the endpoint read: {src}")
+
+
 def selftest(workdir, settings):
     """The CI tier: tiny models through export, the in-process engine,
     and a transformers reference, token-exact. No cluster."""
     _check_compare()
+    _check_compile_names()
     os.makedirs(workdir, exist_ok=True)
     _check_host_reads(workdir)
     _check_local_blobs_copy(workdir)

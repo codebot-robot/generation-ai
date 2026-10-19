@@ -36,12 +36,14 @@ ARTIFACT_TYPE = "application/vnd.gke-labs.vxpu.artifact.v1+json"
 EMPTY_CONFIG = {"mediaType": "application/vnd.oci.empty.v1+json",
                 "digest": "sha256:44136fa355b3678a1146ad16f7e8649e94fb4fc21fe77e8310c060f61caaff8a", "size": 2}
 ANNOTATION_TITLE = "org.opencontainers.image.title"
-# the source model, with the keys modelstore's own imports use
-ANNOTATION_HUB_REPO = "vnd.gke-labs.huggingface.repo"
-ANNOTATION_HUB_REVISION = "vnd.gke-labs.huggingface.revision"
-ANNOTATION_HUB_COMMIT = "vnd.gke-labs.huggingface.commit"
+# the model an artifact was compiled from. Keys of vxpu's own: modelstore
+# reads its Hub keys (vnd.gke-labs.huggingface.*) on a repository as that
+# repository's own identity, and serves the commit as X-Repo-Commit
+ANNOTATION_SOURCE_REPO = "vnd.gke-labs.vxpu.source.repo"
+ANNOTATION_SOURCE_REVISION = "vnd.gke-labs.vxpu.source.revision"
+ANNOTATION_SOURCE_COMMIT = "vnd.gke-labs.vxpu.source.commit"
 
-TAG_RE = re.compile(r"^[A-Za-z0-9_][A-Za-z0-9._-]{0,127}$")
+TAG_RE = re.compile(r"[A-Za-z0-9_][A-Za-z0-9._-]{0,127}")  # with fullmatch: modelstore's tag grammar, whole string
 
 
 def artifact_repository(repo_id):
@@ -70,7 +72,7 @@ def push_directory(base_url, name, tag, directory, annotations=None, artifact_ty
     """Push every file under directory as a layer of repository name,
     tagged tag (blobs modelstore already holds are not sent again).
     Returns the manifest's digest."""
-    if not TAG_RE.match(tag):
+    if not TAG_RE.fullmatch(tag):
         raise ValueError(f"{tag!r} is not a valid tag")
     base = base_url.rstrip("/")
     layers = []
