@@ -858,12 +858,110 @@ def _check_host_reads(workdir):
     print("host reads: gather_rows matches index_select and refuses bad or device indices; MADV_RANDOM taken")
 
 
+def _check_local_blobs_copy(workdir):
+    """Copying into the local weight tier (localblobs.py) through a fake
+    gcloud that copies every file but one and then fails, as gcloud does:
+    the complete files are kept, the next copy fetches only the missing
+    one, and staging left by a process that no longer runs is removed."""
+    import subprocess
+    from . import localblobs
+    root = os.path.join(workdir, "blob-copy")
+    bucket_dir, blob_dir, bindir = (os.path.join(root, d) for d in ("bucket/_blobs", "blobs", "bin"))
+    for d in (bucket_dir, blob_dir, bindir):
+        os.makedirs(d, exist_ok=True)
+    files = {}
+    for k in range(3):
+        sha = f"{k:064x}"
+        with open(os.path.join(bucket_dir, sha), "wb") as f:
+            f.write(bytes([k]) * (1000 + k))
+        files[sha] = {"size": 1000 + k, "name": f"part{k}", "source": "unused"}
+    fake = os.path.join(bindir, "gcloud")
+    with open(fake, "w") as f:
+        f.write(f"""#!{sys.executable}
+import os, shutil, sys
+dest, skip, failed = sys.argv[-1], os.environ.get("FAKE_GCLOUD_SKIP"), False
+for url in sys.stdin.read().split():
+    sha = url.rsplit("/", 1)[1]
+    if sha == skip:
+        failed = True
+        continue
+    shutil.copyfile(os.path.join({os.path.dirname(bucket_dir)!r}, "_blobs", sha), os.path.join(dest, sha))
+sys.exit(1 if failed else 0)
+""")
+    os.chmod(fake, 0o755)
+    gone = subprocess.Popen(["true"])
+    gone.wait()
+    stale = os.path.join(blob_dir, ".incoming", f"{gone.pid}-stale")
+    os.makedirs(stale)
+    skip = next(iter(files))
+    env = {"PATH": bindir + os.pathsep + os.environ.get("PATH", ""), "FAKE_GCLOUD_SKIP": skip}
+    saved = {k: os.environ.get(k) for k in env}
+    os.environ.update(env)
+    try:
+        try:
+            localblobs.localize(files, blob_dir, bucket="gs://fake", log=lambda *_: None)
+        except RuntimeError as e:
+            if "2 of 3 files copied and kept" not in str(e):
+                raise
+        else:
+            raise SystemExit("local blobs: a failed gcloud copy was not reported")
+        kept = sorted(n for n in os.listdir(blob_dir) if not n.startswith("."))
+        if kept != sorted(set(files) - {skip}) or os.listdir(os.path.join(blob_dir, ".incoming")):
+            raise SystemExit(f"local blobs: after a partial copy, kept {kept}, staging "
+                             f"{os.listdir(os.path.join(blob_dir, '.incoming'))}")
+        os.environ.pop("FAKE_GCLOUD_SKIP")
+        _, summary = localblobs.localize(files, blob_dir, bucket="gs://fake", log=lambda *_: None)
+        if summary["copied"] != 1 or summary["local"] != 3:
+            raise SystemExit(f"local blobs: the retry should copy only the missing file: {summary}")
+    finally:
+        for k, v in saved.items():
+            if v is None:
+                os.environ.pop(k, None)
+            else:
+                os.environ[k] = v
+    print("local blobs copy: a partial copy keeps its complete files, the retry copies the rest, stale staging swept")
+
+
+def _check_local_blobs(model, prompts, settings, artifact, plain, workdir):
+    """The executor machine's local weight tier (localblobs.py): with the
+    checkpoint's files in a blob directory, named by sha256, every source
+    points there and the engine's tokens are unchanged."""
+    import shutil
+    from . import localblobs
+    with open(os.path.join(artifact, "manifest.json")) as f:
+        files = json.load(f)["files"]
+    blob_dir = os.path.join(workdir, "blobs")
+    os.makedirs(blob_dir, exist_ok=True)
+    for sha, entry in files.items():
+        shutil.copyfile(entry["source"][len("file://"):], os.path.join(blob_dir, sha))
+    local, summary = localblobs.localize(files, blob_dir)
+    if summary["local"] != len(files) or any(not e["source"].startswith("file://" + os.path.abspath(blob_dir))
+                                             for e in local.values()):
+        print(f"local blobs check: sources not localized: {summary}")
+        return False
+    saved = os.environ.get("VXPU_BLOB_DIR")
+    os.environ["VXPU_BLOB_DIR"] = blob_dir
+    try:
+        got = record_vxpu_engine(model, "main", prompts, settings, artifact)
+    finally:
+        if saved is None:
+            os.environ.pop("VXPU_BLOB_DIR")
+        else:
+            os.environ["VXPU_BLOB_DIR"] = saved
+    if [p["generated_ids"] for p in got["prompts"]] != [p["generated_ids"] for p in plain["prompts"]]:
+        print("local blobs check: tokens changed when reading from the local weight tier")
+        return False
+    print(f"local weight tier: {summary['local']} files read from {blob_dir}, tokens unchanged")
+    return True
+
+
 def selftest(workdir, settings):
     """The CI tier: tiny models through export, the in-process engine,
     and a transformers reference, token-exact. No cluster."""
     _check_compare()
     os.makedirs(workdir, exist_ok=True)
     _check_host_reads(workdir)
+    _check_local_blobs_copy(workdir)
     from .export import export_artifact
     from .fixtures import tiny_fp8_moe
     models = [
@@ -901,6 +999,8 @@ def selftest(workdir, settings):
         print(table(ref, got, rows))
         if not ok:
             failed.append(name)
+        if name == "tiny-fp8-moe" and not _check_local_blobs(model, prompts, settings, artifact, got, workdir):
+            failed.append(name + " (local weight tier)")
         if name == "tiny-deepseek-v41" and not _check_telemetry(model, prompts, settings, artifact, got, workdir):
             failed.append(name + " (telemetry)")
         if name == "tiny-deepseek-v41" and not _check_lowering(model, prompts, settings, artifact, workdir):

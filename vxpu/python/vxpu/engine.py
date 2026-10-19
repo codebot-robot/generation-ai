@@ -103,6 +103,13 @@ class Engine:
         self.external_dir = self.plan["external_dir"]
         with open(os.path.join(artifact_dir, "manifest.json")) as f:
             self.manifest = json.load(f)
+        # this machine's local weight tier: read checkpoint files from local
+        # disk, copying the missing ones from the weight bucket first
+        if self.plan["blob_dir"]:
+            from . import localblobs
+            self.manifest["files"], summary = localblobs.localize(
+                self.manifest["files"], self.plan["blob_dir"], self.plan["blob_bucket"])
+            print(f"[vxpu] local weight tier: {summary['local']} of {summary['files']} files on local disk", flush=True)
         with open(os.path.join(artifact_dir, "binding.json")) as f:
             self.binding = json.load(f)
         if cas_dir:
@@ -212,6 +219,12 @@ class Engine:
         self._resident = None  # set when the split decode keeps one bound state
         self._resident_owner = None
         self._build()
+        if self.plan["blob_dir"]:
+            # the weights are loaded: the blob files' cached pages would only
+            # crowd out the memory-mapped tables read every token
+            from . import localblobs
+            released = localblobs.release(self.manifest["files"], self.plan["blob_dir"])
+            print(f"[vxpu] released the page cache of {released} local blob files", flush=True)
 
     def _bind_external(self, external, cas_dir):
         """Tensors the graphs call out for (ops.py): the expert banks and

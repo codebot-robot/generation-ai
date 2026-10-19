@@ -28,62 +28,6 @@ DEEPSEEK_REPO=$(pin DEEPSEEK_V41_REPO)
 DEEPSEEK_COMMIT=$(pin DEEPSEEK_V41_COMMIT)
 echo "torch $TORCH, transformers $TRANSFORMERS_COMMIT, deepseek_v41 $DEEPSEEK_COMMIT"
 
-# local SSDs as one volume. The members are GCE's local NVMe SSDs by
-# their stable names (never a device-name glob, which can sweep in an
-# attached data disk); an array that survived a reboot is reassembled and
-# mounted, never re-created or reformatted.
-vm_ssh 'set -e
-if ! mountpoint -q /mnt/ssd; then
-  devs=$(ls /dev/disk/by-id/google-local-nvme-ssd-* 2>/dev/null | grep -v -- "-part" || true)
-  if [ -z "$devs" ]; then echo "no local SSDs under /dev/disk/by-id/google-local-nvme-ssd-*" >&2; exit 1; fi
-  md=$(sudo mdadm --detail --scan 2>/dev/null | awk "{print \$2}" | head -1)
-  first=$(echo $devs | cut -d" " -f1)
-  if [ -z "$md" ] && sudo mdadm --examine "$first" >/dev/null 2>&1; then
-    sudo mdadm --assemble /dev/md0 $devs
-    md=/dev/md0
-  fi
-  if [ -z "$md" ]; then
-    sudo mdadm --create /dev/md0 --level=0 --raid-devices=$(echo $devs | wc -w) $devs --run
-    sudo mkfs.ext4 -q -E lazy_itable_init=1,lazy_journal_init=1 /dev/md0
-    md=/dev/md0
-  fi
-  sudo mkdir -p /mnt/ssd
-  sudo mount -o noatime "$md" /mnt/ssd
-  sudo chown "$USER" /mnt/ssd
-fi
-mkdir -p /mnt/ssd/blobs /mnt/ssd/src /mnt/ssd/artifact
-df -h /mnt/ssd | tail -1'
-
-# the venv module, a C++ compiler and Python headers (the CPU kernels build on first use)
-vm_ssh 'sudo DEBIAN_FRONTEND=noninteractive apt-get update -qq >/dev/null
-sudo DEBIAN_FRONTEND=noninteractive apt-get install -y -qq python3-venv python3-dev g++ >/dev/null
-echo "packages ok"'
-
-# the Python environment at the image's pins
-vm_ssh "set -e
-[ -x /mnt/ssd/venv/bin/python ] || python3 -m venv /mnt/ssd/venv
-/mnt/ssd/venv/bin/pip install -q --upgrade pip
-/mnt/ssd/venv/bin/pip install -q torch==$TORCH grpcio 'protobuf>=6.30' requests huggingface_hub accelerate sympy pillow ninja safetensors numpy
-/mnt/ssd/venv/bin/pip install -q 'git+$TRANSFORMERS_REPO@$TRANSFORMERS_COMMIT'
-if [ ! -d /mnt/ssd/deepseek_v41 ]; then git clone -q $DEEPSEEK_REPO /mnt/ssd/deepseek_v41; fi
-git -C /mnt/ssd/deepseek_v41 fetch -q origin && git -C /mnt/ssd/deepseek_v41 checkout -q $DEEPSEEK_COMMIT
-echo 'python environment ok'"
-
-# the run environment, matching the hybrid executor's settings
-vm_ssh 'cores=$(lscpu -p=CORE | grep -v "^#" | sort -u | wc -l)
-cat > /mnt/ssd/env.sh <<EOF
-export PATH=/mnt/ssd/venv/bin:\$PATH
-export PYTHONPATH=/mnt/ssd/src
-export VXPU_PY=/mnt/ssd/src
-export VXPU_DEEPSEEK_V41=/mnt/ssd/deepseek_v41/inference
-export DEEPSEEK_KERNELS=aten
-export TORCH_EXTENSIONS_DIR=/mnt/ssd/torch_ext
-# one thread per physical core for torch and for the kernels: the
-# kernels are memory-bound and oversubscription costs them most
-export OMP_NUM_THREADS=$cores
-export VXPU_KERNEL_THREADS=$cores
-export VXPU_EXTERNAL_DIR=/mnt/ssd/external
-export VXPU_EXPERTS_IN_RAM=1
-export HF_HUB_DISABLE_PROGRESS_BARS=1
-EOF
-echo "wrote /mnt/ssd/env.sh ($cores physical cores)"'
+# the steps run on the VM (remote/setup-vm.sh, also boot.sh's startup script)
+vm_scp "$(dirname "$0")/remote/setup-vm.sh" /tmp/vxpu-setup-vm.sh
+vm_ssh "bash /tmp/vxpu-setup-vm.sh '$TORCH' '$TRANSFORMERS_REPO' '$TRANSFORMERS_COMMIT' '$DEEPSEEK_REPO' '$DEEPSEEK_COMMIT'"

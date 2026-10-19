@@ -31,7 +31,7 @@ args=(--project "$PROJECT" --machine-type "$MACHINE"
       --accelerator "type=nvidia-rtx-pro-6000,count=$GPUS" --maintenance-policy TERMINATE
       --image-project deeplearning-platform-release --image-family common-cu129-ubuntu-2404-nvidia-580
       --boot-disk-type hyperdisk-balanced --boot-disk-size 300GB
-      --scopes "${SCOPES:-storage-ro}" --labels purpose=vxpu-dev)
+      --scopes "${SCOPES:-storage-ro}" --labels purpose=vxpu-dev --tags vxpu-dev)
 for _ in $(seq "$LOCAL_SSDS"); do args+=(--local-ssd=interface=NVME); done
 if [ -n "${SERVICE_ACCOUNT:-}" ]; then args+=(--service-account "$SERVICE_ACCOUNT"); fi
 if [ -z "${ON_DEMAND:-}" ]; then args+=(--provisioning-model SPOT --instance-termination-action STOP); fi
