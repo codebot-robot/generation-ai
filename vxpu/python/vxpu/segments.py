@@ -202,7 +202,7 @@ def call_host_ops_directly(sub):
         sub.recompile()
 
 
-def compile_segments(gm, device, mode, options=None, split_compile=True, direct=True, runtime="jit",
+def compile_segments(gm, device, mode, split_compile=True, direct=True, runtime="jit",
                      aoti_cache_dir=None):
     """The module split at its host ops with every dense segment compiled
     (split_compile=False: the split alone, segments eager, a check of the
@@ -229,9 +229,6 @@ def compile_segments(gm, device, mode, options=None, split_compile=True, direct=
             setattr(split, name, aoti.GraphedSegment(name, sub, aoti.static_arguments(split, name), packages, pool))
             compiled += 1
             continue
-        kwargs = {"mode": mode}
-        if options:
-            kwargs["options"] = options
-        setattr(split, name, torch.compile(sub, **kwargs))
+        setattr(split, name, torch.compile(sub, mode=mode))
         compiled += 1
     return Split(split, len(segments_of(split)), compiled)  # every segment, compiled or not
