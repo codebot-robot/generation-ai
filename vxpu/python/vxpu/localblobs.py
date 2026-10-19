@@ -27,15 +27,21 @@ in-region). The manifest's sources are then pointed at the local files,
 so rehydration reads local disk.
 
 Without a bucket, files not already local keep their manifest sources
-(modelstore, through the router's rewrite). A copy lands under
-blob_dir/.incoming/<pid>/ and is renamed into place only once its size
-matches the manifest, so an interrupted copy is never mistaken for a
-complete file.
+(modelstore, through the router's rewrite). A copy lands in a staging
+directory of its own under blob_dir/.incoming/ (one per call, so
+concurrent loads never share one) and is renamed into place only once its
+size matches the manifest, so an interrupted copy is never mistaken for a
+complete file. Every complete file is kept even when others failed to
+copy, so a retry copies only what is still missing. Staging left by a
+process that no longer runs (a killed executor skips the cleanup) is
+removed by the next copy, and on Linux the copy itself dies with the
+process that started it.
 """
 
 import os
 import shutil
 import subprocess
+import tempfile
 import time
 
 
@@ -52,23 +58,27 @@ def localize(files, blob_dir, bucket=None, log=lambda msg: print(msg, flush=True
     missing = [sha for sha, entry in files.items() if not _complete(os.path.join(blob_dir, sha), entry["size"])]
     copied, copied_bytes, started = 0, 0, time.time()
     if missing and bucket:
-        incoming = os.path.join(blob_dir, ".incoming", str(os.getpid()))
-        os.makedirs(incoming, exist_ok=True)
+        root = os.path.join(blob_dir, ".incoming")
+        os.makedirs(root, exist_ok=True)
+        _sweep(root)
+        incoming = tempfile.mkdtemp(prefix=f"{os.getpid()}-", dir=root)
         try:
             urls = "".join(f"{bucket.rstrip('/')}/_blobs/{sha}\n" for sha in missing)
             total = sum(files[sha]["size"] for sha in missing)
             log(f"[vxpu] copying {len(missing)} weight files ({total / 1e9:.1f} GB) from {bucket} to {blob_dir}")
-            result = subprocess.run(["gcloud", "storage", "cp", "-I", incoming + "/"], input=urls, text=True,
-                                    capture_output=True)
-            if result.returncode != 0:
-                tail = "\n".join(line for line in result.stderr.splitlines() if not line.startswith("Copying"))[-2000:]
-                raise RuntimeError(f"gcloud storage cp from {bucket} failed: {tail}")
+            result = subprocess.run(_with_parent(["gcloud", "storage", "cp", "-I", incoming + "/"]), input=urls,
+                                    text=True, capture_output=True)
+            # every complete file first: gcloud finishes the other copies before reporting a failed one
             for sha in missing:
                 src = os.path.join(incoming, sha)
                 if _complete(src, files[sha]["size"]):
                     os.replace(src, os.path.join(blob_dir, sha))
                     copied += 1
                     copied_bytes += files[sha]["size"]
+            if result.returncode != 0:
+                tail = "\n".join(line for line in result.stderr.splitlines() if not line.startswith("Copying"))[-2000:]
+                raise RuntimeError(f"gcloud storage cp from {bucket} failed ({copied} of {len(missing)} files "
+                                   f"copied and kept): {tail}")
         finally:
             shutil.rmtree(incoming, ignore_errors=True)
     out, local = {}, 0
@@ -110,3 +120,32 @@ def release(files, blob_dir):
         finally:
             os.close(fd)
     return released
+
+
+def _sweep(root):
+    """Remove the staging directories (named <pid>-...) of processes that
+    no longer run: a killed executor never ran its cleanup."""
+    for name in os.listdir(root):
+        pid = name.split("-", 1)[0]
+        if pid.isdigit() and int(pid) != os.getpid() and not _alive(int(pid)):
+            shutil.rmtree(os.path.join(root, name), ignore_errors=True)
+
+
+def _alive(pid):
+    try:
+        os.kill(pid, 0)
+    except ProcessLookupError:
+        return False
+    except PermissionError:  # running, as another user
+        return True
+    return True
+
+
+def _with_parent(cmd):
+    """cmd, run so that it is sent SIGTERM if this process dies (Linux,
+    util-linux's setpriv): a killed executor's copy would otherwise run
+    on, orphaned, into a directory nothing reads. preexec_fn could set
+    the same flag without the extra program, but is unsafe in a
+    process with threads, as the executor is."""
+    setpriv = shutil.which("setpriv")
+    return [setpriv, "--pdeathsig", "TERM", "--"] + cmd if setpriv else cmd
