@@ -381,7 +381,7 @@ func TestRewriteViaWeightStore_PreservesConfigVerbatim(t *testing.T) {
 		`"config":{"final_logit_softcapping":30.0,"rope_theta":1000000.0,"attention_dropout":0.0,"nested":{"x":1.0}},` +
 		`"files":{"abc":{"size":4,"name":"model.safetensors","source":"https://huggingface.co/r/resolve/c/model.safetensors"}},` +
 		`"tensors":{"w":{"dtype":"BF16","length":4,"offset":0,"shape":[2],"file_sha256":"abc"}}}`
-	out, err := s.rewriteViaWeightStore(t.Context(), in)
+	out, err := s.rewriteViaWeightStore(t.Context(), in, false)
 	if err != nil {
 		t.Fatalf("rewriteViaWeightStore: %v", err)
 	}

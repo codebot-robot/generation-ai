@@ -42,7 +42,6 @@ import (
 
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/codes"
-	"google.golang.org/grpc/credentials/insecure"
 	"google.golang.org/grpc/status"
 	"k8s.io/klog/v2"
 
@@ -60,13 +59,15 @@ func main() {
 	log := klog.FromContext(ctx)
 	if len(os.Args) < 2 {
 		fmt.Fprintln(os.Stderr,
-			"usage: vxpu ask [flags] PROMPT | vxpu up [flags] | vxpu down [flags] | vxpu mirror REPO[@REVISION]")
+			"usage: vxpu ask [flags] PROMPT | vxpu register [flags] REPO[@REVISION] | vxpu up [flags] | vxpu down [flags] | vxpu mirror REPO[@REVISION]")
 		os.Exit(2)
 	}
 	var err error
 	switch os.Args[1] {
 	case "ask":
 		err = cmdAsk(ctx, os.Args[2:])
+	case "register":
+		err = cmdRegister(ctx, os.Args[2:])
 	case "up":
 		err = cmdUp(ctx, os.Args[2:])
 	case "down":
@@ -97,7 +98,10 @@ func cmdAsk(ctx context.Context, args []string) error {
 		"GKE accelerator label for the executor pod (used only if the router has to be created; 'vxpu up' changes a running router)")
 	modelstore := flags.String("modelstore", os.Getenv("VXPU_MODELSTORE_URL"),
 		"modelstore URL for weights (used only if the router has to be created; empty: the router finds modelstore.modelstore or caches weights itself)")
+	externalExecutors := flags.String("external-executor", os.Getenv("VXPU_EXTERNAL_EXECUTORS"),
+		"comma-separated executor addresses outside Kubernetes (used only if the router has to be created)")
 	routerAddr := flags.String("router", "", "vxpu-router address (e.g. localhost:50051); if set, skips direct pod creation")
+	model := flags.String("model", "", "a registered model (REPO[@REVISION], see `vxpu register`) instead of --artifact")
 	maxNewTokens := flags.Int("max-new-tokens", 96, "tokens per reply")
 	timeout := flags.Duration("timeout", 20*time.Minute,
 		"end-to-end timeout (cold loads rehydrate all weights)")
@@ -109,42 +113,20 @@ func cmdAsk(ctx context.Context, args []string) error {
 		return errors.New("usage: vxpu ask [flags] PROMPT")
 	}
 
-	var addr string
-	var stop func()
-	if *routerAddr != "" {
-		addr = *routerAddr
-		stop = func() {}
-	} else {
-		// A running router is used as it is: its image, executor image
-		// and accelerator were decided by `vxpu up`; the flags here only
-		// apply when the router has to be created.
-		if err := ensurePod(ctx, *pod, routerSettings{*image, *executorImage, *accelerator, *modelstore}, false); err != nil {
-			return fmt.Errorf("ensuring router pod: %w", err)
-		}
-		var err error
-		addr, stop, err = portForward(ctx, *pod)
-		if err != nil {
-			return fmt.Errorf("port-forward: %w", err)
-		}
-	}
-	defer stop()
-
-	conn, err := grpc.NewClient(addr,
-		grpc.WithTransportCredentials(insecure.NewCredentials()),
-		grpc.WithDefaultCallOptions(
-			grpc.MaxCallSendMsgSize(maxMessageBytes),
-			grpc.MaxCallRecvMsgSize(maxMessageBytes)))
+	client, done, err := connectRouter(ctx, *routerAddr, *pod, routerSettings{image: *image, executorImage: *executorImage,
+		accelerator: *accelerator, modelstore: *modelstore, externalExecutors: *externalExecutors})
 	if err != nil {
-		return fmt.Errorf("dialing %s: %w", addr, err)
+		return err
 	}
-	defer func() {
-		if err := conn.Close(); err != nil {
-			log.Error(err, "closing router connection", "address", addr)
-		}
-	}()
-	client := pb.NewExecutorClient(conn)
+	defer done()
 	ctx, cancel := context.WithTimeout(ctx, *timeout)
 	defer cancel()
+
+	if *model != "" {
+		repo, revision := splitRevision(*model)
+		return askByName(ctx, client, repo, revision, prompt, *maxNewTokens)
+	}
+	log.V(2).Info("shipping the artifact", "artifact", *artifact)
 
 	files := map[string][]byte{}
 	for _, name := range []string{"manifest.json", "binding.json", "prefill.pt2", "decode.pt2"} {
@@ -219,6 +201,10 @@ func cmdUp(ctx context.Context, args []string) error {
 		"GKE accelerator label for the executor pod")
 	modelstore := flags.String("modelstore", os.Getenv("VXPU_MODELSTORE_URL"),
 		"modelstore URL to keep weights in (empty: the router finds modelstore.modelstore if deployed, else caches weights itself)")
+	externalExecutors := flags.String("external-executor", os.Getenv("VXPU_EXTERNAL_EXECUTORS"),
+		"comma-separated executor addresses outside Kubernetes (GPU VMs, Macs) that models registered by name are placed on")
+	externalModelstore := flags.String("modelstore-external-url", os.Getenv("VXPU_MODELSTORE_EXTERNAL_URL"),
+		"modelstore's address for external executors, which cannot resolve its in-cluster Service (empty: they get --modelstore's URL)")
 	if err := flags.Parse(args); err != nil {
 		return err
 	}
@@ -242,8 +228,15 @@ func cmdUp(ctx context.Context, args []string) error {
 		if !set["modelstore"] {
 			*modelstore = current.modelstore
 		}
+		if !set["external-executor"] {
+			*externalExecutors = current.externalExecutors
+		}
+		if !set["modelstore-external-url"] {
+			*externalModelstore = current.externalModelstore
+		}
 	}
-	if err := ensurePod(ctx, *pod, routerSettings{*image, *executorImage, *accelerator, *modelstore}, true); err != nil {
+	if err := ensurePod(ctx, *pod, routerSettings{image: *image, executorImage: *executorImage, accelerator: *accelerator,
+		modelstore: *modelstore, externalExecutors: *externalExecutors, externalModelstore: *externalModelstore}, true); err != nil {
 		return fmt.Errorf("ensuring router pod: %w", err)
 	}
 	fmt.Printf("router %s is ready\n", *pod)
@@ -281,6 +274,8 @@ func cmdDown(ctx context.Context, args []string) error {
 // routerSettings are the values a running router was created with.
 type routerSettings struct {
 	image, executorImage, accelerator, modelstore string
+	externalExecutors                             string // comma-separated host:port
+	externalModelstore                            string // modelstore's URL for external executors
 }
 
 // podSettings reads a running router's image, executor image and
@@ -291,7 +286,9 @@ func podSettings(ctx context.Context, pod string) (*routerSettings, error) {
 		`jsonpath={.spec.containers[0].image}{"\t"}`+
 			`{.spec.containers[0].env[?(@.name=="VXPU_EXECUTOR_IMAGE")].value}{"\t"}`+
 			`{.spec.containers[0].env[?(@.name=="VXPU_ACCELERATOR")].value}{"\t"}`+
-			`{.spec.containers[0].env[?(@.name=="VXPU_MODELSTORE_URL")].value}`).CombinedOutput()
+			`{.spec.containers[0].env[?(@.name=="VXPU_MODELSTORE_URL")].value}{"\t"}`+
+			`{.spec.containers[0].env[?(@.name=="VXPU_EXTERNAL_EXECUTORS")].value}{"\t"}`+
+			`{.spec.containers[0].env[?(@.name=="VXPU_MODELSTORE_EXTERNAL_URL")].value}`).CombinedOutput()
 	if err != nil {
 		return nil, fmt.Errorf("kubectl get pod %s: %w: %s", pod, err,
 			strings.TrimSpace(string(out)))
@@ -303,6 +300,12 @@ func podSettings(ctx context.Context, pod string) (*routerSettings, error) {
 	settings := &routerSettings{image: fields[0], executorImage: fields[1], accelerator: fields[2]}
 	if len(fields) > 3 {
 		settings.modelstore = fields[3]
+	}
+	if len(fields) > 4 {
+		settings.externalExecutors = fields[4]
+	}
+	if len(fields) > 5 {
+		settings.externalModelstore = fields[5]
 	}
 	return settings, nil
 }
@@ -352,14 +355,17 @@ func ensurePod(ctx context.Context, pod string, want routerSettings, reconfigure
 		fmt.Printf("using router %s as it is (run `vxpu up` to change its image or accelerator)\n", pod)
 		return waitReady(ctx, pod)
 	}
-	fmt.Printf("applying router %s (image %s, executor-image %s, accelerator %s, modelstore %q)\n",
-		pod, image, executorImage, accelerator, want.modelstore)
+	fmt.Printf("applying router %s (image %s, executor-image %s, accelerator %s, modelstore %q, external executors %q, "+
+		"modelstore for them %q)\n", pod, image, executorImage, accelerator, want.modelstore, want.externalExecutors,
+		want.externalModelstore)
 	manifest := strings.NewReplacer(
 		`"NAME"`, fmt.Sprintf("%q", pod),
 		`"IMAGE"`, fmt.Sprintf("%q", image),
 		`"EXECUTOR_IMAGE"`, fmt.Sprintf("%q", executorImage),
 		`"ACCELERATOR"`, fmt.Sprintf("%q", accelerator),
 		`"MODELSTORE"`, fmt.Sprintf("%q", want.modelstore),
+		`"EXTERNAL_EXECUTORS"`, fmt.Sprintf("%q", want.externalExecutors),
+		`"MODELSTORE_EXTERNAL_URL"`, fmt.Sprintf("%q", want.externalModelstore),
 	).Replace(routerManifest)
 	if err := kubectlApply(ctx, manifest); err != nil {
 		// Pods are immutable apart from a few fields; recreate.

@@ -15,12 +15,14 @@
 package e2e
 
 import (
+	"context"
 	"fmt"
 	"os"
 	"os/exec"
 	"path/filepath"
 	"strings"
 	"testing"
+	"time"
 )
 
 func TestE2E(t *testing.T) {
@@ -160,6 +162,8 @@ roleRef:
 		t.Logf("second ask output: %s", out)
 	}
 
+	testByName(t, h, gitRoot, vxpuBin, cmd.Env)
+
 	// `vxpu down` removes the router and everything the manifest created.
 	down := exec.Command(vxpuBin, "down")
 	if out, err := down.CombinedOutput(); err != nil {
@@ -170,4 +174,115 @@ roleRef:
 			t.Errorf("%s vxpu-router still exists after vxpu down", kind)
 		}
 	}
+}
+
+// externalExecutorManifest is an executor the router does not manage: in
+// production a GPU VM or a Mac running `python -m vxpu.server`; here a
+// pod and Service the test creates (#357).
+const externalExecutorManifest = `apiVersion: v1
+kind: Pod
+metadata:
+  name: vxpu-external-executor
+  labels:
+    app: vxpu-external-executor
+spec:
+  containers:
+    - name: executor
+      image: vxpu-executor:e2e
+      imagePullPolicy: Never
+      args: ["--keep-alive", "3600"]
+      ports:
+        - containerPort: 50051
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: vxpu-external-executor
+spec:
+  selector:
+    app: vxpu-external-executor
+  ports:
+    - port: 50051
+      targetPort: 50051
+`
+
+// dumpByNameState prints what testByName's commands depend on: the
+// router, the compile Jobs and their pods, the external executor and
+// modelstore, with the events of both namespaces.
+func dumpByNameState(h *Harness) {
+	state, _ := exec.Command("kubectl", "get", "jobs,pods", "-A", "-o", "wide").CombinedOutput()
+	fmt.Fprintf(os.Stderr, "jobs and pods:\n%s\n", state)
+	fmt.Fprintf(os.Stderr, "router logs:\n%s\n", h.GetPodLogs("app=vxpu-router", "default"))
+	fmt.Fprintf(os.Stderr, "compile pods:\n%s\n", h.GetPodYaml("app=vxpu-compile", "default"))
+	fmt.Fprintf(os.Stderr, "compile logs:\n%s\n", h.GetPodLogs("app=vxpu-compile", "default"))
+	fmt.Fprintf(os.Stderr, "external executor logs:\n%s\n", h.GetPodLogs("app=vxpu-external-executor", "default"))
+	fmt.Fprintf(os.Stderr, "modelstore logs:\n%s\n", h.GetPodLogs("app=modelstore", "modelstore"))
+	fmt.Fprintf(os.Stderr, "events (default):\n%s\n", h.GetEvents("default"))
+	fmt.Fprintf(os.Stderr, "events (modelstore):\n%s\n", h.GetEvents("modelstore"))
+}
+
+// testByName registers a model by name (the router imports it into
+// modelstore and compiles it in a Job with the executor image) and asks
+// it a question by name, served by an external executor (#357).
+func testByName(t *testing.T, h *Harness, gitRoot, vxpuBin string, env []string) {
+	const model = "trl-internal-testing/tiny-random-LlamaForCausalLM"
+	modelstoreRoot := filepath.Join(gitRoot, "modelstore")
+	h.DockerBuild("modelstore:e2e", filepath.Join(modelstoreRoot, "images/modelstore/Dockerfile"), modelstoreRoot)
+	h.KindLoad("modelstore:e2e")
+	msManifest, err := os.ReadFile(filepath.Join(modelstoreRoot, "k8s/manifest.yaml"))
+	if err != nil {
+		t.Fatalf("reading the modelstore manifest: %v", err)
+	}
+	manifest := strings.ReplaceAll(string(msManifest), "image: modelstore:latest", "image: modelstore:e2e\n          imagePullPolicy: Never")
+	manifest = strings.ReplaceAll(manifest, "--blob-store=gs://BUCKET", "--blob-store=/tmp/blobs") // no GCS in kind
+	h.KubectlApplyContent("modelstore", manifest)
+	h.RunCommand("kubectl", "rollout", "status", "deployment/modelstore", "-n", "modelstore", "--timeout=300s")
+
+	h.DeletePod("vxpu-external-executor", "default")
+	h.KubectlApplyContent("external-executor", externalExecutorManifest)
+	if err := h.WaitForPodReady("vxpu-external-executor", "default", 5*time.Minute); err != nil {
+		t.Fatalf("external executor: %v", err)
+	}
+
+	// Every command is bounded (a register imports the model and compiles
+	// it in a Job: about two minutes in kind), so a hang fails here with the
+	// cluster's state rather than at the test binary's timeout with none.
+	run := func(args ...string) string {
+		ctx, cancel := context.WithTimeout(context.Background(), 12*time.Minute)
+		defer cancel()
+		c := exec.CommandContext(ctx, vxpuBin, args...)
+		c.Env = env
+		// the CLI's kubectl port-forward inherits its output: without a
+		// WaitDelay, CombinedOutput waits for that child after the deadline
+		// has killed the CLI, and the bound never fires
+		c.WaitDelay = 10 * time.Second
+		out, err := c.CombinedOutput()
+		t.Logf("vxpu %s:\n%s", strings.Join(args, " "), out)
+		if err != nil {
+			if ctx.Err() != nil {
+				err = fmt.Errorf("no answer within 12 minutes: %w", ctx.Err())
+			}
+			dumpByNameState(h)
+			t.Fatalf("vxpu %s: %v", strings.Join(args, " "), err)
+		}
+		return string(out)
+	}
+	run("up", "--modelstore", "http://modelstore.modelstore", "--external-executor", "vxpu-external-executor:50051")
+
+	out := run("register", model)
+	if !strings.Contains(out, "registered "+model) || !strings.Contains(out, ": compiled") {
+		t.Errorf("first register should compile the model, got:\n%s", out)
+	}
+	out = run("ask", "--model", model, "Is the sky blue?")
+	if !strings.Contains(out, "Is the sky blue?") {
+		t.Errorf("ask by name: output lacks the prompt:\n%s", out)
+	}
+	if logs := h.GetPodLogs("app=vxpu-external-executor", "default"); !strings.Contains(logs, "loading") {
+		t.Errorf("the model should have been served by the external executor; its logs:\n%s", logs)
+	}
+	out = run("register", model)
+	if !strings.Contains(out, "already compiled") {
+		t.Errorf("a second register should find the compiled artifact, got:\n%s", out)
+	}
+	h.DeletePod("vxpu-external-executor", "default")
 }

@@ -61,6 +61,11 @@ class ExecutorStub:
                 request_serializer=vxpu__pb2.LoadModelRequest.SerializeToString,
                 response_deserializer=vxpu__pb2.LoadModelResponse.FromString,
                 _registered_method=True)
+        self.RegisterModel = channel.unary_unary(
+                '/vxpu.Executor/RegisterModel',
+                request_serializer=vxpu__pb2.RegisterModelRequest.SerializeToString,
+                response_deserializer=vxpu__pb2.RegisterModelResponse.FromString,
+                _registered_method=True)
         self.NewSession = channel.unary_unary(
                 '/vxpu.Executor/NewSession',
                 request_serializer=vxpu__pb2.NewSessionRequest.SerializeToString,
@@ -98,8 +103,22 @@ class ExecutorServicer:
         context.set_details('Method not implemented!')
         raise NotImplementedError('Method not implemented!')
 
+    def RegisterModel(self, request, context):
+        """RegisterModel makes a model servable by name (router only): the
+        router imports the weights into modelstore and compiles the model
+        for its executor image (a compile job exporting the artifact into
+        modelstore), unless that was done before. Blocks until the model is
+        registered; idempotent.
+        """
+        context.set_code(grpc.StatusCode.UNIMPLEMENTED)
+        context.set_details('Method not implemented!')
+        raise NotImplementedError('Method not implemented!')
+
     def NewSession(self, request, context):
-        """NewSession allocates fresh per-session state (KV cache).
+        """NewSession allocates fresh per-session state (KV cache). With a
+        model name (router only), the router loads that registered model
+        if needed; while it loads, NewSession fails with FAILED_PRECONDITION
+        and the caller retries.
         """
         context.set_code(grpc.StatusCode.UNIMPLEMENTED)
         context.set_details('Method not implemented!')
@@ -131,6 +150,11 @@ def add_ExecutorServicer_to_server(servicer, server):
                     servicer.LoadModel,
                     request_deserializer=vxpu__pb2.LoadModelRequest.FromString,
                     response_serializer=vxpu__pb2.LoadModelResponse.SerializeToString,
+            ),
+            'RegisterModel': grpc.unary_unary_rpc_method_handler(
+                    servicer.RegisterModel,
+                    request_deserializer=vxpu__pb2.RegisterModelRequest.FromString,
+                    response_serializer=vxpu__pb2.RegisterModelResponse.SerializeToString,
             ),
             'NewSession': grpc.unary_unary_rpc_method_handler(
                     servicer.NewSession,
@@ -183,6 +207,33 @@ class Executor:
             '/vxpu.Executor/LoadModel',
             vxpu__pb2.LoadModelRequest.SerializeToString,
             vxpu__pb2.LoadModelResponse.FromString,
+            options,
+            channel_credentials,
+            insecure,
+            call_credentials,
+            compression,
+            wait_for_ready,
+            timeout,
+            metadata,
+            _registered_method=True)
+
+    @staticmethod
+    def RegisterModel(request,
+            target,
+            options=(),
+            channel_credentials=None,
+            call_credentials=None,
+            insecure=False,
+            compression=None,
+            wait_for_ready=None,
+            timeout=None,
+            metadata=None):
+        return grpc.experimental.unary_unary(
+            request,
+            target,
+            '/vxpu.Executor/RegisterModel',
+            vxpu__pb2.RegisterModelRequest.SerializeToString,
+            vxpu__pb2.RegisterModelResponse.FromString,
             options,
             channel_credentials,
             insecure,

@@ -33,10 +33,11 @@ import (
 const _ = grpc.SupportPackageIsVersion9
 
 const (
-	Executor_LoadModel_FullMethodName  = "/vxpu.Executor/LoadModel"
-	Executor_NewSession_FullMethodName = "/vxpu.Executor/NewSession"
-	Executor_Chat_FullMethodName       = "/vxpu.Executor/Chat"
-	Executor_Generate_FullMethodName   = "/vxpu.Executor/Generate"
+	Executor_LoadModel_FullMethodName     = "/vxpu.Executor/LoadModel"
+	Executor_RegisterModel_FullMethodName = "/vxpu.Executor/RegisterModel"
+	Executor_NewSession_FullMethodName    = "/vxpu.Executor/NewSession"
+	Executor_Chat_FullMethodName          = "/vxpu.Executor/Chat"
+	Executor_Generate_FullMethodName      = "/vxpu.Executor/Generate"
 )
 
 // ExecutorClient is the client API for Executor service.
@@ -56,7 +57,16 @@ type ExecutorClient interface {
 	// digest identifies the model, and a matching digest reuses the
 	// already-loaded engine.
 	LoadModel(ctx context.Context, in *LoadModelRequest, opts ...grpc.CallOption) (*LoadModelResponse, error)
-	// NewSession allocates fresh per-session state (KV cache).
+	// RegisterModel makes a model servable by name (router only): the
+	// router imports the weights into modelstore and compiles the model
+	// for its executor image (a compile job exporting the artifact into
+	// modelstore), unless that was done before. Blocks until the model is
+	// registered; idempotent.
+	RegisterModel(ctx context.Context, in *RegisterModelRequest, opts ...grpc.CallOption) (*RegisterModelResponse, error)
+	// NewSession allocates fresh per-session state (KV cache). With a
+	// model name (router only), the router loads that registered model
+	// if needed; while it loads, NewSession fails with FAILED_PRECONDITION
+	// and the caller retries.
 	NewSession(ctx context.Context, in *NewSessionRequest, opts ...grpc.CallOption) (*NewSessionResponse, error)
 	// Chat runs one conversation turn in a session. Multi-turn reuses
 	// the session's cache: only new suffix tokens are prefilled.
@@ -81,6 +91,16 @@ func (c *executorClient) LoadModel(ctx context.Context, in *LoadModelRequest, op
 	cOpts := append([]grpc.CallOption{grpc.StaticMethod()}, opts...)
 	out := new(LoadModelResponse)
 	err := c.cc.Invoke(ctx, Executor_LoadModel_FullMethodName, in, out, cOpts...)
+	if err != nil {
+		return nil, err
+	}
+	return out, nil
+}
+
+func (c *executorClient) RegisterModel(ctx context.Context, in *RegisterModelRequest, opts ...grpc.CallOption) (*RegisterModelResponse, error) {
+	cOpts := append([]grpc.CallOption{grpc.StaticMethod()}, opts...)
+	out := new(RegisterModelResponse)
+	err := c.cc.Invoke(ctx, Executor_RegisterModel_FullMethodName, in, out, cOpts...)
 	if err != nil {
 		return nil, err
 	}
@@ -143,7 +163,16 @@ type ExecutorServer interface {
 	// digest identifies the model, and a matching digest reuses the
 	// already-loaded engine.
 	LoadModel(context.Context, *LoadModelRequest) (*LoadModelResponse, error)
-	// NewSession allocates fresh per-session state (KV cache).
+	// RegisterModel makes a model servable by name (router only): the
+	// router imports the weights into modelstore and compiles the model
+	// for its executor image (a compile job exporting the artifact into
+	// modelstore), unless that was done before. Blocks until the model is
+	// registered; idempotent.
+	RegisterModel(context.Context, *RegisterModelRequest) (*RegisterModelResponse, error)
+	// NewSession allocates fresh per-session state (KV cache). With a
+	// model name (router only), the router loads that registered model
+	// if needed; while it loads, NewSession fails with FAILED_PRECONDITION
+	// and the caller retries.
 	NewSession(context.Context, *NewSessionRequest) (*NewSessionResponse, error)
 	// Chat runs one conversation turn in a session. Multi-turn reuses
 	// the session's cache: only new suffix tokens are prefilled.
@@ -166,6 +195,9 @@ type UnimplementedExecutorServer struct{}
 
 func (UnimplementedExecutorServer) LoadModel(context.Context, *LoadModelRequest) (*LoadModelResponse, error) {
 	return nil, status.Error(codes.Unimplemented, "method LoadModel not implemented")
+}
+func (UnimplementedExecutorServer) RegisterModel(context.Context, *RegisterModelRequest) (*RegisterModelResponse, error) {
+	return nil, status.Error(codes.Unimplemented, "method RegisterModel not implemented")
 }
 func (UnimplementedExecutorServer) NewSession(context.Context, *NewSessionRequest) (*NewSessionResponse, error) {
 	return nil, status.Error(codes.Unimplemented, "method NewSession not implemented")
@@ -211,6 +243,24 @@ func _Executor_LoadModel_Handler(srv interface{}, ctx context.Context, dec func(
 	}
 	handler := func(ctx context.Context, req interface{}) (interface{}, error) {
 		return srv.(ExecutorServer).LoadModel(ctx, req.(*LoadModelRequest))
+	}
+	return interceptor(ctx, in, info, handler)
+}
+
+func _Executor_RegisterModel_Handler(srv interface{}, ctx context.Context, dec func(interface{}) error, interceptor grpc.UnaryServerInterceptor) (interface{}, error) {
+	in := new(RegisterModelRequest)
+	if err := dec(in); err != nil {
+		return nil, err
+	}
+	if interceptor == nil {
+		return srv.(ExecutorServer).RegisterModel(ctx, in)
+	}
+	info := &grpc.UnaryServerInfo{
+		Server:     srv,
+		FullMethod: Executor_RegisterModel_FullMethodName,
+	}
+	handler := func(ctx context.Context, req interface{}) (interface{}, error) {
+		return srv.(ExecutorServer).RegisterModel(ctx, req.(*RegisterModelRequest))
 	}
 	return interceptor(ctx, in, info, handler)
 }
@@ -272,6 +322,10 @@ var Executor_ServiceDesc = grpc.ServiceDesc{
 		{
 			MethodName: "LoadModel",
 			Handler:    _Executor_LoadModel_Handler,
+		},
+		{
+			MethodName: "RegisterModel",
+			Handler:    _Executor_RegisterModel_Handler,
 		},
 		{
 			MethodName: "NewSession",
