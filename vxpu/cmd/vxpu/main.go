@@ -343,7 +343,7 @@ func ensurePod(ctx context.Context, pod string, want routerSettings, reconfigure
 			return waitReady(ctx, pod)
 		}
 		return fmt.Errorf(
-			"pod %q not found and no --image/VXPU_ROUTER_IMAGE set",
+			"router pod %q not found: start it with `vxpu up` (or set VXPU_ROUTER_IMAGE, or pass --router)",
 			pod)
 	}
 	if phase == "Failed" || phase == "Succeeded" {
