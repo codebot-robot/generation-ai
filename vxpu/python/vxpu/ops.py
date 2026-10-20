@@ -159,21 +159,27 @@ def _cpu_experts(plan, moe=None, **_):
 
 
 @implementation("vxpu::moe_experts", "gpu-hot+cpu", ("cpu",), "rounding",
-                "a placement holds this layer's hot experts on the GPU (experts_gpu.py): the token's hot pairs computed "
-                "there on a side stream while the CPU kernels compute the cold ones, and the two sums added",
+                "a placement holds this layer's hot experts on the GPUs (experts_gpu.py): the token's hot pairs computed "
+                "there on side streams while the CPU kernels compute the cold ones, and the sums added",
                 applies=lambda plan, rows=0, hot=False, **ctx: hot and rows <= PINNED_MAX_ROWS and plan["triton"]
                 and _cpu_experts(plan, **ctx), host=True)
-def _moe_gpu_hot(moe, hot, x_in, weights, indices, layer, rec, t0):
+def _moe_gpu_hot(moe, res, x_in, weights, indices, layer, rec, t0):
     dev = x_in.device
     current = torch.cuda.current_stream(dev)
-    hot.stream.wait_stream(current)  # the dense work before produces x_in
-    with torch.cuda.stream(hot.stream):
-        slots = hot.slot_gpu[indices - moe.experts_start_idx]
-        y_hot = triton_ops.fp4_experts_decode(x_in, weights, slots, hot.w1, hot.s1, hot.w3, hot.s3,
-                                              hot.w2, hot.s2, moe.swiglu_limit)
-    x, w, i = _to_host(x_in, weights, indices)  # the GPU computes the hot pairs meanwhile
+    partial = []
+    for pool in res.pools:  # every GPU's share is launched before the host waits for anything
+        pool.stream.wait_stream(current)  # the dense work before produces x_in
+        with torch.cuda.stream(pool.stream):
+            if pool.device == dev:
+                x, w, i = x_in, weights, indices
+            else:  # a few KB to the other GPU
+                x, w, i = (t.to(pool.device, non_blocking=True) for t in (x_in, weights, indices))
+            slots = pool.slot_gpu[i - moe.experts_start_idx]
+            partial.append((pool, triton_ops.fp4_experts_decode(x, w, slots, pool.w1, pool.s1, pool.w3, pool.s3,
+                                                                pool.w2, pool.s2, moe.swiglu_limit)))
+    x, w, i = _to_host(x_in, weights, indices)  # the GPUs compute the hot pairs meanwhile
     t1 = time.perf_counter()
-    cold = hot.slot_cpu[i - moe.experts_start_idx] < 0
+    cold = ~res.held_cpu[i - moe.experts_start_idx]
     n_cold = int(cold.sum())
     y_cold = None
     if n_cold:
@@ -183,10 +189,17 @@ def _moe_gpu_hot(moe, hot, x_in, weights, indices, layer, rec, t0):
         else:  # hot pairs weigh 0: h = w * silu(g) * u = 0, so they add exactly nothing
             y_cold = experts_cpu.forward_batched(moe, x, torch.where(cold, w, torch.zeros_like(w)), i, fused=fused)
     t2 = time.perf_counter()
-    out = _to_device(y_cold, dev) if y_cold is not None else None
-    current.wait_stream(hot.stream)
-    y_hot.record_stream(current)
-    y = y_hot if out is None else y_hot + out
+    y = _to_device(y_cold, dev) if y_cold is not None else None
+    for pool, y_pool in partial:
+        if pool.device == dev:
+            current.wait_stream(pool.stream)
+            y_pool.record_stream(current)
+        else:  # only now does this device's stream wait for the other GPU
+            with torch.cuda.stream(pool.stream):
+                y_pool = y_pool.to(dev, non_blocking=True)
+            current.wait_stream(pool.stream)
+            y_pool.record_stream(current)
+        y = y_pool if y is None else y + y_pool
     if rec is not None:
         t3 = time.perf_counter()
         rec.host_op("moe_experts", wait_to_host_ms=(t1 - t0) * 1e3, impl_ms=(t2 - t1) * 1e3, to_device_ms=(t3 - t2) * 1e3,

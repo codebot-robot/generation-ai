@@ -202,23 +202,30 @@ def _tokens(docs, phase):
     return sum(tel.get(key) or 0 for doc in docs for tel in _records(doc))
 
 
-def placement(counts, per_expert_bytes, budget_bytes):
-    """The hottest experts that fit budget_bytes, chosen across layers by
-    how often they were selected (the most selections served per byte, as
-    every expert costs the same): {"layers": {layer: [ids]}, ...}. The
-    engine holds them on the GPU (experts_gpu.py, VXPU_GPU_EXPERTS)."""
-    if budget_bytes <= 0 or per_expert_bytes <= 0:
-        raise ValueError(f"placement: the budget ({budget_bytes} bytes) and expert size ({per_expert_bytes}) must be positive")
+def placement(counts, per_expert_bytes, budgets):
+    """The hottest experts that fit the budgets (bytes, one per GPU: the
+    engine's own first), chosen across layers by how often they were
+    selected (the most selections served per byte, as every expert costs
+    the same), the hottest on the first GPU, where they need no copy
+    between devices: {"gpus": [{"layers": {layer: [ids]}, ...}], ...}.
+    The engine holds them on the GPUs (experts_gpu.py, VXPU_GPU_EXPERTS)."""
+    if per_expert_bytes <= 0 or not budgets or any(b <= 0 for b in budgets):
+        raise ValueError(f"placement: the budgets ({budgets} bytes) and expert size ({per_expert_bytes}) must be positive")
     ranked = sorted(((n, layer, expert) for layer, c in counts.items() for expert, n in c.items()), reverse=True)
-    k = min(len(ranked), int(budget_bytes // per_expert_bytes))
-    chosen = ranked[:k]
-    layers = collections.defaultdict(list)
-    for _, layer, expert in chosen:
-        layers[layer].append(expert)
     total = sum(n for n, _, _ in ranked)
-    return {"format": "vxpu-placement/1", "experts": k, "bytes": int(k * per_expert_bytes),
-            "share_of_selections": round(sum(n for n, _, _ in chosen) / total, 4) if total else 0.0,
-            "layers": {str(layer): sorted(ids) for layer, ids in sorted(layers.items())}}
+    gpus, start = [], 0
+    for budget in budgets:
+        chosen = ranked[start:start + int(budget // per_expert_bytes)]
+        start += len(chosen)
+        layers = collections.defaultdict(list)
+        for _, layer, expert in chosen:
+            layers[layer].append(expert)
+        gpus.append({"experts": len(chosen), "bytes": int(len(chosen) * per_expert_bytes),
+                     "share_of_selections": round(sum(n for n, _, _ in chosen) / total, 4) if total else 0.0,
+                     "layers": {str(layer): sorted(ids) for layer, ids in sorted(layers.items())}})
+    held = ranked[:start]
+    return {"format": "vxpu-placement/2", "experts": start, "bytes": int(start * per_expert_bytes),
+            "share_of_selections": round(sum(n for n, _, _ in held) / total, 4) if total else 0.0, "gpus": gpus}
 
 
 def main(argv=None):
@@ -228,8 +235,9 @@ def main(argv=None):
     p.add_argument("--artifact", help="artifact directory, for expert sizes and storage bandwidth")
     p.add_argument("--tokens-per-s", type=float, default=20.0)
     p.add_argument("--json", help="also write the full report here")
-    p.add_argument("--placement-gb", type=float,
-                   help="with --artifact and --placement-out: choose the hottest experts that fit this many GB on a GPU")
+    p.add_argument("--placement-gb",
+                   help="with --artifact and --placement-out: choose the hottest experts that fit this many GB on the "
+                   "engine's GPU (a comma-separated list for more GPUs, the engine's first)")
     p.add_argument("--placement-out", help="where to write the placement (for VXPU_GPU_EXPERTS)")
     args = p.parse_args(argv)
     out, text = report(args.files, args.phase, args.artifact, args.tokens_per_s)
@@ -238,11 +246,14 @@ def main(argv=None):
         if not (args.artifact and args.placement_out):
             raise SystemExit("--placement-gb needs --artifact (for expert sizes) and --placement-out")
         per_expert, _ = expert_bytes(args.artifact)
-        plan = placement(collect(load(args.files))[args.phase], per_expert, args.placement_gb * 1e9)
+        budgets = [float(gb) * 1e9 for gb in args.placement_gb.split(",")]
+        plan = placement(collect(load(args.files))[args.phase], per_expert, budgets)
         with open(args.placement_out, "w") as f:
             json.dump(plan, f, indent=1)
+        per_gpu = ", ".join(f"{g['experts']} ({g['bytes'] / 1e9:.1f} GB, {g['share_of_selections']:.0%})" for g in plan["gpus"])
         print(f"placement: {plan['experts']} experts ({plan['bytes'] / 1e9:.1f} GB) serving "
-              f"{plan['share_of_selections']:.0%} of the recorded {args.phase} selections -> {args.placement_out}")
+              f"{plan['share_of_selections']:.0%} of the recorded {args.phase} selections; per GPU {per_gpu} "
+              f"-> {args.placement_out}")
     if args.json:
         with open(args.json, "w") as f:
             json.dump(out, f, indent=1)

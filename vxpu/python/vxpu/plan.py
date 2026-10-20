@@ -309,8 +309,8 @@ class Plan:
             # banks on the GPU would cost its memory and never run
             hot, src = None, "requires CUDA, Triton and the CPU kernels"
         self._set("gpu_experts", hot, src, (),
-                  "a placement file ({layer: [expert ids]}, from expert_stats --placement-gb): those experts are held "
-                  "on the GPU and computed there alongside the CPU's (experts_gpu.py)")
+                  "a placement file (per GPU, {layer: [expert ids]}, from expert_stats --placement-gb): those experts "
+                  "are held on the GPUs and computed there alongside the CPU's (experts_gpu.py)")
         in_ram, src = env_flag("VXPU_EXPERTS_IN_RAM", False)
         placement = "ram" if (in_ram or not ext_dir) else "mmap"
         self._set("experts_placement", placement, src if in_ram else ("default" if not ext_dir else "external_dir"),
