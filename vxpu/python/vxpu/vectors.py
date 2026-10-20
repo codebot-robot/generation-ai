@@ -1235,10 +1235,11 @@ def _check_expert_mailboxes(model, prompts, settings, artifact, plain, workdir):
 
 def _check_expert_remote(model, prompts, settings, artifact, plain):
     """Experts answered by another process (expert_server.py): a server
-    holding every other layer's banks, on a local port, and the engine's
-    mailboxes sending it those layers' pairs. The server computes with
-    the same CPU kernels, so tokens and logits must be bit-identical to
-    the plain engine's."""
+    holding every other layer's banks, on a local port, and the engine,
+    which does not load those layers' banks, sending it every call of
+    theirs (prefill included) through its mailboxes. The server computes
+    with the same CPU kernels, so tokens and logits must be bit-identical
+    to the plain engine's."""
     import subprocess
     import sys
     import threading
@@ -1267,8 +1268,13 @@ def _check_expert_remote(model, prompts, settings, artifact, plain):
         if address is None or ":" not in address:
             print("expert remote check: the expert server did not start:\n" + "".join(lines[-20:]))
             return False
+        keep = []
         got = _with_env({"VXPU_EXPERT_MAILBOXES": "1", "VXPU_EXPERT_REMOTE": address, "VXPU_GPU_EXPERTS": None},
-                        record_vxpu_engine, model, "main", prompts, settings, artifact)
+                        record_vxpu_engine, model, "main", prompts, settings, artifact, keep=keep)
+        loaded = [layer for layer in served if not keep[0].external.experts[layer].w1.is_meta]
+        if loaded:
+            print(f"expert remote check: layers {loaded} are on the expert server but were loaded here too")
+            return False
         if not _check_expert_server_errors(address, artifact, served[0]):
             return False
     finally:

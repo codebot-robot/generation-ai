@@ -115,7 +115,7 @@ def moe_experts(x_in: torch.Tensor, weights: torch.Tensor, indices: torch.Tensor
     if x_in.is_meta:  # a graph walked on the meta device (loading, device passes): shape only
         return x_in.new_empty((x_in.shape[0], x_in.shape[1]), dtype=torch.float32)
     moe = _current("experts", layer)
-    host = moe.w1.device
+    host = moe.w1.device if not moe.w1.is_meta else torch.device("cpu")  # meta: the banks are on an expert server
     # decode-sized inputs cross through the engine's pinned buffers; a
     # prefill keeps plain copies (its crossing is noise against its compute,
     # and pinned buffers sized for the longest prompt would stay pinned)
@@ -123,9 +123,10 @@ def moe_experts(x_in: torch.Tensor, weights: torch.Tensor, indices: torch.Tensor
     rec = _recorder()
     t0 = time.perf_counter() if rec is not None else 0.0
     boxes = getattr(moe, "_vxpu_mailboxes", None)
-    if boxes is not None and x_in.shape[0] <= PINNED_MAX_ROWS:
+    remote_only = boxes is not None and boxes.remote is not None and moe.w1.is_meta  # its banks are not here
+    if boxes is not None and (x_in.shape[0] <= PINNED_MAX_ROWS or remote_only):
         impl = _plan(host.type).select("vxpu::moe_experts", host.type, key=f"rows={x_in.shape[0]}", moe=moe,
-                                       rows=x_in.shape[0], mailboxes=True)
+                                       rows=x_in.shape[0], mailboxes=True, remote_only=remote_only)
         if impl.fn is _moe_mailboxes:
             return _moe_mailboxes(moe, boxes, x_in, weights, indices, layer, rec, t0, crossing)
     hot = getattr(moe, "_vxpu_hot", None) if crossing else None
@@ -172,8 +173,9 @@ def _cpu_experts(plan, moe=None, **_):
 @implementation("vxpu::moe_experts", "mailboxes", ("cpu",), "rounding",
                 "decode: each (token, k) pair answered by its expert's owner (the CPU kernels, a GPU pool) and the "
                 "replies summed in k order, so the sum does not depend on where each expert ran (mailboxes.py)",
-                applies=lambda plan, rows=0, mailboxes=False, **ctx: mailboxes and rows <= PINNED_MAX_ROWS
-                and plan["fused_experts"] and _cpu_experts(plan, **ctx), host=True)
+                applies=lambda plan, rows=0, mailboxes=False, remote_only=False, **ctx: mailboxes and (
+                    remote_only or (rows <= PINNED_MAX_ROWS and plan["fused_experts"] and _cpu_experts(plan, **ctx))),
+                host=True)
 def _moe_mailboxes(moe, boxes, x_in, weights, indices, layer, rec, t0, crossing):
     host = _to_host(x_in, weights, indices) if crossing else None
     t1 = time.perf_counter()

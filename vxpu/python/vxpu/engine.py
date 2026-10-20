@@ -273,9 +273,18 @@ class Engine:
         # when the node has the 272 GB, so residency is guaranteed rather
         # than left to the page cache; the kernels are memory-bound and
         # want the bytes resident.
-        experts, downloaded = load_expert_layers(self.manifest, external.get("experts", {}), args, cas_dir, mm,
-                                                 in_ram=self.plan["experts_placement"] == "ram")
+        # Layers an expert server holds (expert_remote) are not loaded
+        # here: their modules keep the meta banks they are built with, and
+        # every call of theirs goes to the server through the mailboxes.
+        self._remotes = self._connect_expert_servers()
+        self._remote_layers = {layer for r in self._remotes for layer in r.layers}
+        specs = external.get("experts", {})
+        local = {int(layer) for layer in specs} - self._remote_layers
+        experts, downloaded = load_expert_layers(self.manifest, specs, args, cas_dir, mm,
+                                                 in_ram=self.plan["experts_placement"] == "ram", layers=local)
         self.external.experts.update(experts)
+        for layer in sorted({int(layer) for layer in specs} & self._remote_layers):
+            self.external.experts[layer] = ds.host_experts(layer, args, {})
         self.bytes_fetched += downloaded
         if self.plan["gpu_experts"] and self.external.experts:
             self._place_hot_experts(self.plan["gpu_experts"])
@@ -292,14 +301,19 @@ class Engine:
             self.external.engram[int(layer)] = ds.host_engram(int(layer), spec["num_embeddings"], spec["dim"], weight, scale)
             ops.ENGRAM_DIM[int(layer)] = spec["dim"]
 
+    def _connect_expert_servers(self):
+        """The expert servers of the plan's expert_remote, connected."""
+        from . import mailboxes
+        from .expert_server import checkpoint_id
+        return [mailboxes.RemoteOwner(a, checkpoint=checkpoint_id(self.manifest))
+                for a in (self.plan["expert_remote"] or "").split(",") if a]
+
     def _attach_mailboxes(self):
         """Decode's experts as mailboxes (mailboxes.py): per layer, the GPU
         pools of its residency, an expert server holding it (expert_remote)
         or the CPU here for the rest."""
         from . import mailboxes
-        from .expert_server import checkpoint_id
-        remotes = [mailboxes.RemoteOwner(a, checkpoint=checkpoint_id(self.manifest))
-                   for a in (self.plan["expert_remote"] or "").split(",") if a]
+        remotes = self._remotes
         owners = collections.Counter()
         for layer, moe in self.external.experts.items():
             remote = next((r for r in remotes if layer in r.layers), None)
@@ -320,6 +334,8 @@ class Engine:
         if len(gpus) > len(devices):
             raise ValueError(f"placement {path} names {len(gpus)} GPUs; {len(devices)} are visible")
         for layer, moe in self.external.experts.items():
+            if layer in self._remote_layers:
+                continue  # its banks are on an expert server, not here to copy from
             by_device = [(dev, gpu.get(layer)) for dev, gpu in zip(devices, gpus)]
             if any(ids for _, ids in by_device):
                 moe._vxpu_hot = experts_gpu.Residency(moe, by_device)
