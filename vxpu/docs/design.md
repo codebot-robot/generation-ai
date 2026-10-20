@@ -179,10 +179,10 @@ Before the GPUs, the planner decides whose RAM holds each layer's
 experts. The engine keeps the layers that fit its budget (85% of its
 RAM, less 16 GiB, less the dense weights when it has no GPU). The next
 layers go to other free executors, each up to its own budget. Each of
-those executors loads its layers and answers on a port of its machine
-(the `ServeExperts` RPC, the expert server of §4 in the executor), and
-the router wires the engine's mailboxes to them (`VXPU_EXPERT_REMOTE`,
-which only the router sets). Layers that fit no machine stay on the
+those executors serves the experts nodes of its layers from a native
+node server (§6, the `ServeNodes` RPC), and the router wires the engine's
+mailboxes for those nodes to it (`VXPU_REMOTE_NODES`, which only the
+router sets). Layers that fit no machine stay on the
 engine, paged from its disk. The GPUs then hold the hottest experts of
 the layers the engine keeps. So a model that fits no single machine runs
 on several smaller ones: GPUs with 24 GB, or none, and CPU machines for
@@ -281,13 +281,18 @@ computes.
 - On one machine, the whole step can be one CUDA graph: host ops become
   mailboxes the GPU waits on itself (a flag in pinned memory), with no
   Python in between.
-- Across machines, the transport is RDMA verbs, with Soft-iWARP where
-  there is no RDMA NIC, written once for both (#386). Today an expert
-  server (`expert_server.py`, `VXPU_EXPERT_REMOTE`) answers a layer's
-  messages over a length-prefixed TCP protocol from Python: the same
-  message contents and error semantics, as a first step. It is
-  bit-identical to the CPU here, at ~0.2-0.3 ms per remote layer call
-  on loopback.
+- Across machines, a node runs on a node server (`nodeserver.py`,
+  `csrc/node_server.cpp`, #394): the node compiled to an AOTInductor
+  package, a host op lowered to the native kernels (`nodes.py`), its
+  residents loaded once, answering its mailbox over TCP (`tcp://`, a
+  small binary framing) with no Python per message. The engine's side is
+  a native client, reached from the host op itself, so node by node,
+  the dataflow runner, the step graph and prefill all reach it. The
+  coordinator places nodes by name: an executor describes the decode
+  step's nodes (`DescribeNodes`) and serves those it is given
+  (`ServeNodes`). Remote nodes are bit-identical to local ones. RDMA
+  verbs, with Soft-iWARP where there is no RDMA NIC (#386), and shared
+  memory are further mailbox addresses for the same messages.
 - Chains of mailboxes that traffic always takes compile as one unit
   (#387).
 - The coordinator places subgraph nodes by name, on CPUs, GPUs, SSDs and

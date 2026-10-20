@@ -174,7 +174,7 @@ doesn't understand: `VXPU_KERNELS`, `VXPU_FUSED_EXPERTS`,
 `VXPU_BF16_CACHE_HEADROOM_GB`, `VXPU_GPU_EXPERTS_MOVES`,
 `VXPU_GPU_EXPERTS_REQUEST_WEIGHT`, `VXPU_EXPERT_MAILBOXES`, `VXPU_DATAFLOW`,
 `VXPU_DATAFLOW_PLACE`, `VXPU_STEP_GRAPH`; and `VXPU_EXTERNAL_DIR`,
-`VXPU_AOTI_CACHE_DIR`, `VXPU_GPU_EXPERTS` and `VXPU_EXPERT_REMOTE`, taken as
+`VXPU_AOTI_CACHE_DIR`, `VXPU_GPU_EXPERTS` and `VXPU_REMOTE_NODES`, taken as
 given. Choosing between plans by cost, and
 deployment hints, come next (#316, #332, #349). `vxpu machines [NAME]`
 shows the machine database (`pkg/machines`).
@@ -200,16 +200,17 @@ On DeepSeek-V4.1-Flash the graph is 85 nodes (43 dense, 40 experts,
 - **`VXPU_EXPERT_MAILBOXES=1`** answers decode's routed experts through
   mailboxes (`python/vxpu/mailboxes.py`):
   - each (token, k) pair goes to its expert's owner: the CPU kernels, a
-    GPU pool of hot experts (`VXPU_GPU_EXPERTS`), or an expert server;
+    GPU pool of hot experts (`VXPU_GPU_EXPERTS`);
   - every owner replies with the pair's bf16 down projection;
   - the replies are summed in k order whoever answered.
 
   With every expert on the CPU this is bit-identical to the fused kernel.
-- **`VXPU_EXPERT_REMOTE=host:port[,host:port]`** (with `VXPU_EXPERT_MAILBOXES=1`) names expert servers:
-  `python -m vxpu.expert_server ARTIFACT --port P --layers 0,2`, another
-  process on this machine or another one. A server answers the layers it
-  holds over TCP with the same CPU kernels, so the results are
-  bit-identical. The engine does not load those layers' banks at all.
+- **`VXPU_REMOTE_NODES=name=tcp://host:port/index[,...]`** names host
+  nodes (an experts layer, an n-gram table) a node server serves: another
+  executor, on this machine or another, running the nodes as native
+  packages (`python/vxpu/nodeserver.py`; the coordinator starts them with
+  `ServeNodes` and sets this). The engine does not load those nodes'
+  banks or tables, and the results are bit-identical.
 - **`VXPU_STEP_GRAPH=1`** (CUDA, with `VXPU_DATAFLOW=1` and
   `VXPU_SEGMENT_RUNTIME=aoti`) captures the whole decode step in one CUDA
   graph (`python/vxpu/stepgraph.py`):

@@ -1360,98 +1360,6 @@ def _check_expert_mailboxes(model, prompts, settings, artifact, plain, workdir):
     return ok
 
 
-def _check_expert_remote(model, prompts, settings, artifact, plain):
-    """Experts answered by another executor: an executor asked to serve
-    every other layer's experts (ServeExperts, as the coordinator asks it,
-    #394) holds those banks and answers on a port of its machine; the
-    engine, which does not load those layers' banks, sends it every call
-    of theirs (prefill included) through its mailboxes. The server
-    computes with the same CPU kernels, so tokens and logits must be
-    bit-identical to the plain engine's."""
-    from . import vxpu_pb2
-    from .server import ExecutorServicer
-    with open(os.path.join(artifact, "binding.json")) as f:
-        binding = f.read()
-    with open(os.path.join(artifact, "manifest.json")) as f:
-        manifest = f.read()
-    layers = sorted(int(x) for x in ((json.loads(binding).get("external") or {}).get("experts") or {}))
-    if not layers:
-        return True
-    served = layers[::2]
-
-    class Context:  # what a gRPC call's context records
-        code = details = None
-
-        def set_code(self, code):
-            self.code = code
-
-        def set_details(self, details):
-            self.details = details
-
-    executor, ctx = ExecutorServicer(work_dir=tempfile.mkdtemp(prefix="vxpu-experts-")), Context()
-    resp = executor.ServeExperts(vxpu_pb2.ServeExpertsRequest(manifest_json=manifest, binding_json=binding,
-                                                              layers=served), ctx)
-    if ctx.code is not None or not resp.port:
-        print(f"expert remote check: ServeExperts failed: {ctx.code} {ctx.details}")
-        return False
-    address = f"127.0.0.1:{resp.port}"
-    try:
-        again = executor.ServeExperts(vxpu_pb2.ServeExpertsRequest(manifest_json=manifest, binding_json=binding,
-                                                                   layers=served), ctx)
-        if again.port != resp.port:
-            print("expert remote check: asking again for the same experts should not start another server")
-            return False
-        keep = []
-        got = _with_env({"VXPU_EXPERT_MAILBOXES": "1", "VXPU_EXPERT_REMOTE": address, "VXPU_GPU_EXPERTS": None},
-                        record_vxpu_engine, model, "main", prompts, settings, artifact, keep=keep)
-        loaded = [layer for layer in served if not keep[0].external.experts[layer].w1.is_meta]
-        if loaded:
-            print(f"expert remote check: layers {loaded} are on the expert server but were loaded here too")
-            return False
-        if not _check_expert_server_errors(address, artifact, served[0]):
-            return False
-    finally:
-        executor.experts[1].shutdown()
-        executor.experts[1].server_close()
-    same = ([p["generated_ids"] for p in got["prompts"]] == [p["generated_ids"] for p in plain["prompts"]]
-            and [p["top_logits"] for p in got["prompts"]] == [p["top_logits"] for p in plain["prompts"]])
-    rows, _ = compare(plain, got, strict_tokens=True)
-    print(f"experts of layers {served} answered by another executor at {address}, against the plain engine "
-          "(must be bit-identical):")
-    print(table(plain, got, rows))
-    if not same:
-        print("expert remote check: not bit-identical")
-    return same
-
-
-def _check_expert_server_errors(address, artifact, layer):
-    """The expert server refuses a request it cannot serve with a reason
-    the engine hears (a layer it does not hold), then closes; the next
-    request is answered on a new connection."""
-    import torch
-    from . import expert_server, mailboxes
-    with open(os.path.join(artifact, "manifest.json")) as f:
-        owner = mailboxes.RemoteOwner(address, checkpoint=expert_server.checkpoint_id(json.load(f)))
-    experts, _ = expert_server.load(artifact, {layer})
-    moe = experts[layer]
-    x = torch.zeros(1, moe.dim, dtype=torch.bfloat16)
-    one = torch.zeros(1, dtype=torch.long)
-    try:
-        owner.answer(moe, x, one, one + moe.experts_start_idx, torch.ones(1), layer=10_000)
-    except RuntimeError as e:
-        if "not held here" not in str(e):
-            print(f"expert remote check: unexpected refusal: {e}")
-            return False
-    else:
-        print("expert remote check: a request for a layer the server does not hold was answered")
-        return False
-    if owner.answer(moe, x, one, one + moe.experts_start_idx, torch.ones(1), layer=layer).shape != (1, moe.dim):
-        print("expert remote check: no answer after the refused request")
-        return False
-    owner.close()
-    return True
-
-
 def _check_step_graph(model, prompts, settings, artifact, workdir):
     """On a GPU: the whole decode step in one CUDA graph (stepgraph.py),
     the AOTInductor segments and the host ops as mailboxes the GPU waits
@@ -1697,19 +1605,52 @@ def _check_native_nodes(model, prompts, settings, artifact, workdir):
 
 
 def _check_remote_nodes(model, prompts, settings, artifact, plain, workdir):
-    """Host nodes in another process (#394): a node server serves every
-    other experts layer's node and the n-gram nodes, and the engine, which
-    does not load their banks or tables, sends their host ops' inputs to
-    the server's mailboxes (remote_nodes), prefill and decode alike. The
+    """Host nodes in another executor (#394), as the coordinator places
+    them: the executor describes the decode step's nodes (DescribeNodes),
+    and serves every other experts layer's node and the n-gram nodes
+    (ServeNodes) from a native node server. The engine, which does not
+    load their banks or tables, sends their host ops' inputs to the
+    server's mailboxes (remote_nodes), prefill and decode alike. The
     server runs the native kernels on the same arguments, so tokens and
     logits must be bit-identical to the plain engine's."""
-    from . import nodes, nodeserver
-    calls = nodes.host_calls(nodes.decode_split(artifact))
-    experts = sorted((i, name) for name, (kind, i) in calls.items() if kind == "experts")
-    served = [name for _, name in experts[::2]] + [name for name, (kind, _) in calls.items() if kind == "engram"]
-    server = nodeserver.start(artifact, served, cache_dir=os.path.join(workdir, "native-nodes"))
+    from . import vxpu_pb2
+    from .server import ExecutorServicer
+
+    class Context:  # what a gRPC call's context records
+        code = details = None
+
+        def set_code(self, code):
+            self.code = code
+
+        def set_details(self, details):
+            self.details = details
+
+        def is_active(self):
+            return True
+
+    files = {}
+    for name in ("manifest.json", "binding.json", "decode.pt2"):
+        with open(os.path.join(artifact, name), "rb") as f:
+            files[name] = f.read()
+    request = dict(manifest_json=files["manifest.json"].decode(), binding_json=files["binding.json"].decode(),
+                   decode_graph=files["decode.pt2"])
+    executor, ctx = ExecutorServicer(work_dir=tempfile.mkdtemp(prefix="vxpu-nodes-")), Context()
+    described = json.loads(executor.DescribeNodes(vxpu_pb2.DescribeNodesRequest(**request), ctx).nodes_json or "[]")
+    host = [n for n in described if "collection" in n]
+    if ctx.code is not None or not host or any(n["resident_bytes"] <= 0 for n in host):
+        print(f"remote nodes check: DescribeNodes failed or described no host nodes: {ctx.code} {ctx.details} {described}")
+        return False
+    experts = sorted((n["index"], n["name"]) for n in host if n["collection"] == "experts")
+    served = [name for _, name in experts[::2]] + [n["name"] for n in host if n["collection"] == "engram"]
+    calls = {n["name"]: (n["collection"], n["index"]) for n in host}
+    resp = _with_env({"VXPU_AOTI_CACHE_DIR": os.path.join(workdir, "native-nodes")}, executor.ServeNodes,
+                     vxpu_pb2.ServeNodesRequest(nodes=served, **request), ctx)
+    if ctx.code is not None or not resp.port:
+        print(f"remote nodes check: ServeNodes failed: {ctx.code} {ctx.details}")
+        return False
+    server = executor.node_server[1]
     try:
-        spec = ",".join(f"{name}=tcp://127.0.0.1:{server.port()}/{i}" for i, name in enumerate(served))
+        spec = ",".join(f"{name}=tcp://127.0.0.1:{resp.port}/{i}" for i, name in enumerate(served))
         keep = []
         got = _with_env({"VXPU_REMOTE_NODES": spec, "VXPU_EXPERT_MAILBOXES": None, "VXPU_GPU_EXPERTS": None},
                         record_vxpu_engine, model, "main", prompts, settings, artifact, keep=keep)
@@ -1915,8 +1856,6 @@ def selftest(workdir, settings):
             failed.append(name + " (dataflow)")
         if name == "tiny-deepseek-v41" and not _check_expert_mailboxes(model, prompts, settings, artifact, got, workdir):
             failed.append(name + " (expert mailboxes)")
-        if name == "tiny-deepseek-v41" and not _check_expert_remote(model, prompts, settings, artifact, got):
-            failed.append(name + " (expert remote)")
         if name == "tiny-deepseek-v41" and not _check_native_nodes(model, prompts, settings, artifact, workdir):
             failed.append(name + " (native nodes)")
         if name == "tiny-deepseek-v41" and not _check_remote_nodes(model, prompts, settings, artifact, got, workdir):

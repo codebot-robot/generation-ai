@@ -41,7 +41,8 @@ const (
 	Executor_GetModelStats_FullMethodName = "/vxpu.Executor/GetModelStats"
 	Executor_Describe_FullMethodName      = "/vxpu.Executor/Describe"
 	Executor_ExplainModel_FullMethodName  = "/vxpu.Executor/ExplainModel"
-	Executor_ServeExperts_FullMethodName  = "/vxpu.Executor/ServeExperts"
+	Executor_DescribeNodes_FullMethodName = "/vxpu.Executor/DescribeNodes"
+	Executor_ServeNodes_FullMethodName    = "/vxpu.Executor/ServeNodes"
 )
 
 // ExecutorClient is the client API for Executor service.
@@ -93,11 +94,15 @@ type ExecutorClient interface {
 	// ExplainModel (router only) returns the plan the coordinator chose for
 	// a model's last load by name, and why (#394).
 	ExplainModel(ctx context.Context, in *ExplainModelRequest, opts ...grpc.CallOption) (*ExplainModelResponse, error)
-	// ServeExperts (executor only) loads some layers' routed experts of an
-	// artifact and serves them to other executors' mailboxes on a port of
-	// this machine (expert_server.py): how the coordinator spreads a model's
-	// experts over executors (#394). Answers once the banks are loaded.
-	ServeExperts(ctx context.Context, in *ServeExpertsRequest, opts ...grpc.CallOption) (*ServeExpertsResponse, error)
+	// DescribeNodes (executor only) describes an artifact's decode step as
+	// a dataflow graph: its nodes in call order, and for a host node what
+	// it reads and how many bytes that is (#394). The coordinator places
+	// nodes from it.
+	DescribeNodes(ctx context.Context, in *DescribeNodesRequest, opts ...grpc.CallOption) (*DescribeNodesResponse, error)
+	// ServeNodes (executor only) serves some of an artifact's decode-step
+	// nodes on a port of this machine: a native node server (nodeserver.py)
+	// that answers their tcp:// mailboxes. Answers once they are loaded.
+	ServeNodes(ctx context.Context, in *ServeNodesRequest, opts ...grpc.CallOption) (*ServeNodesResponse, error)
 }
 
 type executorClient struct {
@@ -197,10 +202,20 @@ func (c *executorClient) ExplainModel(ctx context.Context, in *ExplainModelReque
 	return out, nil
 }
 
-func (c *executorClient) ServeExperts(ctx context.Context, in *ServeExpertsRequest, opts ...grpc.CallOption) (*ServeExpertsResponse, error) {
+func (c *executorClient) DescribeNodes(ctx context.Context, in *DescribeNodesRequest, opts ...grpc.CallOption) (*DescribeNodesResponse, error) {
 	cOpts := append([]grpc.CallOption{grpc.StaticMethod()}, opts...)
-	out := new(ServeExpertsResponse)
-	err := c.cc.Invoke(ctx, Executor_ServeExperts_FullMethodName, in, out, cOpts...)
+	out := new(DescribeNodesResponse)
+	err := c.cc.Invoke(ctx, Executor_DescribeNodes_FullMethodName, in, out, cOpts...)
+	if err != nil {
+		return nil, err
+	}
+	return out, nil
+}
+
+func (c *executorClient) ServeNodes(ctx context.Context, in *ServeNodesRequest, opts ...grpc.CallOption) (*ServeNodesResponse, error) {
+	cOpts := append([]grpc.CallOption{grpc.StaticMethod()}, opts...)
+	out := new(ServeNodesResponse)
+	err := c.cc.Invoke(ctx, Executor_ServeNodes_FullMethodName, in, out, cOpts...)
 	if err != nil {
 		return nil, err
 	}
@@ -256,11 +271,15 @@ type ExecutorServer interface {
 	// ExplainModel (router only) returns the plan the coordinator chose for
 	// a model's last load by name, and why (#394).
 	ExplainModel(context.Context, *ExplainModelRequest) (*ExplainModelResponse, error)
-	// ServeExperts (executor only) loads some layers' routed experts of an
-	// artifact and serves them to other executors' mailboxes on a port of
-	// this machine (expert_server.py): how the coordinator spreads a model's
-	// experts over executors (#394). Answers once the banks are loaded.
-	ServeExperts(context.Context, *ServeExpertsRequest) (*ServeExpertsResponse, error)
+	// DescribeNodes (executor only) describes an artifact's decode step as
+	// a dataflow graph: its nodes in call order, and for a host node what
+	// it reads and how many bytes that is (#394). The coordinator places
+	// nodes from it.
+	DescribeNodes(context.Context, *DescribeNodesRequest) (*DescribeNodesResponse, error)
+	// ServeNodes (executor only) serves some of an artifact's decode-step
+	// nodes on a port of this machine: a native node server (nodeserver.py)
+	// that answers their tcp:// mailboxes. Answers once they are loaded.
+	ServeNodes(context.Context, *ServeNodesRequest) (*ServeNodesResponse, error)
 	mustEmbedUnimplementedExecutorServer()
 }
 
@@ -295,8 +314,11 @@ func (UnimplementedExecutorServer) Describe(context.Context, *DescribeRequest) (
 func (UnimplementedExecutorServer) ExplainModel(context.Context, *ExplainModelRequest) (*ExplainModelResponse, error) {
 	return nil, status.Error(codes.Unimplemented, "method ExplainModel not implemented")
 }
-func (UnimplementedExecutorServer) ServeExperts(context.Context, *ServeExpertsRequest) (*ServeExpertsResponse, error) {
-	return nil, status.Error(codes.Unimplemented, "method ServeExperts not implemented")
+func (UnimplementedExecutorServer) DescribeNodes(context.Context, *DescribeNodesRequest) (*DescribeNodesResponse, error) {
+	return nil, status.Error(codes.Unimplemented, "method DescribeNodes not implemented")
+}
+func (UnimplementedExecutorServer) ServeNodes(context.Context, *ServeNodesRequest) (*ServeNodesResponse, error) {
+	return nil, status.Error(codes.Unimplemented, "method ServeNodes not implemented")
 }
 func (UnimplementedExecutorServer) mustEmbedUnimplementedExecutorServer() {}
 func (UnimplementedExecutorServer) testEmbeddedByValue()                  {}
@@ -456,20 +478,38 @@ func _Executor_ExplainModel_Handler(srv interface{}, ctx context.Context, dec fu
 	return interceptor(ctx, in, info, handler)
 }
 
-func _Executor_ServeExperts_Handler(srv interface{}, ctx context.Context, dec func(interface{}) error, interceptor grpc.UnaryServerInterceptor) (interface{}, error) {
-	in := new(ServeExpertsRequest)
+func _Executor_DescribeNodes_Handler(srv interface{}, ctx context.Context, dec func(interface{}) error, interceptor grpc.UnaryServerInterceptor) (interface{}, error) {
+	in := new(DescribeNodesRequest)
 	if err := dec(in); err != nil {
 		return nil, err
 	}
 	if interceptor == nil {
-		return srv.(ExecutorServer).ServeExperts(ctx, in)
+		return srv.(ExecutorServer).DescribeNodes(ctx, in)
 	}
 	info := &grpc.UnaryServerInfo{
 		Server:     srv,
-		FullMethod: Executor_ServeExperts_FullMethodName,
+		FullMethod: Executor_DescribeNodes_FullMethodName,
 	}
 	handler := func(ctx context.Context, req interface{}) (interface{}, error) {
-		return srv.(ExecutorServer).ServeExperts(ctx, req.(*ServeExpertsRequest))
+		return srv.(ExecutorServer).DescribeNodes(ctx, req.(*DescribeNodesRequest))
+	}
+	return interceptor(ctx, in, info, handler)
+}
+
+func _Executor_ServeNodes_Handler(srv interface{}, ctx context.Context, dec func(interface{}) error, interceptor grpc.UnaryServerInterceptor) (interface{}, error) {
+	in := new(ServeNodesRequest)
+	if err := dec(in); err != nil {
+		return nil, err
+	}
+	if interceptor == nil {
+		return srv.(ExecutorServer).ServeNodes(ctx, in)
+	}
+	info := &grpc.UnaryServerInfo{
+		Server:     srv,
+		FullMethod: Executor_ServeNodes_FullMethodName,
+	}
+	handler := func(ctx context.Context, req interface{}) (interface{}, error) {
+		return srv.(ExecutorServer).ServeNodes(ctx, req.(*ServeNodesRequest))
 	}
 	return interceptor(ctx, in, info, handler)
 }
@@ -510,8 +550,12 @@ var Executor_ServiceDesc = grpc.ServiceDesc{
 			Handler:    _Executor_ExplainModel_Handler,
 		},
 		{
-			MethodName: "ServeExperts",
-			Handler:    _Executor_ServeExperts_Handler,
+			MethodName: "DescribeNodes",
+			Handler:    _Executor_DescribeNodes_Handler,
+		},
+		{
+			MethodName: "ServeNodes",
+			Handler:    _Executor_ServeNodes_Handler,
 		},
 	},
 	Streams: []grpc.StreamDesc{

@@ -231,3 +231,30 @@ def is_native(sub):
     return any(n.op == "call_function" and _host_op(n.target) for n in sub.graph.nodes)
 
 
+def describe(split, manifest, binding):
+    """The decode step's nodes, for the coordinator (#394): [{name, kind,
+    layers}] in call order, and for a host node the collection and index
+    its op reads and its residents' bytes (what a node server holding it
+    needs in RAM)."""
+    from . import segments
+    from .telemetry import segment_info
+    tensors = manifest["tensors"]
+    specs = binding.get("external") or {}
+
+    def nbytes(names):
+        return sum(tensors[n]["length"] for n in names)
+
+    out = []
+    info = {seg["name"]: seg for seg in segment_info(split)}
+    for name, sub in segments.segments_of(split):
+        node = {"name": name, "kind": info[name]["kind"], "layers": info[name]["layers"]}
+        if is_native(sub):
+            kind, index = host_call(sub)
+            spec = specs.get(kind, {}).get(str(index), {})
+            if kind == "experts":
+                resident = nbytes(t for bank in spec.values() for part in bank["parts"] for t in part)
+            else:
+                resident = nbytes([spec["weight"], spec["scale"]]) if spec else 0
+            node.update(collection=kind, index=index, resident_bytes=resident)
+        out.append(node)
+    return out

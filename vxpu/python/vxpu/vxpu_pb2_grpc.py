@@ -96,10 +96,15 @@ class ExecutorStub:
                 request_serializer=vxpu__pb2.ExplainModelRequest.SerializeToString,
                 response_deserializer=vxpu__pb2.ExplainModelResponse.FromString,
                 _registered_method=True)
-        self.ServeExperts = channel.unary_unary(
-                '/vxpu.Executor/ServeExperts',
-                request_serializer=vxpu__pb2.ServeExpertsRequest.SerializeToString,
-                response_deserializer=vxpu__pb2.ServeExpertsResponse.FromString,
+        self.DescribeNodes = channel.unary_unary(
+                '/vxpu.Executor/DescribeNodes',
+                request_serializer=vxpu__pb2.DescribeNodesRequest.SerializeToString,
+                response_deserializer=vxpu__pb2.DescribeNodesResponse.FromString,
+                _registered_method=True)
+        self.ServeNodes = channel.unary_unary(
+                '/vxpu.Executor/ServeNodes',
+                request_serializer=vxpu__pb2.ServeNodesRequest.SerializeToString,
+                response_deserializer=vxpu__pb2.ServeNodesResponse.FromString,
                 _registered_method=True)
 
 
@@ -190,11 +195,20 @@ class ExecutorServicer:
         context.set_details('Method not implemented!')
         raise NotImplementedError('Method not implemented!')
 
-    def ServeExperts(self, request, context):
-        """ServeExperts (executor only) loads some layers' routed experts of an
-        artifact and serves them to other executors' mailboxes on a port of
-        this machine (expert_server.py): how the coordinator spreads a model's
-        experts over executors (#394). Answers once the banks are loaded.
+    def DescribeNodes(self, request, context):
+        """DescribeNodes (executor only) describes an artifact's decode step as
+        a dataflow graph: its nodes in call order, and for a host node what
+        it reads and how many bytes that is (#394). The coordinator places
+        nodes from it.
+        """
+        context.set_code(grpc.StatusCode.UNIMPLEMENTED)
+        context.set_details('Method not implemented!')
+        raise NotImplementedError('Method not implemented!')
+
+    def ServeNodes(self, request, context):
+        """ServeNodes (executor only) serves some of an artifact's decode-step
+        nodes on a port of this machine: a native node server (nodeserver.py)
+        that answers their tcp:// mailboxes. Answers once they are loaded.
         """
         context.set_code(grpc.StatusCode.UNIMPLEMENTED)
         context.set_details('Method not implemented!')
@@ -243,10 +257,15 @@ def add_ExecutorServicer_to_server(servicer, server):
                     request_deserializer=vxpu__pb2.ExplainModelRequest.FromString,
                     response_serializer=vxpu__pb2.ExplainModelResponse.SerializeToString,
             ),
-            'ServeExperts': grpc.unary_unary_rpc_method_handler(
-                    servicer.ServeExperts,
-                    request_deserializer=vxpu__pb2.ServeExpertsRequest.FromString,
-                    response_serializer=vxpu__pb2.ServeExpertsResponse.SerializeToString,
+            'DescribeNodes': grpc.unary_unary_rpc_method_handler(
+                    servicer.DescribeNodes,
+                    request_deserializer=vxpu__pb2.DescribeNodesRequest.FromString,
+                    response_serializer=vxpu__pb2.DescribeNodesResponse.SerializeToString,
+            ),
+            'ServeNodes': grpc.unary_unary_rpc_method_handler(
+                    servicer.ServeNodes,
+                    request_deserializer=vxpu__pb2.ServeNodesRequest.FromString,
+                    response_serializer=vxpu__pb2.ServeNodesResponse.SerializeToString,
             ),
     }
     generic_handler = grpc.method_handlers_generic_handler(
@@ -484,7 +503,7 @@ class Executor:
             _registered_method=True)
 
     @staticmethod
-    def ServeExperts(request,
+    def DescribeNodes(request,
             target,
             options=(),
             channel_credentials=None,
@@ -497,9 +516,36 @@ class Executor:
         return grpc.experimental.unary_unary(
             request,
             target,
-            '/vxpu.Executor/ServeExperts',
-            vxpu__pb2.ServeExpertsRequest.SerializeToString,
-            vxpu__pb2.ServeExpertsResponse.FromString,
+            '/vxpu.Executor/DescribeNodes',
+            vxpu__pb2.DescribeNodesRequest.SerializeToString,
+            vxpu__pb2.DescribeNodesResponse.FromString,
+            options,
+            channel_credentials,
+            insecure,
+            call_credentials,
+            compression,
+            wait_for_ready,
+            timeout,
+            metadata,
+            _registered_method=True)
+
+    @staticmethod
+    def ServeNodes(request,
+            target,
+            options=(),
+            channel_credentials=None,
+            call_credentials=None,
+            insecure=False,
+            compression=None,
+            wait_for_ready=None,
+            timeout=None,
+            metadata=None):
+        return grpc.experimental.unary_unary(
+            request,
+            target,
+            '/vxpu.Executor/ServeNodes',
+            vxpu__pb2.ServeNodesRequest.SerializeToString,
+            vxpu__pb2.ServeNodesResponse.FromString,
             options,
             channel_credentials,
             insecure,

@@ -170,7 +170,8 @@ func ReadArtifact(manifestJSON, bindingJSON []byte) (Artifact, error) {
 type Plan struct {
 	Switches map[string]string `json:"switches"`
 	// ExpertExecutors is the layers each other executor (by address)
-	// serves to the engine's mailboxes (ServeExperts).
+	// serves, as nodes of the decode step, to the engine's mailboxes
+	// (ServeNodes).
 	ExpertExecutors map[string][]int `json:"expert_executors,omitempty"`
 	Reasons         []string         `json:"reasons"`
 	Prediction      Prediction       `json:"prediction"`
@@ -270,7 +271,7 @@ func spread(p *Plan, a Artifact, probe *machines.Probe, others []Executor) map[i
 		for _, layer := range held {
 			delete(local, layer)
 		}
-		p.Reasons = append(p.Reasons, fmt.Sprintf("experts: layers %d-%d (%.1f GB) on %s (%s, %.1f GB RAM), answering the engine's mailboxes",
+		p.Reasons = append(p.Reasons, fmt.Sprintf("experts: layers %d-%d (%.1f GB) on %s (%s, %.1f GB RAM), their nodes served there",
 			held[0], held[len(held)-1], gb(bytes), other.Address, describe(other.Probe), gb(other.Probe.RAMBytes)))
 	}
 	if next < len(layers) {
@@ -280,9 +281,6 @@ func spread(p *Plan, a Artifact, probe *machines.Probe, others []Executor) map[i
 		}
 		p.Reasons = append(p.Reasons, fmt.Sprintf("experts: %d layers (%.1f GB) fit no machine's RAM: they stay on the engine, paged from its disk",
 			len(layers)-next, gb(short)))
-	}
-	if len(p.ExpertExecutors) > 0 {
-		p.Switches["VXPU_EXPERT_MAILBOXES"] = "1" // the other executors answer through them
 	}
 	return local
 }

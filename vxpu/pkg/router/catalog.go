@@ -468,7 +468,7 @@ func (s *Server) loadByName(ctx context.Context, model, revision string) (string
 		}, true, func(ctx context.Context, info *executorInfo, manifest string) map[string]string {
 			// the manifest as sent: the expert executors read their
 			// weights from where the engine does
-			return s.planLoad(ctx, model, []byte(manifest), files["binding.json"], hints, info)
+			return s.planLoad(ctx, model, []byte(manifest), files["binding.json"], files["decode.pt2"], hints, info)
 		})
 		if err != nil {
 			return "", err
