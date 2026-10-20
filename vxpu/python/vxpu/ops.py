@@ -186,9 +186,10 @@ def _moe_mailboxes(moe, boxes, x_in, weights, indices, layer, rec, t0, crossing)
         started, completed = res.mover.observe(res, selected)
     if rec is not None:
         t3 = time.perf_counter()
-        gpu = sum(v for k, v in counts.items() if k != "cpu")
+        gpu = sum(v for k, v in counts.items() if k not in ("cpu", "remote"))
         rec.host_op("moe_experts", wait_to_host_ms=(t1 - t0) * 1e3, impl_ms=(t2 - t1) * 1e3, to_device_ms=(t3 - t2) * 1e3,
                     gpu_pairs=float(gpu), cpu_pairs=float(counts.get("cpu", 0)),
+                    **({"remote_pairs": float(counts["remote"])} if "remote" in counts else {}),
                     **({"moves_started": float(started), "moves_completed": float(completed)} if res and res.mover else {}))
         rec.selected_experts(layer, selected)
     return y
