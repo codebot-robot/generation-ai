@@ -109,13 +109,13 @@ class Packages:
                   + (f" in {self.build_s:.0f} s" if self.built else ""), flush=True)
         return runner
 
-    def path(self, sub, args, extra="", code=None):
+    def path(self, sub, args, extra="", code=None, dynamic_shapes=None):
         """The segment's package file, built first if not cached."""
         import torch._inductor.config as inductor_config
         with inductor_config.patch(deterministic=True):
-            return self._path(sub, args, extra, code)
+            return self._path(sub, args, extra + repr(dynamic_shapes), code, dynamic_shapes)
 
-    def _path(self, sub, args, extra, code):
+    def _path(self, sub, args, extra, code, dynamic_shapes=None):
         path = os.path.join(self.cache_dir, cache_key(sub, args, extra, code) + ".pt2")
         if os.path.exists(path):
             self.loaded += 1
@@ -124,7 +124,7 @@ class Packages:
                 print(f"[vxpu] building AOTInductor packages (once per artifact, plan and "
                       f"machine; kept in {self.cache_dir})", flush=True)
             t = time.perf_counter()
-            ep = torch.export.export(sub, tuple(args), strict=False)
+            ep = torch.export.export(sub, tuple(args), dynamic_shapes=dynamic_shapes, strict=False)
             tmp = f"{path[:-len('.pt2')]}.{os.getpid()}.tmp.pt2"  # aoti_compile_and_package wants .pt2
             torch._inductor.aoti_compile_and_package(ep, package_path=tmp)
             os.replace(tmp, path)  # another process building the same key writes the same package

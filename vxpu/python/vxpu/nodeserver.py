@@ -40,15 +40,7 @@ import types
 
 import torch
 
-from . import aoti, kernels, nodes, segments
-
-
-def _decode_split(artifact_dir):
-    """The artifact's decode graph split at its host ops, weightless."""
-    from . import ops  # noqa: F401  (registers the vxpu ops the graph calls)
-    program = torch.export.load(os.path.join(artifact_dir, "decode.pt2"))
-    split, _ = segments.split_at_host_ops(program.module())
-    return split
+from . import aoti, kernels, nodes
 
 
 def _example_inputs(sub):
@@ -99,7 +91,7 @@ def start(artifact_dir, names, port=0, cache_dir=None):
     k = kernels.load()
     if k is None:
         raise RuntimeError(f"a node server needs the CPU kernels: {kernels.why_not()}")
-    split = _decode_split(artifact_dir)
+    split = nodes.decode_split(artifact_dir)
     subs = []
     for name in names:
         sub = getattr(split, name, None)

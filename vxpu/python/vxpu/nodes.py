@@ -118,10 +118,12 @@ def _lower_engram_rows(embed):
 
 
 # host op target -> (which of external's collections its integer argument
-# names a module of, the lowering)
+# names a module of, the lowering, the dimension of each of the op's tensor
+# arguments that counts tokens: one package serves a decode step's one
+# token and a prefill's many)
 LOWERINGS = {
-    "vxpu.moe_experts.default": ("experts", _lower_moe_experts),
-    "vxpu.engram_rows.default": ("engram", _lower_engram_rows),
+    "vxpu.moe_experts.default": ("experts", _lower_moe_experts, (0, 0, 0)),
+    "vxpu.engram_rows.default": ("engram", _lower_engram_rows, (1,)),
 }
 
 
@@ -141,7 +143,7 @@ def host_call(sub):
     calls = [n for n in sub.graph.nodes if n.op == "call_function" and _host_op(n.target)]
     if len(calls) != 1:
         raise ValueError(f"a native node calls one host op, this one {len(calls)}")
-    kind, _ = LOWERINGS[_host_op(calls[0].target)]
+    kind = LOWERINGS[_host_op(calls[0].target)][0]
     return kind, next(a for a in calls[0].args if isinstance(a, int))
 
 
@@ -157,7 +159,7 @@ class NativeNode(torch.nn.Module):
         if len(calls) != 1:
             raise ValueError(f"a native node calls one host op, this one {len(calls)}")
         call = self.call = calls[0]
-        kind, lower = LOWERINGS[_host_op(call.target)]
+        kind, lower, self.token_dims = LOWERINGS[_host_op(call.target)]
         index = next(a for a in call.args if isinstance(a, int))
         module = getattr(external, kind)[index]
         self.fn, self.residents = lower(module)
@@ -189,12 +191,39 @@ class NativeNode(torch.nn.Module):
 
 
 def native_package(packages, sub, external, inputs):
-    """The package file of a host node on its decode inputs (built first
-    if not cached), and its residents: run it on its inputs, then its
-    residents."""
+    """The package file of a host node (built first if not cached), for
+    any number of tokens, and its residents: run it on its inputs, then
+    its residents. inputs: the node's decode-step inputs (their shapes)."""
     node = NativeNode(sub, external)
-    args = list(inputs) + list(node.residents)
-    return packages.path(node, args, extra=node.cache_extra(), code=sub.code), node.residents
+    # exported on two tokens, with the token dimension dynamic: one token
+    # would be specialized (torch.export fixes dimensions of size 1)
+    tokens = torch.export.Dim("tokens", min=1, max=1 << 16)
+    examples, spec = [], []
+    for t, dim in zip(inputs, node.token_dims):
+        shape = list(t.shape)
+        shape[dim] = 2
+        examples.append(torch.zeros(shape, dtype=t.dtype))
+        spec.append({dim: tokens})
+    args = examples + list(node.residents)
+    dynamic = {"args": tuple(spec) + (None,) * len(node.residents)}
+    return packages.path(node, args, extra=node.cache_extra() + "tokens", code=sub.code,
+                         dynamic_shapes=dynamic), node.residents
+
+
+def decode_split(artifact_dir):
+    """An artifact's decode graph split at its host ops, as the engine
+    splits it (its nodes' names and graphs), loaded without weights."""
+    import os
+    from . import ops, segments  # noqa: F401  (ops registers the vxpu ops the graph calls)
+    program = torch.export.load(os.path.join(artifact_dir, "decode.pt2"))
+    split, _ = segments.split_at_host_ops(program.module())
+    return split
+
+
+def host_calls(split):
+    """{node name: (collection, index)} for a split graph's host nodes."""
+    from . import segments
+    return {name: host_call(sub) for name, sub in segments.segments_of(split) if is_native(sub)}
 
 
 def is_native(sub):

@@ -33,6 +33,7 @@
 #include <torch/csrc/inductor/aoti_package/model_package_loader.h>
 
 #include <arpa/inet.h>
+#include <netdb.h>
 #include <netinet/in.h>
 #include <netinet/tcp.h>
 #include <sys/socket.h>
@@ -278,7 +279,92 @@ class NodeServer {
   std::atomic<int64_t> messages_{0};
 };
 
+// NodeClient calls a node server's nodes: one connection, kept, one call
+// at a time; the engine's side of a tcp:// mailbox.
+// A node client is one connection to a node server. A call that fails
+// (the server gone, or silent for kCallTimeoutSec) fails the step and
+// closes the connection, and the next call connects again: a hung or
+// restarted server must not wedge the step host that waits on it.
+class NodeClient {
+ public:
+  NodeClient(const std::string& host, int64_t port) : host_(host), port_(port) { connect(); }
+
+  ~NodeClient() {
+    if (fd_ >= 0) ::close(fd_);
+  }
+
+  std::vector<at::Tensor> call(int64_t node, const std::vector<at::Tensor>& inputs) {
+    std::lock_guard<std::mutex> lock(mu_);
+    if (fd_ < 0) connect();
+    try {
+      return exchange(node, inputs);
+    } catch (...) {
+      ::close(fd_);  // mid-message, or the server's state unknown: start over
+      fd_ = -1;
+      throw;
+    }
+  }
+
+ private:
+  // a long prefill's experts on a CPU take seconds; a server silent for
+  // two minutes is gone
+  static constexpr int kCallTimeoutSec = 120;
+
+  void connect() {
+    const std::string& host = host_;
+    const int64_t port = port_;
+    addrinfo hints{};
+    hints.ai_family = AF_UNSPEC;
+    hints.ai_socktype = SOCK_STREAM;
+    addrinfo* found = nullptr;
+    int rc = ::getaddrinfo(host.c_str(), std::to_string(port).c_str(), &hints, &found);
+    TORCH_CHECK(rc == 0, "node client: resolving ", host, ": ", ::gai_strerror(rc));
+    for (addrinfo* a = found; a != nullptr; a = a->ai_next) {
+      fd_ = ::socket(a->ai_family, a->ai_socktype, a->ai_protocol);
+      if (fd_ >= 0 && ::connect(fd_, a->ai_addr, a->ai_addrlen) == 0) break;
+      if (fd_ >= 0) ::close(fd_);
+      fd_ = -1;
+    }
+    ::freeaddrinfo(found);
+    TORCH_CHECK(fd_ >= 0, "node client: cannot connect to ", host, ":", port);
+    int one = 1;
+    ::setsockopt(fd_, IPPROTO_TCP, TCP_NODELAY, &one, sizeof(one));
+    timeval timeout{kCallTimeoutSec, 0};
+    ::setsockopt(fd_, SOL_SOCKET, SO_RCVTIMEO, &timeout, sizeof(timeout));
+    ::setsockopt(fd_, SOL_SOCKET, SO_SNDTIMEO, &timeout, sizeof(timeout));
+  }
+
+  std::vector<at::Tensor> exchange(int64_t node, const std::vector<at::Tensor>& inputs) {
+    write_exact(fd_, "VXN1", 4);
+    write_value<uint32_t>(fd_, static_cast<uint32_t>(node));
+    write_value<uint32_t>(fd_, static_cast<uint32_t>(inputs.size()));
+    for (const auto& t : inputs) write_tensor(fd_, t);
+    char magic[4];
+    read_exact(fd_, magic, 4);
+    TORCH_CHECK(std::memcmp(magic, "VXR1", 4) == 0, "node client: not a node server reply");
+    if (read_value<uint32_t>(fd_) != 0) {
+      uint32_t length = read_value<uint32_t>(fd_);
+      std::string error(length, '\0');
+      read_exact(fd_, error.data(), length);
+      TORCH_CHECK(false, "node ", node, ": ", error);
+    }
+    uint32_t count = read_value<uint32_t>(fd_);
+    TORCH_CHECK(count <= kMaxTensors, "node client: too many tensors");
+    std::vector<at::Tensor> outputs;
+    for (uint32_t i = 0; i < count; ++i) outputs.push_back(read_tensor(fd_));
+    return outputs;
+  }
+
+  std::string host_;
+  int64_t port_;
+  int fd_ = -1;
+  std::mutex mu_;
+};
+
 void register_node_server(pybind11::module& m) {
+  pybind11::class_<NodeClient>(m, "NodeClient")
+      .def(pybind11::init<const std::string&, int64_t>())
+      .def("call", &NodeClient::call, pybind11::call_guard<pybind11::gil_scoped_release>());
   pybind11::class_<NodeServer>(m, "NodeServer", pybind11::dynamic_attr())
       .def(pybind11::init<int64_t, const std::vector<std::string>&, const std::vector<std::vector<at::Tensor>>&>(),
            pybind11::call_guard<pybind11::gil_scoped_release>())

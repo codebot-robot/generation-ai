@@ -1601,6 +1601,34 @@ def _check_mover_lifetime():
         raise SystemExit("expert mover: its worker thread outlived it")
 
 
+def _check_node_client():
+    """The engine's node client (#405) against a node server that goes
+    away and comes back on its port: the call in between fails at once
+    (no hang), and the next call connects again."""
+    from . import kernels
+    k = kernels.load()
+
+    def call(client):
+        try:
+            client.call(0, [])
+        except RuntimeError as e:
+            return str(e).splitlines()[0]
+        return "answered"
+
+    server = k.NodeServer(0, [], [])  # no nodes: every call is answered with an error
+    port = server.port()
+    client = k.NodeClient("127.0.0.1", port)
+    first = call(client)
+    server.stop()
+    gone = call(client)
+    server = k.NodeServer(port, [], [])
+    back = call(client)
+    server.stop()
+    ok = "no such node" in first and "cannot connect" in gone and "no such node" in back
+    print(f"node client: a server that goes away fails the call ({gone!r}), and the next call connects again: {ok}")
+    return ok
+
+
 def _check_native_nodes(model, prompts, settings, artifact, workdir):
     """The decode step's host nodes served native (nodes.py,
     nodeserver.py, #394): a node server for every experts and n-gram node,
@@ -1666,6 +1694,43 @@ def _check_native_nodes(model, prompts, settings, artifact, workdir):
     if not ended:
         print("native nodes check: a connection outlived its stopped server")
     return not bad and ended
+
+
+def _check_remote_nodes(model, prompts, settings, artifact, plain, workdir):
+    """Host nodes in another process (#394): a node server serves every
+    other experts layer's node and the n-gram nodes, and the engine, which
+    does not load their banks or tables, sends their host ops' inputs to
+    the server's mailboxes (remote_nodes), prefill and decode alike. The
+    server runs the native kernels on the same arguments, so tokens and
+    logits must be bit-identical to the plain engine's."""
+    from . import nodes, nodeserver
+    calls = nodes.host_calls(nodes.decode_split(artifact))
+    experts = sorted((i, name) for name, (kind, i) in calls.items() if kind == "experts")
+    served = [name for _, name in experts[::2]] + [name for name, (kind, _) in calls.items() if kind == "engram"]
+    server = nodeserver.start(artifact, served, cache_dir=os.path.join(workdir, "native-nodes"))
+    try:
+        spec = ",".join(f"{name}=tcp://127.0.0.1:{server.port()}/{i}" for i, name in enumerate(served))
+        keep = []
+        got = _with_env({"VXPU_REMOTE_NODES": spec, "VXPU_EXPERT_MAILBOXES": None, "VXPU_GPU_EXPERTS": None},
+                        record_vxpu_engine, model, "main", prompts, settings, artifact, keep=keep)
+        external = keep[0].external
+        loaded = [f"{kind}.{i}" for name in served for kind, i in [calls[name]]
+                  if (kind == "experts" and not external.experts[i].w1.is_meta) or (kind == "engram" and i in external.engram)]
+        messages = server.messages()
+    finally:
+        server.stop()
+    if loaded:
+        print(f"remote nodes check: {loaded} are served remotely but were loaded here too")
+        return False
+    same = ([p["generated_ids"] for p in got["prompts"]] == [p["generated_ids"] for p in plain["prompts"]]
+            and [p["top_logits"] for p in got["prompts"]] == [p["top_logits"] for p in plain["prompts"]])
+    rows, _ = compare(plain, got, strict_tokens=True)
+    print(f"host nodes {served} served by a native node server ({messages} messages), against the plain engine "
+          "(must be bit-identical):")
+    print(table(plain, got, rows))
+    if not same:
+        print("remote nodes check: not bit-identical")
+    return same
 
 
 def _check_plan_given():
@@ -1854,6 +1919,10 @@ def selftest(workdir, settings):
             failed.append(name + " (expert remote)")
         if name == "tiny-deepseek-v41" and not _check_native_nodes(model, prompts, settings, artifact, workdir):
             failed.append(name + " (native nodes)")
+        if name == "tiny-deepseek-v41" and not _check_remote_nodes(model, prompts, settings, artifact, got, workdir):
+            failed.append(name + " (remote nodes)")
+        if name == "tiny-deepseek-v41" and not _check_node_client():
+            failed.append(name + " (node client)")
         if name == "tiny-deepseek-v41" and not _check_step_graph(model, prompts, settings, artifact, workdir):
             failed.append(name + " (step graph)")
         if name == "tiny-deepseek-v41" and not _check_step_graph_pools(model, prompts, settings, artifact, workdir):
