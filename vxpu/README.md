@@ -171,10 +171,67 @@ doesn't understand: `VXPU_KERNELS`, `VXPU_FUSED_EXPERTS`,
 `VXPU_KERNEL_THREADS`, `VXPU_SPLIT_DECODE`, `VXPU_COMPILE_MODE`,
 `VXPU_SPLIT_COMPILE`, `VXPU_DIRECT_HOST_OPS`, `VXPU_LOWER_DECODE`,
 `VXPU_SEGMENT_RUNTIME`, `VXPU_EXPERTS_IN_RAM`, `VXPU_BF16_WEIGHT_CACHE`,
-`VXPU_BF16_CACHE_HEADROOM_GB`; and `VXPU_EXTERNAL_DIR` and `VXPU_AOTI_CACHE_DIR`,
-paths, taken as given. Choosing between plans by cost, and
+`VXPU_BF16_CACHE_HEADROOM_GB`, `VXPU_GPU_EXPERTS_MOVES`,
+`VXPU_GPU_EXPERTS_REQUEST_WEIGHT`, `VXPU_EXPERT_MAILBOXES`, `VXPU_DATAFLOW`,
+`VXPU_DATAFLOW_PLACE`, `VXPU_STEP_GRAPH`; and `VXPU_EXTERNAL_DIR`,
+`VXPU_AOTI_CACHE_DIR`, `VXPU_GPU_EXPERTS` and `VXPU_EXPERT_REMOTE`, taken as
+given. Choosing between plans by cost, and
 deployment hints, come next (#316, #332, #349). `python -m vxpu.hardware [--machine NAME] [--json]`
 inspects the machine catalog and current probed hardware.
+
+## The dataflow executor: segments, experts and mailboxes
+
+A decode step split at its host ops is a dataflow graph (#372,
+`python/vxpu/dataflow.py`):
+- the dense segments, the routed experts and the n-gram lookups are its
+  nodes;
+- a node's inputs arrive in its inboxes, written by the nodes that
+  produce them;
+- each node runs where the plan places it.
+
+On DeepSeek-V4.1-Flash the graph is 85 nodes (43 dense, 40 experts,
+2 engram) and 418 edges.
+
+- **`VXPU_DATAFLOW=1`** runs decode through the reference runner: one
+  inbox per edge at the consumer's device, allocated once, and a node
+  fires when its inboxes are full. `VXPU_DATAFLOW_PLACE=experts=cpu,engram=cpu`
+  places nodes by kind. The runner computes exactly what the split
+  module computes.
+- **`VXPU_EXPERT_MAILBOXES=1`** answers decode's routed experts through
+  mailboxes (`python/vxpu/mailboxes.py`):
+  - each (token, k) pair goes to its expert's owner: the CPU kernels, a
+    GPU pool of hot experts (`VXPU_GPU_EXPERTS`), or an expert server;
+  - every owner replies with the pair's bf16 down projection;
+  - the replies are summed in k order whoever answered.
+
+  With every expert on the CPU this is bit-identical to the fused kernel.
+- **`VXPU_EXPERT_REMOTE=host:port[,host:port]`** (with `VXPU_EXPERT_MAILBOXES=1`) names expert servers:
+  `python -m vxpu.expert_server ARTIFACT --port P --layers 0,2`, another
+  process on this machine or another one. A server answers the layers it
+  holds over TCP with the same CPU kernels, so the results are
+  bit-identical. The engine does not load those layers' banks at all.
+- **`VXPU_STEP_GRAPH=1`** (CUDA, with `VXPU_DATAFLOW=1` and
+  `VXPU_SEGMENT_RUNTIME=aoti`) captures the whole decode step in one CUDA
+  graph (`python/vxpu/stepgraph.py`):
+  - the dense nodes are their AOTInductor packages;
+  - each host op is a mailbox in the graph: the GPU copies the inputs to
+    pinned memory and raises a flag (`cuStreamWriteValue32`); a CPU
+    worker answers and raises a flag back; the GPU waits on that flag
+    (`cuStreamWaitValue32`) and copies the reply in;
+  - hot experts in a GPU pool run inside the graph while the CPU answers
+    the rest.
+
+  Python launches a step and waits for its end.
+
+Measured on DeepSeek-V4.1-Flash (a g4-standard-96, two RTX PRO 6000s; ten
+prompts none of which were in the traffic the placements came from):
+
+| decode | ms/token |
+|---|---|
+| node by node, every expert on the CPU | 46.9–47.7 |
+| node by node, hot experts on both GPUs (163 GB) | 31.7–38.0 |
+| one graph a step, every expert on the CPU | 35.7–36.1 (3 prompts) |
+| one graph a step, hot experts (68 GB) inside it | 24.1–30.9 |
 
 ## Models by name
 
