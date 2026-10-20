@@ -225,7 +225,9 @@ def placement(counts, per_expert_bytes, budgets):
                      "layers": {str(layer): sorted(ids) for layer, ids in sorted(layers.items())}})
     held = ranked[:start]
     return {"format": "vxpu-placement/2", "experts": start, "bytes": int(start * per_expert_bytes),
-            "share_of_selections": round(sum(n for n, _, _ in held) / total, 4) if total else 0.0, "gpus": gpus}
+            "share_of_selections": round(sum(n for n, _, _ in held) / total, 4) if total else 0.0, "gpus": gpus,
+            # the history, for the engine's scores when experts move (experts_gpu.Mover)
+            "counts": {str(layer): {str(e): n for e, n in sorted(c.items())} for layer, c in sorted(counts.items())}}
 
 
 def main(argv=None):

@@ -132,11 +132,16 @@ def moe_experts(x_in: torch.Tensor, weights: torch.Tensor, indices: torch.Tensor
         x, w, i = _to_host(x_in, weights, indices)
     else:
         x, w, i = x_in.to(host), weights.to(host), indices.to(host)
+    res = getattr(moe, "_vxpu_hot", None)
     if rec is None:
         y = impl.fn(moe, x, w, i)
+        if res is not None and res.mover is not None:  # a prefill: the request's selections, while the CPU works
+            res.mover.observe(res, i.flatten().tolist())
         return _to_device(y, x_in.device) if crossing else y.to(x_in.device)
     t1 = time.perf_counter()
     y = impl.fn(moe, x, w, i)
+    if res is not None and res.mover is not None:
+        res.mover.observe(res, i.flatten().tolist())
     t2 = time.perf_counter()
     out = _to_device(y, x_in.device) if crossing else y.to(x_in.device)
     t3 = time.perf_counter()
@@ -200,11 +205,16 @@ def _moe_gpu_hot(moe, res, x_in, weights, indices, layer, rec, t0):
             current.wait_stream(pool.stream)
             y_pool.record_stream(current)
         y = y_pool if y is None else y + y_pool
+    selected = i.flatten().tolist()
+    started = completed = 0
+    if res.mover is not None:  # after this call's kernels, so a move's unmapping is ordered after them
+        started, completed = res.mover.observe(res, selected)
     if rec is not None:
         t3 = time.perf_counter()
         rec.host_op("moe_experts", wait_to_host_ms=(t1 - t0) * 1e3, impl_ms=(t2 - t1) * 1e3, to_device_ms=(t3 - t2) * 1e3,
-                    gpu_pairs=float(i.numel() - n_cold), cpu_pairs=float(n_cold))
-        rec.selected_experts(layer, i.flatten().tolist())
+                    gpu_pairs=float(i.numel() - n_cold), cpu_pairs=float(n_cold),
+                    **({"moves_started": float(started), "moves_completed": float(completed)} if res.mover else {}))
+        rec.selected_experts(layer, selected)
     return y
 
 

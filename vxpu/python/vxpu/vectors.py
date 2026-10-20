@@ -298,13 +298,16 @@ def record_deepseek_eager(model, revision, prompts, settings):
 
 
 def record_vxpu_engine(model, revision, prompts, settings, artifact, device="cpu",
-                       compile_decode=False, telemetry=False):
+                       compile_decode=False, telemetry=False, keep=None):
     """Candidate: the executor's engine in this process (no cluster).
-    telemetry=True keeps each prompt's execution telemetry with it."""
+    telemetry=True keeps each prompt's execution telemetry with it; keep,
+    a list, receives the engine (for checks of its state afterwards)."""
     import torch
     from .engine import Engine, SamplingParams
     tok = _tokenizer(model, revision, prompts)
     engine = Engine(artifact, device=device, compile_decode=compile_decode)
+    if keep is not None:
+        keep.append(engine)
     out = []
     for prompt in _prompt_set(tok, prompts):
         ids = _encode(tok, prompt)
@@ -1136,17 +1139,101 @@ def _check_gpu_experts(model, prompts, settings, artifact, workdir):
                 os.environ["VXPU_GPU_EXPERTS"] = saved
     if "gpu-hot+cpu" not in runs["gpu"]["producer"]["plan"]["selected"].get("vxpu::moe_experts", []):
         print("gpu experts check: the hot experts' implementation never ran")
+    runs["cpu"] = _with_env({"VXPU_GPU_EXPERTS": None}, record_vxpu_engine,
+                            model, "main", prompts, settings, artifact, device="cuda")
+    runs["gpu"] = _with_env({"VXPU_GPU_EXPERTS": path}, record_vxpu_engine,
+                            model, "main", prompts, settings, artifact, device="cuda", telemetry=True)
+    if not any(n.startswith("hot experts on") for n in runs["gpu"]["producer"]["plan"].get("notes", [])):
+        print("gpu experts check: the placement was not applied")
         return False
     rows, ok = compare(runs["cpu"], runs["gpu"], strict_tokens=True)
     print(f"hot experts on {gpus} GPU(s) (kernels relative error {rel:.2g}) against all on the CPU:")
     print(table(runs["cpu"], runs["gpu"], rows))
+    return _check_expert_moves(model, prompts, settings, artifact, workdir, runs, gpus, list(experts), n) and ok
+
+
+def _check_expert_moves(model, prompts, settings, artifact, workdir, runs, gpus, layers, n):
+    """Experts moving with the traffic (experts_gpu.Mover): start from the
+    worst placement, the experts the previous run selected least, so moves
+    must happen; then the tokens against all on the CPU, and every held
+    expert's rows on its GPU against the host's (experts_gpu.verify)."""
+    import torch
+    from . import experts_gpu
+    from .expert_stats import collect
+    counts = collect([runs["gpu"]])["decode"]
+    cold = {layer: sorted(range(n), key=lambda e: counts[int(layer)][e])[:n // 2] for layer in layers}
+    placement = {"format": "vxpu-placement/2",
+                 "gpus": [{"layers": {layer: ids[g::gpus] for layer, ids in cold.items()}} for g in range(gpus)]}
+    path = os.path.join(workdir, "placement-cold.json")
+    with open(path, "w") as f:
+        json.dump(placement, f)
+    keep = []
+    moved = _with_env({"VXPU_GPU_EXPERTS": path, "VXPU_GPU_EXPERTS_MOVES": "2"},
+                      record_vxpu_engine, model, "main", prompts, settings, artifact, device="cuda",
+                      telemetry=True, keep=keep)
+    mover = keep[0].expert_mover
+    recorded = sum(p["telemetry"]["host_ops"].get("decode", {}).get("moe_experts", {}).get("moves_completed", 0.0)
+                   for p in moved["prompts"])
+    if not (mover.completed and recorded):
+        print(f"gpu experts check: from a placement of the least selected, {mover.started} moves started, "
+              f"{mover.completed} completed ({recorded:g} per step in the telemetry)")
+        return False
+    torch.cuda.synchronize()
+    for moe in keep[0].external.experts.values():
+        res = getattr(moe, "_vxpu_hot", None)
+        if res is not None:
+            experts_gpu.verify(res)
+    rows, ok = compare(runs["cpu"], moved, strict_tokens=True)
+    print(f"experts moving with the traffic ({mover.started} moves started, {mover.completed} completed; "
+          "the residency matches the host banks) against all on the CPU:")
+    print(table(runs["cpu"], moved, rows))
     return ok
+
+
+def _with_env(env, fn, *args, **kwargs):
+    """fn(*args, **kwargs) with env set (None: unset), restored after."""
+    saved = {k: os.environ.get(k) for k in env}
+    try:
+        for k, v in env.items():
+            if v is None:
+                os.environ.pop(k, None)
+            else:
+                os.environ[k] = v
+        return fn(*args, **kwargs)
+    finally:
+        for k, v in saved.items():
+            if v is None:
+                os.environ.pop(k, None)
+            else:
+                os.environ[k] = v
+
+
+def _check_mover_lifetime():
+    """The expert mover (experts_gpu.Mover) is freed with its engine: its
+    worker thread holds it only weakly, so the pools and banks it reaches
+    go with it, and the thread exits."""
+    import gc
+    import threading
+    import weakref
+    from . import experts_gpu
+    mover = experts_gpu.Mover(2, 0.25)
+    ref = weakref.ref(mover)
+    del mover
+    gc.collect()
+    if ref() is not None:
+        raise SystemExit("expert mover: still referenced after its engine let it go (the worker holds it)")
+    deadline = time.time() + 5
+    while any(t.name == "vxpu-expert-moves" for t in threading.enumerate()) and time.time() < deadline:
+        time.sleep(0.1)
+    if any(t.name == "vxpu-expert-moves" for t in threading.enumerate()):
+        raise SystemExit("expert mover: its worker thread outlived it")
 
 
 def selftest(workdir, settings):
     """The CI tier: tiny models through export, the in-process engine,
     and a transformers reference, token-exact. No cluster."""
     _check_compare()
+    _check_mover_lifetime()
     _check_compile_plan()
     _check_compile_names()
     os.makedirs(workdir, exist_ok=True)
