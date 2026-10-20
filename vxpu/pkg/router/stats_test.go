@@ -188,6 +188,20 @@ func TestStats_FlushStatsWritesEveryBuffer(t *testing.T) {
 	}
 }
 
+func TestStats_DropsARecordThatDoesNotEncode(t *testing.T) {
+	s, _ := newCatalogServer(t, &fakeModelstore{compiled: true})
+	s.UseStats(0)
+	s.stats.record(t.Context(), requestRecord{Format: requestFormat, Model: "org/m", RPC: "chat", Telemetry: json.RawMessage(`{"ms": NaN}`)})
+	s.stats.record(t.Context(), requestRecord{Format: requestFormat, Model: "org/m", RPC: "chat"})
+	stats, err := s.GetModelStats(t.Context(), &pb.GetModelStatsRequest{Model: "org/m"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(stats.SummaryJson, `"requests": 1`) {
+		t.Errorf("the good record should be written without the bad one: %s", stats.SummaryJson)
+	}
+}
+
 func TestStats_BacksOffAfterAFailedWrite(t *testing.T) {
 	var uploads atomic.Int64
 	failing := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {

@@ -241,9 +241,14 @@ func (st *statsStore) write(ctx context.Context, model string, recs []requestRec
 	var buf bytes.Buffer
 	enc := json.NewEncoder(&buf)
 	for _, r := range recs {
+		// One bad record (telemetry that is not JSON, say) is dropped; kept,
+		// it would fail every write of the batch it is in.
 		if err := enc.Encode(r); err != nil {
-			return err
+			klog.FromContext(ctx).Error(err, "Dropping a statistics record that does not encode", "model", model)
 		}
+	}
+	if buf.Len() == 0 {
+		return nil
 	}
 	name := statsRepository(model)
 	digest, err := st.ws.PutBlob(ctx, name, buf.Bytes())
