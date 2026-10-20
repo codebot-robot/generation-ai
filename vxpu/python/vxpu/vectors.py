@@ -1356,11 +1356,12 @@ def _check_step_graph(model, prompts, settings, artifact, workdir):
 
 
 def _check_step_graph_pools(model, prompts, settings, artifact, workdir):
-    """On a GPU: the step graph with hot experts in a pool on the engine's
-    GPU, their kernels inside the graph and the CPU answering the other
-    pairs through its mailbox, against the same dataflow run node by node
-    with expert mailboxes and the same placement (the same per-pair
-    replies, summed in the same order): bit-identical."""
+    """On a GPU: the step graph with half of every layer's experts in GPU
+    pools (split between two GPUs where there are two: the other GPU's
+    graph takes part), the CPU answering the other pairs through its
+    mailbox, against the same dataflow run node by node with expert
+    mailboxes and the same placement (the same per-pair replies, summed
+    in the same order): bit-identical."""
     import torch
     if not torch.cuda.is_available():
         return True
@@ -1369,9 +1370,12 @@ def _check_step_graph_pools(model, prompts, settings, artifact, workdir):
     if not experts:
         return True
     n = len(next(iter(next(iter(experts.values())).values()))["parts"])
+    gpus = min(torch.cuda.device_count(), 2)  # with two, half on each: the other GPU's graph takes part too
+    held = list(range(0, n, 2))
     path = os.path.join(workdir, "placement-step-graph.json")
     with open(path, "w") as f:
-        json.dump({"format": "vxpu-placement/2", "gpus": [{"layers": {layer: list(range(0, n, 2)) for layer in experts}}]}, f)
+        json.dump({"format": "vxpu-placement/2",
+                   "gpus": [{"layers": {layer: held[g::gpus] for layer in experts}} for g in range(gpus)]}, f)
     base = {"VXPU_DATAFLOW": "1", "VXPU_SEGMENT_RUNTIME": "aoti", "VXPU_AOTI_CACHE_DIR": os.path.join(workdir, "aoti"),
             "VXPU_DATAFLOW_PLACE": None, "VXPU_EXPERT_MAILBOXES": "1", "VXPU_GPU_EXPERTS": path}
     ref = _with_env({**base, "VXPU_STEP_GRAPH": None}, record_vxpu_engine, model, "main", prompts, settings, artifact,
@@ -1382,7 +1386,7 @@ def _check_step_graph_pools(model, prompts, settings, artifact, workdir):
     same = ([p["generated_ids"] for p in got["prompts"]] == [p["generated_ids"] for p in ref["prompts"]]
             and [p["top_logits"] for p in got["prompts"]] == [p["top_logits"] for p in ref["prompts"]])
     rows, _ = compare(ref, got, strict_tokens=True)
-    print("the step graph with half the experts in a GPU pool inside it, against the same run node by node "
+    print(f"the step graph with half the experts in GPU pools on {gpus} GPU(s), against the same run node by node "
           "(must be bit-identical):")
     print(table(ref, got, rows))
     # the experts nodes answered in the graph record their selections too:
