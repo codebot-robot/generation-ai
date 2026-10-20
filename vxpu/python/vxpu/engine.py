@@ -340,7 +340,10 @@ class Engine:
             if any(ids for _, ids in by_device):
                 moe._vxpu_hot = experts_gpu.Residency(moe, by_device)
         placed = [m._vxpu_hot for m in self.external.experts.values() if getattr(m, "_vxpu_hot", None)]
-        if self.plan["gpu_experts_moves"]:
+        if self.plan["gpu_experts_moves"] and self.plan["step_graph"]:
+            self.plan.note("hot experts stay where the placement put them: moving them would rewrite slot maps "
+                           "while the step graph replays")
+        elif self.plan["gpu_experts_moves"]:
             self.expert_mover = experts_gpu.Mover(self.plan["gpu_experts_moves"],
                                                   self.plan["gpu_experts_request_weight"])
             counts = experts_gpu.load_counts(path)

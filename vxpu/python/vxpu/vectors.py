@@ -1355,6 +1355,45 @@ def _check_step_graph(model, prompts, settings, artifact, workdir):
     return same
 
 
+def _check_step_graph_pools(model, prompts, settings, artifact, workdir):
+    """On a GPU: the step graph with hot experts in a pool on the engine's
+    GPU, their kernels inside the graph and the CPU answering the other
+    pairs through its mailbox, against the same dataflow run node by node
+    with expert mailboxes and the same placement (the same per-pair
+    replies, summed in the same order): bit-identical."""
+    import torch
+    if not torch.cuda.is_available():
+        return True
+    with open(os.path.join(artifact, "binding.json")) as f:
+        experts = (json.load(f).get("external") or {}).get("experts") or {}
+    if not experts:
+        return True
+    n = len(next(iter(next(iter(experts.values())).values()))["parts"])
+    path = os.path.join(workdir, "placement-step-graph.json")
+    with open(path, "w") as f:
+        json.dump({"format": "vxpu-placement/2", "gpus": [{"layers": {layer: list(range(0, n, 2)) for layer in experts}}]}, f)
+    base = {"VXPU_DATAFLOW": "1", "VXPU_SEGMENT_RUNTIME": "aoti", "VXPU_AOTI_CACHE_DIR": os.path.join(workdir, "aoti"),
+            "VXPU_DATAFLOW_PLACE": None, "VXPU_EXPERT_MAILBOXES": "1", "VXPU_GPU_EXPERTS": path}
+    ref = _with_env({**base, "VXPU_STEP_GRAPH": None}, record_vxpu_engine, model, "main", prompts, settings, artifact,
+                    device="cuda", compile_decode=True, telemetry=True)
+    keep = []
+    got = _with_env({**base, "VXPU_STEP_GRAPH": "1"}, record_vxpu_engine, model, "main", prompts, settings, artifact,
+                    device="cuda", compile_decode=True, telemetry=True, keep=keep)
+    same = ([p["generated_ids"] for p in got["prompts"]] == [p["generated_ids"] for p in ref["prompts"]]
+            and [p["top_logits"] for p in got["prompts"]] == [p["top_logits"] for p in ref["prompts"]])
+    rows, _ = compare(ref, got, strict_tokens=True)
+    print("the step graph with half the experts in a GPU pool inside it, against the same run node by node "
+          "(must be bit-identical):")
+    print(table(ref, got, rows))
+    # the experts nodes answered in the graph record their selections too:
+    # the statistics placements are made from see the same as node by node
+    selections = [[(p.get("telemetry") or {}).get("experts", {}).get("decode") for p in d["prompts"]] for d in (ref, got)]
+    if selections[0] != selections[1] or not any(selections[0]):
+        print("step graph pools check: decode expert selections differ from the node-by-node run's")
+        return False
+    return same and isinstance(getattr(keep[0]._decode_split, "graph", None), torch.cuda.CUDAGraph)
+
+
 def _check_dataflow(model, prompts, settings, artifact, plain):
     """The engine's decode run as a dataflow graph (dataflow.py): the same
     tokens and logits as the plain run, every edge through an inbox. On a
@@ -1554,6 +1593,8 @@ def selftest(workdir, settings):
             failed.append(name + " (expert remote)")
         if name == "tiny-deepseek-v41" and not _check_step_graph(model, prompts, settings, artifact, workdir):
             failed.append(name + " (step graph)")
+        if name == "tiny-deepseek-v41" and not _check_step_graph_pools(model, prompts, settings, artifact, workdir):
+            failed.append(name + " (step graph with pools)")
         if name == "tiny-llama" and not _check_chat_telemetry(artifact):
             failed.append(name + " (chat telemetry)")
         if name == "tiny-deepseek-v41" and not _check_gpu_experts(model, prompts, settings, artifact, workdir):

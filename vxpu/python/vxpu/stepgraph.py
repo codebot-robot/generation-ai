@@ -50,11 +50,12 @@ out.
 import ctypes
 import gc
 import threading
+import time
 import weakref
 
 import torch
 
-from . import dataflow
+from . import dataflow, triton_ops
 
 CU_STREAM_WAIT_VALUE_EQ = 0x1
 CU_STREAM_WRITE_VALUE_DEFAULT = 0x0  # with a system-wide memory fence before the write
@@ -91,6 +92,17 @@ class _Driver:
 def _check(status, what):
     if status != 0:
         raise RuntimeError(f"step graph: {what} failed (CUresult {status})")
+
+
+def _experts_call(sub):
+    """For a host segment that calls the routed experts: (layer, the
+    positions of x, weights and indices among the segment's inputs)."""
+    placeholders = [n for n in sub.graph.nodes if n.op == "placeholder"]
+    for n in sub.graph.nodes:
+        if n.op == "call_function" and "moe_experts" in str(getattr(n.target, "__name__", n.target)):
+            x, w, i, layer = n.args[:4]
+            return int(layer), [placeholders.index(a) for a in (x, w, i)]
+    return None, None
 
 
 class StepGraph(torch.nn.Module):
@@ -153,6 +165,8 @@ class StepGraph(torch.nn.Module):
         mailboxes = []  # per host node: (node, pinned inputs, pinned outbox, flag index)
         produced = {}  # node -> its output tensors on the GPU, as captured
         dev = runner.device
+        if dev.index is None:  # the pools name their GPU by index
+            dev = torch.device(dev.type, torch.cuda.current_device())
 
         def resolve(r):
             if isinstance(r, (tuple, list)):
@@ -169,14 +183,26 @@ class StepGraph(torch.nn.Module):
         # every pinned buffer before the capture (allocating pinned memory
         # while a stream captures is not allowed), shaped like the inboxes
         # the runner's first step allocated
-        boxes = {}
+        from . import ops
+        external = ops._active.external
+        boxes, pooled = {}, {}
         for node in host_nodes:
             dev_ = runner._devices[node.name]
             example = [runner._arg(r, dev_, inputs) for r in node.args]
             like = next(t for (p, _, _), t in runner.inboxes.items() if p == node.name)
+            out_like = like
+            if node.kind == "experts":
+                layer, where = _experts_call(getattr(self.split, node.name))
+                res = getattr(external.experts.get(layer), "_vxpu_hot", None) if layer is not None else None
+                pools = [p for p in (res.pools if res else []) if p.device == dev]
+                if pools:  # the hot pairs on this GPU inside the graph; the CPU answers the rest per pair
+                    x_, _, i_ = (example[k] for k in where)
+                    out_like = torch.empty(i_.shape[0], i_.shape[1], x_.shape[1], dtype=torch.float32)
+                    pooled[node.name] = (external.experts[layer], pools, where, layer)
             boxes[node.name] = ([torch.empty_like(a, device="cpu").pin_memory() if isinstance(a, torch.Tensor) else a
                                  for a in example],
-                                torch.empty_like(like, device="cpu").pin_memory(), like)
+                                torch.empty_like(out_like, device="cpu").pin_memory(), out_like)
+        side = torch.cuda.Stream(device=dev)  # the in-graph pools' kernels, forked from the step and joined back
         torch.cuda.synchronize()
         g = torch.cuda.CUDAGraph()
         with torch.cuda.graph(g):
@@ -192,6 +218,18 @@ class StepGraph(torch.nn.Module):
                     continue
                 i = len(mailboxes)
                 pinned, outbox, like = boxes[node.name]
+                hot = None
+                if node.name in pooled:
+                    moe, pools, where, _ = pooled[node.name]
+                    x_, w_, i_ = (args_[k] for k in where)
+                    side.wait_stream(stream)
+                    with torch.cuda.stream(side):
+                        hot = []
+                        for pool in pools:
+                            slots = pool.slot_gpu[i_ - moe.experts_start_idx]
+                            hot.append((slots >= 0, triton_ops.fp4_experts_decode(
+                                x_, w_, slots, pool.w1, pool.s1, pool.w3, pool.s3, pool.w2, pool.s2,
+                                moe.swiglu_limit, per_pair=True)))
                 for p, a in zip(pinned, args_):
                     if isinstance(a, torch.Tensor):
                         p.copy_(a, non_blocking=True)
@@ -200,8 +238,16 @@ class StepGraph(torch.nn.Module):
                 driver.write_value(stream, base + 4 * (2 * i + 1), 0)
                 reply = torch.empty_like(like, device=dev)
                 reply.copy_(outbox, non_blocking=True)
+                if hot is not None:  # per-pair replies: the GPU's where it holds the expert, then the k-order sum
+                    stream.wait_stream(side)
+                    for mine, replies in hot:
+                        reply = torch.where(mine.unsqueeze(-1), replies, reply)
+                    y = torch.zeros(reply.shape[0], reply.shape[2], dtype=torch.float32, device=dev)
+                    for k in range(reply.shape[1]):
+                        y = y + reply[:, k]
+                    reply = y
                 produced[node.name] = reply
-                mailboxes.append((node, pinned, kwargs_, outbox, i))
+                mailboxes.append((node, pinned, kwargs_, outbox, i, pooled.get(node.name)))
             output = resolve(graph.output)
         self.graph, self._output = g, output
         from . import ops
@@ -239,14 +285,43 @@ class _Worker(threading.Thread):
             if self.stopping:
                 return
             try:
-                for node, pinned, kwargs, outbox, i in self.mailboxes:
+                for node, pinned, kwargs, outbox, i, pooled in self.mailboxes:
                     while self.view[2 * i] != 1:
                         pass
                     self.view[2 * i] = 0
-                    out = getattr(self.split, node.name)(*pinned, **kwargs)
-                    outbox.copy_(out[0] if isinstance(out, (tuple, list)) else out)
+                    if pooled is None:
+                        out = getattr(self.split, node.name)(*pinned, **kwargs)
+                        outbox.copy_(out[0] if isinstance(out, (tuple, list)) else out)
+                    else:
+                        self._answer_cold(pooled, pinned, outbox)
                     self.view[2 * i + 1] = 1
             except BaseException as e:  # the GPU would wait forever: release it, then report
                 self.error = e
-                for _, _, _, _, i in self.mailboxes:
+                for _, _, _, _, i, _ in self.mailboxes:
                     self.view[2 * i + 1] = 1
+
+    def _answer_cold(self, pooled, pinned, outbox):
+        """The pairs no in-graph pool holds, per pair, into the outbox
+        [n, topk, dim] (zero where a pool answers, in the graph). Records
+        the node as _moe_mailboxes does (ops.py), so its selections reach
+        the statistics the placements come from."""
+        from . import ops
+        from .mailboxes import CpuOwner
+        moe, pools, where, layer = pooled
+        rec = ops._recorder()
+        t0 = time.perf_counter()
+        x, w, i = (pinned[k] for k in where)
+        held = torch.zeros_like(i, dtype=torch.bool)
+        for pool in pools:
+            held |= pool.slot_cpu[i - moe.experts_start_idx] >= 0
+        cold = ~held
+        outbox.zero_()
+        if cold.any():
+            n, topk = i.shape
+            tokens = torch.arange(n).view(n, 1).expand(n, topk)[cold]
+            outbox[cold] = CpuOwner().answer(moe, x, tokens, i[cold], w[cold])
+        if rec is not None:
+            n_cold = int(cold.sum())
+            rec.host_op("moe_experts", impl_ms=(time.perf_counter() - t0) * 1e3,
+                        gpu_pairs=float(i.numel() - n_cold), cpu_pairs=float(n_cold))
+            rec.selected_experts(layer, i.flatten().tolist())
