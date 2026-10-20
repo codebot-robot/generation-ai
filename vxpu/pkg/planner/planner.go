@@ -27,6 +27,7 @@ import (
 	"fmt"
 	"sort"
 	"strconv"
+	"strings"
 
 	"github.com/gke-labs/generation-ai/vxpu/pkg/machines"
 )
@@ -42,6 +43,11 @@ const (
 	// two RTX PRO 6000s (the hero run, 68 + 95 GB of experts): GPU0 used
 	// 24 GiB besides its experts, for 9.8 GB of dense weights.
 	denseFactor = 2.5
+	// denseFP8Factor is the same without the bf16 copies prefill keeps of
+	// the fp8 weights (decode reads the fp8 weights either way): the
+	// weights, the KV cache and the graph pools (estimated, not yet
+	// measured).
+	denseFP8Factor = 1.5
 	// ramFraction and ramHeadroomBytes give the RAM a machine's experts
 	// may take: the rest is the process, the kernels' buffers, the page
 	// cache the n-gram tables are read through (they are memory-mapped
@@ -54,6 +60,11 @@ const (
 type Artifact struct {
 	DenseBytes int64         // weights bound into the graphs
 	Experts    map[int]Layer // routed experts held outside the graphs, by layer
+	// what a decode step reads of the dense weights (all but the
+	// embedding table, which it only indexes): fp8 weights, and the rest
+	DecodeFP8Bytes, DecodeOtherBytes int64
+	TopK                             int // routed experts each token selects in each layer
+	EngramLayers                     int // layers with an n-gram table (a host op each, like the experts)
 }
 
 // Layer is one layer's routed experts.
@@ -64,14 +75,22 @@ type Layer struct {
 
 // ReadArtifact takes the inventory of an artifact's manifest and binding.
 func ReadArtifact(manifestJSON, bindingJSON []byte) (Artifact, error) {
+	type topK struct {
+		NumExpertsPerTok int `json:"num_experts_per_tok"`
+	}
 	var manifest struct {
 		Tensors map[string]struct {
 			Length int64 `json:"length"`
 		} `json:"tensors"`
+		Config struct {
+			topK
+			TextConfig topK `json:"text_config"`
+		} `json:"config"`
 	}
 	var binding struct {
 		Bound map[string]struct {
-			Length int64 `json:"length"`
+			Length int64  `json:"length"`
+			DType  string `json:"dtype"`
 		} `json:"bound"`
 		Stacked map[string]struct {
 			Parts [][]string `json:"parts"`
@@ -80,6 +99,7 @@ func ReadArtifact(manifestJSON, bindingJSON []byte) (Artifact, error) {
 			Experts map[string]map[string]struct {
 				Parts [][]string `json:"parts"`
 			} `json:"experts"`
+			Engram map[string]json.RawMessage `json:"engram"`
 		} `json:"external"`
 	}
 	if err := json.Unmarshal(manifestJSON, &manifest); err != nil {
@@ -101,9 +121,17 @@ func ReadArtifact(manifestJSON, bindingJSON []byte) (Artifact, error) {
 		}
 		return n, nil
 	}
-	a := Artifact{Experts: map[int]Layer{}}
-	for _, t := range binding.Bound {
+	a := Artifact{Experts: map[int]Layer{}, TopK: max(manifest.Config.NumExpertsPerTok, manifest.Config.TextConfig.NumExpertsPerTok),
+		EngramLayers: len(binding.External.Engram)}
+	for name, t := range binding.Bound {
 		a.DenseBytes += t.Length
+		switch {
+		case strings.Contains(name, ".embed."): // indexed, not read whole
+		case t.DType == "F8_E4M3":
+			a.DecodeFP8Bytes += t.Length
+		default:
+			a.DecodeOtherBytes += t.Length
+		}
 	}
 	for name, s := range binding.Stacked {
 		n, err := bytesOf(s.Parts)
@@ -145,6 +173,7 @@ type Plan struct {
 	// serves to the engine's mailboxes (ServeExperts).
 	ExpertExecutors map[string][]int `json:"expert_executors,omitempty"`
 	Reasons         []string         `json:"reasons"`
+	Prediction      Prediction       `json:"prediction"`
 }
 
 // Executor is another executor the coordinator may give experts to.
@@ -162,15 +191,22 @@ func Choose(a Artifact, probe *machines.Probe, others []Executor, counts map[int
 	p := Plan{Switches: map[string]string{}}
 	if len(a.Experts) == 0 {
 		p.Reasons = append(p.Reasons, "experts: the model has no routed experts held outside its graphs")
+		p.Prediction = Predict(a, p, probe, nil, counts)
 		return p
 	}
 	local := spread(&p, a, probe, others)
-	for layer := range counts {
-		if !local[layer] {
-			delete(counts, layer) // served elsewhere: the engine's GPUs cannot hold them
+	engineCounts := map[int]map[int]int64{}
+	for layer, c := range counts {
+		if local[layer] { // the others' layers the engine's GPUs cannot hold
+			engineCounts[layer] = c
 		}
 	}
-	placeOnGPUs(&p, a, probe, counts)
+	placeOnGPUs(&p, a, probe, engineCounts)
+	machinesOf := map[string]machines.Probe{}
+	for _, o := range others {
+		machinesOf[o.Address] = o.Probe
+	}
+	p.Prediction = Predict(a, p, probe, machinesOf, counts)
 	return p
 }
 
@@ -286,7 +322,17 @@ func placeOnGPUs(p *Plan, a Artifact, probe *machines.Probe, counts map[int]map[
 	for i := range budgets {
 		budgets[i] = probe.GPUMemoryBytes - gpuHeadroomBytes
 	}
-	budgets[0] -= int64(denseFactor * float64(a.DenseBytes))
+	factor := denseFactor
+	if budgets[0] < int64(denseFactor*float64(a.DenseBytes)) {
+		// the bf16 copies prefill keeps do not fit beside the fp8 weights:
+		// prefill dequantizes each weight as it uses it instead, and the
+		// memory goes to experts (decode reads the fp8 weights either way)
+		factor = denseFP8Factor
+		p.Switches["VXPU_BF16_WEIGHT_CACHE"] = "0"
+		p.Reasons = append(p.Reasons, fmt.Sprintf("dense: no bf16 copies for prefill (%.1fx the %.1f GB of dense weights "+
+			"would not fit on a %.1f GB GPU); decode reads the fp8 weights either way", denseFactor, gb(a.DenseBytes), gb(probe.GPUMemoryBytes)))
+	}
+	budgets[0] -= int64(factor * float64(a.DenseBytes))
 	for i := range budgets { // a GPU with less room than one expert (or none: the headroom) holds none
 		if budgets[i] < perExpert {
 			budgets[i] = 0
@@ -314,7 +360,7 @@ func placeOnGPUs(p *Plan, a Artifact, probe *machines.Probe, counts map[int]map[
 	p.Reasons = append(p.Reasons, fmt.Sprintf("GPU experts: %d of %d on %d %s GPU(s), serving %.0f%% of the recorded selections; "+
 		"budgets%s (each GPU's %.1f GB, less %.1f GB headroom; GPU0 also less %.1fx the %.1f GB of dense weights)",
 		held, total, probe.GPUCount, probe.GPU, 100*share, budgetText, gb(probe.GPUMemoryBytes), gb(gpuHeadroomBytes),
-		denseFactor, gb(a.DenseBytes)))
+		factor, gb(a.DenseBytes)))
 }
 
 // place is expert_stats.placement: the experts selected most, across

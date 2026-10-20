@@ -126,6 +126,9 @@ type modelPlan struct {
 	// where they answer
 	ExpertExecutors map[string][]int `json:"expert_executors,omitempty"`
 	Reasons         []string         `json:"reasons"`
+	// the decode time the cost model predicts for the plan (before the
+	// registered plan's switches; telemetry measures it)
+	Prediction planner.Prediction `json:"prediction"`
 }
 
 // planLoad chooses the switches a load of model sends: the planner's,
@@ -162,16 +165,20 @@ func (s *Server) planLoad(ctx context.Context, model string, manifest, binding [
 		s.mu.Lock()
 		s.releaseHelpersLocked(engine) // its experts are placed again
 		s.mu.Unlock()
-		p := planner.Choose(artifact, probe, s.freeExecutors(ctx, engine), counts)
-		mp.Switches, mp.Reasons = p.Switches, append(mp.Reasons, p.Reasons...)
+		free := s.freeExecutors(ctx, engine)
+		p := planner.Choose(artifact, probe, free, counts)
+		mp.Switches, mp.Reasons, mp.Prediction = p.Switches, append(mp.Reasons, p.Reasons...), p.Prediction
 		// the other executors load their layers and answer on a port each;
 		// the engine's mailboxes are wired to them
 		var remotes []string
+		repredict := false
 		for _, addr := range sortedKeys(p.ExpertExecutors) {
 			layers := p.ExpertExecutors[addr]
 			remote, err := s.serveExperts(ctx, engine, addr, manifest, binding, layers)
 			if err != nil {
 				mp.Reasons = append(mp.Reasons, fmt.Sprintf("experts: %s could not serve layers %v (%v): the engine holds them", addr, layers, err))
+				delete(p.ExpertExecutors, addr)
+				repredict = true
 				continue
 			}
 			remotes = append(remotes, remote)
@@ -179,6 +186,13 @@ func (s *Server) planLoad(ctx context.Context, model string, manifest, binding [
 				mp.ExpertExecutors = map[string][]int{}
 			}
 			mp.ExpertExecutors[remote] = layers
+		}
+		if repredict { // the engine holds what an executor could not serve: price that
+			others := map[string]machines.Probe{}
+			for _, e := range free {
+				others[e.Address] = e.Probe
+			}
+			mp.Prediction = planner.Predict(artifact, p, probe, others, counts)
 		}
 		if len(remotes) > 0 {
 			mp.Switches["VXPU_EXPERT_REMOTE"] = strings.Join(remotes, ",")
@@ -198,7 +212,8 @@ func (s *Server) planLoad(ctx context.Context, model string, manifest, binding [
 	}
 	s.plans[statsKey(model)] = mp
 	s.mu.Unlock()
-	log.Info("Planned the load", "model", model, "machine", mp.Machine, "switches", len(mp.Switches), "reasons", mp.Reasons)
+	log.Info("Planned the load", "model", model, "machine", mp.Machine, "switches", len(mp.Switches),
+		"predictedMsPerToken", mp.Prediction.MsPerToken, "reasons", mp.Reasons)
 	return mp.Switches
 }
 

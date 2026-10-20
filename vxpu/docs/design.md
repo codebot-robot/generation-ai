@@ -220,6 +220,21 @@ op's time. Records are batched into modelstore (`vxpu-stats/<model>`, one
 tag per day). `vxpu stats` summarizes them, and `expert_stats` and
 `expert_sim` read them.
 
+The planner predicts each plan's decode time (`pkg/planner/cost.go`,
+#349): decode is memory-bound, so each part costs its bytes over the
+bandwidth that reads them. The dense weights a step reads go over the
+GPU's GEMV bandwidth. Each layer's top-k experts go partly over GPU
+bandwidth and partly over the CPU expert kernel's, in parallel, or over
+another executor's CPU and a network round trip. Each host op adds a
+fixed crossing cost, and without the step graph each dense segment adds
+Python's launch. The bandwidths come from the machine catalog: measured
+where we measured them (an L4's GEMVs reach 252 of 300 GB/s, bf16 and
+fp8 alike), otherwise a measured share of the memory bandwidth. The
+constants are fitted to the hero run, which the model reproduces within
+9% (35.9 ms/token with every expert on the CPU, 26.4 with 68 GB on a
+GPU). `vxpu explain` shows the prediction by part, and telemetry
+measures what ran.
+
 **Why.** A database keeps statistics about its tables (row counts, value
 distributions) because its optimizer can only choose between plans by
 predicting what each will cost. vXPU is building the same kind of

@@ -82,7 +82,9 @@ func TestMatch(t *testing.T) {
 		{Probe{GPU: "NVIDIA H100 80GB HBM3", GPUCount: 1}, ""},
 		{Probe{GPU: "NVIDIA A100-SXM4-40GB", GPUCount: 1}, "a2-highgpu-1g"},
 		{Probe{GPU: "NVIDIA A100-SXM4-40GB", GPUCount: 8}, ""},
-		{Probe{GPU: "NVIDIA L4", GPUCount: 2, CPU: "AMD EPYC 9B45"}, ""}, // a GPU decides: an L4 host's CPU does not borrow G4's numbers
+		{Probe{GPU: "NVIDIA L4", GPUCount: 2, CPU: "AMD EPYC 9B45"}, "g2-standard-24"}, // a GPU decides, not the CPU
+		{Probe{GPU: "NVIDIA L4", GPUCount: 4, GPUMemoryBytes: 23_659_151_360}, "g2-standard-48"},
+		{Probe{GPU: "NVIDIA L4", GPUCount: 1}, ""},
 		{Probe{GPU: "NVIDIA RTX A6000", GPUCount: 1}, ""},
 		// the memory tells apart siblings the name matches
 		{Probe{GPU: "NVIDIA RTX PRO 6000 Blackwell Server Edition", GPUCount: 2, GPUMemoryBytes: 102_005_473_280}, "g4-standard-96"},
