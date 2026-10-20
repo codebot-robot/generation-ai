@@ -39,6 +39,7 @@ const (
 	Executor_Chat_FullMethodName          = "/vxpu.Executor/Chat"
 	Executor_Generate_FullMethodName      = "/vxpu.Executor/Generate"
 	Executor_GetModelStats_FullMethodName = "/vxpu.Executor/GetModelStats"
+	Executor_Describe_FullMethodName      = "/vxpu.Executor/Describe"
 )
 
 // ExecutorClient is the client API for Executor service.
@@ -83,6 +84,10 @@ type ExecutorClient interface {
 	// execution telemetry of the requests it sampled (kept in modelstore,
 	// so they outlive the router).
 	GetModelStats(ctx context.Context, in *GetModelStatsRequest, opts ...grpc.CallOption) (*GetModelStatsResponse, error)
+	// Describe reports what the executor runs on (executor only): its probe
+	// of the machine, for the coordinator's machine database (#394).
+	// Answers with or without a model loaded.
+	Describe(ctx context.Context, in *DescribeRequest, opts ...grpc.CallOption) (*DescribeResponse, error)
 }
 
 type executorClient struct {
@@ -162,6 +167,16 @@ func (c *executorClient) GetModelStats(ctx context.Context, in *GetModelStatsReq
 	return out, nil
 }
 
+func (c *executorClient) Describe(ctx context.Context, in *DescribeRequest, opts ...grpc.CallOption) (*DescribeResponse, error) {
+	cOpts := append([]grpc.CallOption{grpc.StaticMethod()}, opts...)
+	out := new(DescribeResponse)
+	err := c.cc.Invoke(ctx, Executor_Describe_FullMethodName, in, out, cOpts...)
+	if err != nil {
+		return nil, err
+	}
+	return out, nil
+}
+
 // ExecutorServer is the server API for Executor service.
 // All implementations must embed UnimplementedExecutorServer
 // for forward compatibility.
@@ -204,6 +219,10 @@ type ExecutorServer interface {
 	// execution telemetry of the requests it sampled (kept in modelstore,
 	// so they outlive the router).
 	GetModelStats(context.Context, *GetModelStatsRequest) (*GetModelStatsResponse, error)
+	// Describe reports what the executor runs on (executor only): its probe
+	// of the machine, for the coordinator's machine database (#394).
+	// Answers with or without a model loaded.
+	Describe(context.Context, *DescribeRequest) (*DescribeResponse, error)
 	mustEmbedUnimplementedExecutorServer()
 }
 
@@ -231,6 +250,9 @@ func (UnimplementedExecutorServer) Generate(*GenerateRequest, grpc.ServerStreami
 }
 func (UnimplementedExecutorServer) GetModelStats(context.Context, *GetModelStatsRequest) (*GetModelStatsResponse, error) {
 	return nil, status.Error(codes.Unimplemented, "method GetModelStats not implemented")
+}
+func (UnimplementedExecutorServer) Describe(context.Context, *DescribeRequest) (*DescribeResponse, error) {
+	return nil, status.Error(codes.Unimplemented, "method Describe not implemented")
 }
 func (UnimplementedExecutorServer) mustEmbedUnimplementedExecutorServer() {}
 func (UnimplementedExecutorServer) testEmbeddedByValue()                  {}
@@ -354,6 +376,24 @@ func _Executor_GetModelStats_Handler(srv interface{}, ctx context.Context, dec f
 	return interceptor(ctx, in, info, handler)
 }
 
+func _Executor_Describe_Handler(srv interface{}, ctx context.Context, dec func(interface{}) error, interceptor grpc.UnaryServerInterceptor) (interface{}, error) {
+	in := new(DescribeRequest)
+	if err := dec(in); err != nil {
+		return nil, err
+	}
+	if interceptor == nil {
+		return srv.(ExecutorServer).Describe(ctx, in)
+	}
+	info := &grpc.UnaryServerInfo{
+		Server:     srv,
+		FullMethod: Executor_Describe_FullMethodName,
+	}
+	handler := func(ctx context.Context, req interface{}) (interface{}, error) {
+		return srv.(ExecutorServer).Describe(ctx, req.(*DescribeRequest))
+	}
+	return interceptor(ctx, in, info, handler)
+}
+
 // Executor_ServiceDesc is the grpc.ServiceDesc for Executor service.
 // It's only intended for direct use with grpc.RegisterService,
 // and not to be introspected or modified (even as a copy)
@@ -380,6 +420,10 @@ var Executor_ServiceDesc = grpc.ServiceDesc{
 		{
 			MethodName: "GetModelStats",
 			Handler:    _Executor_GetModelStats_Handler,
+		},
+		{
+			MethodName: "Describe",
+			Handler:    _Executor_Describe_Handler,
 		},
 	},
 	Streams: []grpc.StreamDesc{

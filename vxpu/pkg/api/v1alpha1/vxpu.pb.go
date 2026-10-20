@@ -949,6 +949,89 @@ func (x *GetModelStatsResponse) GetRecordsJsonl() string {
 	return ""
 }
 
+type DescribeRequest struct {
+	state         protoimpl.MessageState `protogen:"open.v1"`
+	unknownFields protoimpl.UnknownFields
+	sizeCache     protoimpl.SizeCache
+}
+
+func (x *DescribeRequest) Reset() {
+	*x = DescribeRequest{}
+	mi := &file_proto_vxpu_proto_msgTypes[12]
+	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+	ms.StoreMessageInfo(mi)
+}
+
+func (x *DescribeRequest) String() string {
+	return protoimpl.X.MessageStringOf(x)
+}
+
+func (*DescribeRequest) ProtoMessage() {}
+
+func (x *DescribeRequest) ProtoReflect() protoreflect.Message {
+	mi := &file_proto_vxpu_proto_msgTypes[12]
+	if x != nil {
+		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+		if ms.LoadMessageInfo() == nil {
+			ms.StoreMessageInfo(mi)
+		}
+		return ms
+	}
+	return mi.MessageOf(x)
+}
+
+// Deprecated: Use DescribeRequest.ProtoReflect.Descriptor instead.
+func (*DescribeRequest) Descriptor() ([]byte, []int) {
+	return file_proto_vxpu_proto_rawDescGZIP(), []int{12}
+}
+
+type DescribeResponse struct {
+	state protoimpl.MessageState `protogen:"open.v1"`
+	// The executor's probe of its machine, as JSON: device, cpu,
+	// cpu_threads, simd, ram_bytes, and with a GPU gpu, gpu_memory_bytes,
+	// gpu_count (vxpu/pkg/machines.Probe).
+	HardwareJson  string `protobuf:"bytes,1,opt,name=hardware_json,json=hardwareJson,proto3" json:"hardware_json,omitempty"`
+	unknownFields protoimpl.UnknownFields
+	sizeCache     protoimpl.SizeCache
+}
+
+func (x *DescribeResponse) Reset() {
+	*x = DescribeResponse{}
+	mi := &file_proto_vxpu_proto_msgTypes[13]
+	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+	ms.StoreMessageInfo(mi)
+}
+
+func (x *DescribeResponse) String() string {
+	return protoimpl.X.MessageStringOf(x)
+}
+
+func (*DescribeResponse) ProtoMessage() {}
+
+func (x *DescribeResponse) ProtoReflect() protoreflect.Message {
+	mi := &file_proto_vxpu_proto_msgTypes[13]
+	if x != nil {
+		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+		if ms.LoadMessageInfo() == nil {
+			ms.StoreMessageInfo(mi)
+		}
+		return ms
+	}
+	return mi.MessageOf(x)
+}
+
+// Deprecated: Use DescribeResponse.ProtoReflect.Descriptor instead.
+func (*DescribeResponse) Descriptor() ([]byte, []int) {
+	return file_proto_vxpu_proto_rawDescGZIP(), []int{13}
+}
+
+func (x *DescribeResponse) GetHardwareJson() string {
+	if x != nil {
+		return x.HardwareJson
+	}
+	return ""
+}
+
 var File_proto_vxpu_proto protoreflect.FileDescriptor
 
 const file_proto_vxpu_proto_rawDesc = "" +
@@ -1047,7 +1130,10 @@ const file_proto_vxpu_proto_rawDesc = "" +
 	"\arecords\x18\x02 \x01(\bR\arecords\"_\n" +
 	"\x15GetModelStatsResponse\x12!\n" +
 	"\fsummary_json\x18\x01 \x01(\tR\vsummaryJson\x12#\n" +
-	"\rrecords_jsonl\x18\x02 \x01(\tR\frecordsJsonl2\x95\x03\n" +
+	"\rrecords_jsonl\x18\x02 \x01(\tR\frecordsJsonl\"\x11\n" +
+	"\x0fDescribeRequest\"7\n" +
+	"\x10DescribeResponse\x12#\n" +
+	"\rhardware_json\x18\x01 \x01(\tR\fhardwareJson2\xd2\x03\n" +
 	"\bExecutor\x12>\n" +
 	"\tLoadModel\x12\x16.vxpu.LoadModelRequest\x1a\x17.vxpu.LoadModelResponse\"\x00\x12J\n" +
 	"\rRegisterModel\x12\x1a.vxpu.RegisterModelRequest\x1a\x1b.vxpu.RegisterModelResponse\"\x00\x12A\n" +
@@ -1055,7 +1141,8 @@ const file_proto_vxpu_proto_rawDesc = "" +
 	"NewSession\x12\x17.vxpu.NewSessionRequest\x1a\x18.vxpu.NewSessionResponse\"\x00\x12/\n" +
 	"\x04Chat\x12\x11.vxpu.ChatRequest\x1a\x12.vxpu.ChatResponse\"\x00\x12=\n" +
 	"\bGenerate\x12\x15.vxpu.GenerateRequest\x1a\x16.vxpu.GenerateResponse\"\x000\x01\x12J\n" +
-	"\rGetModelStats\x12\x1a.vxpu.GetModelStatsRequest\x1a\x1b.vxpu.GetModelStatsResponse\"\x00BBZ@github.com/gke-labs/generation-ai/vxpu/pkg/api/v1alpha1;v1alpha1b\x06proto3"
+	"\rGetModelStats\x12\x1a.vxpu.GetModelStatsRequest\x1a\x1b.vxpu.GetModelStatsResponse\"\x00\x12;\n" +
+	"\bDescribe\x12\x15.vxpu.DescribeRequest\x1a\x16.vxpu.DescribeResponse\"\x00BBZ@github.com/gke-labs/generation-ai/vxpu/pkg/api/v1alpha1;v1alpha1b\x06proto3"
 
 var (
 	file_proto_vxpu_proto_rawDescOnce sync.Once
@@ -1069,7 +1156,7 @@ func file_proto_vxpu_proto_rawDescGZIP() []byte {
 	return file_proto_vxpu_proto_rawDescData
 }
 
-var file_proto_vxpu_proto_msgTypes = make([]protoimpl.MessageInfo, 14)
+var file_proto_vxpu_proto_msgTypes = make([]protoimpl.MessageInfo, 16)
 var file_proto_vxpu_proto_goTypes = []any{
 	(*LoadModelRequest)(nil),      // 0: vxpu.LoadModelRequest
 	(*LoadModelResponse)(nil),     // 1: vxpu.LoadModelResponse
@@ -1083,26 +1170,30 @@ var file_proto_vxpu_proto_goTypes = []any{
 	(*GenerateResponse)(nil),      // 9: vxpu.GenerateResponse
 	(*GetModelStatsRequest)(nil),  // 10: vxpu.GetModelStatsRequest
 	(*GetModelStatsResponse)(nil), // 11: vxpu.GetModelStatsResponse
-	nil,                           // 12: vxpu.LoadModelRequest.PlanEntry
-	nil,                           // 13: vxpu.RegisterModelRequest.PlanEntry
+	(*DescribeRequest)(nil),       // 12: vxpu.DescribeRequest
+	(*DescribeResponse)(nil),      // 13: vxpu.DescribeResponse
+	nil,                           // 14: vxpu.LoadModelRequest.PlanEntry
+	nil,                           // 15: vxpu.RegisterModelRequest.PlanEntry
 }
 var file_proto_vxpu_proto_depIdxs = []int32{
-	12, // 0: vxpu.LoadModelRequest.plan:type_name -> vxpu.LoadModelRequest.PlanEntry
-	13, // 1: vxpu.RegisterModelRequest.plan:type_name -> vxpu.RegisterModelRequest.PlanEntry
+	14, // 0: vxpu.LoadModelRequest.plan:type_name -> vxpu.LoadModelRequest.PlanEntry
+	15, // 1: vxpu.RegisterModelRequest.plan:type_name -> vxpu.RegisterModelRequest.PlanEntry
 	0,  // 2: vxpu.Executor.LoadModel:input_type -> vxpu.LoadModelRequest
 	2,  // 3: vxpu.Executor.RegisterModel:input_type -> vxpu.RegisterModelRequest
 	4,  // 4: vxpu.Executor.NewSession:input_type -> vxpu.NewSessionRequest
 	6,  // 5: vxpu.Executor.Chat:input_type -> vxpu.ChatRequest
 	8,  // 6: vxpu.Executor.Generate:input_type -> vxpu.GenerateRequest
 	10, // 7: vxpu.Executor.GetModelStats:input_type -> vxpu.GetModelStatsRequest
-	1,  // 8: vxpu.Executor.LoadModel:output_type -> vxpu.LoadModelResponse
-	3,  // 9: vxpu.Executor.RegisterModel:output_type -> vxpu.RegisterModelResponse
-	5,  // 10: vxpu.Executor.NewSession:output_type -> vxpu.NewSessionResponse
-	7,  // 11: vxpu.Executor.Chat:output_type -> vxpu.ChatResponse
-	9,  // 12: vxpu.Executor.Generate:output_type -> vxpu.GenerateResponse
-	11, // 13: vxpu.Executor.GetModelStats:output_type -> vxpu.GetModelStatsResponse
-	8,  // [8:14] is the sub-list for method output_type
-	2,  // [2:8] is the sub-list for method input_type
+	12, // 8: vxpu.Executor.Describe:input_type -> vxpu.DescribeRequest
+	1,  // 9: vxpu.Executor.LoadModel:output_type -> vxpu.LoadModelResponse
+	3,  // 10: vxpu.Executor.RegisterModel:output_type -> vxpu.RegisterModelResponse
+	5,  // 11: vxpu.Executor.NewSession:output_type -> vxpu.NewSessionResponse
+	7,  // 12: vxpu.Executor.Chat:output_type -> vxpu.ChatResponse
+	9,  // 13: vxpu.Executor.Generate:output_type -> vxpu.GenerateResponse
+	11, // 14: vxpu.Executor.GetModelStats:output_type -> vxpu.GetModelStatsResponse
+	13, // 15: vxpu.Executor.Describe:output_type -> vxpu.DescribeResponse
+	9,  // [9:16] is the sub-list for method output_type
+	2,  // [2:9] is the sub-list for method input_type
 	2,  // [2:2] is the sub-list for extension type_name
 	2,  // [2:2] is the sub-list for extension extendee
 	0,  // [0:2] is the sub-list for field type_name
@@ -1121,7 +1212,7 @@ func file_proto_vxpu_proto_init() {
 			GoPackagePath: reflect.TypeOf(x{}).PkgPath(),
 			RawDescriptor: unsafe.Slice(unsafe.StringData(file_proto_vxpu_proto_rawDesc), len(file_proto_vxpu_proto_rawDesc)),
 			NumEnums:      0,
-			NumMessages:   14,
+			NumMessages:   16,
 			NumExtensions: 0,
 			NumServices:   1,
 		},

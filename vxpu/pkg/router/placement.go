@@ -24,6 +24,7 @@ import (
 	"k8s.io/apimachinery/pkg/api/resource"
 
 	"github.com/gke-labs/generation-ai/vxpu/pkg/api/v1alpha1"
+	"github.com/gke-labs/generation-ai/vxpu/pkg/machines"
 )
 
 const (
@@ -40,25 +41,6 @@ const (
 	// VXPU_CPU_EXECUTOR_MAX_CPUS.
 	defaultMaxExecutorCPUs = 30
 )
-
-// acceleratorMemoryGB maps GKE accelerator labels to on-board memory.
-// Override for an unlisted (or MIG-partitioned) accelerator with
-// VXPU_ACCELERATOR_MEMORY_GIB.
-var acceleratorMemoryGB = map[string]float64{
-	"nvidia-tesla-k80":      12,
-	"nvidia-tesla-p4":       8,
-	"nvidia-tesla-p100":     16,
-	"nvidia-tesla-v100":     16,
-	"nvidia-tesla-t4":       16,
-	"nvidia-l4":             24,
-	"nvidia-tesla-a100":     40,
-	"nvidia-a100-80gb":      80,
-	"nvidia-h100-80gb":      80,
-	"nvidia-h100-mega-80gb": 80,
-	"nvidia-h200-141gb":     141,
-	"nvidia-b200":           180,
-	"nvidia-rtx-pro-6000":   96,
-}
 
 // Placement is the router's decision of where an executor runs and
 // how big it is. The artifact is hardware-agnostic; the router sizes
@@ -91,7 +73,7 @@ func acceleratorMemoryBytes(accelerator string) int64 {
 			return int64(f * float64(gib))
 		}
 	}
-	if gb, ok := acceleratorMemoryGB[accelerator]; ok {
+	if gb, ok := machines.AcceleratorMemoryGB(accelerator); ok {
 		return int64(gb * 1e9)
 	}
 	return 0

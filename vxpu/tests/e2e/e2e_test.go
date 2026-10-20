@@ -290,6 +290,10 @@ func testByName(t *testing.T, h *Harness, gitRoot, vxpuBin string, env []string)
 	if logs := h.GetPodLogs("app=vxpu-external-executor", "default"); !strings.Contains(logs, "loading") {
 		t.Errorf("the model should have been served by the external executor; its logs:\n%s", logs)
 	}
+	// the coordinator asked the executor what it runs on (#394)
+	if logs := h.GetPodLogs("app=vxpu-router", "default"); !strings.Contains(logs, `"Executor described"`) { // klog quotes the message: not "... itself unreadably"
+		t.Errorf("the router should have described the external executor; its logs:\n%s", logs)
+	}
 	out = run("stats", model)
 	if !strings.Contains(out, `"requests": 1`) || !strings.Contains(out, `"telemetry_sampled": 1`) {
 		t.Errorf("the engine should have recorded the request and its telemetry, got:\n%s", out)

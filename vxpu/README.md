@@ -176,8 +176,8 @@ doesn't understand: `VXPU_KERNELS`, `VXPU_FUSED_EXPERTS`,
 `VXPU_DATAFLOW_PLACE`, `VXPU_STEP_GRAPH`; and `VXPU_EXTERNAL_DIR`,
 `VXPU_AOTI_CACHE_DIR`, `VXPU_GPU_EXPERTS` and `VXPU_EXPERT_REMOTE`, taken as
 given. Choosing between plans by cost, and
-deployment hints, come next (#316, #332, #349). `python -m vxpu.hardware [--machine NAME] [--json]`
-inspects the machine catalog and current probed hardware.
+deployment hints, come next (#316, #332, #349). `vxpu machines [NAME]`
+shows the machine database (`pkg/machines`).
 
 ## The dataflow executor: segments, experts and mailboxes
 

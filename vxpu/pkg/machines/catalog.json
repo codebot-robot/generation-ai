@@ -1,0 +1,350 @@
+{
+ "aliases": {
+  "a2": "a2-highgpu-1g",
+  "a2-highgpu": "a2-highgpu-1g",
+  "a3-highgpu": "a3-highgpu-8g",
+  "dev-mac": "mac-m4-pro",
+  "m4-pro": "mac-m4-pro",
+  "mac": "mac-m4-pro"
+ },
+ "machines": {
+  "a2-highgpu-1g": {
+   "cpu": {
+    "cache_sizes": {
+     "l1d": 196608,
+     "l1i": 196608,
+     "l2": 6291456,
+     "l3": 39845888
+    },
+    "cores": 6,
+    "memory_bandwidth_bytes_per_sec": 100000000000.0,
+    "model": "Intel Xeon Scalable (Cascade Lake)",
+    "simd": "avx512",
+    "threads": 12
+   },
+   "description": "GCP A2 accelerator instance with 1x NVIDIA A100 40GB SXM4 GPU",
+   "gpu": {
+    "memory_bandwidth_bytes_per_sec": 1555000000000.0,
+    "memory_bytes": 42949672960,
+    "name": "NVIDIA A100-SXM4-40GB",
+    "pcie_bandwidth_bytes_per_sec": 31500000000.0,
+    "pcie_gen": 4,
+    "pcie_lanes": 16,
+    "peak_compute_flops": {
+     "bf16": 312000000000000.0,
+     "fp32": 19500000000000.0,
+     "fp8": 0.0
+    },
+    "sm_count": 108
+   },
+   "gpu_count": 1,
+   "measured": null,
+   "name": "a2-highgpu-1g",
+   "network": {
+    "bandwidth_bytes_per_sec": 3000000000.0
+   },
+   "price": {
+    "on_demand_usd_per_hour": 3.67,
+    "spot_usd_per_hour": 1.1
+   },
+   "ram_bytes": 91268055040,
+   "storage": null
+  },
+  "a3-highgpu-8g": {
+   "cpu": {
+    "cache_sizes": {
+     "l1d": 5111808,
+     "l1i": 3407872,
+     "l2": 218103808,
+     "l3": 220200960
+    },
+    "cores": 104,
+    "memory_bandwidth_bytes_per_sec": 614400000000.0,
+    "model": "Intel Xeon Platinum 8480C",
+    "simd": "avx512",
+    "threads": 208
+   },
+   "description": "GCP A3 accelerator instance with 8x NVIDIA H100 80GB SXM5 GPUs",
+   "gpu": {
+    "memory_bandwidth_bytes_per_sec": 3350000000000.0,
+    "memory_bytes": 85899345920,
+    "name": "NVIDIA H100 80GB HBM3",
+    "pcie_bandwidth_bytes_per_sec": 63000000000.0,
+    "pcie_gen": 5,
+    "pcie_lanes": 16,
+    "peak_compute_flops": {
+     "bf16": 989000000000000.0,
+     "fp32": 67000000000000.0,
+     "fp8": 1979000000000000.0
+    },
+    "sm_count": 132
+   },
+   "gpu_count": 8,
+   "measured": null,
+   "name": "a3-highgpu-8g",
+   "network": {
+    "bandwidth_bytes_per_sec": 125000000000.0
+   },
+   "price": {
+    "on_demand_usd_per_hour": 88.49,
+    "spot_usd_per_hour": 50.32
+   },
+   "ram_bytes": 2010044694528,
+   "storage": {
+    "capacity_bytes": 6000000000000,
+    "devices": 16,
+    "read_bandwidth_bytes_per_sec": 10560000000.0,
+    "read_iops": 2720000.0,
+    "write_bandwidth_bytes_per_sec": 5600000000.0,
+    "write_iops": 1440000.0
+   }
+  },
+  "c3d-highmem-180": {
+   "cpu": {
+    "cache_sizes": {
+     "l1d": 2949120,
+     "l1i": 2949120,
+     "l2": 94371840,
+     "l3": 402653184
+    },
+    "cores": 90,
+    "memory_bandwidth_bytes_per_sec": 460800000000.0,
+    "model": "AMD EPYC 9B14",
+    "simd": "avx512",
+    "threads": 180
+   },
+   "description": "GCP C3D high-memory compute instance with AMD EPYC Genoa processors (180 vCPUs, 1.4 TB RAM)",
+   "gpu": null,
+   "gpu_count": 0,
+   "measured": null,
+   "name": "c3d-highmem-180",
+   "network": {
+    "bandwidth_bytes_per_sec": 12500000000.0
+   },
+   "price": {
+    "on_demand_usd_per_hour": 11.0223,
+    "spot_usd_per_hour": 2.6674
+   },
+   "ram_bytes": 1546188226560,
+   "storage": null
+  },
+  "c3d-standard-180": {
+   "cpu": {
+    "cache_sizes": {
+     "l1d": 2949120,
+     "l1i": 2949120,
+     "l2": 94371840,
+     "l3": 402653184
+    },
+    "cores": 90,
+    "memory_bandwidth_bytes_per_sec": 460800000000.0,
+    "model": "AMD EPYC 9B14",
+    "simd": "avx512",
+    "threads": 180
+   },
+   "description": "GCP C3D compute instance with AMD EPYC Genoa processors (180 vCPUs)",
+   "gpu": null,
+   "gpu_count": 0,
+   "measured": null,
+   "name": "c3d-standard-180",
+   "network": {
+    "bandwidth_bytes_per_sec": 12500000000.0
+   },
+   "price": {
+    "on_demand_usd_per_hour": 8.1718,
+    "spot_usd_per_hour": 1.9776
+   },
+   "ram_bytes": 773094113280,
+   "storage": null
+  },
+  "c3d-standard-60": {
+   "cpu": {
+    "cache_sizes": {
+     "l1d": 983040,
+     "l1i": 983040,
+     "l2": 31457280,
+     "l3": 134217728
+    },
+    "cores": 30,
+    "memory_bandwidth_bytes_per_sec": 153600000000.0,
+    "model": "AMD EPYC 9B14",
+    "simd": "avx512",
+    "threads": 60
+   },
+   "description": "GCP C3D compute instance with AMD EPYC Genoa processors (60 vCPUs)",
+   "gpu": null,
+   "gpu_count": 0,
+   "measured": {
+    "fp4_expert_decode_kernel_bytes_per_sec": 121000000000.0,
+    "gcs_blob_fetch_bytes_per_sec": 1400000000.0
+   },
+   "name": "c3d-standard-60",
+   "network": {
+    "bandwidth_bytes_per_sec": 5000000000.0
+   },
+   "price": {
+    "on_demand_usd_per_hour": 2.7239,
+    "spot_usd_per_hour": 0.6594
+   },
+   "ram_bytes": 257698037760,
+   "storage": null
+  },
+  "g4-standard-48": {
+   "cpu": {
+    "cache_sizes": {
+     "l1d": 1179648,
+     "l1i": 786432,
+     "l2": 25165824,
+     "l3": 100663296
+    },
+    "cores": 24,
+    "memory_bandwidth_bytes_per_sec": 144000000000.0,
+    "model": "AMD EPYC 9B45 (Turin)",
+    "simd": "avx512",
+    "threads": 48
+   },
+   "description": "GCP G4 instance with 1x NVIDIA RTX PRO 6000 Blackwell Server Edition GPU",
+   "gpu": {
+    "memory_bandwidth_bytes_per_sec": 1597000000000.0,
+    "memory_bytes": 103079215104,
+    "name": "NVIDIA RTX PRO 6000",
+    "pcie_bandwidth_bytes_per_sec": 63000000000.0,
+    "pcie_gen": 5,
+    "pcie_lanes": 16,
+    "peak_compute_flops": {
+     "bf16": 500000000000000.0,
+     "fp32": 125000000000000.0,
+     "fp8": 1008000000000000.0
+    },
+    "sm_count": 188
+   },
+   "gpu_count": 1,
+   "measured": null,
+   "name": "g4-standard-48",
+   "network": {
+    "bandwidth_bytes_per_sec": 6250000000.0
+   },
+   "price": {
+    "on_demand_usd_per_hour": 4.5,
+    "spot_usd_per_hour": 1.7149
+   },
+   "ram_bytes": 193273528320,
+   "storage": {
+    "capacity_bytes": 1500000000000,
+    "devices": 4,
+    "read_bandwidth_bytes_per_sec": 2621440000.0,
+    "read_iops": 600000.0,
+    "write_bandwidth_bytes_per_sec": 1384120320.0,
+    "write_iops": 300000.0
+   }
+  },
+  "g4-standard-96": {
+   "cpu": {
+    "cache_sizes": {
+     "l1d": 2359296,
+     "l1i": 1572864,
+     "l2": 50331648,
+     "l3": 201326592
+    },
+    "cores": 48,
+    "memory_bandwidth_bytes_per_sec": 288000000000.0,
+    "model": "AMD EPYC 9B45 (Turin)",
+    "simd": "avx512",
+    "threads": 96
+   },
+   "description": "GCP G4 instance with 2x NVIDIA RTX PRO 6000 Blackwell Server Edition GPUs (the dev VM)",
+   "gpu": {
+    "memory_bandwidth_bytes_per_sec": 1597000000000.0,
+    "memory_bytes": 103079215104,
+    "name": "NVIDIA RTX PRO 6000",
+    "pcie_bandwidth_bytes_per_sec": 63000000000.0,
+    "pcie_gen": 5,
+    "pcie_lanes": 16,
+    "peak_compute_flops": {
+     "bf16": 500000000000000.0,
+     "fp32": 125000000000000.0,
+     "fp8": 1008000000000000.0
+    },
+    "sm_count": 188
+   },
+   "gpu_count": 2,
+   "measured": {
+    "checkpoint_load_bytes_per_sec": 2830000000.0,
+    "cpu_fp4_expert_kernel_effective_bytes_per_sec": 209000000000.0,
+    "gcs_blob_fetch_bytes_per_sec": 1700000000.0,
+    "gcs_checkpoint_copy_bytes_per_sec": 2890000000.0,
+    "local_ssd_read_bytes_per_sec": 5440000000.0,
+    "local_ssd_read_iops": 1330000.0,
+    "usable_gpu_memory_bytes": 102641958912
+   },
+   "name": "g4-standard-96",
+   "network": {
+    "bandwidth_bytes_per_sec": 12500000000.0
+   },
+   "price": {
+    "on_demand_usd_per_hour": 8.9999,
+    "spot_usd_per_hour": 3.4298
+   },
+   "ram_bytes": 386547056640,
+   "storage": {
+    "capacity_bytes": 3000000000000,
+    "devices": 8,
+    "read_bandwidth_bytes_per_sec": 5242880000.0,
+    "read_iops": 1200000.0,
+    "write_bandwidth_bytes_per_sec": 2768240640.0,
+    "write_iops": 600000.0
+   }
+  },
+  "mac-m4-pro": {
+   "cpu": {
+    "cache_sizes": {
+     "l1d": 1572864,
+     "l1i": 2490368,
+     "l2": 20971520,
+     "l3": 25165824
+    },
+    "cores": 14,
+    "memory_bandwidth_bytes_per_sec": 273000000000.0,
+    "model": "Apple M4 Pro",
+    "simd": "neon",
+    "threads": 14
+   },
+   "description": "Apple Mac developer machine with M4 Pro chip (14 CPU cores, 20 GPU cores, unified memory)",
+   "gpu": {
+    "memory_bandwidth_bytes_per_sec": 273000000000.0,
+    "memory_bytes": 51539607552,
+    "name": "Apple M4 Pro GPU",
+    "pcie_bandwidth_bytes_per_sec": null,
+    "pcie_gen": null,
+    "pcie_lanes": null,
+    "peak_compute_flops": {
+     "bf16": 17000000000000.0,
+     "fp32": 8500000000000.0,
+     "fp8": 0.0
+    },
+    "sm_count": 0
+   },
+   "gpu_count": 1,
+   "measured": {
+    "fp4_expert_decode_kernel_bytes_per_sec": 52000000000.0
+   },
+   "name": "mac-m4-pro",
+   "network": {
+    "bandwidth_bytes_per_sec": 1250000000.0
+   },
+   "price": {
+    "on_demand_usd_per_hour": 0.0,
+    "spot_usd_per_hour": 0.0
+   },
+   "ram_bytes": 51539607552,
+   "storage": {
+    "capacity_bytes": 1000000000000,
+    "devices": 1,
+    "read_bandwidth_bytes_per_sec": 5500000000.0,
+    "read_iops": 200000.0,
+    "write_bandwidth_bytes_per_sec": 5000000000.0,
+    "write_iops": 200000.0
+   }
+  }
+ }
+}

@@ -39,7 +39,7 @@ import torch
 
 from . import vxpu_pb2, vxpu_pb2_grpc
 from .engine import Engine, SamplingParams
-from .plan import ConfigError, Plan
+from .plan import ConfigError, Plan, probe_hardware
 
 MAX_MESSAGE_BYTES = 128 * 1024 * 1024
 
@@ -163,6 +163,11 @@ class ExecutorServicer(vxpu_pb2_grpc.ExecutorServicer):
             context.set_code(grpc.StatusCode.INTERNAL)
             context.set_details(str(e))
             return vxpu_pb2.LoadModelResponse(success=False)
+
+    def Describe(self, request, context):
+        """What this executor runs on, for the coordinator's machine
+        database (#394): the same probe its plans record."""
+        return vxpu_pb2.DescribeResponse(hardware_json=json.dumps(probe_hardware(self.device)))
 
     def NewSession(self, request, context):
         with self.lock:
