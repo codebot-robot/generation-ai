@@ -343,19 +343,25 @@ def devices_for(engine_device):
     return [first] + [torch.device("cuda", i) for i in range(torch.cuda.device_count()) if i != first.index]
 
 
-def load_placement(path):
+def _placement_doc(spec):
+    """A placement: inline JSON (as the coordinator sends it) or a file."""
+    if spec.lstrip().startswith("{"):
+        return json.loads(spec)
+    with open(spec) as f:
+        return json.load(f)
+
+
+def load_placement(spec):
     """[{layer: [expert ids]}] per GPU, in devices_for's order, from a
-    placement file (expert_stats --placement-gb): format
+    placement (expert_stats --placement-gb), inline or a file: format
     vxpu-placement/2 lists "gpus"; /1 is one GPU's "layers"."""
-    with open(path) as f:
-        doc = json.load(f)
+    doc = _placement_doc(spec)
     gpus = doc["gpus"] if "gpus" in doc else [doc]
     return [{int(layer): ids for layer, ids in gpu["layers"].items()} for gpu in gpus]
 
 
-def load_counts(path):
+def load_counts(spec):
     """{layer: {expert: selections}}, the history a placement was chosen
     from (its "counts"), or {} when it carries none."""
-    with open(path) as f:
-        doc = json.load(f)
+    doc = _placement_doc(spec)
     return {int(layer): c for layer, c in (doc.get("counts") or {}).items()}

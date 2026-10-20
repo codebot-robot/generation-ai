@@ -82,6 +82,16 @@ func cmdRegister(ctx context.Context, args []string) error {
 	pod := flags.String("pod", "vxpu-router", "router pod name")
 	routerAddr := flags.String("router", "", "vxpu-router address (e.g. localhost:50051); if set, skips the pod and port-forward")
 	timeout := flags.Duration("timeout", 2*time.Hour, "how long to wait (importing weights and compiling can take a while)")
+	plan := map[string]string{}
+	flags.Func("plan", "VXPU_NAME=VALUE: a switch the router sends with every load of the model, as the "+
+		"environment would set it (repeatable; replaces the model's plan)", func(kv string) error {
+		k, v, ok := strings.Cut(kv, "=")
+		if !ok || !strings.HasPrefix(k, "VXPU_") {
+			return fmt.Errorf("%q: expected VXPU_NAME=VALUE", kv)
+		}
+		plan[k] = v
+		return nil
+	})
 	if err := flags.Parse(args); err != nil {
 		return err
 	}
@@ -98,7 +108,7 @@ func cmdRegister(ctx context.Context, args []string) error {
 	defer cancel()
 	fmt.Printf("registering %s (importing weights into modelstore, compiling if needed)...\n", flags.Arg(0))
 	started := time.Now()
-	resp, err := client.RegisterModel(ctx, &pb.RegisterModelRequest{Model: repo, Revision: revision}, grpc.WaitForReady(true))
+	resp, err := client.RegisterModel(ctx, &pb.RegisterModelRequest{Model: repo, Revision: revision, Plan: plan}, grpc.WaitForReady(true))
 	if err != nil {
 		return fmt.Errorf("RegisterModel: %w", err)
 	}
@@ -108,6 +118,9 @@ func cmdRegister(ctx context.Context, args []string) error {
 	}
 	fmt.Printf("registered %s@%s (commit %s): %s, %.1f GB of weights, artifact %s (%.0fs)\n",
 		resp.Model, resp.Revision, resp.Commit, how, float64(resp.WeightBytes)/1e9, resp.Artifact, time.Since(started).Seconds())
+	if len(plan) > 0 {
+		fmt.Printf("plan: %v (sent with every load of the model)\n", plan)
+	}
 	return nil
 }
 

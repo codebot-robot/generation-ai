@@ -176,6 +176,15 @@ func (s *Server) RegisterModel(ctx context.Context, req *pb.RegisterModelRequest
 	}
 	repo := weightstore.ArtifactRepository(req.Model)
 	tag := artifactTag(commit, s.imageName)
+	if len(req.Plan) > 0 {
+		if err := s.putPlan(ctx, req.Model, req.Plan); err != nil {
+			return nil, status.Errorf(codes.Unavailable, "storing the plan of %s: %v", req.Model, err)
+		}
+		// the next session loads it under the new plan (loadByName
+		// compares it with the one a loaded tag was loaded under)
+		s.setHints(req.Model, req.Plan, true)
+		log.Info("Stored the model's plan", "model", req.Model, "switches", planSwitches(req.Plan))
+	}
 	resp := &pb.RegisterModelResponse{Model: req.Model, Revision: revision, Commit: commit, Artifact: repo + ":" + tag}
 
 	exists, err := s.weightStore.ManifestExists(ctx, repo, tag)
@@ -404,8 +413,12 @@ func (s *Server) loadByName(ctx context.Context, model, revision string) (string
 
 	s.mu.RLock()
 	key, loaded := s.loadedTags[tag]
+	current, known := s.hints[statsKey(model)]
+	stale := known && s.loadedHints[tag] != current
 	s.mu.RUnlock()
-	if loaded {
+	if loaded && stale {
+		klog.FromContext(ctx).Info("The model's plan changed; loading it again", "model", model, "model_key", key)
+	} else if loaded {
 		_, err := s.executorEndpoint(ctx, key)
 		if err == nil {
 			return key, nil
@@ -424,6 +437,11 @@ func (s *Server) loadByName(ctx context.Context, model, revision string) (string
 		if !exists {
 			return "", status.Errorf(codes.FailedPrecondition, "model %s@%s is not compiled for executor image %s: call RegisterModel", model, revision, s.imageName)
 		}
+		plan, err := s.getPlan(ctx, model)
+		if err != nil {
+			return "", status.Errorf(codes.Unavailable, "reading the plan of %s: %v", model, err)
+		}
+		s.setHints(model, plan, false)
 		files := map[string][]byte{}
 		for _, f := range []string{"manifest.json", "binding.json", "prefill.pt2", "decode.pt2"} {
 			data, err := s.weightStore.FetchFile(ctx, repo, tag, f)
@@ -437,12 +455,17 @@ func (s *Server) loadByName(ctx context.Context, model, revision string) (string
 			BindingJson:  string(files["binding.json"]),
 			PrefillGraph: files["prefill.pt2"],
 			DecodeGraph:  files["decode.pt2"],
+			Plan:         plan,
 		}, true)
 		if err != nil {
 			return "", err
 		}
 		s.mu.Lock()
 		s.loadedTags[tag] = key
+		if s.loadedHints == nil {
+			s.loadedHints = map[string]string{}
+		}
+		s.loadedHints[tag] = hintsKey(plan)
 		s.keyModel[key] = modelRef{Model: model, Commit: commit, Artifact: repo + ":" + tag}
 		s.mu.Unlock()
 		return key, nil

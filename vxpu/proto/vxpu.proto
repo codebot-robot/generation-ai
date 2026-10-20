@@ -63,6 +63,10 @@ message LoadModelRequest {
   string binding_json = 2;
   bytes prefill_graph = 3;
   bytes decode_graph = 4;
+  // The plan the coordinator chose for this load: switches by name
+  // (VXPU_GPU_EXPERTS, VXPU_EXPERT_MAILBOXES, ...) with the values the
+  // environment would hold, read ahead of the environment (#394).
+  map<string, string> plan = 5;
 }
 
 message LoadModelResponse {
@@ -74,6 +78,10 @@ message RegisterModelRequest {
   string model = 1;
   // Branch, tag or commit; empty means "main".
   string revision = 2;
+  // Switches the coordinator sets whenever it loads this model (see
+  // LoadModelRequest.plan). Replaces the model's previous plan; empty
+  // leaves it as it is.
+  map<string, string> plan = 3;
 }
 
 message RegisterModelResponse {

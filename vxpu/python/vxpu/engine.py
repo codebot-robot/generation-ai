@@ -116,7 +116,7 @@ def _has_tokenizer_files(repo):
 
 class Engine:
     def __init__(self, artifact_dir, device="cpu", compile_decode=False,
-                 cas_dir=None, external_dir=None):
+                 cas_dir=None, external_dir=None, plan_given=None):
         from transformers import AutoTokenizer
         from transformers.models.auto.configuration_auto import (
             CONFIG_MAPPING)
@@ -126,7 +126,7 @@ class Engine:
         self.compile_decode = compile_decode
         # The physical plan: every choice about how this engine runs the
         # artifact, made here once and reported by explain() (plan.py).
-        self.plan = Plan(device, compile_decode=compile_decode, external_dir=external_dir)
+        self.plan = Plan(device, compile_decode=compile_decode, external_dir=external_dir, given=plan_given)
         # Where the tensors the graphs call out for (expert banks, n-gram
         # tables) are placed: None keeps them in host memory; a directory
         # (local SSD) memory-maps them from files there, the page cache
@@ -326,13 +326,13 @@ class Engine:
         print(f"[vxpu] {msg}", flush=True)
         self.plan.note(msg)
 
-    def _place_hot_experts(self, path):
+    def _place_hot_experts(self, spec):
         """Hold the placement's hot experts on the GPUs (experts_gpu.py)."""
         from . import experts_gpu
-        gpus = experts_gpu.load_placement(path)
+        gpus = experts_gpu.load_placement(spec)
         devices = experts_gpu.devices_for(self.device)
         if len(gpus) > len(devices):
-            raise ValueError(f"placement {path} names {len(gpus)} GPUs; {len(devices)} are visible")
+            raise ValueError(f"the placement names {len(gpus)} GPUs; {len(devices)} are visible")
         for layer, moe in self.external.experts.items():
             if layer in self._remote_layers:
                 continue  # its banks are on an expert server, not here to copy from
@@ -346,7 +346,7 @@ class Engine:
         elif self.plan["gpu_experts_moves"]:
             self.expert_mover = experts_gpu.Mover(self.plan["gpu_experts_moves"],
                                                   self.plan["gpu_experts_request_weight"])
-            counts = experts_gpu.load_counts(path)
+            counts = experts_gpu.load_counts(spec)
             for layer, moe in sorted(self.external.experts.items()):
                 if getattr(moe, "_vxpu_hot", None):
                     self.expert_mover.attach(moe._vxpu_hot, counts.get(layer))
