@@ -281,6 +281,16 @@ class Plan:
         cache, src = env_text("VXPU_AOTI_CACHE_DIR", os.path.join(base, "vxpu", "aoti"))
         self._set("aoti_cache_dir", cache, src, (), "where AOTInductor segment packages are kept (the compiled plans)")
 
+        # inductor settings: prologue fusion folds dequantization into GEMM operand loads on CUDA
+        if not cuda:
+            on, src = False, "CUDA only"
+        elif not compile_decode:
+            on, src = False, "requires compile_decode"
+        else:
+            on, src = True, "default"
+        self._set("prologue_fusion", on, src, (True, False),
+                  "inductor prologue fusion folds dequantization into GEMM operand loads on CUDA")
+
         # where the external tensors live
         if external_dir:  # an explicit argument wins over the environment, as it always has
             ext_dir, src = external_dir, "argument"

@@ -50,8 +50,8 @@ from .rehydrate import (advise_random, derived_tensor, fetch_stacked, fetch_tens
                         load_program, share_state, strip_asserts)
 
 
-def compile_options(device):
-    """How the executor compiles the decode graph on this device.
+def configure_inductor(plan):
+    """Set Inductor settings the executor relies on under this plan.
 
     The artifact carries reference semantics (an fp8 linear is cast,
     scale, matmul); the engine's job is to make that fast here. On CUDA,
@@ -64,12 +64,9 @@ def compile_options(device):
     The mode itself is a choice of the engine's plan (plan.Plan:
     compile_mode, which VXPU_COMPILE_MODE overrides).
     """
-    if not str(device).startswith("cuda"):
-        return {}
-    import torch._inductor.config as inductor_config
-    inductor_config.prologue_fusion = True
-    return {}
-
+    if plan["prologue_fusion"]:
+        import torch._inductor.config as inductor_config
+        inductor_config.prologue_fusion = True
 
 
 TOKENIZER_FILES = ("tokenizer.json", "tokenizer_config.json",
@@ -337,7 +334,7 @@ class Engine:
         self._decode_run = self._decode
         if self.compile_decode:
             strip_asserts(self._decode)
-            opts = compile_options(self.device)
+            configure_inductor(self.plan)
             mode = self.plan["compile_mode"]
             if self.plan["split_decode"]:
                 # cut at the host ops; each dense segment its own compiled
@@ -349,7 +346,7 @@ class Engine:
                     print(f"[vxpu] {msg}", flush=True)
                     self.plan.note(msg)
                 self._decode_split = segments.compile_segments(
-                    self._decode, self.device, mode, opts.get("options"),
+                    self._decode, self.device, mode,
                     split_compile=self.plan["split_compile"], direct=self.plan["direct_host_ops"],
                     runtime=self.plan["segment_runtime"], aoti_cache_dir=self.plan["aoti_cache_dir"])
                 self._segment_info = segment_info(self._decode_split.split)
@@ -368,7 +365,7 @@ class Engine:
                         torch._dynamo.mark_static_address(tensor)
             else:
                 ops.prepare_compile()
-                self._decode_run = torch.compile(self._decode, mode=mode, **opts)
+                self._decode_run = torch.compile(self._decode, mode=mode)
         print("[vxpu] " + self.plan.summary(self.plan_ops()).replace("\n", "\n[vxpu] "), flush=True)
 
     def plan_ops(self):

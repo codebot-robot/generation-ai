@@ -696,6 +696,49 @@ def _check_compare():
     assert ok
 
 
+def _check_compile_plan():
+    """Verify configure_inductor and Plan's compiler choices for prologue_fusion."""
+    from . import engine, plan
+
+    # CPU: prologue_fusion is False, marked CUDA only
+    p_cpu = plan.Plan("cpu", compile_decode=False)
+    assert p_cpu["prologue_fusion"] is False
+    assert p_cpu.choices["prologue_fusion"].source == "CUDA only"
+
+    # CUDA without compile_decode: requires compile_decode
+    p_cuda_no_compile = plan.Plan("cuda", compile_decode=False)
+    assert p_cuda_no_compile["prologue_fusion"] is False
+    assert p_cuda_no_compile.choices["prologue_fusion"].source == "requires compile_decode"
+
+    # CUDA with compile_decode: True by default
+    p_cuda_compile = plan.Plan("cuda", compile_decode=True)
+    assert p_cuda_compile["prologue_fusion"] is True
+    assert p_cuda_compile.choices["prologue_fusion"].source == "default"
+
+    # Recorded in explain choices
+    explained = p_cuda_compile.explain()
+    assert "prologue_fusion" in explained["choices"]
+    assert explained["choices"]["prologue_fusion"]["value"] is True
+
+    # configure_inductor sets torch._inductor.config.prologue_fusion when enabled by the plan
+    try:
+        import torch._inductor.config as inductor_config
+        orig = getattr(inductor_config, "prologue_fusion", None)
+        try:
+            inductor_config.prologue_fusion = False
+            engine.configure_inductor(p_cpu)
+            assert inductor_config.prologue_fusion is False  # untouched on CPU
+            engine.configure_inductor(p_cuda_compile)
+            assert inductor_config.prologue_fusion is True
+            engine.configure_inductor(p_cpu)
+            assert inductor_config.prologue_fusion is True  # left untouched
+        finally:
+            if orig is not None:
+                inductor_config.prologue_fusion = orig
+    except ImportError:
+        pass
+
+
 def _check_continuation(artifact, ids, new_tokens=4):
     """A session extended by a later turn must see what a fresh session
     given the whole transcript sees. For a model whose prefill graph
@@ -999,6 +1042,7 @@ def selftest(workdir, settings):
     """The CI tier: tiny models through export, the in-process engine,
     and a transformers reference, token-exact. No cluster."""
     _check_compare()
+    _check_compile_plan()
     _check_compile_names()
     os.makedirs(workdir, exist_ok=True)
     _check_host_reads(workdir)
