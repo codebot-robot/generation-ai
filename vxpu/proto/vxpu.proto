@@ -63,6 +63,11 @@ service Executor {
   // ExplainModel (router only) returns the plan the coordinator chose for
   // a model's last load by name, and why (#394).
   rpc ExplainModel(ExplainModelRequest) returns (ExplainModelResponse) {}
+  // ServeExperts (executor only) loads some layers' routed experts of an
+  // artifact and serves them to other executors' mailboxes on a port of
+  // this machine (expert_server.py): how the coordinator spreads a model's
+  // experts over executors (#394). Answers once the banks are loaded.
+  rpc ServeExperts(ServeExpertsRequest) returns (ServeExpertsResponse) {}
 }
 
 message LoadModelRequest {
@@ -222,4 +227,17 @@ message ExplainModelResponse {
   // {model, machine, time, switches (sent), hints (the registered plan's,
   // which win), reasons}, as JSON.
   string plan_json = 1;
+}
+
+
+message ServeExpertsRequest {
+  string manifest_json = 1;
+  string binding_json = 2;
+  // The layers whose experts to hold.
+  repeated int32 layers = 3;
+}
+
+message ServeExpertsResponse {
+  // The port the experts are served on, on the executor's own address.
+  int32 port = 1;
 }

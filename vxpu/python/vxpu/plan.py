@@ -64,15 +64,18 @@ FALSE = ("0", "false", "off", "no")
 # read ahead of it, with source "coordinator" (#394).
 _given = contextvars.ContextVar("vxpu_plan_given", default=None)
 
-# The switches the coordinator may set: how the engine runs the model and
-# where it holds the experts. Not the ones naming the machine's own
-# resources (directories, the weight bucket, expert servers to trust):
-# those stay with whoever runs the executor. Nor the ones the kernels
+# The switches the coordinator may set: how the engine runs the model,
+# where it holds the experts, and the expert servers it wired them to
+# (VXPU_EXPERT_REMOTE: other executors it asked to serve experts; the
+# router never forwards it from a client's plan). Not the ones naming the
+# machine's own resources (directories, the weight bucket): those stay
+# with whoever runs the executor. Nor the ones the kernels
 # read for themselves at first use (VXPU_KERNELS, VXPU_KERNEL_THREADS),
 # which a value from the coordinator would not reach.
 COORDINATOR_SWITCHES = frozenset({
     "VXPU_FUSED_EXPERTS", "VXPU_SPLIT_DECODE", "VXPU_COMPILE_MODE", "VXPU_SPLIT_COMPILE", "VXPU_DIRECT_HOST_OPS",
-    "VXPU_LOWER_DECODE", "VXPU_SEGMENT_RUNTIME", "VXPU_EXPERT_MAILBOXES", "VXPU_DATAFLOW", "VXPU_STEP_GRAPH",
+    "VXPU_LOWER_DECODE", "VXPU_SEGMENT_RUNTIME", "VXPU_EXPERT_MAILBOXES", "VXPU_EXPERT_REMOTE", "VXPU_DATAFLOW",
+    "VXPU_STEP_GRAPH",
     "VXPU_DATAFLOW_PLACE", "VXPU_GPU_EXPERTS", "VXPU_GPU_EXPERTS_MOVES", "VXPU_GPU_EXPERTS_REQUEST_WEIGHT",
     "VXPU_EXPERTS_IN_RAM", "VXPU_BF16_WEIGHT_CACHE", "VXPU_BF16_CACHE_HEADROOM_GB",
 })

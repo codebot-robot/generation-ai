@@ -77,6 +77,7 @@ type Server struct {
 	hints         map[string]string       // statsKey(model) -> its registered plan, as last stored or read (hintsKey)
 	keyModel      map[string]modelRef     // model key -> the named model it serves (stats.go)
 	executors     map[string]executorInfo // endpoint -> what it runs on (executors.go)
+	expertHolders map[string]string       // external executor address -> address of the engine whose experts it serves
 	plans         map[string]modelPlan    // statsKey(model) -> its last load's plan (modelplan.go)
 	stats         *statsStore             // statistics for models served by name, nil without modelstore
 	// externalModelstoreURL is modelstore's address for external executors
@@ -486,9 +487,11 @@ func artifactKey(manifestJSON string) string {
 // key sessions are routed by.
 //
 // planFor, when set, chooses the plan sent with the load, knowing what
-// the executor runs on (nil: it did not say); otherwise req's is sent.
+// the executor runs on (nil: it did not say) and given the manifest as
+// sent, its weights' sources rewritten to where executors read them;
+// otherwise req's plan is sent.
 func (s *Server) loadArtifact(ctx context.Context, req *pb.LoadModelRequest, external bool,
-	planFor func(context.Context, *executorInfo) map[string]string) (string, error) {
+	planFor func(context.Context, *executorInfo, string) map[string]string) (string, error) {
 	log := klog.FromContext(ctx)
 	modelKey := artifactKey(req.ManifestJson)
 	log.Info("Loading artifact", "model_key", modelKey, "external", external, "plan", planSwitches(req.Plan))
@@ -549,24 +552,16 @@ func (s *Server) loadArtifact(ctx context.Context, req *pb.LoadModelRequest, ext
 		delete(s.executors, endpoint)
 		s.mu.Unlock()
 	}
-	maxMsgSize := 128 * 1024 * 1024
-	conn, err := grpc.NewClient(
-		endpoint,
-		grpc.WithTransportCredentials(insecure.NewCredentials()),
-		grpc.WithDefaultCallOptions(
-			grpc.MaxCallRecvMsgSize(maxMsgSize),
-			grpc.MaxCallSendMsgSize(maxMsgSize),
-		),
-	)
+	conn, err := dialExecutor(endpoint)
 	if err != nil {
 		return "", status.Errorf(codes.Internal, "failed to connect to executor: %v", err)
 	}
 	defer closeConn(ctx, conn)
 
 	client := pb.NewExecutorClient(conn)
-	info := s.waitForExecutor(ctx, client, endpoint)
+	info := s.waitForExecutor(ctx, client, endpoint, 30)
 	if planFor != nil {
-		reqCopy.Plan = planFor(ctx, info)
+		reqCopy.Plan = planFor(ctx, info, reqCopy.ManifestJson)
 	}
 
 	var loadErr error
@@ -638,7 +633,7 @@ func (s *Server) NewSession(ctx context.Context, req *pb.NewSessionRequest) (*pb
 		strings.Contains(status.Convert(err).Message(), "LoadModel first") {
 		// The executor evicted the model (idle keep-alive) or restarted:
 		// forget where it was, so the caller's retry loads it again.
-		s.forgetModel(modelKey)
+		s.forgetModel(modelKey, endpoint)
 		return nil, status.Errorf(codes.FailedPrecondition, "%s is being reloaded (the executor no longer holds it)", req.Model)
 	}
 	if err != nil && req.Model != "" && status.Code(err) == codes.Internal &&
@@ -646,7 +641,7 @@ func (s *Server) NewSession(ctx context.Context, req *pb.NewSessionRequest) (*pb
 		// The executor's asynchronous load failed (it keeps answering so
 		// until it is asked to load again): forget the placement, so the
 		// next request by name loads the model again.
-		s.forgetModel(modelKey)
+		s.forgetModel(modelKey, endpoint)
 		return nil, status.Errorf(codes.Unavailable, "%s failed to load on its executor; the next request loads it again: %s",
 			req.Model, status.Convert(err).Message())
 	}

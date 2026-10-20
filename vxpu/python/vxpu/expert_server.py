@@ -110,6 +110,10 @@ def load(artifact_dir, layers=None):
     with open(os.path.join(artifact_dir, "binding.json")) as f:
         binding = json.load(f)
     plan = Plan("cpu")
+    if plan["blob_dir"]:  # this machine's local weight tier, as the engine reads it
+        from . import localblobs
+        manifest["files"], summary = localblobs.localize(manifest["files"], plan["blob_dir"], plan["blob_bucket"])
+        print(f"[vxpu] local weight tier: {summary['local']} of {summary['files']} files on local disk", flush=True)
     mm = external_files_dir(plan["external_dir"], manifest)
     args = ds.model_args(manifest["source"]["repo"], int(binding.get("max_cache_len", 1024)))
     experts, _ = load_expert_layers(manifest, (binding.get("external") or {}).get("experts", {}), args, None, mm,

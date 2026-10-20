@@ -96,6 +96,11 @@ class ExecutorStub:
                 request_serializer=vxpu__pb2.ExplainModelRequest.SerializeToString,
                 response_deserializer=vxpu__pb2.ExplainModelResponse.FromString,
                 _registered_method=True)
+        self.ServeExperts = channel.unary_unary(
+                '/vxpu.Executor/ServeExperts',
+                request_serializer=vxpu__pb2.ServeExpertsRequest.SerializeToString,
+                response_deserializer=vxpu__pb2.ServeExpertsResponse.FromString,
+                _registered_method=True)
 
 
 class ExecutorServicer:
@@ -185,6 +190,16 @@ class ExecutorServicer:
         context.set_details('Method not implemented!')
         raise NotImplementedError('Method not implemented!')
 
+    def ServeExperts(self, request, context):
+        """ServeExperts (executor only) loads some layers' routed experts of an
+        artifact and serves them to other executors' mailboxes on a port of
+        this machine (expert_server.py): how the coordinator spreads a model's
+        experts over executors (#394). Answers once the banks are loaded.
+        """
+        context.set_code(grpc.StatusCode.UNIMPLEMENTED)
+        context.set_details('Method not implemented!')
+        raise NotImplementedError('Method not implemented!')
+
 
 def add_ExecutorServicer_to_server(servicer, server):
     rpc_method_handlers = {
@@ -227,6 +242,11 @@ def add_ExecutorServicer_to_server(servicer, server):
                     servicer.ExplainModel,
                     request_deserializer=vxpu__pb2.ExplainModelRequest.FromString,
                     response_serializer=vxpu__pb2.ExplainModelResponse.SerializeToString,
+            ),
+            'ServeExperts': grpc.unary_unary_rpc_method_handler(
+                    servicer.ServeExperts,
+                    request_deserializer=vxpu__pb2.ServeExpertsRequest.FromString,
+                    response_serializer=vxpu__pb2.ServeExpertsResponse.SerializeToString,
             ),
     }
     generic_handler = grpc.method_handlers_generic_handler(
@@ -453,6 +473,33 @@ class Executor:
             '/vxpu.Executor/ExplainModel',
             vxpu__pb2.ExplainModelRequest.SerializeToString,
             vxpu__pb2.ExplainModelResponse.FromString,
+            options,
+            channel_credentials,
+            insecure,
+            call_credentials,
+            compression,
+            wait_for_ready,
+            timeout,
+            metadata,
+            _registered_method=True)
+
+    @staticmethod
+    def ServeExperts(request,
+            target,
+            options=(),
+            channel_credentials=None,
+            call_credentials=None,
+            insecure=False,
+            compression=None,
+            wait_for_ready=None,
+            timeout=None,
+            metadata=None):
+        return grpc.experimental.unary_unary(
+            request,
+            target,
+            '/vxpu.Executor/ServeExperts',
+            vxpu__pb2.ServeExpertsRequest.SerializeToString,
+            vxpu__pb2.ServeExpertsResponse.FromString,
             options,
             channel_credentials,
             insecure,

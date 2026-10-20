@@ -159,6 +159,11 @@ func (s *Server) RegisterModel(ctx context.Context, req *pb.RegisterModelRequest
 		revision = "main"
 	}
 	log.Info("RegisterModel", "model", req.Model, "revision", revision)
+	for _, owned := range routerOwnedSwitches {
+		if _, set := req.Plan[owned]; set {
+			return nil, status.Errorf(codes.InvalidArgument, "%s is the router's to set (it wires the executors it starts), not a registered plan's", owned)
+		}
+	}
 
 	// The weights first (quick when modelstore already has them): export
 	// reads the model's config and headers from modelstore, and
@@ -455,8 +460,10 @@ func (s *Server) loadByName(ctx context.Context, model, revision string) (string
 			BindingJson:  string(files["binding.json"]),
 			PrefillGraph: files["prefill.pt2"],
 			DecodeGraph:  files["decode.pt2"],
-		}, true, func(ctx context.Context, info *executorInfo) map[string]string {
-			return s.planLoad(ctx, model, files["manifest.json"], files["binding.json"], hints, info)
+		}, true, func(ctx context.Context, info *executorInfo, manifest string) map[string]string {
+			// the manifest as sent: the expert executors read their
+			// weights from where the engine does
+			return s.planLoad(ctx, model, []byte(manifest), files["binding.json"], hints, info)
 		})
 		if err != nil {
 			return "", err

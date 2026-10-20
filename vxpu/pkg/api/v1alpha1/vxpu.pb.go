@@ -1122,6 +1122,112 @@ func (x *ExplainModelResponse) GetPlanJson() string {
 	return ""
 }
 
+type ServeExpertsRequest struct {
+	state        protoimpl.MessageState `protogen:"open.v1"`
+	ManifestJson string                 `protobuf:"bytes,1,opt,name=manifest_json,json=manifestJson,proto3" json:"manifest_json,omitempty"`
+	BindingJson  string                 `protobuf:"bytes,2,opt,name=binding_json,json=bindingJson,proto3" json:"binding_json,omitempty"`
+	// The layers whose experts to hold.
+	Layers        []int32 `protobuf:"varint,3,rep,packed,name=layers,proto3" json:"layers,omitempty"`
+	unknownFields protoimpl.UnknownFields
+	sizeCache     protoimpl.SizeCache
+}
+
+func (x *ServeExpertsRequest) Reset() {
+	*x = ServeExpertsRequest{}
+	mi := &file_proto_vxpu_proto_msgTypes[16]
+	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+	ms.StoreMessageInfo(mi)
+}
+
+func (x *ServeExpertsRequest) String() string {
+	return protoimpl.X.MessageStringOf(x)
+}
+
+func (*ServeExpertsRequest) ProtoMessage() {}
+
+func (x *ServeExpertsRequest) ProtoReflect() protoreflect.Message {
+	mi := &file_proto_vxpu_proto_msgTypes[16]
+	if x != nil {
+		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+		if ms.LoadMessageInfo() == nil {
+			ms.StoreMessageInfo(mi)
+		}
+		return ms
+	}
+	return mi.MessageOf(x)
+}
+
+// Deprecated: Use ServeExpertsRequest.ProtoReflect.Descriptor instead.
+func (*ServeExpertsRequest) Descriptor() ([]byte, []int) {
+	return file_proto_vxpu_proto_rawDescGZIP(), []int{16}
+}
+
+func (x *ServeExpertsRequest) GetManifestJson() string {
+	if x != nil {
+		return x.ManifestJson
+	}
+	return ""
+}
+
+func (x *ServeExpertsRequest) GetBindingJson() string {
+	if x != nil {
+		return x.BindingJson
+	}
+	return ""
+}
+
+func (x *ServeExpertsRequest) GetLayers() []int32 {
+	if x != nil {
+		return x.Layers
+	}
+	return nil
+}
+
+type ServeExpertsResponse struct {
+	state protoimpl.MessageState `protogen:"open.v1"`
+	// The port the experts are served on, on the executor's own address.
+	Port          int32 `protobuf:"varint,1,opt,name=port,proto3" json:"port,omitempty"`
+	unknownFields protoimpl.UnknownFields
+	sizeCache     protoimpl.SizeCache
+}
+
+func (x *ServeExpertsResponse) Reset() {
+	*x = ServeExpertsResponse{}
+	mi := &file_proto_vxpu_proto_msgTypes[17]
+	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+	ms.StoreMessageInfo(mi)
+}
+
+func (x *ServeExpertsResponse) String() string {
+	return protoimpl.X.MessageStringOf(x)
+}
+
+func (*ServeExpertsResponse) ProtoMessage() {}
+
+func (x *ServeExpertsResponse) ProtoReflect() protoreflect.Message {
+	mi := &file_proto_vxpu_proto_msgTypes[17]
+	if x != nil {
+		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+		if ms.LoadMessageInfo() == nil {
+			ms.StoreMessageInfo(mi)
+		}
+		return ms
+	}
+	return mi.MessageOf(x)
+}
+
+// Deprecated: Use ServeExpertsResponse.ProtoReflect.Descriptor instead.
+func (*ServeExpertsResponse) Descriptor() ([]byte, []int) {
+	return file_proto_vxpu_proto_rawDescGZIP(), []int{17}
+}
+
+func (x *ServeExpertsResponse) GetPort() int32 {
+	if x != nil {
+		return x.Port
+	}
+	return 0
+}
+
 var File_proto_vxpu_proto protoreflect.FileDescriptor
 
 const file_proto_vxpu_proto_rawDesc = "" +
@@ -1227,7 +1333,13 @@ const file_proto_vxpu_proto_rawDesc = "" +
 	"\x13ExplainModelRequest\x12\x14\n" +
 	"\x05model\x18\x01 \x01(\tR\x05model\"3\n" +
 	"\x14ExplainModelResponse\x12\x1b\n" +
-	"\tplan_json\x18\x01 \x01(\tR\bplanJson2\x9b\x04\n" +
+	"\tplan_json\x18\x01 \x01(\tR\bplanJson\"u\n" +
+	"\x13ServeExpertsRequest\x12#\n" +
+	"\rmanifest_json\x18\x01 \x01(\tR\fmanifestJson\x12!\n" +
+	"\fbinding_json\x18\x02 \x01(\tR\vbindingJson\x12\x16\n" +
+	"\x06layers\x18\x03 \x03(\x05R\x06layers\"*\n" +
+	"\x14ServeExpertsResponse\x12\x12\n" +
+	"\x04port\x18\x01 \x01(\x05R\x04port2\xe4\x04\n" +
 	"\bExecutor\x12>\n" +
 	"\tLoadModel\x12\x16.vxpu.LoadModelRequest\x1a\x17.vxpu.LoadModelResponse\"\x00\x12J\n" +
 	"\rRegisterModel\x12\x1a.vxpu.RegisterModelRequest\x1a\x1b.vxpu.RegisterModelResponse\"\x00\x12A\n" +
@@ -1237,7 +1349,8 @@ const file_proto_vxpu_proto_rawDesc = "" +
 	"\bGenerate\x12\x15.vxpu.GenerateRequest\x1a\x16.vxpu.GenerateResponse\"\x000\x01\x12J\n" +
 	"\rGetModelStats\x12\x1a.vxpu.GetModelStatsRequest\x1a\x1b.vxpu.GetModelStatsResponse\"\x00\x12;\n" +
 	"\bDescribe\x12\x15.vxpu.DescribeRequest\x1a\x16.vxpu.DescribeResponse\"\x00\x12G\n" +
-	"\fExplainModel\x12\x19.vxpu.ExplainModelRequest\x1a\x1a.vxpu.ExplainModelResponse\"\x00BBZ@github.com/gke-labs/generation-ai/vxpu/pkg/api/v1alpha1;v1alpha1b\x06proto3"
+	"\fExplainModel\x12\x19.vxpu.ExplainModelRequest\x1a\x1a.vxpu.ExplainModelResponse\"\x00\x12G\n" +
+	"\fServeExperts\x12\x19.vxpu.ServeExpertsRequest\x1a\x1a.vxpu.ServeExpertsResponse\"\x00BBZ@github.com/gke-labs/generation-ai/vxpu/pkg/api/v1alpha1;v1alpha1b\x06proto3"
 
 var (
 	file_proto_vxpu_proto_rawDescOnce sync.Once
@@ -1251,7 +1364,7 @@ func file_proto_vxpu_proto_rawDescGZIP() []byte {
 	return file_proto_vxpu_proto_rawDescData
 }
 
-var file_proto_vxpu_proto_msgTypes = make([]protoimpl.MessageInfo, 18)
+var file_proto_vxpu_proto_msgTypes = make([]protoimpl.MessageInfo, 20)
 var file_proto_vxpu_proto_goTypes = []any{
 	(*LoadModelRequest)(nil),      // 0: vxpu.LoadModelRequest
 	(*LoadModelResponse)(nil),     // 1: vxpu.LoadModelResponse
@@ -1269,12 +1382,14 @@ var file_proto_vxpu_proto_goTypes = []any{
 	(*DescribeResponse)(nil),      // 13: vxpu.DescribeResponse
 	(*ExplainModelRequest)(nil),   // 14: vxpu.ExplainModelRequest
 	(*ExplainModelResponse)(nil),  // 15: vxpu.ExplainModelResponse
-	nil,                           // 16: vxpu.LoadModelRequest.PlanEntry
-	nil,                           // 17: vxpu.RegisterModelRequest.PlanEntry
+	(*ServeExpertsRequest)(nil),   // 16: vxpu.ServeExpertsRequest
+	(*ServeExpertsResponse)(nil),  // 17: vxpu.ServeExpertsResponse
+	nil,                           // 18: vxpu.LoadModelRequest.PlanEntry
+	nil,                           // 19: vxpu.RegisterModelRequest.PlanEntry
 }
 var file_proto_vxpu_proto_depIdxs = []int32{
-	16, // 0: vxpu.LoadModelRequest.plan:type_name -> vxpu.LoadModelRequest.PlanEntry
-	17, // 1: vxpu.RegisterModelRequest.plan:type_name -> vxpu.RegisterModelRequest.PlanEntry
+	18, // 0: vxpu.LoadModelRequest.plan:type_name -> vxpu.LoadModelRequest.PlanEntry
+	19, // 1: vxpu.RegisterModelRequest.plan:type_name -> vxpu.RegisterModelRequest.PlanEntry
 	0,  // 2: vxpu.Executor.LoadModel:input_type -> vxpu.LoadModelRequest
 	2,  // 3: vxpu.Executor.RegisterModel:input_type -> vxpu.RegisterModelRequest
 	4,  // 4: vxpu.Executor.NewSession:input_type -> vxpu.NewSessionRequest
@@ -1283,16 +1398,18 @@ var file_proto_vxpu_proto_depIdxs = []int32{
 	10, // 7: vxpu.Executor.GetModelStats:input_type -> vxpu.GetModelStatsRequest
 	12, // 8: vxpu.Executor.Describe:input_type -> vxpu.DescribeRequest
 	14, // 9: vxpu.Executor.ExplainModel:input_type -> vxpu.ExplainModelRequest
-	1,  // 10: vxpu.Executor.LoadModel:output_type -> vxpu.LoadModelResponse
-	3,  // 11: vxpu.Executor.RegisterModel:output_type -> vxpu.RegisterModelResponse
-	5,  // 12: vxpu.Executor.NewSession:output_type -> vxpu.NewSessionResponse
-	7,  // 13: vxpu.Executor.Chat:output_type -> vxpu.ChatResponse
-	9,  // 14: vxpu.Executor.Generate:output_type -> vxpu.GenerateResponse
-	11, // 15: vxpu.Executor.GetModelStats:output_type -> vxpu.GetModelStatsResponse
-	13, // 16: vxpu.Executor.Describe:output_type -> vxpu.DescribeResponse
-	15, // 17: vxpu.Executor.ExplainModel:output_type -> vxpu.ExplainModelResponse
-	10, // [10:18] is the sub-list for method output_type
-	2,  // [2:10] is the sub-list for method input_type
+	16, // 10: vxpu.Executor.ServeExperts:input_type -> vxpu.ServeExpertsRequest
+	1,  // 11: vxpu.Executor.LoadModel:output_type -> vxpu.LoadModelResponse
+	3,  // 12: vxpu.Executor.RegisterModel:output_type -> vxpu.RegisterModelResponse
+	5,  // 13: vxpu.Executor.NewSession:output_type -> vxpu.NewSessionResponse
+	7,  // 14: vxpu.Executor.Chat:output_type -> vxpu.ChatResponse
+	9,  // 15: vxpu.Executor.Generate:output_type -> vxpu.GenerateResponse
+	11, // 16: vxpu.Executor.GetModelStats:output_type -> vxpu.GetModelStatsResponse
+	13, // 17: vxpu.Executor.Describe:output_type -> vxpu.DescribeResponse
+	15, // 18: vxpu.Executor.ExplainModel:output_type -> vxpu.ExplainModelResponse
+	17, // 19: vxpu.Executor.ServeExperts:output_type -> vxpu.ServeExpertsResponse
+	11, // [11:20] is the sub-list for method output_type
+	2,  // [2:11] is the sub-list for method input_type
 	2,  // [2:2] is the sub-list for extension type_name
 	2,  // [2:2] is the sub-list for extension extendee
 	0,  // [0:2] is the sub-list for field type_name
@@ -1311,7 +1428,7 @@ func file_proto_vxpu_proto_init() {
 			GoPackagePath: reflect.TypeOf(x{}).PkgPath(),
 			RawDescriptor: unsafe.Slice(unsafe.StringData(file_proto_vxpu_proto_rawDesc), len(file_proto_vxpu_proto_rawDesc)),
 			NumEnums:      0,
-			NumMessages:   18,
+			NumMessages:   20,
 			NumExtensions: 0,
 			NumServices:   1,
 		},

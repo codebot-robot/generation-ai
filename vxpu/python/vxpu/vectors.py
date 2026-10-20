@@ -1361,39 +1361,45 @@ def _check_expert_mailboxes(model, prompts, settings, artifact, plain, workdir):
 
 
 def _check_expert_remote(model, prompts, settings, artifact, plain):
-    """Experts answered by another process (expert_server.py): a server
-    holding every other layer's banks, on a local port, and the engine,
-    which does not load those layers' banks, sending it every call of
-    theirs (prefill included) through its mailboxes. The server computes
-    with the same CPU kernels, so tokens and logits must be bit-identical
-    to the plain engine's."""
-    import subprocess
-    import sys
-    import threading
+    """Experts answered by another executor: an executor asked to serve
+    every other layer's experts (ServeExperts, as the coordinator asks it,
+    #394) holds those banks and answers on a port of its machine; the
+    engine, which does not load those layers' banks, sends it every call
+    of theirs (prefill included) through its mailboxes. The server
+    computes with the same CPU kernels, so tokens and logits must be
+    bit-identical to the plain engine's."""
+    from . import vxpu_pb2
+    from .server import ExecutorServicer
     with open(os.path.join(artifact, "binding.json")) as f:
-        layers = sorted(int(x) for x in ((json.load(f).get("external") or {}).get("experts") or {}))
+        binding = f.read()
+    with open(os.path.join(artifact, "manifest.json")) as f:
+        manifest = f.read()
+    layers = sorted(int(x) for x in ((json.loads(binding).get("external") or {}).get("experts") or {}))
     if not layers:
         return True
     served = layers[::2]
-    proc = subprocess.Popen([sys.executable, "-m", "vxpu.expert_server", artifact, "--host", "127.0.0.1",
-                             "--port", "0", "--layers", ",".join(map(str, served))],
-                            stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True)
-    lines, started = [], threading.Event()
 
-    def read():  # the server's output, kept for a failure; the address once it listens
-        for line in proc.stdout:
-            lines.append(line)
-            if "expert server on " in line:
-                started.set()
-        started.set()  # it exited
+    class Context:  # what a gRPC call's context records
+        code = details = None
 
-    threading.Thread(target=read, daemon=True).start()
+        def set_code(self, code):
+            self.code = code
+
+        def set_details(self, details):
+            self.details = details
+
+    executor, ctx = ExecutorServicer(work_dir=tempfile.mkdtemp(prefix="vxpu-experts-")), Context()
+    resp = executor.ServeExperts(vxpu_pb2.ServeExpertsRequest(manifest_json=manifest, binding_json=binding,
+                                                              layers=served), ctx)
+    if ctx.code is not None or not resp.port:
+        print(f"expert remote check: ServeExperts failed: {ctx.code} {ctx.details}")
+        return False
+    address = f"127.0.0.1:{resp.port}"
     try:
-        started.wait(timeout=300)
-        address = next((ln.split("expert server on ", 1)[1].split()[0].rstrip(":") for ln in lines
-                        if "expert server on " in ln), None)
-        if address is None or ":" not in address:
-            print("expert remote check: the expert server did not start:\n" + "".join(lines[-20:]))
+        again = executor.ServeExperts(vxpu_pb2.ServeExpertsRequest(manifest_json=manifest, binding_json=binding,
+                                                                   layers=served), ctx)
+        if again.port != resp.port:
+            print("expert remote check: asking again for the same experts should not start another server")
             return False
         keep = []
         got = _with_env({"VXPU_EXPERT_MAILBOXES": "1", "VXPU_EXPERT_REMOTE": address, "VXPU_GPU_EXPERTS": None},
@@ -1405,12 +1411,12 @@ def _check_expert_remote(model, prompts, settings, artifact, plain):
         if not _check_expert_server_errors(address, artifact, served[0]):
             return False
     finally:
-        proc.terminate()
-        proc.wait(timeout=30)
+        executor.experts[1].shutdown()
+        executor.experts[1].server_close()
     same = ([p["generated_ids"] for p in got["prompts"]] == [p["generated_ids"] for p in plain["prompts"]]
             and [p["top_logits"] for p in got["prompts"]] == [p["top_logits"] for p in plain["prompts"]])
     rows, _ = compare(plain, got, strict_tokens=True)
-    print(f"experts of layers {served} answered by an expert server at {address}, against the plain engine "
+    print(f"experts of layers {served} answered by another executor at {address}, against the plain engine "
           "(must be bit-identical):")
     print(table(plain, got, rows))
     if not same:
@@ -1598,8 +1604,8 @@ def _check_mover_lifetime():
 def _check_plan_given():
     """The switches the coordinator sends (LoadModelRequest.plan, #394):
     read ahead of the environment and recorded as "coordinator"; only the
-    execution and placement switches are taken (not the machine's paths,
-    bucket or expert servers, nor what only the kernels read), never
+    execution and placement switches are taken (not the machine's paths
+    or bucket, nor what only the kernels read), never
     empty, and a placement only inline; a placement inline parses like a
     file."""
     from . import experts_gpu
@@ -1611,7 +1617,7 @@ def _check_plan_given():
     if _with_env({"VXPU_FUSED_EXPERTS": "0"}, Plan, "cpu", triton_available=False).choices["fused_experts"].source != "env":
         raise SystemExit("plan: without the coordinator, the environment's switch should apply")
     for bad in ({"VXPU_NO_SUCH_SWITCH": "1"}, {"VXPU_KERNEL_THREADS": "4"}, {"VXPU_KERNELS": "0"},
-                {"VXPU_BLOB_DIR": "/tmp/x"}, {"VXPU_EXPERT_REMOTE": "evil:1"}, {"VXPU_FUSED_EXPERTS": " "},
+                {"VXPU_BLOB_DIR": "/tmp/x"}, {"VXPU_AOTI_CACHE_DIR": "/tmp/x"}, {"VXPU_FUSED_EXPERTS": " "},
                 {"VXPU_GPU_EXPERTS": "/etc/placement.json"}, {"VXPU_FUSED_EXPERTS": "maybe"}):
         try:
             Plan("cpu", triton_available=False, given=bad)

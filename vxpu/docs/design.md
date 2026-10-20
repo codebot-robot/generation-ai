@@ -60,8 +60,8 @@ The planner (`pkg/planner`) writes the rest of the plan for each load by
 name. Before loading, the router asks the executor what it runs on, and
 the planner chooses from that, from what the artifact holds (its dense
 weights, and each layer's experts and their bytes) and from what the
-model's traffic selected (§5). v0 chooses one thing: which experts the
-GPUs hold (§4). The registered plan's switches win over the planner's,
+model's traffic selected (§5). v0 chooses where the experts live (§4):
+in which machine's RAM, then which of the engine's the GPUs hold. The registered plan's switches win over the planner's,
 as a person's hints. `vxpu explain MODEL` shows the switches sent and
 the reason for each choice.
 
@@ -173,7 +173,20 @@ The planner chooses it at every load by name (§1), with each GPU's budget
 derived from the machine: its memory, less headroom, and on the engine's
 GPU less the dense weights and caches (2.5x the dense bytes, measured on
 DeepSeek). `expert_stats --placement-gb` does the same offline with
-budgets a person gives. `expert_sim` replays
+budgets a person gives.
+
+Before the GPUs, the planner decides whose RAM holds each layer's
+experts. The engine keeps the layers that fit its budget (85% of its
+RAM, less 16 GiB, less the dense weights when it has no GPU). The next
+layers go to other free executors, each up to its own budget. Each of
+those executors loads its layers and answers on a port of its machine
+(the `ServeExperts` RPC, the expert server of §4 in the executor), and
+the router wires the engine's mailboxes to them (`VXPU_EXPERT_REMOTE`,
+which only the router sets). Layers that fit no machine stay on the
+engine, paged from its disk. The GPUs then hold the hottest experts of
+the layers the engine keeps. So a model that fits no single machine runs
+on several smaller ones: GPUs with 24 GB, or none, and CPU machines for
+the experts that do not fit. `expert_sim` replays
 recorded traffic against placement policies before any is built: static,
 decayed, informed by the prompt, and the oracle as a bound.
 

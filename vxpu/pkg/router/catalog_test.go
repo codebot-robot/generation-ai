@@ -169,9 +169,22 @@ type loadingExecutor struct {
 	lastManifest string            // the manifest of the last LoadModel
 	lastPlan     map[string]string // the plan of the last LoadModel
 	refused      int               // LoadModels refused for their plan
+	probe        string            // what Describe says (default: a g4-standard-96)
+	served       []int32           // the layers of the last ServeExperts
+	servedFrom   string            // the manifest of the last ServeExperts
+}
+
+func (e *loadingExecutor) ServeExperts(_ context.Context, req *pb.ServeExpertsRequest) (*pb.ServeExpertsResponse, error) {
+	e.mu.Lock()
+	defer e.mu.Unlock()
+	e.served, e.servedFrom = req.Layers, req.ManifestJson
+	return &pb.ServeExpertsResponse{Port: 7000}, nil
 }
 
 func (e *loadingExecutor) Describe(context.Context, *pb.DescribeRequest) (*pb.DescribeResponse, error) {
+	if e.probe != "" {
+		return &pb.DescribeResponse{HardwareJson: e.probe}, nil
+	}
 	return &pb.DescribeResponse{HardwareJson: `{"device":"cuda","cpu":"AMD EPYC 9B45 48-Core Processor",` +
 		`"cpu_threads":96,"simd":"avx512","gpu":"NVIDIA RTX PRO 6000","gpu_memory_bytes":102005473280,"gpu_count":2}`}, nil
 }
@@ -372,6 +385,47 @@ func TestNewSessionByName_PlansFromTheModelsTraffic(t *testing.T) {
 	explained, err := s.ExplainModel(ctx, &pb.ExplainModelRequest{Model: "org/M"})
 	if err != nil || !strings.Contains(explained.PlanJson, "experts: 3 of 8") || !strings.Contains(explained.PlanJson, "g4-standard-96") {
 		t.Errorf("ExplainModel: %v\n%v", err, explained)
+	}
+}
+
+// TestNewSessionByName_SpreadsExpertsOverExecutors: an engine whose RAM
+// holds one of two layers of experts gets the other from a free executor
+// the coordinator asks to serve it, wired to its mailboxes (#394).
+func TestNewSessionByName_SpreadsExpertsOverExecutors(t *testing.T) {
+	ctx := t.Context()
+	manifest := strings.Replace(testManifest, `"tensors":{}`, `"tensors":{"e":{"length":1000000000}}`, 1)
+	layer := `{"w1":{"parts":[["e"],["e"],["e"],["e"]]}}` // 4 GB a layer
+	binding := `{"bound":{"embed":{"length":1000}},"external":{"experts":{"0":` + layer + `,"1":` + layer + `}}}`
+	s, _ := newCatalogServer(t, &fakeModelstore{compiled: true, manifest: manifest, binding: binding})
+	// 0.85 x 26 GB - 16 GiB: room for one layer; the other machine, for both
+	engine := &loadingExecutor{probe: `{"device":"cpu","cpu":"AMD EPYC 9B14","cpu_threads":8,"ram_bytes":26000000000}`}
+	helper := &loadingExecutor{probe: `{"device":"cpu","cpu":"AMD EPYC 9B14","cpu_threads":60,"ram_bytes":100000000000}`}
+	helperAddr := startExecutor(t, helper)
+	s.UseExternalExecutors([]string{startExecutor(t, engine), helperAddr})
+
+	if _, err := s.NewSession(ctx, &pb.NewSessionRequest{Model: "org/M"}); err != nil {
+		t.Fatalf("NewSession: %v", err)
+	}
+	if !reflect.DeepEqual(helper.served, []int32{1}) {
+		t.Errorf("the other executor should serve layer 1, served %v", helper.served)
+	}
+	if !strings.Contains(helper.servedFrom, "/blobs/abc") {
+		t.Errorf("the expert executor should read the weights from where the engine does (the rewritten manifest): %s", helper.servedFrom)
+	}
+	want := map[string]string{"VXPU_EXPERT_MAILBOXES": "1", "VXPU_EXPERT_REMOTE": "127.0.0.1:7000"}
+	if !reflect.DeepEqual(engine.lastPlan, want) {
+		t.Errorf("the engine's plan: got %v, want %v", engine.lastPlan, want)
+	}
+	if helper.loads != 0 {
+		t.Errorf("the expert executor should not be loaded as an engine: %d loads", helper.loads)
+	}
+	explained, err := s.ExplainModel(ctx, &pb.ExplainModelRequest{Model: "org/M"})
+	if err != nil || !strings.Contains(explained.PlanJson, "answering the engine's mailboxes") {
+		t.Errorf("ExplainModel: %v\n%v", err, explained)
+	}
+	// a client cannot name the expert servers an engine trusts
+	if _, err := s.RegisterModel(ctx, &pb.RegisterModelRequest{Model: "org/M", Plan: want}); status.Code(err) != codes.InvalidArgument {
+		t.Errorf("a registered plan naming expert servers: got %v, want INVALID_ARGUMENT", err)
 	}
 }
 

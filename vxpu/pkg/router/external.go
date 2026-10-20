@@ -58,7 +58,9 @@ func (s *Server) pickExternalExecutor(modelKey string) string {
 		return addr
 	}
 	for _, addr := range s.externalExecutors {
-		if _, busy := s.externalModel[addr]; !busy {
+		_, busy := s.externalModel[addr]
+		_, serving := s.expertHolders[addr] // its RAM holds another model's experts
+		if !busy && !serving {
 			return addr
 		}
 	}
@@ -71,6 +73,7 @@ func (s *Server) placedExternally(modelKey, addr string) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	if previous, ok := s.externalModel[addr]; ok && previous != modelKey {
+		s.releaseHelpersLocked(addr) // the experts previous's engine had elsewhere
 		delete(s.modelEndpoint, previous)
 		for tag, key := range s.loadedTags {
 			if key == previous {
@@ -103,10 +106,12 @@ func (s *Server) executorEndpoint(ctx context.Context, modelKey string) (string,
 }
 
 // forgetModel drops what the router knows about where modelKey is loaded
-// (its executor no longer holds it), so the next request loads it again.
-func (s *Server) forgetModel(modelKey string) {
+// (its executor, at endpoint, no longer holds it), so the next request
+// loads it again, and frees the executors that held its experts.
+func (s *Server) forgetModel(modelKey, endpoint string) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
+	s.releaseHelpersLocked(endpoint) // the executors holding its engine's experts
 	if addr, ok := s.modelEndpoint[modelKey]; ok && s.externalModel[addr] == modelKey {
 		delete(s.externalModel, addr)
 	}

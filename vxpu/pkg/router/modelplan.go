@@ -20,6 +20,7 @@ import (
 	"errors"
 	"fmt"
 	"sort"
+	"strings"
 	"time"
 
 	"google.golang.org/grpc/codes"
@@ -121,7 +122,10 @@ type modelPlan struct {
 	Time     string            `json:"time"`
 	Switches map[string]string `json:"switches"`        // what was sent
 	Hints    map[string]string `json:"hints,omitempty"` // the registered plan's switches, which win
-	Reasons  []string          `json:"reasons"`
+	// the layers other executors serve to the engine's mailboxes, by
+	// where they answer
+	ExpertExecutors map[string][]int `json:"expert_executors,omitempty"`
+	Reasons         []string         `json:"reasons"`
 }
 
 // planLoad chooses the switches a load of model sends: the planner's,
@@ -151,8 +155,36 @@ func (s *Server) planLoad(ctx context.Context, model string, manifest, binding [
 		if err != nil {
 			mp.Reasons = append(mp.Reasons, fmt.Sprintf("planner: could not read the statistics (%v)", err))
 		}
-		p := planner.Choose(artifact, probe, counts)
+		engine := ""
+		if info != nil {
+			engine = info.Endpoint
+		}
+		s.mu.Lock()
+		s.releaseHelpersLocked(engine) // its experts are placed again
+		s.mu.Unlock()
+		p := planner.Choose(artifact, probe, s.freeExecutors(ctx, engine), counts)
 		mp.Switches, mp.Reasons = p.Switches, append(mp.Reasons, p.Reasons...)
+		// the other executors load their layers and answer on a port each;
+		// the engine's mailboxes are wired to them
+		var remotes []string
+		for _, addr := range sortedKeys(p.ExpertExecutors) {
+			layers := p.ExpertExecutors[addr]
+			remote, err := s.serveExperts(ctx, engine, addr, manifest, binding, layers)
+			if err != nil {
+				mp.Reasons = append(mp.Reasons, fmt.Sprintf("experts: %s could not serve layers %v (%v): the engine holds them", addr, layers, err))
+				continue
+			}
+			remotes = append(remotes, remote)
+			if mp.ExpertExecutors == nil {
+				mp.ExpertExecutors = map[string][]int{}
+			}
+			mp.ExpertExecutors[remote] = layers
+		}
+		if len(remotes) > 0 {
+			mp.Switches["VXPU_EXPERT_REMOTE"] = strings.Join(remotes, ",")
+		} else {
+			delete(mp.Switches, "VXPU_EXPERT_MAILBOXES") // only for the other executors
+		}
 	}
 	for k, v := range hints {
 		if _, chosen := mp.Switches[k]; chosen {
@@ -185,3 +217,17 @@ func (s *Server) ExplainModel(ctx context.Context, req *pb.ExplainModelRequest) 
 	}
 	return &pb.ExplainModelResponse{PlanJson: string(data)}, nil
 }
+
+func sortedKeys[V any](m map[string]V) []string {
+	keys := make([]string, 0, len(m))
+	for k := range m {
+		keys = append(keys, k)
+	}
+	sort.Strings(keys)
+	return keys
+}
+
+// routerOwnedSwitches are the plan switches only the router sets: which
+// expert servers an engine trusts is the router's to wire (the executors
+// it asked to serve them), never a client's to name.
+var routerOwnedSwitches = []string{"VXPU_EXPERT_REMOTE"}
