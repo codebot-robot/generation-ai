@@ -183,7 +183,7 @@ class StepGraph(torch.nn.Module):
         return [values[name] for name in self.runner.graph.inputs]
 
     def _capture(self, args, kwargs):
-        from . import aoti, ops
+        from . import ops
         graph, runner = self.runner.graph, self.runner
         driver = _Driver()
         self._inputs = [v.clone() for v in self._input_values(args, kwargs)]
@@ -252,7 +252,43 @@ class StepGraph(torch.nn.Module):
 
         mailboxes = []  # per host node: (node, pinned inputs, kwargs, outbox, flag offset, pooled)
         side = torch.cuda.Stream(device=dev)  # this GPU's pools' kernels, forked from the step and joined back
+        self._warm(pooled, runner, inputs, dev)
         torch.cuda.synchronize()
+        self._capture_all(graph, mailboxes, boxes, pooled, peers, driver, flags, F, flag, side, dev, resolve,
+                          produced, host_nodes, external)
+
+    def _warm(self, pooled, runner, inputs, dev):
+        """Every kernel the captures will launch, run once first on the
+        runner's inboxes: Triton compiles (and loads) a kernel on its first
+        call, which a capture forbids."""
+        for name, (moe, here, peer_boxes, where, _) in pooled.items():
+            node = self.runner.graph.by_name[name]
+            example = [runner._arg(r, runner._devices[name], inputs) for r in node.args]
+            x_, w_, i_ = (example[k] for k in where)
+            start = moe.experts_start_idx
+            local = None
+            for pool in here:
+                local = triton_ops.fp4_experts_decode(x_, w_, pool.slot_gpu, pool.w1, pool.s1, pool.w3, pool.s3,
+                                                      pool.w2, pool.s2, moe.swiglu_limit, per_pair=True,
+                                                      indices=i_, start=start)
+            peer = None
+            for pdev, (pool, inbox, _, theirs, _, slot_here) in peer_boxes.items():
+                with torch.cuda.device(pdev):
+                    xs, ws, is_ = (t.to(pdev) for t in (x_, w_, i_))
+                    triton_ops.fp4_experts_decode(xs, ws, pool.slot_gpu, pool.w1, pool.s1, pool.w3, pool.s3,
+                                                  pool.w2, pool.s2, moe.swiglu_limit, per_pair=True,
+                                                  indices=is_, start=start)
+                peer = (theirs, slot_here)
+            cpu = torch.zeros(i_.shape[0], i_.shape[1], x_.shape[1], dtype=torch.float32, device=dev)
+            if len(here) <= 1 and len(peer_boxes) <= 1:
+                triton_ops.combine_replies(cpu, i_, start, local=local, local_map=here[0].slot_gpu if here else None,
+                                           peer=peer[0] if peer else None, peer_map=peer[1] if peer else None)
+        for pdev in {d for _, _, boxes_, _, _ in pooled.values() for d in boxes_}:
+            torch.cuda.synchronize(pdev)
+
+    def _capture_all(self, graph, mailboxes, boxes, pooled, peers, driver, flags, F, flag, side, dev, resolve,
+                     produced, host_nodes, external):
+        from . import aoti
         g = torch.cuda.CUDAGraph()
         with torch.cuda.graph(g):
             stream = torch.cuda.current_stream()
@@ -274,37 +310,43 @@ class StepGraph(torch.nn.Module):
                     side.wait_stream(stream)
                     with torch.cuda.stream(side):
                         for pool in here:
-                            slots = pool.slot_gpu[i_ - moe.experts_start_idx]
-                            hot.append((slots >= 0, triton_ops.fp4_experts_decode(
-                                x_, w_, slots, pool.w1, pool.s1, pool.w3, pool.s3, pool.w2, pool.s2,
-                                moe.swiglu_limit, per_pair=True)))
+                            hot.append((pool, triton_ops.fp4_experts_decode(
+                                x_, w_, pool.slot_gpu, pool.w1, pool.s1, pool.w3, pool.s3, pool.w2, pool.s2,
+                                moe.swiglu_limit, per_pair=True, indices=i_, start=moe.experts_start_idx)))
+                for pdev, (pool, inbox, flag_in, _, _, _) in peer_boxes.items():  # the other GPUs first: they
+                    for dst, k in zip(inbox, where):                              # wait on copies, not on the CPU
+                        driver.memcpy(stream, dst, args_[k])
+                    driver.write_value(stream, flag_in.data_ptr(), 1)
                 for p, a in zip(pinned, args_):
                     if isinstance(a, torch.Tensor):
                         p.copy_(a, non_blocking=True)
                 driver.write_value(stream, flag(i, 0), 1)
-                for pdev, (pool, inbox, flag_in, _, _, _) in peer_boxes.items():
-                    for dst, k in zip(inbox, where):
-                        driver.memcpy(stream, dst, args_[k])
-                    driver.write_value(stream, flag_in.data_ptr(), 1)
                 driver.wait_value(stream, flag(i, 1), 1)
                 driver.write_value(stream, flag(i, 1), 0)
                 reply = torch.empty_like(like, device=dev)
                 reply.copy_(outbox, non_blocking=True)
                 if moe is not None:  # per-pair replies: each from whoever holds the expert, then the k-order sum
                     i_ = args_[where[2]]
+                    start = moe.experts_start_idx
                     for pdev, (pool, _, _, theirs, flag_back, slot_here) in peer_boxes.items():
                         driver.wait_value(stream, flag_back.data_ptr(), 1)
                         driver.write_value(stream, flag_back.data_ptr(), 0)
-                        mine = slot_here[i_ - moe.experts_start_idx] >= 0
-                        reply = torch.where(mine.unsqueeze(-1), theirs, reply)
                     if hot:
                         stream.wait_stream(side)
-                    for mine, replies in hot:
-                        reply = torch.where(mine.unsqueeze(-1), replies, reply)
-                    y = torch.zeros(reply.shape[0], reply.shape[2], dtype=torch.float32, device=dev)
-                    for k in range(reply.shape[1]):
-                        y = y + reply[:, k]
-                    reply = y
+                    if len(hot) <= 1 and len(peer_boxes) <= 1:  # one kernel for the choice and the sum
+                        peer = next(iter(peer_boxes.values()), None)
+                        reply = triton_ops.combine_replies(
+                            reply, i_, start, local=hot[0][1] if hot else None, local_map=hot[0][0].slot_gpu if hot else None,
+                            peer=peer[3] if peer else None, peer_map=peer[5] if peer else None)
+                    else:
+                        for pool, _, _, theirs, _, slot_here in peer_boxes.values():
+                            reply = torch.where((slot_here[i_ - start] >= 0).unsqueeze(-1), theirs, reply)
+                        for pool, replies in hot:
+                            reply = torch.where((pool.slot_gpu[i_ - start] >= 0).unsqueeze(-1), replies, reply)
+                        y = torch.zeros(reply.shape[0], reply.shape[2], dtype=torch.float32, device=dev)
+                        for k in range(reply.shape[1]):
+                            y = y + reply[:, k]
+                        reply = y
                 produced[node.name] = reply
                 mailboxes.append((node, pinned, kwargs_, outbox, F * i, pooled.get(node.name)))
             output = resolve(graph.output)
@@ -337,9 +379,9 @@ class StepGraph(torch.nn.Module):
                     driver.wait_value(s, flag_in.data_ptr(), 1)
                     driver.write_value(s, flag_in.data_ptr(), 0)
                     x_, w_, i_ = inbox
-                    slots = pool.slot_gpu[i_ - moe.experts_start_idx]
-                    replies = triton_ops.fp4_experts_decode(x_, w_, slots, pool.w1, pool.s1, pool.w3, pool.s3,
-                                                            pool.w2, pool.s2, moe.swiglu_limit, per_pair=True)
+                    replies = triton_ops.fp4_experts_decode(x_, w_, pool.slot_gpu, pool.w1, pool.s1, pool.w3, pool.s3,
+                                                            pool.w2, pool.s2, moe.swiglu_limit, per_pair=True,
+                                                            indices=i_, start=moe.experts_start_idx)
                     driver.memcpy(s, theirs, replies)
                     driver.write_value(s, flag_back.data_ptr(), 1)
         return pdev, g
