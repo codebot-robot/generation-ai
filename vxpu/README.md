@@ -520,7 +520,7 @@ cmd/vxpu-router/  in-cluster router: keeps weights in modelstore (or
 images/       executor and router container images
 examples/     notebooks (Gemma 4 on vXPU)
 third_party/  forked dependencies as submodules (transformers)
-docs/         design notes (representation.md: why the artifact is pt2)
+docs/         design notes (design.md: vXPU as a database engine for LLMs, today and where it is heading; representation.md: why the artifact is pt2)
 ```
 
 ## Building
