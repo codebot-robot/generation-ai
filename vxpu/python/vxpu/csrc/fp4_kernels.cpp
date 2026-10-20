@@ -792,6 +792,8 @@ TORCH_LIBRARY_IMPL(vxpu_native, CPU, m) {
   m.impl("gather_rows", &gather_rows);
 }
 
+void register_node_server(pybind11::module& m);  // node_server.cpp
+
 PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
   m.def("fp4_gather_mm", &fp4_gather_mm, "x[M,K] bf16 x packed fp4 experts sel[M] -> bf16 [M,N]");
   m.def("fp4_grouped_mm", &fp4_grouped_mm, "x[M,K] bf16 (sorted by expert, offs[E]) x packed fp4 experts -> bf16 [M,N]");
@@ -801,4 +803,5 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
   m.def("gather_rows", &gather_rows, "rows of a 2-D table by index, copied concurrently (page faults overlap) -> [*indices.shape, cols]");
   m.def("has_avx512", &has_avx512, "whether the AVX-512 paths are in use");
   m.def("has_neon", &has_neon, "whether the NEON paths are in use");
+  register_node_server(m);
 }

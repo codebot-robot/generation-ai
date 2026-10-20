@@ -135,6 +135,16 @@ def _host_op(target):
     return name if name in LOWERINGS else None
 
 
+def host_call(sub):
+    """(the External collection, the module's index) a host node's op
+    reads: ("experts", 3) for layer 3's experts."""
+    calls = [n for n in sub.graph.nodes if n.op == "call_function" and _host_op(n.target)]
+    if len(calls) != 1:
+        raise ValueError(f"a native node calls one host op, this one {len(calls)}")
+    kind, _ = LOWERINGS[_host_op(calls[0].target)]
+    return kind, next(a for a in calls[0].args if isinstance(a, int))
+
+
 class NativeNode(torch.nn.Module):
     """A host node with its host op lowered: called with the node's
     inputs, then its residents."""
@@ -179,11 +189,12 @@ class NativeNode(torch.nn.Module):
 
 
 def native_package(packages, sub, external, inputs):
-    """The package of a host node on its decode inputs: (runner, its
-    residents). Call runner(*inputs, *residents)."""
+    """The package file of a host node on its decode inputs (built first
+    if not cached), and its residents: run it on its inputs, then its
+    residents."""
     node = NativeNode(sub, external)
     args = list(inputs) + list(node.residents)
-    return packages.get(node, args, extra=node.cache_extra(), code=sub.code), node.residents
+    return packages.path(node, args, extra=node.cache_extra(), code=sub.code), node.residents
 
 
 def is_native(sub):

@@ -1602,13 +1602,14 @@ def _check_mover_lifetime():
 
 
 def _check_native_nodes(model, prompts, settings, artifact, workdir):
-    """The decode step's host nodes as native packages (nodes.py, #394):
-    each experts and n-gram node, its host op lowered to the native
-    kernels and compiled by AOTInductor, run on the inputs the engine gave
-    it in a decode step, returns bit-identically what the engine's node
-    returned."""
+    """The decode step's host nodes served native (nodes.py,
+    nodeserver.py, #394): a node server for every experts and n-gram node,
+    each lowered to the native kernels and compiled by AOTInductor, sent
+    the inputs the engine gave it in a decode step over TCP, replies
+    bit-identically what the engine's node returned."""
+    import time
     import torch
-    from . import aoti, nodes
+    from . import nodeserver
     from .engine import SamplingParams
     keep = []
     _with_env({"VXPU_DATAFLOW": "1", "VXPU_DATAFLOW_PLACE": None, "VXPU_EXPERT_MAILBOXES": None,
@@ -1633,21 +1634,38 @@ def _check_native_nodes(model, prompts, settings, artifact, workdir):
     finally:
         for h in hooks:
             h.remove()
-    packages = aoti.Packages(os.path.join(workdir, "native-nodes"))
-    bad = []
-    for name in host:
-        args, want = seen[name]
-        runner, residents = nodes.native_package(packages, getattr(split, name), engine.external, args)
-        got = runner(*args, *residents)
-        want = list(want) if isinstance(want, (tuple, list)) else [want]
-        got = list(got) if isinstance(got, (tuple, list)) else [got]
-        if len(got) != len(want) or not all(torch.equal(g, w) for g, w in zip(got, want)):
-            bad.append(name)
-    print(f"native nodes: {len(host) - len(bad)} of {len(host)} host nodes (experts, n-gram) bit-identical as "
-          f"AOTInductor packages on the native kernels")
+    server = nodeserver.start(artifact, host, cache_dir=os.path.join(workdir, "native-nodes"))
+    bad, calls = [], 0
+    t = time.perf_counter()
+    idle = nodeserver.connect(f"127.0.0.1:{server.port()}")  # still connected when the server stops
+    try:
+        sock = nodeserver.connect(f"127.0.0.1:{server.port()}")
+        for i, name in enumerate(host):
+            args, want = seen[name]
+            got = nodeserver.call(sock, i, [a for a in args if isinstance(a, torch.Tensor)])
+            calls += 1
+            want = list(want) if isinstance(want, (tuple, list)) else [want]
+            if len(got) != len(want) or not all(torch.equal(g, w) for g, w in zip(got, want)):
+                bad.append(name)
+        sock.close()
+    finally:
+        served = server.messages()
+        server.stop()
+    print(f"native nodes: {len(host) - len(bad)} of {len(host)} host nodes (experts, n-gram) bit-identical from a "
+          f"node server ({served} messages, {1e6 * (time.perf_counter() - t) / max(calls, 1):.0f} us a call)")
     if bad:
         print(f"native nodes check: {bad} differ from the engine's")
-    return not bad
+    # stopping the server ends its connections (their threads would
+    # otherwise outlive it), so a connected client sees the end at once
+    idle.settimeout(5)
+    try:
+        ended = idle.recv(1) == b""
+    except (TimeoutError, OSError):
+        ended = False
+    idle.close()
+    if not ended:
+        print("native nodes check: a connection outlived its stopped server")
+    return not bad and ended
 
 
 def _check_plan_given():
