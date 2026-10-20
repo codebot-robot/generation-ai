@@ -276,6 +276,10 @@ class Plan:
         self._set("segment_runtime", runtime, rsrc, ("jit", "aoti"),
                   "how dense segments run: jit (torch.compile, CUDA graphs by its cudagraph trees) or aoti "
                   "(AOTInductor packages, built once and cached, in the engine's own CUDA graphs; aoti.py)")
+        on, src = env_flag("VXPU_EXPERT_MAILBOXES", False)
+        self._set("expert_mailboxes", on, src, (True, False),
+                  "decode's routed experts as mailboxes (mailboxes.py, #372): each (token, k) pair answered by its "
+                  "expert's owner (the CPU, a GPU pool), the replies summed in k order whoever answered")
         on, src = env_flag("VXPU_DATAFLOW", False)
         self._set("dataflow", on, src, (True, False),
                   "run the decode step as a dataflow graph: its segments as nodes, each fired when the inboxes "

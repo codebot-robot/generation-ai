@@ -256,6 +256,14 @@ class Engine:
             self.external.experts[int(layer)] = ds.host_experts(int(layer), args, banks)
         if self.plan["gpu_experts"] and self.external.experts:
             self._place_hot_experts(self.plan["gpu_experts"])
+        if self.plan["expert_mailboxes"] and self.external.experts:
+            from . import mailboxes
+            for moe in self.external.experts.values():
+                moe._vxpu_mailboxes = mailboxes.Layer(moe, residency=getattr(moe, "_vxpu_hot", None))
+            self.plan.note(f"expert mailboxes: {len(self.external.experts)} layers, owners cpu"
+                           + "".join(sorted({f", {p.device}" for m in self.external.experts.values()
+                                             for p in (getattr(m, '_vxpu_hot', None).pools
+                                                       if getattr(m, '_vxpu_hot', None) else [])})))
         for layer, spec in external.get("engram", {}).items():
             weight, downloaded = fetch_tensor(self.manifest["tensors"][spec["weight"]], self.manifest["files"], cas_dir, mmap_dir=mm)
             self.bytes_fetched += downloaded

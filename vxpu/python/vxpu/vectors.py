@@ -1190,6 +1190,49 @@ def _check_expert_moves(model, prompts, settings, artifact, workdir, runs, gpus,
     return ok
 
 
+def _check_expert_mailboxes(model, prompts, settings, artifact, plain, workdir):
+    """Decode's experts as mailboxes (mailboxes.py): with every expert on
+    the CPU, bit-identical to the plain engine (each reply is the fused
+    kernel's own term, summed in its order). On a GPU also with half of
+    every layer's experts in GPU pools, against the plain GPU engine: the
+    rounding class (a GPU's replies may differ in the last bf16 bit)."""
+    import torch
+    keep = []
+    got = _with_env({"VXPU_EXPERT_MAILBOXES": "1", "VXPU_GPU_EXPERTS": None}, record_vxpu_engine,
+                    model, "main", prompts, settings, artifact, keep=keep)
+    selected = {s["impl"] for s in keep[0].plan.explain(keep[0].plan_ops())["ops"]["vxpu::moe_experts"]["selected"]}
+    if "mailboxes" not in selected:
+        print(f"expert mailboxes check: the mailboxes implementation was not selected ({sorted(selected)})")
+        return False
+    same = ([p["generated_ids"] for p in got["prompts"]] == [p["generated_ids"] for p in plain["prompts"]]
+            and [p["top_logits"] for p in got["prompts"]] == [p["top_logits"] for p in plain["prompts"]])
+    rows, _ = compare(plain, got, strict_tokens=True)
+    print("expert mailboxes, every expert on the CPU, against the plain engine (must be bit-identical):")
+    print(table(plain, got, rows))
+    if not same:
+        print("expert mailboxes check: not bit-identical with every expert on the CPU")
+        return False
+    if not torch.cuda.is_available():
+        return True
+    with open(os.path.join(artifact, "binding.json")) as f:
+        experts = (json.load(f).get("external") or {}).get("experts") or {}
+    n = len(next(iter(next(iter(experts.values())).values()))["parts"])
+    gpus = min(torch.cuda.device_count(), 2)
+    held = list(range(0, n, 2))
+    path = os.path.join(workdir, "placement-mailboxes.json")
+    with open(path, "w") as f:
+        json.dump({"format": "vxpu-placement/2",
+                   "gpus": [{"layers": {layer: held[g::gpus] for layer in experts}} for g in range(gpus)]}, f)
+    ref = _with_env({"VXPU_EXPERT_MAILBOXES": None, "VXPU_GPU_EXPERTS": None}, record_vxpu_engine,
+                    model, "main", prompts, settings, artifact, device="cuda")
+    pooled = _with_env({"VXPU_EXPERT_MAILBOXES": "1", "VXPU_GPU_EXPERTS": path}, record_vxpu_engine,
+                       model, "main", prompts, settings, artifact, device="cuda")
+    rows, ok = compare(ref, pooled, strict_tokens=True)
+    print(f"expert mailboxes with half the experts in {gpus} GPU pool(s), against the plain GPU engine:")
+    print(table(ref, pooled, rows))
+    return ok
+
+
 def _check_dataflow(model, prompts, settings, artifact, plain):
     """The engine's decode run as a dataflow graph (dataflow.py): the same
     tokens and logits as the plain run, every edge through an inbox. On a
@@ -1312,6 +1355,8 @@ def selftest(workdir, settings):
             failed.append(name + " (local weight tier)")
         if not _check_dataflow(model, prompts, settings, artifact, got):
             failed.append(name + " (dataflow)")
+        if name == "tiny-deepseek-v41" and not _check_expert_mailboxes(model, prompts, settings, artifact, got, workdir):
+            failed.append(name + " (expert mailboxes)")
         if name == "tiny-llama" and not _check_chat_telemetry(artifact):
             failed.append(name + " (chat telemetry)")
         if name == "tiny-deepseek-v41" and not _check_gpu_experts(model, prompts, settings, artifact, workdir):
