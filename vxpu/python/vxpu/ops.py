@@ -122,12 +122,16 @@ def moe_experts(x_in: torch.Tensor, weights: torch.Tensor, indices: torch.Tensor
     crossing = x_in.device.type == "cuda" and host.type == "cpu" and x_in.shape[0] <= PINNED_MAX_ROWS
     rec = _recorder()
     t0 = time.perf_counter() if rec is not None else 0.0
+    hot = getattr(moe, "_vxpu_hot", None) if crossing else None
+    rows = x_in.shape[0]
+    impl = _plan(host.type).select("vxpu::moe_experts", host.type, key=f"rows={rows}", moe=moe, rows=rows,
+                                   hot=hot is not None)
+    if impl.fn is _moe_gpu_hot:
+        return _moe_gpu_hot(moe, hot, x_in, weights, indices, layer, rec, t0)
     if crossing:
         x, w, i = _to_host(x_in, weights, indices)
     else:
         x, w, i = x_in.to(host), weights.to(host), indices.to(host)
-    rows = x.shape[0]
-    impl = _plan(host.type).select("vxpu::moe_experts", host.type, key=f"rows={rows}", moe=moe, rows=rows)
     if rec is None:
         y = impl.fn(moe, x, w, i)
         return _to_device(y, x_in.device) if crossing else y.to(x_in.device)
@@ -152,6 +156,43 @@ def _recorder():
 
 def _cpu_experts(plan, moe=None, **_):
     return plan["kernels"] and experts_cpu.applicable(moe)
+
+
+@implementation("vxpu::moe_experts", "gpu-hot+cpu", ("cpu",), "rounding",
+                "a placement holds this layer's hot experts on the GPU (experts_gpu.py): the token's hot pairs computed "
+                "there on a side stream while the CPU kernels compute the cold ones, and the two sums added",
+                applies=lambda plan, rows=0, hot=False, **ctx: hot and rows <= PINNED_MAX_ROWS and plan["triton"]
+                and _cpu_experts(plan, **ctx), host=True)
+def _moe_gpu_hot(moe, hot, x_in, weights, indices, layer, rec, t0):
+    dev = x_in.device
+    current = torch.cuda.current_stream(dev)
+    hot.stream.wait_stream(current)  # the dense work before produces x_in
+    with torch.cuda.stream(hot.stream):
+        slots = hot.slot_gpu[indices - moe.experts_start_idx]
+        y_hot = triton_ops.fp4_experts_decode(x_in, weights, slots, hot.w1, hot.s1, hot.w3, hot.s3,
+                                              hot.w2, hot.s2, moe.swiglu_limit)
+    x, w, i = _to_host(x_in, weights, indices)  # the GPU computes the hot pairs meanwhile
+    t1 = time.perf_counter()
+    cold = hot.slot_cpu[i - moe.experts_start_idx] < 0
+    n_cold = int(cold.sum())
+    y_cold = None
+    if n_cold:
+        fused = _plan("cpu")["fused_experts"]
+        if x.shape[0] == 1:  # one token: only its cold pairs reach the CPU kernels
+            y_cold = experts_cpu.forward_batched(moe, x, w[cold].view(1, -1), i[cold].view(1, -1), fused=fused)
+        else:  # hot pairs weigh 0: h = w * silu(g) * u = 0, so they add exactly nothing
+            y_cold = experts_cpu.forward_batched(moe, x, torch.where(cold, w, torch.zeros_like(w)), i, fused=fused)
+    t2 = time.perf_counter()
+    out = _to_device(y_cold, dev) if y_cold is not None else None
+    current.wait_stream(hot.stream)
+    y_hot.record_stream(current)
+    y = y_hot if out is None else y_hot + out
+    if rec is not None:
+        t3 = time.perf_counter()
+        rec.host_op("moe_experts", wait_to_host_ms=(t1 - t0) * 1e3, impl_ms=(t2 - t1) * 1e3, to_device_ms=(t3 - t2) * 1e3,
+                    gpu_pairs=float(i.numel() - n_cold), cpu_pairs=float(n_cold))
+        rec.selected_experts(layer, i.flatten().tolist())
+    return y
 
 
 # The routed experts' implementations, run on the banks' device: the fused

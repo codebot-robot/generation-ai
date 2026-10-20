@@ -253,6 +253,8 @@ class Engine:
                 banks[name] = tensor
                 self.bytes_fetched += downloaded
             self.external.experts[int(layer)] = ds.host_experts(int(layer), args, banks)
+        if self.plan["gpu_experts"] and self.external.experts:
+            self._place_hot_experts(self.plan["gpu_experts"])
         for layer, spec in external.get("engram", {}).items():
             weight, downloaded = fetch_tensor(self.manifest["tensors"][spec["weight"]], self.manifest["files"], cas_dir, mmap_dir=mm)
             self.bytes_fetched += downloaded
@@ -263,6 +265,23 @@ class Engine:
                 advise_random(scale)
             self.external.engram[int(layer)] = ds.host_engram(int(layer), spec["num_embeddings"], spec["dim"], weight, scale)
             ops.ENGRAM_DIM[int(layer)] = spec["dim"]
+
+    def _place_hot_experts(self, path):
+        """Hold the placement's hot experts on the GPU (experts_gpu.py)."""
+        from . import experts_gpu
+        placement = experts_gpu.load_placement(path)
+        count = held = 0
+        for layer, moe in self.external.experts.items():
+            ids = placement.get(layer)
+            if ids:
+                moe._vxpu_hot = experts_gpu.HotExperts(moe, ids, self.device)
+                count += moe._vxpu_hot.count
+                held += moe._vxpu_hot.bytes
+        total = sum(m.n_local_experts for m in self.external.experts.values())
+        msg = (f"hot experts on {self.device}: {count} of {total} ({held / 1e9:.1f} GB), "
+               f"in {sum(1 for m in self.external.experts.values() if getattr(m, '_vxpu_hot', None))} layers")
+        print(f"[vxpu] {msg}", flush=True)
+        self.plan.note(msg)
 
     def external_scope(self):
         """The context in which this engine's graphs must run: the ops
