@@ -39,6 +39,7 @@ Usage:
 
 import argparse
 import contextlib
+import hashlib
 import json
 import os
 import sys
@@ -315,6 +316,117 @@ def constant_aliases(exportable, *programs):
     return aliases
 
 
+def _tensor_key(tensor):
+    return (
+        tensor.dtype,
+        tuple(tensor.shape),
+        hashlib.sha256(
+            tensor.detach()
+            .cpu()
+            .contiguous()
+            .view(-1)
+            .view(torch.uint8)
+            .numpy()
+            .tobytes()
+        ).digest(),
+    )
+
+
+def _rewire(program, dup, keep, ph_by_name, spec_by_target):
+    del program.constants[dup]
+    assert dup in spec_by_target and keep in spec_by_target, (
+        f"missing input spec for constant rewire: {dup} -> {keep}"
+    )
+    dup_spec = spec_by_target.pop(dup)
+    keep_spec = spec_by_target[keep]
+    dup_node = ph_by_name.pop(dup_spec.arg.name)
+    keep_node = ph_by_name[keep_spec.arg.name]
+    dup_node.replace_all_uses_with(keep_node)
+    program.graph.erase_node(dup_node)
+    program.graph_signature.input_specs = [
+        s for s in program.graph_signature.input_specs
+        if s.arg.name != dup_node.name
+    ]
+
+
+def deduplicate_constants(aliases, *programs):
+    """Deduplicate constant tensors with identical content across exported programs.
+
+    Finds lifted constants and non-persistent buffers with identical dtype, shape,
+    and byte content. For each distinct content, one canonical constant is kept,
+    and all other occurrences in the graphs are rewritten to reference that
+    canonical constant. The duplicates are removed from the programs' constants
+    and added to `aliases`.
+    """
+    aliases = dict(aliases or {})
+    exclude = set().union(*(mutated_fqns(p) for p in programs))
+    exclude |= {a for a, c in aliases.items() if c in exclude}
+    exclude |= {c for a, c in aliases.items() if a in exclude}
+
+    # 1. Key every constant once; a name whose content differs between programs is never shared.
+    key_of, conflicting = {}, set()
+    for p in programs:
+        for fqn, t in p.constants.items():
+            if fqn in exclude or not isinstance(t, torch.Tensor) or t.is_meta:
+                continue
+            k = _tensor_key(t)
+            if key_of.setdefault(fqn, k) != k:
+                conflicting.add(fqn)
+
+    # 2. One pass per program: the first name seen for a content is canonical everywhere.
+    canon_of = {}
+    for p in programs:
+        ph_by_name = {n.name: n for n in p.graph.nodes if n.op == "placeholder"}
+        spec_by_target = {s.target: s for s in p.graph_signature.input_specs if s.target}
+        here = {}
+        modified = False
+
+        for fqn in list(p.constants):
+            if fqn in exclude or fqn in conflicting or fqn not in key_of:
+                continue
+            k = key_of[fqn]
+            canon = canon_of.setdefault(k, fqn)
+            keep = canon if canon in p.constants else here.setdefault(k, fqn)
+            if keep != fqn:
+                _rewire(p, fqn, keep, ph_by_name, spec_by_target)
+                aliases[fqn] = keep
+                modified = True
+
+        targets = [s.target for s in p.graph_signature.input_specs if s.target]
+        assert len(targets) == len(set(targets)), (
+            f"duplicate input spec targets in {p}: {targets}"
+        )
+        if modified:
+            p.graph.lint()
+            p.graph_module.recompile()
+
+    # Flatten chained aliases
+    for a in list(aliases):
+        c = aliases[a]
+        while c in aliases and aliases[c] != c:
+            c = aliases[c]
+        aliases[a] = c
+
+    return aliases
+
+
+def assert_no_duplicate_constants(program_or_path):
+    """Assert that no two constants in an exported graph have identical content."""
+    if isinstance(program_or_path, (str, os.PathLike)):
+        program = torch.export.load(program_or_path)
+    else:
+        program = program_or_path
+    seen = {}
+    for fqn, val in program.constants.items():
+        if isinstance(val, torch.Tensor) and not val.is_meta:
+            key = _tensor_key(val)
+            if key in seen:
+                raise AssertionError(
+                    f"duplicate constant in exported program: {fqn} has "
+                    f"identical content to {seen[key]} (dtype={val.dtype}, shape={tuple(val.shape)})")
+            seen[key] = fqn
+
+
 MIN_PREFILL_LEN = 2
 
 
@@ -477,13 +589,14 @@ def export_artifact(repo_id, out_dir, max_cache_len=1024, revision="main"):
             strict=False)
 
     aliases = constant_aliases(exportable, prefill, decode)
+    state_fqns = set().union(*(mutated_fqns(p) for p in (prefill, decode)))
+    state_fqns |= {a for a, c in aliases.items() if c in state_fqns}
+    state_fqns |= {c for a, c in aliases.items() if a in state_fqns}
     for program in (prefill, decode):
-        state_fqns = {f for f in mutated_fqns(program)}
-        state_fqns |= {a for a, c in aliases.items() if c in state_fqns}
-        state_fqns |= {c for a, c in aliases.items() if a in state_fqns}
         strip_state_values(program, state_fqns)
         params = set(program.graph_signature.inputs_to_parameters.values())
         inject_buffer_values(program, buffers, params, state_fqns)
+    aliases = deduplicate_constants(aliases, prefill, decode)
     torch.export.save(prefill, os.path.join(out_dir, "prefill.pt2"))
     torch.export.save(decode, os.path.join(out_dir, "decode.pt2"))
 
@@ -523,13 +636,14 @@ def export_deepseek_v41(repo_id, out_dir, manifest, max_cache_len, revision):
     prefill, decode = ds.export_graphs(model, max_cache_len, MIN_PREFILL_LEN)
 
     aliases = constant_aliases(ds.Prefill(model), prefill, decode)
+    state_fqns = set().union(*(mutated_fqns(p) for p in (prefill, decode)))
+    state_fqns |= {a for a, c in aliases.items() if c in state_fqns}
+    state_fqns |= {c for a, c in aliases.items() if a in state_fqns}
     for program in (prefill, decode):
-        state_fqns = {f for f in mutated_fqns(program)}
-        state_fqns |= {a for a, c in aliases.items() if c in state_fqns}
-        state_fqns |= {c for a, c in aliases.items() if a in state_fqns}
         strip_state_values(program, state_fqns)
         params = set(program.graph_signature.inputs_to_parameters.values())
         inject_buffer_values(program, buffers, params, state_fqns)
+    aliases = deduplicate_constants(aliases, prefill, decode)
     torch.export.save(prefill, os.path.join(out_dir, "prefill.pt2"))
     torch.export.save(decode, os.path.join(out_dir, "decode.pt2"))
 
