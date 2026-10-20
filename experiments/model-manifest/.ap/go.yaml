@@ -1,5 +1,0 @@
-# Copyright 2026 Google LLC
-gofmt:
-  enabled: true
-govet:
-  enabled: true

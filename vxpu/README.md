@@ -582,8 +582,8 @@ clients.
 
 ## Status and roadmap
 
-vXPU is an early extraction of the `experiments/model-manifest`
-work — the experiment retains the full research trail.
+vXPU started as the `experiments/model-manifest` experiment, which is in
+the git history (removed in #392).
 
 Known simplifications / tasks for the immediate roadmap are:
 - Tokenizer/processor files ride alongside the manifest rather than
@@ -597,5 +597,5 @@ Known simplifications / tasks for the immediate roadmap are:
   kernels, would be a placement choice, not an artifact change.
 - `.pt2` graphs pin the exporting torch version (the serialization
   format promises newer-loads-older; same-version is what we test).
-- A shared paged KV pool is designed (see the experiment's
-  PLAN-paged-rewrite.md) to replace fixed-shape per-session static caches.
+- A shared paged KV pool is designed (see PLAN-paged-rewrite.md in the
+  experiment's git history) to replace fixed-shape per-session static caches.
