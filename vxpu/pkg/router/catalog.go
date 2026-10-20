@@ -437,11 +437,11 @@ func (s *Server) loadByName(ctx context.Context, model, revision string) (string
 		if !exists {
 			return "", status.Errorf(codes.FailedPrecondition, "model %s@%s is not compiled for executor image %s: call RegisterModel", model, revision, s.imageName)
 		}
-		plan, err := s.getPlan(ctx, model)
+		hints, err := s.getPlan(ctx, model)
 		if err != nil {
 			return "", status.Errorf(codes.Unavailable, "reading the plan of %s: %v", model, err)
 		}
-		s.setHints(model, plan, false)
+		s.setHints(model, hints, false)
 		files := map[string][]byte{}
 		for _, f := range []string{"manifest.json", "binding.json", "prefill.pt2", "decode.pt2"} {
 			data, err := s.weightStore.FetchFile(ctx, repo, tag, f)
@@ -455,8 +455,9 @@ func (s *Server) loadByName(ctx context.Context, model, revision string) (string
 			BindingJson:  string(files["binding.json"]),
 			PrefillGraph: files["prefill.pt2"],
 			DecodeGraph:  files["decode.pt2"],
-			Plan:         plan,
-		}, true)
+		}, true, func(ctx context.Context, info *executorInfo) map[string]string {
+			return s.planLoad(ctx, model, files["manifest.json"], files["binding.json"], hints, info)
+		})
 		if err != nil {
 			return "", err
 		}
@@ -465,7 +466,7 @@ func (s *Server) loadByName(ctx context.Context, model, revision string) (string
 		if s.loadedHints == nil {
 			s.loadedHints = map[string]string{}
 		}
-		s.loadedHints[tag] = hintsKey(plan)
+		s.loadedHints[tag] = hintsKey(hints)
 		s.keyModel[key] = modelRef{Model: model, Commit: commit, Artifact: repo + ":" + tag}
 		s.mu.Unlock()
 		return key, nil

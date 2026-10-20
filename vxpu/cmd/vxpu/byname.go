@@ -217,3 +217,30 @@ func cmdStats(ctx context.Context, args []string) error {
 	}
 	return nil
 }
+
+// cmdExplain shows the plan the coordinator chose for a model's last
+// load by name, and why (#394).
+func cmdExplain(ctx context.Context, args []string) error {
+	flags := flag.NewFlagSet("explain", flag.ContinueOnError)
+	pod := flags.String("pod", "vxpu-router", "router pod name")
+	routerAddr := flags.String("router", "", "vxpu-router address (e.g. localhost:50051); if set, skips the pod and port-forward")
+	if err := flags.Parse(args); err != nil {
+		return err
+	}
+	if flags.NArg() != 1 {
+		return fmt.Errorf("usage: vxpu explain [flags] REPO")
+	}
+	ctx, cancel := context.WithTimeout(ctx, time.Minute)
+	defer cancel()
+	client, done, err := connectRouter(ctx, *routerAddr, *pod, envRouterSettings())
+	if err != nil {
+		return err
+	}
+	defer done()
+	resp, err := client.ExplainModel(ctx, &pb.ExplainModelRequest{Model: flags.Arg(0)})
+	if err != nil {
+		return fmt.Errorf("ExplainModel: %w", err)
+	}
+	fmt.Println(resp.PlanJson)
+	return nil
+}

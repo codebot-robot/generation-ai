@@ -1032,6 +1032,96 @@ func (x *DescribeResponse) GetHardwareJson() string {
 	return ""
 }
 
+type ExplainModelRequest struct {
+	state         protoimpl.MessageState `protogen:"open.v1"`
+	Model         string                 `protobuf:"bytes,1,opt,name=model,proto3" json:"model,omitempty"`
+	unknownFields protoimpl.UnknownFields
+	sizeCache     protoimpl.SizeCache
+}
+
+func (x *ExplainModelRequest) Reset() {
+	*x = ExplainModelRequest{}
+	mi := &file_proto_vxpu_proto_msgTypes[14]
+	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+	ms.StoreMessageInfo(mi)
+}
+
+func (x *ExplainModelRequest) String() string {
+	return protoimpl.X.MessageStringOf(x)
+}
+
+func (*ExplainModelRequest) ProtoMessage() {}
+
+func (x *ExplainModelRequest) ProtoReflect() protoreflect.Message {
+	mi := &file_proto_vxpu_proto_msgTypes[14]
+	if x != nil {
+		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+		if ms.LoadMessageInfo() == nil {
+			ms.StoreMessageInfo(mi)
+		}
+		return ms
+	}
+	return mi.MessageOf(x)
+}
+
+// Deprecated: Use ExplainModelRequest.ProtoReflect.Descriptor instead.
+func (*ExplainModelRequest) Descriptor() ([]byte, []int) {
+	return file_proto_vxpu_proto_rawDescGZIP(), []int{14}
+}
+
+func (x *ExplainModelRequest) GetModel() string {
+	if x != nil {
+		return x.Model
+	}
+	return ""
+}
+
+type ExplainModelResponse struct {
+	state protoimpl.MessageState `protogen:"open.v1"`
+	// {model, machine, time, switches (sent), hints (the registered plan's,
+	// which win), reasons}, as JSON.
+	PlanJson      string `protobuf:"bytes,1,opt,name=plan_json,json=planJson,proto3" json:"plan_json,omitempty"`
+	unknownFields protoimpl.UnknownFields
+	sizeCache     protoimpl.SizeCache
+}
+
+func (x *ExplainModelResponse) Reset() {
+	*x = ExplainModelResponse{}
+	mi := &file_proto_vxpu_proto_msgTypes[15]
+	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+	ms.StoreMessageInfo(mi)
+}
+
+func (x *ExplainModelResponse) String() string {
+	return protoimpl.X.MessageStringOf(x)
+}
+
+func (*ExplainModelResponse) ProtoMessage() {}
+
+func (x *ExplainModelResponse) ProtoReflect() protoreflect.Message {
+	mi := &file_proto_vxpu_proto_msgTypes[15]
+	if x != nil {
+		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+		if ms.LoadMessageInfo() == nil {
+			ms.StoreMessageInfo(mi)
+		}
+		return ms
+	}
+	return mi.MessageOf(x)
+}
+
+// Deprecated: Use ExplainModelResponse.ProtoReflect.Descriptor instead.
+func (*ExplainModelResponse) Descriptor() ([]byte, []int) {
+	return file_proto_vxpu_proto_rawDescGZIP(), []int{15}
+}
+
+func (x *ExplainModelResponse) GetPlanJson() string {
+	if x != nil {
+		return x.PlanJson
+	}
+	return ""
+}
+
 var File_proto_vxpu_proto protoreflect.FileDescriptor
 
 const file_proto_vxpu_proto_rawDesc = "" +
@@ -1133,7 +1223,11 @@ const file_proto_vxpu_proto_rawDesc = "" +
 	"\rrecords_jsonl\x18\x02 \x01(\tR\frecordsJsonl\"\x11\n" +
 	"\x0fDescribeRequest\"7\n" +
 	"\x10DescribeResponse\x12#\n" +
-	"\rhardware_json\x18\x01 \x01(\tR\fhardwareJson2\xd2\x03\n" +
+	"\rhardware_json\x18\x01 \x01(\tR\fhardwareJson\"+\n" +
+	"\x13ExplainModelRequest\x12\x14\n" +
+	"\x05model\x18\x01 \x01(\tR\x05model\"3\n" +
+	"\x14ExplainModelResponse\x12\x1b\n" +
+	"\tplan_json\x18\x01 \x01(\tR\bplanJson2\x9b\x04\n" +
 	"\bExecutor\x12>\n" +
 	"\tLoadModel\x12\x16.vxpu.LoadModelRequest\x1a\x17.vxpu.LoadModelResponse\"\x00\x12J\n" +
 	"\rRegisterModel\x12\x1a.vxpu.RegisterModelRequest\x1a\x1b.vxpu.RegisterModelResponse\"\x00\x12A\n" +
@@ -1142,7 +1236,8 @@ const file_proto_vxpu_proto_rawDesc = "" +
 	"\x04Chat\x12\x11.vxpu.ChatRequest\x1a\x12.vxpu.ChatResponse\"\x00\x12=\n" +
 	"\bGenerate\x12\x15.vxpu.GenerateRequest\x1a\x16.vxpu.GenerateResponse\"\x000\x01\x12J\n" +
 	"\rGetModelStats\x12\x1a.vxpu.GetModelStatsRequest\x1a\x1b.vxpu.GetModelStatsResponse\"\x00\x12;\n" +
-	"\bDescribe\x12\x15.vxpu.DescribeRequest\x1a\x16.vxpu.DescribeResponse\"\x00BBZ@github.com/gke-labs/generation-ai/vxpu/pkg/api/v1alpha1;v1alpha1b\x06proto3"
+	"\bDescribe\x12\x15.vxpu.DescribeRequest\x1a\x16.vxpu.DescribeResponse\"\x00\x12G\n" +
+	"\fExplainModel\x12\x19.vxpu.ExplainModelRequest\x1a\x1a.vxpu.ExplainModelResponse\"\x00BBZ@github.com/gke-labs/generation-ai/vxpu/pkg/api/v1alpha1;v1alpha1b\x06proto3"
 
 var (
 	file_proto_vxpu_proto_rawDescOnce sync.Once
@@ -1156,7 +1251,7 @@ func file_proto_vxpu_proto_rawDescGZIP() []byte {
 	return file_proto_vxpu_proto_rawDescData
 }
 
-var file_proto_vxpu_proto_msgTypes = make([]protoimpl.MessageInfo, 16)
+var file_proto_vxpu_proto_msgTypes = make([]protoimpl.MessageInfo, 18)
 var file_proto_vxpu_proto_goTypes = []any{
 	(*LoadModelRequest)(nil),      // 0: vxpu.LoadModelRequest
 	(*LoadModelResponse)(nil),     // 1: vxpu.LoadModelResponse
@@ -1172,12 +1267,14 @@ var file_proto_vxpu_proto_goTypes = []any{
 	(*GetModelStatsResponse)(nil), // 11: vxpu.GetModelStatsResponse
 	(*DescribeRequest)(nil),       // 12: vxpu.DescribeRequest
 	(*DescribeResponse)(nil),      // 13: vxpu.DescribeResponse
-	nil,                           // 14: vxpu.LoadModelRequest.PlanEntry
-	nil,                           // 15: vxpu.RegisterModelRequest.PlanEntry
+	(*ExplainModelRequest)(nil),   // 14: vxpu.ExplainModelRequest
+	(*ExplainModelResponse)(nil),  // 15: vxpu.ExplainModelResponse
+	nil,                           // 16: vxpu.LoadModelRequest.PlanEntry
+	nil,                           // 17: vxpu.RegisterModelRequest.PlanEntry
 }
 var file_proto_vxpu_proto_depIdxs = []int32{
-	14, // 0: vxpu.LoadModelRequest.plan:type_name -> vxpu.LoadModelRequest.PlanEntry
-	15, // 1: vxpu.RegisterModelRequest.plan:type_name -> vxpu.RegisterModelRequest.PlanEntry
+	16, // 0: vxpu.LoadModelRequest.plan:type_name -> vxpu.LoadModelRequest.PlanEntry
+	17, // 1: vxpu.RegisterModelRequest.plan:type_name -> vxpu.RegisterModelRequest.PlanEntry
 	0,  // 2: vxpu.Executor.LoadModel:input_type -> vxpu.LoadModelRequest
 	2,  // 3: vxpu.Executor.RegisterModel:input_type -> vxpu.RegisterModelRequest
 	4,  // 4: vxpu.Executor.NewSession:input_type -> vxpu.NewSessionRequest
@@ -1185,15 +1282,17 @@ var file_proto_vxpu_proto_depIdxs = []int32{
 	8,  // 6: vxpu.Executor.Generate:input_type -> vxpu.GenerateRequest
 	10, // 7: vxpu.Executor.GetModelStats:input_type -> vxpu.GetModelStatsRequest
 	12, // 8: vxpu.Executor.Describe:input_type -> vxpu.DescribeRequest
-	1,  // 9: vxpu.Executor.LoadModel:output_type -> vxpu.LoadModelResponse
-	3,  // 10: vxpu.Executor.RegisterModel:output_type -> vxpu.RegisterModelResponse
-	5,  // 11: vxpu.Executor.NewSession:output_type -> vxpu.NewSessionResponse
-	7,  // 12: vxpu.Executor.Chat:output_type -> vxpu.ChatResponse
-	9,  // 13: vxpu.Executor.Generate:output_type -> vxpu.GenerateResponse
-	11, // 14: vxpu.Executor.GetModelStats:output_type -> vxpu.GetModelStatsResponse
-	13, // 15: vxpu.Executor.Describe:output_type -> vxpu.DescribeResponse
-	9,  // [9:16] is the sub-list for method output_type
-	2,  // [2:9] is the sub-list for method input_type
+	14, // 9: vxpu.Executor.ExplainModel:input_type -> vxpu.ExplainModelRequest
+	1,  // 10: vxpu.Executor.LoadModel:output_type -> vxpu.LoadModelResponse
+	3,  // 11: vxpu.Executor.RegisterModel:output_type -> vxpu.RegisterModelResponse
+	5,  // 12: vxpu.Executor.NewSession:output_type -> vxpu.NewSessionResponse
+	7,  // 13: vxpu.Executor.Chat:output_type -> vxpu.ChatResponse
+	9,  // 14: vxpu.Executor.Generate:output_type -> vxpu.GenerateResponse
+	11, // 15: vxpu.Executor.GetModelStats:output_type -> vxpu.GetModelStatsResponse
+	13, // 16: vxpu.Executor.Describe:output_type -> vxpu.DescribeResponse
+	15, // 17: vxpu.Executor.ExplainModel:output_type -> vxpu.ExplainModelResponse
+	10, // [10:18] is the sub-list for method output_type
+	2,  // [2:10] is the sub-list for method input_type
 	2,  // [2:2] is the sub-list for extension type_name
 	2,  // [2:2] is the sub-list for extension extendee
 	0,  // [0:2] is the sub-list for field type_name
@@ -1212,7 +1311,7 @@ func file_proto_vxpu_proto_init() {
 			GoPackagePath: reflect.TypeOf(x{}).PkgPath(),
 			RawDescriptor: unsafe.Slice(unsafe.StringData(file_proto_vxpu_proto_rawDesc), len(file_proto_vxpu_proto_rawDesc)),
 			NumEnums:      0,
-			NumMessages:   16,
+			NumMessages:   18,
 			NumExtensions: 0,
 			NumServices:   1,
 		},

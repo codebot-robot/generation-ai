@@ -331,53 +331,29 @@ func (s *Server) GetModelStats(ctx context.Context, req *pb.GetModelStatsRequest
 	if err := s.stats.flush(ctx, req.Model); err != nil {
 		klog.FromContext(ctx).Error(err, "flushing statistics before the summary", "model", req.Model)
 	}
-	name := statsRepository(req.Model)
-	tags, err := s.weightStore.ListTags(ctx, name)
-	if err != nil {
-		return nil, status.Errorf(codes.Unavailable, "%v", err)
-	}
-	sort.Strings(tags) // dYYYYMMDD, dYYYYMMDD.1, ...: oldest first
 	acc := &statsAccumulator{}
 	var kept [][]byte // the newest records, within statsRecordsMaxBytes
 	keptBytes, start, omitted := 0, 0, 0
-	for _, tag := range tags {
-		m, err := s.weightStore.GetManifest(ctx, name, tag)
-		if err != nil {
-			return nil, status.Errorf(codes.Unavailable, "%v", err)
+	unreadable, err := s.eachRecord(ctx, req.Model, func(line []byte) {
+		if !acc.add(line) || !req.Records {
+			return
 		}
-		for _, layer := range m.Layers {
-			data, err := s.weightStore.FetchBlob(ctx, name, layer.Digest)
-			if err != nil {
-				return nil, status.Errorf(codes.Unavailable, "%v", err)
-			}
-			sc := bufio.NewScanner(bytes.NewReader(data))
-			sc.Buffer(make([]byte, 1<<20), 64<<20)
-			for sc.Scan() {
-				line := bytes.TrimSpace(sc.Bytes())
-				if len(line) == 0 || !acc.add(line) {
-					continue
-				}
-				if !req.Records {
-					continue
-				}
-				kept = append(kept, append([]byte(nil), line...))
-				keptBytes += len(line) + 1
-				for keptBytes > statsRecordsMaxBytes && len(kept)-start > 1 {
-					keptBytes -= len(kept[start]) + 1
-					kept[start] = nil
-					start++
-					omitted++
-				}
-				if start > len(kept)/2 {
-					kept, start = append([][]byte(nil), kept[start:]...), 0
-				}
-			}
-			if err := sc.Err(); err != nil { // the rest of this batch cannot be read
-				acc.skipped++
-				klog.FromContext(ctx).Error(err, "reading a statistics batch", "model", req.Model, "tag", tag, "blob", layer.Digest)
-			}
+		kept = append(kept, append([]byte(nil), line...))
+		keptBytes += len(line) + 1
+		for keptBytes > statsRecordsMaxBytes && len(kept)-start > 1 {
+			keptBytes -= len(kept[start]) + 1
+			kept[start] = nil
+			start++
+			omitted++
 		}
+		if start > len(kept)/2 {
+			kept, start = append([][]byte(nil), kept[start:]...), 0
+		}
+	})
+	if err != nil {
+		return nil, status.Errorf(codes.Unavailable, "%v", err)
 	}
+	acc.skipped += unreadable
 	if acc.skipped > 0 {
 		klog.FromContext(ctx).Info("Skipped unreadable statistics lines", "model", req.Model, "skipped", acc.skipped)
 	}
@@ -390,6 +366,63 @@ func (s *Server) GetModelStats(ctx context.Context, req *pb.GetModelStatsRequest
 		resp.RecordsJsonl = string(bytes.Join(kept[start:], []byte("\n")))
 	}
 	return resp, nil
+}
+
+// eachRecord calls fn with every recorded line of model's statistics,
+// oldest first. It returns how many batches could not be read to the end.
+func (s *Server) eachRecord(ctx context.Context, model string, fn func(line []byte)) (int, error) {
+	name := statsRepository(model)
+	tags, err := s.weightStore.ListTags(ctx, name)
+	if err != nil {
+		return 0, err
+	}
+	sort.Strings(tags) // dYYYYMMDD, dYYYYMMDD.1, ...: oldest first
+	unreadable := 0
+	for _, tag := range tags {
+		m, err := s.weightStore.GetManifest(ctx, name, tag)
+		if err != nil {
+			return 0, err
+		}
+		for _, layer := range m.Layers {
+			data, err := s.weightStore.FetchBlob(ctx, name, layer.Digest)
+			if err != nil {
+				return 0, err
+			}
+			sc := bufio.NewScanner(bytes.NewReader(data))
+			sc.Buffer(make([]byte, 1<<20), 64<<20)
+			for sc.Scan() {
+				if line := bytes.TrimSpace(sc.Bytes()); len(line) > 0 {
+					fn(line)
+				}
+			}
+			if err := sc.Err(); err != nil { // the rest of this batch cannot be read
+				unreadable++
+				klog.FromContext(ctx).Error(err, "reading a statistics batch", "model", model, "tag", tag, "blob", layer.Digest)
+			}
+		}
+	}
+	return unreadable, nil
+}
+
+// expertCounts is model's recorded decode selections: layer -> expert ->
+// how many times it was selected.
+func (s *Server) expertCounts(ctx context.Context, model string) (map[int]map[int]int64, error) {
+	acc := &statsAccumulator{}
+	if _, err := s.eachRecord(ctx, model, func(line []byte) { acc.add(line) }); err != nil {
+		return nil, err
+	}
+	counts := map[int]map[int]int64{}
+	for key, c := range acc.experts {
+		layer, err := strconv.Atoi(key)
+		if err != nil {
+			continue // not a layer index; the record is from another format
+		}
+		counts[layer] = map[int]int64{}
+		for expert, n := range c {
+			counts[layer][int(expert)] = n
+		}
+	}
+	return counts, nil
 }
 
 // telemetrySummary is the part of a vxpu-telemetry/1 record the summary reads.

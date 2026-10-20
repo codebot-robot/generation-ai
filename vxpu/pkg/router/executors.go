@@ -19,6 +19,8 @@ import (
 	"encoding/json"
 	"time"
 
+	"google.golang.org/grpc/codes"
+	"google.golang.org/grpc/status"
 	"k8s.io/klog/v2"
 
 	pb "github.com/gke-labs/generation-ai/vxpu/pkg/api/v1alpha1"
@@ -33,29 +35,40 @@ type executorInfo struct {
 	Machine *machines.Machine
 }
 
-// describeExecutor asks the executor at endpoint what it runs on, once.
-// An executor that cannot say (an older image) is served as before.
-func (s *Server) describeExecutor(ctx context.Context, client pb.ExecutorClient, endpoint string) {
+// waitForExecutor waits until the executor at endpoint answers, and
+// returns what it runs on: it asks it to describe itself (once per
+// endpoint) until it does. An executor that cannot describe itself (an
+// older image) is ready but unknown: nil.
+func (s *Server) waitForExecutor(ctx context.Context, client pb.ExecutorClient, endpoint string) *executorInfo {
 	s.mu.RLock()
-	_, known := s.executors[endpoint]
+	info, known := s.executors[endpoint]
 	s.mu.RUnlock()
 	if known {
-		return
+		return &info
 	}
 	log := klog.FromContext(ctx)
-	callCtx, cancel := context.WithTimeout(ctx, 10*time.Second) // a probe: it answers at once or not at all
-	defer cancel()
-	resp, err := client.Describe(callCtx, &pb.DescribeRequest{})
+	var resp *pb.DescribeResponse
+	var err error
+	for i := 0; i < 30; i++ {
+		callCtx, cancel := context.WithTimeout(ctx, 30*time.Second)
+		resp, err = client.Describe(callCtx, &pb.DescribeRequest{})
+		cancel()
+		if err == nil || status.Code(err) == codes.Unimplemented || ctx.Err() != nil {
+			break
+		}
+		log.Info("Waiting for the executor to answer", "endpoint", endpoint, "attempt", i, "error", err.Error())
+		time.Sleep(2 * time.Second)
+	}
 	if err != nil {
 		log.Info("Executor did not describe itself", "endpoint", endpoint, "error", err.Error())
-		return
+		return nil
 	}
 	var probe machines.Probe
 	if err := json.Unmarshal([]byte(resp.HardwareJson), &probe); err != nil {
 		log.Info("Executor described itself unreadably", "endpoint", endpoint, "error", err.Error())
-		return
+		return nil
 	}
-	info := executorInfo{Probe: probe, Machine: machines.Match(probe)}
+	info = executorInfo{Probe: probe, Machine: machines.Match(probe)}
 	s.mu.Lock()
 	if s.executors == nil {
 		s.executors = map[string]executorInfo{}
@@ -68,4 +81,5 @@ func (s *Server) describeExecutor(ctx context.Context, client pb.ExecutorClient,
 	}
 	log.Info("Executor described", "endpoint", endpoint, "machine", machine, "cpu", probe.CPU,
 		"cpu_threads", probe.CPUThreads, "ram_bytes", probe.RAMBytes, "gpu", probe.GPU, "gpu_count", probe.GPUCount)
+	return &info
 }
