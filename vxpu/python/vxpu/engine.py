@@ -483,9 +483,12 @@ class Engine:
             kinds = dict(item.split("=", 1) for item in self.plan["dataflow_placement"].split(","))
             runner.place({n.name: kinds[n.kind] for n in runner.graph.nodes if n.kind in kinds})
         self._decode_split = runner
+        if self.plan["step_graph"]:
+            from .stepgraph import StepGraph
+            self._decode_split = StepGraph(runner)
         self._segment_info = segment_info(self._decode_split.split)
         self._decode_run = self._decode_split
-        msg = self._decode_split.graph.describe()
+        msg = runner.graph.describe() + (", the step one CUDA graph" if self.plan["step_graph"] else "")
         print(f"[vxpu] {msg}", flush=True)
         self.plan.note(msg)
 

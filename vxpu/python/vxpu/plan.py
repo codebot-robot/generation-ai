@@ -290,6 +290,12 @@ class Plan:
         self._set("dataflow", on, src, (True, False),
                   "run the decode step as a dataflow graph: its segments as nodes, each fired when the inboxes "
                   "its inputs are written into are full (dataflow.py, the reference runner; #372)")
+        on, src = env_flag("VXPU_STEP_GRAPH", False)
+        if on and not (cuda and self["dataflow"] and self["segment_runtime"] == "aoti"):
+            on, src = False, "requires CUDA, dataflow and segment_runtime=aoti"
+        self._set("step_graph", on, src, (True, False),
+                  "capture the whole decode step in one CUDA graph: the AOTInductor segments, and the host ops as "
+                  "mailboxes the GPU waits on (stepgraph.py, #372)")
         place, src = env_text("VXPU_DATAFLOW_PLACE", None)
         if place:
             try:
