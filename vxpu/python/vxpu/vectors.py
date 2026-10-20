@@ -1389,12 +1389,83 @@ def _check_mover_lifetime():
         raise SystemExit("expert mover: its worker thread outlived it")
 
 
+def _check_hardware():
+    import json
+    from .hardware import CATALOG, probe, _match_catalog, Machine, CPU
+
+    for name, m in CATALOG.items():
+        m.validate()
+        s = m.summary()
+        if not s.startswith(f"Machine: {m.name}"):
+            raise SystemExit(f"{name}: summary did not start with Machine name")
+        decoded = json.loads(m.to_json())
+        if decoded["name"] != m.name:
+            raise SystemExit(f"{name}: JSON round-trip mismatch: {decoded['name']!r} != {m.name!r}")
+
+    current = probe()
+    current.validate()
+    current.summary()
+    if not current.name.startswith("probed:"):
+        raise SystemExit(f"expected probed machine name to start with 'probed:', got {current.name!r}")
+    if current.measured is not None:
+        raise SystemExit("probed machine must not inherit catalog benchmark measurements")
+
+    for cpu, threads, want in [
+        ("AMD EPYC 9B14 64-Core Processor", 60, "c3d-standard-60"),
+        ("AMD EPYC 9B14 64-Core Processor", 180, "c3d-standard-180"),
+        ("AMD EPYC 9B45 48-Core Processor", 48, "g4-standard-48"),
+        ("AMD EPYC 9B45 48-Core Processor", 96, "g4-standard-96"),
+        ("Apple M4 Pro", 14, "mac-m4-pro"),
+        ("AMD EPYC 7B13 64-Core Processor", 32, None),  # Milan: not in catalog
+        ("AMD Ryzen 9 7950X 16-Core Processor", 32, None),
+        ("Apple M1", 8, None),
+        ("Intel(R) Xeon(R) Platinum 8281 CPU @ 2.70GHz", 32, None),
+    ]:
+        got = _match_catalog({"cpu": cpu, "cpu_threads": threads})
+        got_name = got.name if got else None
+        if got_name != want:
+            raise SystemExit(f"{cpu!r} x{threads}: matched {got_name!r}, want {want!r}")
+
+    for gpu, count, want in [
+        ("NVIDIA RTX PRO 6000", 2, "g4-standard-96"),
+        ("NVIDIA RTX PRO 6000", 1, "g4-standard-48"),
+        ("NVIDIA H100 80GB HBM3", 8, "a3-highgpu-8g"),
+        ("NVIDIA H100 80GB HBM3", 1, None),
+        ("NVIDIA A100-SXM4-40GB", 1, "a2-highgpu-1g"),
+        ("NVIDIA A100-SXM4-40GB", 8, None),
+        ("NVIDIA L4", 1, None),
+        ("Tesla T4", 1, None),
+        ("NVIDIA RTX A6000", 1, None),
+    ]:
+        got = _match_catalog({"gpu": gpu, "gpu_count": count})
+        got_name = got.name if got else None
+        if got_name != want:
+            raise SystemExit(f"{gpu!r} x{count}: matched {got_name!r}, want {want!r}")
+
+    try:
+        Machine(name="bad", cpu=CPU("cpu", 0, 0, "sse"), ram_bytes=-1)
+        raise SystemExit("expected Machine validation failure on bad parameters")
+    except ValueError:
+        pass
+
+    test_m = Machine(
+        name="test-summary",
+        cpu=CPU("test-cpu", 4, 4, "sse", 50e9, {"l1": 1024}),
+        ram_bytes=16 * 1024**3,
+        measured={"comms_path": "gcs", "items": 12, "time_ms": 5.2, "bytes_per_sec": 1e9},
+    )
+    s = test_m.summary()
+    if "comms_path: gcs" not in s or "items: 12" not in s:
+        raise SystemExit("summary did not format non-numeric measured fields properly")
+
+
 def selftest(workdir, settings):
     """The CI tier: tiny models through export, the in-process engine,
     and a transformers reference, token-exact. No cluster."""
     _check_compare()
     _check_mover_lifetime()
     _check_compile_plan()
+    _check_hardware()
     _check_compile_names()
     os.makedirs(workdir, exist_ok=True)
     _check_host_reads(workdir)
