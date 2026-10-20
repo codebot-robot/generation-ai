@@ -24,6 +24,7 @@ This file provides context and instructions for LLM coding agents working on the
     - One idea per PR.
     - Well-structured commits (see Commit Messages and PR Descriptions below).
     - Reference issues in the commit body.
+    - **Design changes in vxpu**: update `vxpu/docs/design.md` in the same PR. GitHub issues hold the backlog; the design itself lives in the repo.
     - **Binary Files**: Do not check in binary files or large data files into the repository. Agents MUST confirm they have not checked in any binaries before sending a PR!
 
 ### Commit Messages and PR Descriptions
