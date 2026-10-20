@@ -38,6 +38,7 @@ const (
 	Executor_NewSession_FullMethodName    = "/vxpu.Executor/NewSession"
 	Executor_Chat_FullMethodName          = "/vxpu.Executor/Chat"
 	Executor_Generate_FullMethodName      = "/vxpu.Executor/Generate"
+	Executor_GetModelStats_FullMethodName = "/vxpu.Executor/GetModelStats"
 )
 
 // ExecutorClient is the client API for Executor service.
@@ -77,6 +78,11 @@ type ExecutorClient interface {
 	// sampling) in the session and streams back the new ids. The
 	// session's cache is reused for whatever prefix matches.
 	Generate(ctx context.Context, in *GenerateRequest, opts ...grpc.CallOption) (grpc.ServerStreamingClient[GenerateResponse], error)
+	// GetModelStats (router only) summarises what the engine recorded
+	// about a model served by name: every request's statistics, and the
+	// execution telemetry of the requests it sampled (kept in modelstore,
+	// so they outlive the router).
+	GetModelStats(ctx context.Context, in *GetModelStatsRequest, opts ...grpc.CallOption) (*GetModelStatsResponse, error)
 }
 
 type executorClient struct {
@@ -146,6 +152,16 @@ func (c *executorClient) Generate(ctx context.Context, in *GenerateRequest, opts
 // This type alias is provided for backwards compatibility with existing code that references the prior non-generic stream type by name.
 type Executor_GenerateClient = grpc.ServerStreamingClient[GenerateResponse]
 
+func (c *executorClient) GetModelStats(ctx context.Context, in *GetModelStatsRequest, opts ...grpc.CallOption) (*GetModelStatsResponse, error) {
+	cOpts := append([]grpc.CallOption{grpc.StaticMethod()}, opts...)
+	out := new(GetModelStatsResponse)
+	err := c.cc.Invoke(ctx, Executor_GetModelStats_FullMethodName, in, out, cOpts...)
+	if err != nil {
+		return nil, err
+	}
+	return out, nil
+}
+
 // ExecutorServer is the server API for Executor service.
 // All implementations must embed UnimplementedExecutorServer
 // for forward compatibility.
@@ -183,6 +199,11 @@ type ExecutorServer interface {
 	// sampling) in the session and streams back the new ids. The
 	// session's cache is reused for whatever prefix matches.
 	Generate(*GenerateRequest, grpc.ServerStreamingServer[GenerateResponse]) error
+	// GetModelStats (router only) summarises what the engine recorded
+	// about a model served by name: every request's statistics, and the
+	// execution telemetry of the requests it sampled (kept in modelstore,
+	// so they outlive the router).
+	GetModelStats(context.Context, *GetModelStatsRequest) (*GetModelStatsResponse, error)
 	mustEmbedUnimplementedExecutorServer()
 }
 
@@ -207,6 +228,9 @@ func (UnimplementedExecutorServer) Chat(context.Context, *ChatRequest) (*ChatRes
 }
 func (UnimplementedExecutorServer) Generate(*GenerateRequest, grpc.ServerStreamingServer[GenerateResponse]) error {
 	return status.Error(codes.Unimplemented, "method Generate not implemented")
+}
+func (UnimplementedExecutorServer) GetModelStats(context.Context, *GetModelStatsRequest) (*GetModelStatsResponse, error) {
+	return nil, status.Error(codes.Unimplemented, "method GetModelStats not implemented")
 }
 func (UnimplementedExecutorServer) mustEmbedUnimplementedExecutorServer() {}
 func (UnimplementedExecutorServer) testEmbeddedByValue()                  {}
@@ -312,6 +336,24 @@ func _Executor_Generate_Handler(srv interface{}, stream grpc.ServerStream) error
 // This type alias is provided for backwards compatibility with existing code that references the prior non-generic stream type by name.
 type Executor_GenerateServer = grpc.ServerStreamingServer[GenerateResponse]
 
+func _Executor_GetModelStats_Handler(srv interface{}, ctx context.Context, dec func(interface{}) error, interceptor grpc.UnaryServerInterceptor) (interface{}, error) {
+	in := new(GetModelStatsRequest)
+	if err := dec(in); err != nil {
+		return nil, err
+	}
+	if interceptor == nil {
+		return srv.(ExecutorServer).GetModelStats(ctx, in)
+	}
+	info := &grpc.UnaryServerInfo{
+		Server:     srv,
+		FullMethod: Executor_GetModelStats_FullMethodName,
+	}
+	handler := func(ctx context.Context, req interface{}) (interface{}, error) {
+		return srv.(ExecutorServer).GetModelStats(ctx, req.(*GetModelStatsRequest))
+	}
+	return interceptor(ctx, in, info, handler)
+}
+
 // Executor_ServiceDesc is the grpc.ServiceDesc for Executor service.
 // It's only intended for direct use with grpc.RegisterService,
 // and not to be introspected or modified (even as a copy)
@@ -334,6 +376,10 @@ var Executor_ServiceDesc = grpc.ServiceDesc{
 		{
 			MethodName: "Chat",
 			Handler:    _Executor_Chat_Handler,
+		},
+		{
+			MethodName: "GetModelStats",
+			Handler:    _Executor_GetModelStats_Handler,
 		},
 	},
 	Streams: []grpc.StreamDesc{

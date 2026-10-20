@@ -70,9 +70,11 @@ type Server struct {
 	// there when any are configured (external.go).
 	externalExecutors []string
 	// catalog state for models served by name (catalog.go), under mu
-	externalModel map[string]string // external executor address -> model key it holds
-	modelEndpoint map[string]string // model key -> external executor address
-	loadedTags    map[string]string // compiled artifact tag -> model key loaded from it
+	externalModel map[string]string   // external executor address -> model key it holds
+	modelEndpoint map[string]string   // model key -> external executor address
+	loadedTags    map[string]string   // compiled artifact tag -> model key loaded from it
+	keyModel      map[string]modelRef // model key -> the named model it serves (stats.go)
+	stats         *statsStore         // statistics for models served by name, nil without modelstore
 	// externalModelstoreURL is modelstore's address for external executors
 	// (VMs outside the cluster, which cannot resolve its Service), when set
 	externalModelstoreURL string
@@ -80,6 +82,9 @@ type Server struct {
 	// compile job settings (catalog.go)
 	compileResources corev1.ResourceRequirements
 	compilePoll      time.Duration
+	// compileUnschedulable is how long a compile pod may stay unschedulable
+	// before RegisterModel gives up and says why
+	compileUnschedulable time.Duration
 }
 
 // errNoExecutor: no executor pod exists for the model on this router
@@ -109,11 +114,13 @@ func NewServer(clientset kubernetes.Interface, namespace, imageName, accelerator
 		blobServer:   bs,
 		executorPort: 50051,
 
-		externalModel:    make(map[string]string),
-		modelEndpoint:    make(map[string]string),
-		loadedTags:       make(map[string]string),
-		compileResources: defaultCompileResources(),
-		compilePoll:      5 * time.Second,
+		externalModel:        make(map[string]string),
+		modelEndpoint:        make(map[string]string),
+		loadedTags:           make(map[string]string),
+		keyModel:             make(map[string]modelRef),
+		compileResources:     defaultCompileResources(),
+		compilePoll:          5 * time.Second,
+		compileUnschedulable: 5 * time.Minute,
 	}
 	return s
 }
@@ -649,8 +656,29 @@ func (s *Server) Chat(ctx context.Context, req *pb.ChatRequest) (*pb.ChatRespons
 	}
 	defer closeConn(ctx, conn)
 
+	backend := backendChatRequest(req, backendSessionID)
+	ref, executor, recorded := s.statsTarget(modelKey)
+	asked := req.GetTelemetry()
+	if recorded && !asked && s.stats.sampleTelemetry() {
+		on := true
+		backend.Telemetry = &on
+	}
 	// Propagate the backend's status error unchanged.
-	return client.Chat(ctx, backendChatRequest(req, backendSessionID))
+	resp, err := client.Chat(ctx, backend)
+	if err != nil || !recorded {
+		return resp, err
+	}
+	r := newRecord(ref, executor, "chat")
+	r.PromptTokens, r.PrefilledTokens = resp.SessionTokens-resp.Generated, resp.NewPromptTokens
+	r.Generated, r.PrefillMs, r.MsPerToken = resp.Generated, resp.PrefillMs, resp.MsPerToken
+	if resp.TelemetryJson != "" {
+		r.Telemetry = json.RawMessage(resp.TelemetryJson)
+	}
+	s.stats.record(ctx, r)
+	if !asked {
+		resp.TelemetryJson = "" // the engine's own record, unless the client asked for it
+	}
+	return resp, nil
 }
 
 // Generate proxies the executor's token stream to the client.
@@ -671,6 +699,12 @@ func (s *Server) Generate(req *pb.GenerateRequest, stream grpc.ServerStreamingSe
 
 	backend := proto.Clone(req).(*pb.GenerateRequest)
 	backend.SessionId = backendSessionID
+	ref, executor, recorded := s.statsTarget(modelKey)
+	asked := req.GetTelemetry()
+	if recorded && !asked && s.stats.sampleTelemetry() {
+		on := true
+		backend.Telemetry = &on
+	}
 	upstream, err := client.Generate(ctx, backend)
 	if err != nil {
 		return err
@@ -682,6 +716,18 @@ func (s *Server) Generate(req *pb.GenerateRequest, stream grpc.ServerStreamingSe
 		}
 		if err != nil {
 			return err // the executor's status, unchanged
+		}
+		if resp.Done && recorded {
+			r := newRecord(ref, executor, "generate")
+			r.PromptTokens, r.PrefilledTokens, r.Generated = resp.PromptTokens, resp.PrefilledTokens, resp.Generated
+			r.PrefillMs, r.MsPerToken, r.FinishReason = resp.PrefillMs, resp.MsPerToken, resp.FinishReason
+			if resp.TelemetryJson != "" {
+				r.Telemetry = json.RawMessage(resp.TelemetryJson)
+			}
+			s.stats.record(ctx, r)
+			if !asked {
+				resp.TelemetryJson = ""
+			}
 		}
 		if err := stream.Send(resp); err != nil {
 			return err

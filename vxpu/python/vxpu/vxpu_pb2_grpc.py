@@ -81,6 +81,11 @@ class ExecutorStub:
                 request_serializer=vxpu__pb2.GenerateRequest.SerializeToString,
                 response_deserializer=vxpu__pb2.GenerateResponse.FromString,
                 _registered_method=True)
+        self.GetModelStats = channel.unary_unary(
+                '/vxpu.Executor/GetModelStats',
+                request_serializer=vxpu__pb2.GetModelStatsRequest.SerializeToString,
+                response_deserializer=vxpu__pb2.GetModelStatsResponse.FromString,
+                _registered_method=True)
 
 
 class ExecutorServicer:
@@ -143,6 +148,16 @@ class ExecutorServicer:
         context.set_details('Method not implemented!')
         raise NotImplementedError('Method not implemented!')
 
+    def GetModelStats(self, request, context):
+        """GetModelStats (router only) summarises what the engine recorded
+        about a model served by name: every request's statistics, and the
+        execution telemetry of the requests it sampled (kept in modelstore,
+        so they outlive the router).
+        """
+        context.set_code(grpc.StatusCode.UNIMPLEMENTED)
+        context.set_details('Method not implemented!')
+        raise NotImplementedError('Method not implemented!')
+
 
 def add_ExecutorServicer_to_server(servicer, server):
     rpc_method_handlers = {
@@ -170,6 +185,11 @@ def add_ExecutorServicer_to_server(servicer, server):
                     servicer.Generate,
                     request_deserializer=vxpu__pb2.GenerateRequest.FromString,
                     response_serializer=vxpu__pb2.GenerateResponse.SerializeToString,
+            ),
+            'GetModelStats': grpc.unary_unary_rpc_method_handler(
+                    servicer.GetModelStats,
+                    request_deserializer=vxpu__pb2.GetModelStatsRequest.FromString,
+                    response_serializer=vxpu__pb2.GetModelStatsResponse.SerializeToString,
             ),
     }
     generic_handler = grpc.method_handlers_generic_handler(
@@ -315,6 +335,33 @@ class Executor:
             '/vxpu.Executor/Generate',
             vxpu__pb2.GenerateRequest.SerializeToString,
             vxpu__pb2.GenerateResponse.FromString,
+            options,
+            channel_credentials,
+            insecure,
+            call_credentials,
+            compression,
+            wait_for_ready,
+            timeout,
+            metadata,
+            _registered_method=True)
+
+    @staticmethod
+    def GetModelStats(request,
+            target,
+            options=(),
+            channel_credentials=None,
+            call_credentials=None,
+            insecure=False,
+            compression=None,
+            wait_for_ready=None,
+            timeout=None,
+            metadata=None):
+        return grpc.experimental.unary_unary(
+            request,
+            target,
+            '/vxpu.Executor/GetModelStats',
+            vxpu__pb2.GetModelStatsRequest.SerializeToString,
+            vxpu__pb2.GetModelStatsResponse.FromString,
             options,
             channel_credentials,
             insecure,

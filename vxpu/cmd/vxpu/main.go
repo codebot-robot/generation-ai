@@ -59,7 +59,7 @@ func main() {
 	log := klog.FromContext(ctx)
 	if len(os.Args) < 2 {
 		fmt.Fprintln(os.Stderr,
-			"usage: vxpu ask [flags] PROMPT | vxpu register [flags] REPO[@REVISION] | vxpu up [flags] | vxpu down [flags] | vxpu mirror REPO[@REVISION]")
+			"usage: vxpu ask [flags] PROMPT | vxpu register [flags] REPO[@REVISION] | vxpu stats [flags] REPO | vxpu up [flags] | vxpu down [flags] | vxpu mirror REPO[@REVISION]")
 		os.Exit(2)
 	}
 	var err error
@@ -68,6 +68,8 @@ func main() {
 		err = cmdAsk(ctx, os.Args[2:])
 	case "register":
 		err = cmdRegister(ctx, os.Args[2:])
+	case "stats":
+		err = cmdStats(ctx, os.Args[2:])
 	case "up":
 		err = cmdUp(ctx, os.Args[2:])
 	case "down":
@@ -341,7 +343,7 @@ func ensurePod(ctx context.Context, pod string, want routerSettings, reconfigure
 			return waitReady(ctx, pod)
 		}
 		return fmt.Errorf(
-			"pod %q not found and no --image/VXPU_ROUTER_IMAGE set",
+			"router pod %q not found: start it with `vxpu up` (or set VXPU_ROUTER_IMAGE, or pass --router)",
 			pod)
 	}
 	if phase == "Failed" || phase == "Succeeded" {

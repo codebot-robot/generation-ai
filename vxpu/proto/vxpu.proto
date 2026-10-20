@@ -51,6 +51,11 @@ service Executor {
   // sampling) in the session and streams back the new ids. The
   // session's cache is reused for whatever prefix matches.
   rpc Generate(GenerateRequest) returns (stream GenerateResponse) {}
+  // GetModelStats (router only) summarises what the engine recorded
+  // about a model served by name: every request's statistics, and the
+  // execution telemetry of the requests it sampled (kept in modelstore,
+  // so they outlive the router).
+  rpc GetModelStats(GetModelStatsRequest) returns (GetModelStatsResponse) {}
 }
 
 message LoadModelRequest {
@@ -108,6 +113,9 @@ message ChatRequest {
   // the full rendered conversation each turn: the executor prefills
   // from the first token that differs from the session's cache.
   bool raw_prompt = 4;
+  // Return the executor's execution telemetry for this turn, as for
+  // GenerateRequest.telemetry.
+  optional bool telemetry = 5;
 }
 
 message ChatResponse {
@@ -117,6 +125,9 @@ message ChatResponse {
   int32 generated = 4;
   float prefill_ms = 5;
   float ms_per_token = 6;
+  // When the request set telemetry: the execution telemetry as JSON
+  // (format "vxpu-telemetry/1").
+  string telemetry_json = 7;
 }
 
 // GenerateRequest mirrors the generation parameters of
@@ -163,4 +174,18 @@ message GenerateResponse {
   // On the final message when the request set telemetry: the executor's
   // execution telemetry as JSON (format "vxpu-telemetry/1").
   string telemetry_json = 9;
+}
+
+message GetModelStatsRequest {
+  // A model served by name (see RegisterModel).
+  string model = 1;
+  // Also return every stored record, as JSON lines.
+  bool records = 2;
+}
+
+message GetModelStatsResponse {
+  // The summary as JSON (format "vxpu-model-stats/1").
+  string summary_json = 1;
+  // With records set: one JSON object per line ("vxpu-request/1").
+  string records_jsonl = 2;
 }

@@ -199,14 +199,16 @@ class ExecutorServicer(vxpu_pb2_grpc.ExecutorServicer):
             reply = engine.chat(
                 request.session_id, request.text,
                 max_new_tokens=max_new_tokens,
-                raw_prompt=request.raw_prompt)
+                raw_prompt=request.raw_prompt,
+                telemetry=request.telemetry)
             return vxpu_pb2.ChatResponse(
                 text=reply["text"],
                 session_tokens=reply["session_tokens"],
                 new_prompt_tokens=reply["new_prompt_tokens"],
                 generated=reply["generated"],
                 prefill_ms=float(reply["prefill_ms"]),
-                ms_per_token=float(reply["ms_per_token"]))
+                ms_per_token=float(reply["ms_per_token"]),
+                telemetry_json=json.dumps(reply["telemetry"]) if "telemetry" in reply else "")
         except ValueError as e:
             context.set_code(grpc.StatusCode.INVALID_ARGUMENT)
             context.set_details(str(e))

@@ -455,11 +455,13 @@ class Engine:
             }
         return session_id
 
-    def chat(self, session_id, text, max_new_tokens=96, raw_prompt=False):
-        """One templated (or raw) text turn; greedy, like the CLI expects."""
+    def chat(self, session_id, text, max_new_tokens=96, raw_prompt=False, telemetry=False):
+        """One templated (or raw) text turn; greedy, like the CLI expects.
+        ``telemetry=True`` adds the turn's execution telemetry to the
+        reply (as generate does), under ``"telemetry"``."""
         with self._lock:
             return self._chat_locked(session_id, text, max_new_tokens,
-                                     raw_prompt)
+                                     raw_prompt, telemetry)
 
     def _prompt_ids(self, session, text, raw_prompt):
         """Token ids of the whole conversation so far plus this turn.
@@ -483,12 +485,12 @@ class Engine:
             messages, add_generation_prompt=True,
             return_tensors="pt", return_dict=True)["input_ids"][0].tolist()
 
-    def _chat_locked(self, session_id, text, max_new_tokens, raw_prompt):
+    def _chat_locked(self, session_id, text, max_new_tokens, raw_prompt, telemetry=False):
         session = self._session(session_id)
         ids = self._prompt_ids(session, text, raw_prompt)
         token_ids, stats = [], None
         for chunk in self._generate_locked(
-                session, ids, max_new_tokens, SamplingParams(do_sample=False)):
+                session, ids, max_new_tokens, SamplingParams(do_sample=False), telemetry=telemetry):
             if chunk["token_ids"]:
                 token_ids.extend(chunk["token_ids"])
             if chunk["done"]:
@@ -513,6 +515,7 @@ class Engine:
             "generated": stats["generated"],
             "prefill_ms": stats["prefill_ms"],
             "ms_per_token": stats["ms_per_token"],
+            **({"telemetry": stats["telemetry"]} if "telemetry" in stats else {}),
         }
 
     def generate(self, session_id, input_ids, max_new_tokens, params,

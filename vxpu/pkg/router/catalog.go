@@ -251,6 +251,9 @@ func (s *Server) runCompileJob(ctx context.Context, model, commit, repo, tag str
 				return status.Errorf(codes.Internal, "compiling %s failed (job %s: %s): %s", model, name, cond.Reason, s.compileLogTail(ctx, name, 20))
 			}
 		}
+		if why, stuck := s.compileUnschedulableFor(ctx, name); stuck {
+			return status.Errorf(codes.ResourceExhausted, "compiling %s: job %s's pod cannot be scheduled: %s", model, name, why)
+		}
 		select {
 		case <-ctx.Done():
 			return status.FromContextError(ctx.Err()).Err()
@@ -327,6 +330,26 @@ func jobFinished(job *batchv1.Job) bool {
 	return false
 }
 
+// compileUnschedulableFor reports whether the compile job's pod has been
+// unschedulable (no node with the resources it requests) for longer than
+// s.compileUnschedulable, and the scheduler's reason. Otherwise the Job
+// would wait out its hour-long deadline in silence.
+func (s *Server) compileUnschedulableFor(ctx context.Context, job string) (string, bool) {
+	pods, err := s.clientset.CoreV1().Pods(s.namespace).List(ctx, metav1.ListOptions{LabelSelector: "vxpu.gke-labs.dev/compile=" + job})
+	if err != nil {
+		return "", false
+	}
+	for _, p := range pods.Items {
+		for _, c := range p.Status.Conditions {
+			if c.Type == corev1.PodScheduled && c.Status == corev1.ConditionFalse && c.Reason == corev1.PodReasonUnschedulable &&
+				time.Since(c.LastTransitionTime.Time) > s.compileUnschedulable {
+				return c.Message, true
+			}
+		}
+	}
+	return "", false
+}
+
 // compileLogTail is the end of the compile job's newest pod's log.
 func (s *Server) compileLogTail(ctx context.Context, job string, lines int64) string {
 	pods, err := s.clientset.CoreV1().Pods(s.namespace).List(ctx, metav1.ListOptions{LabelSelector: "vxpu.gke-labs.dev/compile=" + job})
@@ -390,6 +413,10 @@ func (s *Server) loadByName(ctx context.Context, model, revision string) (string
 		klog.FromContext(ctx).Info("Loaded model's executor is gone; loading again", "model", model, "model_key", key, "error", err.Error())
 	}
 	v, err := s.flights.do("load/"+repo+":"+tag, func() (any, error) {
+		// the flight is shared: the caller that started it going away
+		// must not fail it for the others, as loadArtifact below already
+		// is not
+		ctx := context.WithoutCancel(ctx)
 		exists, err := s.weightStore.ManifestExists(ctx, repo, tag)
 		if err != nil {
 			return "", status.Errorf(codes.Unavailable, "%v", err)
@@ -416,6 +443,7 @@ func (s *Server) loadByName(ctx context.Context, model, revision string) (string
 		}
 		s.mu.Lock()
 		s.loadedTags[tag] = key
+		s.keyModel[key] = modelRef{Model: model, Commit: commit, Artifact: repo + ":" + tag}
 		s.mu.Unlock()
 		return key, nil
 	})

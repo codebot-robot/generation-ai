@@ -20,8 +20,10 @@ import (
 	"fmt"
 	"net"
 	"os"
+	"os/signal"
 	"path/filepath"
 	"strings"
+	"syscall"
 	"time"
 
 	"google.golang.org/grpc"
@@ -49,6 +51,8 @@ func main() {
 		"modelstore URL to keep weights in (default: VXPU_MODELSTORE_URL, else http://modelstore.modelstore if it resolves, else the router caches weights itself)")
 	externalModelstoreFlag := flag.String("modelstore-external-url", "",
 		"modelstore's address for external executors, which cannot resolve its in-cluster Service (default: VXPU_MODELSTORE_EXTERNAL_URL; unset, they get --modelstore's URL)")
+	telemetryEvery := flag.Int("telemetry-every", 1,
+		"for models served by name, record execution telemetry on every Nth request (0: none); every request's statistics are recorded")
 	externalFlag := flag.String("external-executor", "",
 		"comma-separated host:port of executors outside Kubernetes (GPU VMs, Macs) that models registered by name are placed on (default: VXPU_EXTERNAL_EXECUTORS)")
 	flag.Parse()
@@ -148,7 +152,22 @@ func main() {
 		log.Info("The executor image is not pinned by digest: compiled artifacts are keyed by its tag, so a rebuilt "+
 			"tag reuses artifacts the previous build compiled", "image", imageName)
 	}
+	srv.UseStats(*telemetryEvery)
 	pb.RegisterExecutorServer(s, srv)
+
+	// On SIGTERM (a pod being deleted or redeployed) write the buffered
+	// statistics before exiting, within the pod's grace period.
+	stopping, stopSignals := signal.NotifyContext(ctx, syscall.SIGTERM, os.Interrupt)
+	defer stopSignals()
+	go func() {
+		<-stopping.Done()
+		flushCtx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
+		defer cancel()
+		if err := srv.FlushStats(flushCtx); err != nil {
+			log.Error(err, "flushing statistics on shutdown")
+		}
+		s.Stop()
+	}()
 
 	log.Info("Starting vxpu-router gRPC server", "port", *portFlag, "namespace", namespace, "image", imageName,
 		"accelerator", accelerator, "externalExecutors", externalAddrs)

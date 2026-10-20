@@ -976,6 +976,25 @@ def _check_compile_names():
         raise SystemExit(f"a moving ref's source should be the endpoint read: {src}")
 
 
+def _check_chat_telemetry(artifact):
+    """Chat (text in, text out; what clients without a tokenizer use)
+    returns the turn's execution telemetry when asked, as generate does;
+    the router records it for models served by name."""
+    from .engine import Engine
+    engine = Engine(artifact)
+    reply = engine.chat(engine.new_session(), "Is the sky blue?", max_new_tokens=4, telemetry=True)
+    tel = reply.get("telemetry") or {}
+    if tel.get("format") != "vxpu-telemetry/1" or tel.get("decode_steps", 0) < 1:
+        print(f"chat telemetry check: no telemetry record in the reply ({sorted(reply)})")
+        return False
+    plain = engine.chat(engine.new_session(), "Is the sky blue?", max_new_tokens=4)
+    if "telemetry" in plain or plain["text"] != reply["text"]:
+        print("chat telemetry check: telemetry changed the reply, or was recorded unasked")
+        return False
+    print(f"chat telemetry: {tel['decode_steps']} decode steps recorded, reply unchanged")
+    return True
+
+
 def selftest(workdir, settings):
     """The CI tier: tiny models through export, the in-process engine,
     and a transformers reference, token-exact. No cluster."""
@@ -1023,6 +1042,8 @@ def selftest(workdir, settings):
             failed.append(name)
         if name == "tiny-fp8-moe" and not _check_local_blobs(model, prompts, settings, artifact, got, workdir):
             failed.append(name + " (local weight tier)")
+        if name == "tiny-llama" and not _check_chat_telemetry(artifact):
+            failed.append(name + " (chat telemetry)")
         if name == "tiny-deepseek-v41" and not _check_telemetry(model, prompts, settings, artifact, got, workdir):
             failed.append(name + " (telemetry)")
         if name == "tiny-deepseek-v41" and not _check_lowering(model, prompts, settings, artifact, workdir):

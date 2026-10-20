@@ -236,8 +236,18 @@ func testByName(t *testing.T, h *Harness, gitRoot, vxpuBin string, env []string)
 	manifest := strings.ReplaceAll(string(msManifest), "image: modelstore:latest", "image: modelstore:e2e\n          imagePullPolicy: Never")
 	manifest = strings.ReplaceAll(manifest, "--blob-store=gs://BUCKET", "--blob-store=/tmp/blobs") // no GCS in kind
 	h.KubectlApplyContent("modelstore", manifest)
+	// A reused kind cluster keeps the previous run's modelstore pod, and
+	// with it that run's statistics and compiled artifact (its blob store
+	// is the container's /tmp): restart it, so "first register compiles"
+	// and "one request recorded" are about this run.
+	h.RunCommand("kubectl", "rollout", "restart", "deployment/modelstore", "-n", "modelstore")
 	h.RunCommand("kubectl", "rollout", "status", "deployment/modelstore", "-n", "modelstore", "--timeout=300s")
 
+	// The first part's in-cluster executor still holds its CPU request: on
+	// a single kind node the compile Job's pod then never schedules.
+	if out, err := exec.Command("kubectl", "delete", "pod", "-l", "app=vxpu-executor", "-n", "default", "--wait").CombinedOutput(); err != nil {
+		t.Logf("deleting the in-cluster executors (best effort): %v: %s", err, out)
+	}
 	h.DeletePod("vxpu-external-executor", "default")
 	h.KubectlApplyContent("external-executor", externalExecutorManifest)
 	if err := h.WaitForPodReady("vxpu-external-executor", "default", 5*time.Minute); err != nil {
@@ -248,7 +258,7 @@ func testByName(t *testing.T, h *Harness, gitRoot, vxpuBin string, env []string)
 	// it in a Job: about two minutes in kind), so a hang fails here with the
 	// cluster's state rather than at the test binary's timeout with none.
 	run := func(args ...string) string {
-		ctx, cancel := context.WithTimeout(context.Background(), 12*time.Minute)
+		ctx, cancel := context.WithTimeout(t.Context(), 12*time.Minute)
 		defer cancel()
 		c := exec.CommandContext(ctx, vxpuBin, args...)
 		c.Env = env
@@ -279,6 +289,10 @@ func testByName(t *testing.T, h *Harness, gitRoot, vxpuBin string, env []string)
 	}
 	if logs := h.GetPodLogs("app=vxpu-external-executor", "default"); !strings.Contains(logs, "loading") {
 		t.Errorf("the model should have been served by the external executor; its logs:\n%s", logs)
+	}
+	out = run("stats", model)
+	if !strings.Contains(out, `"requests": 1`) || !strings.Contains(out, `"telemetry_sampled": 1`) {
+		t.Errorf("the engine should have recorded the request and its telemetry, got:\n%s", out)
 	}
 	out = run("register", model)
 	if !strings.Contains(out, "already compiled") {

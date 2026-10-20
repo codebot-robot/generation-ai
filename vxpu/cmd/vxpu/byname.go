@@ -18,6 +18,7 @@ import (
 	"context"
 	"flag"
 	"fmt"
+	"os"
 	"strings"
 	"time"
 
@@ -88,7 +89,7 @@ func cmdRegister(ctx context.Context, args []string) error {
 		return fmt.Errorf("usage: vxpu register [flags] REPO[@REVISION]")
 	}
 	repo, revision := splitRevision(flags.Arg(0))
-	client, done, err := connectRouter(ctx, *routerAddr, *pod, routerSettings{})
+	client, done, err := connectRouter(ctx, *routerAddr, *pod, envRouterSettings())
 	if err != nil {
 		return err
 	}
@@ -110,9 +111,35 @@ func cmdRegister(ctx context.Context, args []string) error {
 	return nil
 }
 
+// envRouterSettings are the router settings the environment gives, for a
+// command that creates the router if there is none (as `vxpu ask` does).
+func envRouterSettings() routerSettings {
+	return routerSettings{image: os.Getenv("VXPU_ROUTER_IMAGE"), executorImage: os.Getenv("VXPU_EXECUTOR_IMAGE"),
+		accelerator: "nvidia-l4", modelstore: os.Getenv("VXPU_MODELSTORE_URL"),
+		externalExecutors: os.Getenv("VXPU_EXTERNAL_EXECUTORS"), externalModelstore: os.Getenv("VXPU_MODELSTORE_EXTERNAL_URL")}
+}
+
+// loadPoll is how often askByName asks again while a model loads.
+var loadPoll = 15 * time.Second
+
+// stillLoading reports whether NewSession's error is a state that passes
+// on its own: the model loading on its executor, being reloaded after an
+// eviction, or loading again after a failed load. Every other error (not
+// registered, not compiled, no modelstore, ...) is final.
+func stillLoading(err error) bool {
+	msg := status.Convert(err).Message()
+	switch status.Code(err) {
+	case codes.FailedPrecondition:
+		return strings.Contains(msg, "still loading") || strings.Contains(msg, "being reloaded")
+	case codes.Unavailable:
+		return strings.Contains(msg, "loads it again")
+	}
+	return false
+}
+
 // askByName opens a session on a registered model by name (the router
-// loads it the first time; NewSession fails with FAILED_PRECONDITION
-// until it is loaded) and runs one chat turn.
+// loads it the first time; NewSession reports it loading until it is)
+// and runs one chat turn.
 func askByName(ctx context.Context, client pb.ExecutorClient, repo, revision, prompt string, maxNewTokens int) error {
 	started := time.Now()
 	var session *pb.NewSessionResponse
@@ -122,15 +149,14 @@ func askByName(ctx context.Context, client pb.ExecutorClient, repo, revision, pr
 		if err == nil {
 			break
 		}
-		if status.Code(err) != codes.FailedPrecondition || strings.Contains(err.Error(), "not registered") ||
-			strings.Contains(err.Error(), "not compiled") {
+		if !stillLoading(err) {
 			return fmt.Errorf("NewSession: %w", err)
 		}
 		if ctx.Err() != nil {
 			return fmt.Errorf("timed out waiting for %s to load: %w", repo, err)
 		}
-		fmt.Printf("  loading %s... (%.0fs)\n", repo, time.Since(started).Seconds())
-		time.Sleep(15 * time.Second)
+		fmt.Printf("  loading %s... (%.0fs: %s)\n", repo, time.Since(started).Seconds(), status.Convert(err).Message())
+		time.Sleep(loadPoll)
 	}
 	fmt.Printf("session on %s ready in %.1fs\n", repo, time.Since(started).Seconds())
 	started = time.Now()
@@ -140,5 +166,41 @@ func askByName(ctx context.Context, client pb.ExecutorClient, repo, revision, pr
 	}
 	fmt.Printf("\n>>> %s\n%s\n\n(%d tokens, %.1f ms/token on the executor, %.1fs round trip)\n",
 		prompt, reply.Text, reply.Generated, reply.MsPerToken, time.Since(started).Seconds())
+	return nil
+}
+
+// cmdStats prints the engine's statistics for a model served by name,
+// and with --records writes every stored record (JSON lines; readable by
+// `python -m vxpu.expert_stats`).
+func cmdStats(ctx context.Context, args []string) error {
+	flags := flag.NewFlagSet("stats", flag.ContinueOnError)
+	pod := flags.String("pod", "vxpu-router", "router pod name")
+	routerAddr := flags.String("router", "", "vxpu-router address (e.g. localhost:50051); if set, skips the pod and port-forward")
+	records := flags.String("records", "", "also write the stored records to this file (JSON lines; the newest 64 MiB)")
+	timeout := flags.Duration("timeout", 5*time.Minute, "how long to wait for the summary")
+	if err := flags.Parse(args); err != nil {
+		return err
+	}
+	if flags.NArg() != 1 {
+		return fmt.Errorf("usage: vxpu stats [flags] REPO")
+	}
+	ctx, cancel := context.WithTimeout(ctx, *timeout)
+	defer cancel()
+	client, done, err := connectRouter(ctx, *routerAddr, *pod, envRouterSettings())
+	if err != nil {
+		return err
+	}
+	defer done()
+	resp, err := client.GetModelStats(ctx, &pb.GetModelStatsRequest{Model: flags.Arg(0), Records: *records != ""})
+	if err != nil {
+		return fmt.Errorf("GetModelStats: %w", err)
+	}
+	fmt.Println(resp.SummaryJson)
+	if *records != "" {
+		if err := os.WriteFile(*records, []byte(resp.RecordsJsonl+"\n"), 0o644); err != nil {
+			return err
+		}
+		fmt.Printf("records written to %s\n", *records)
+	}
 	return nil
 }

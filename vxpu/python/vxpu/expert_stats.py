@@ -36,8 +36,9 @@ and, with --artifact, the expert size and the storage bandwidth the misses
 would need at a target decode rate.
 
 Counts come from any file carrying telemetry: `vectors record --telemetry`
-output (each prompt's "telemetry"), attribute_decode.py output, or a raw
-telemetry dict. Small samples overstate skew: an expert that was not seen
+output (each prompt's "telemetry"), attribute_decode.py output, a raw
+telemetry dict, or the engine's request records (JSON lines, from `vxpu
+stats --records`). Small samples overstate skew: an expert that was not seen
 looks cold. The report says when the sample is small against the number
 of experts.
 
@@ -130,7 +131,11 @@ def report(paths, phase="decode", artifact=None, tokens_per_s=20.0):
     docs = []
     for path in paths:
         with open(path) as f:
-            docs.append(json.load(f))
+            text = f.read()
+        try:
+            docs.append(json.loads(text))
+        except json.JSONDecodeError:  # JSON lines: the engine's request records (`vxpu stats --records`)
+            docs.extend(json.loads(line) for line in text.splitlines() if line.strip())
     counts = collect(docs)
     if phase not in counts:
         raise SystemExit(f"no {phase} expert counts in {', '.join(paths)} (record with telemetry)")
