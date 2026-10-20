@@ -1190,6 +1190,37 @@ def _check_expert_moves(model, prompts, settings, artifact, workdir, runs, gpus,
     return ok
 
 
+def _check_dataflow(model, prompts, settings, artifact, plain):
+    """The engine's decode run as a dataflow graph (dataflow.py): the same
+    tokens and logits as the plain run, every edge through an inbox. On a
+    GPU also with the host-op nodes placed on the CPU: their inputs and
+    outputs then cross devices through the inboxes (the GPU run first
+    without, as the reference)."""
+    import torch
+    keep = []
+    got = _with_env({"VXPU_DATAFLOW": "1", "VXPU_DATAFLOW_PLACE": None}, record_vxpu_engine,
+                    model, "main", prompts, settings, artifact, keep=keep)
+    runner = keep[0]._decode_split
+    rows, ok = compare(plain, got, strict_tokens=True)
+    plan = runner.inbox_plan()
+    print(f"{runner.graph.describe()}, {len(plan)} inboxes, {sum(i['bytes'] for i in plan)} bytes a step, "
+          "against the plain engine:")
+    print(table(plain, got, rows))
+    if not torch.cuda.is_available() or not any(n.kind != "dense" for n in runner.graph.nodes):
+        return ok
+    ref = _with_env({"VXPU_DATAFLOW": None}, record_vxpu_engine, model, "main", prompts, settings, artifact,
+                    device="cuda")
+    keep = []
+    placed = _with_env({"VXPU_DATAFLOW": "1", "VXPU_DATAFLOW_PLACE": "experts=cpu,engram=cpu"}, record_vxpu_engine,
+                       model, "main", prompts, settings, artifact, device="cuda", keep=keep)
+    crossing = sum(i["bytes"] for i in keep[0]._decode_split.inbox_plan() if not i["device"].startswith("cuda"))
+    rows2, ok2 = compare(ref, placed, strict_tokens=True)
+    print(f"dataflow on the GPU with the host-op nodes on the CPU ({crossing} bytes a step into CPU inboxes), "
+          "against the plain GPU engine:")
+    print(table(ref, placed, rows2))
+    return ok and ok2
+
+
 def _with_env(env, fn, *args, **kwargs):
     """fn(*args, **kwargs) with env set (None: unset), restored after."""
     saved = {k: os.environ.get(k) for k in env}
@@ -1279,6 +1310,8 @@ def selftest(workdir, settings):
             failed.append(name)
         if name == "tiny-fp8-moe" and not _check_local_blobs(model, prompts, settings, artifact, got, workdir):
             failed.append(name + " (local weight tier)")
+        if not _check_dataflow(model, prompts, settings, artifact, got):
+            failed.append(name + " (dataflow)")
         if name == "tiny-llama" and not _check_chat_telemetry(artifact):
             failed.append(name + " (chat telemetry)")
         if name == "tiny-deepseek-v41" and not _check_gpu_experts(model, prompts, settings, artifact, workdir):

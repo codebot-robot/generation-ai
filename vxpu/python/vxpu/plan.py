@@ -276,6 +276,25 @@ class Plan:
         self._set("segment_runtime", runtime, rsrc, ("jit", "aoti"),
                   "how dense segments run: jit (torch.compile, CUDA graphs by its cudagraph trees) or aoti "
                   "(AOTInductor packages, built once and cached, in the engine's own CUDA graphs; aoti.py)")
+        on, src = env_flag("VXPU_DATAFLOW", False)
+        self._set("dataflow", on, src, (True, False),
+                  "run the decode step as a dataflow graph: its segments as nodes, each fired when the inboxes "
+                  "its inputs are written into are full (dataflow.py, the reference runner; #372)")
+        place, src = env_text("VXPU_DATAFLOW_PLACE", None)
+        if place:
+            try:
+                kinds = dict(item.split("=", 1) for item in place.split(","))
+            except ValueError:
+                raise ValueError(f"VXPU_DATAFLOW_PLACE={place!r}: expected kind=device[,kind=device...]") from None
+            unknown = set(kinds) - {"experts", "engram"}  # a dense node's weights are not moved, so it stays put
+            if unknown:
+                raise ValueError(f"VXPU_DATAFLOW_PLACE: kinds {sorted(unknown)} cannot be placed (experts, engram can)")
+            place = ",".join(f"{k}={v}" for k, v in sorted(kinds.items()))
+        if place and not self["dataflow"]:
+            place, src = None, "requires dataflow"
+        self._set("dataflow_placement", place, src, (),
+                  "where the dataflow graph's nodes run, by kind (e.g. experts=cpu,engram=cpu); unnamed kinds run "
+                  "where their resident tensors are")
         home = os.path.expanduser("~")
         base = os.path.join(home, ".cache") if home != "~" else tempfile.gettempdir()  # no HOME: not a relative "~"
         cache, src = env_text("VXPU_AOTI_CACHE_DIR", os.path.join(base, "vxpu", "aoti"))

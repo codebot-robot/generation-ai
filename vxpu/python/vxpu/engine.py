@@ -401,7 +401,32 @@ class Engine:
             else:
                 ops.prepare_compile()
                 self._decode_run = torch.compile(self._decode, mode=mode)
+        if self.plan["dataflow"]:
+            self._run_as_dataflow(scratch)
         print("[vxpu] " + self.plan.summary(self.plan_ops()).replace("\n", "\n[vxpu] "), flush=True)
+
+    def _run_as_dataflow(self, scratch):
+        """Run decode through the dataflow runner (dataflow.py): over the
+        compiled split when there is one, else over the split alone (the
+        segments eager). Either way the graphs stay bound to one resident
+        state, as the compiled split's are (see _bind)."""
+        from . import dataflow
+        split = self._decode_split
+        if split is None:
+            split = segments.compile_segments(self._decode, self.device, None, split_compile=False,
+                                              direct=self.plan["direct_host_ops"])
+            self._resident = scratch
+            self._resident_owner = None
+        runner = dataflow.Runner(split.split, *split.vxpu_segments, device=self.device)
+        if self.plan["dataflow_placement"]:
+            kinds = dict(item.split("=", 1) for item in self.plan["dataflow_placement"].split(","))
+            runner.place({n.name: kinds[n.kind] for n in runner.graph.nodes if n.kind in kinds})
+        self._decode_split = runner
+        self._segment_info = segment_info(self._decode_split.split)
+        self._decode_run = self._decode_split
+        msg = self._decode_split.graph.describe()
+        print(f"[vxpu] {msg}", flush=True)
+        self.plan.note(msg)
 
     def plan_ops(self):
         """The vxpu ops this engine's graphs call."""
