@@ -1601,6 +1601,55 @@ def _check_mover_lifetime():
         raise SystemExit("expert mover: its worker thread outlived it")
 
 
+def _check_native_nodes(model, prompts, settings, artifact, workdir):
+    """The decode step's host nodes as native packages (nodes.py, #394):
+    each experts and n-gram node, its host op lowered to the native
+    kernels and compiled by AOTInductor, run on the inputs the engine gave
+    it in a decode step, returns bit-identically what the engine's node
+    returned."""
+    import torch
+    from . import aoti, nodes
+    from .engine import SamplingParams
+    keep = []
+    _with_env({"VXPU_DATAFLOW": "1", "VXPU_DATAFLOW_PLACE": None, "VXPU_EXPERT_MAILBOXES": None,
+               "VXPU_GPU_EXPERTS": None}, record_vxpu_engine, model, "main", prompts, settings, artifact, keep=keep)
+    engine = keep[0]
+    split = engine._decode_split.split
+    host = [n.name for n in engine._decode_split.graph.nodes if n.kind != "dense"]
+    seen = {}
+
+    def hook(name):
+        def record(module, args, out):
+            if name not in seen:  # the first decode step's
+                seen[name] = ([a.clone() if isinstance(a, torch.Tensor) else a for a in args], out)
+        return record
+
+    hooks = [getattr(split, name).register_forward_hook(hook(name)) for name in host]
+    try:
+        tok = _tokenizer(model, "main", prompts)
+        ids = _encode(tok, next(iter(_prompt_set(tok, prompts))))
+        for _ in engine.generate(engine.new_session(), ids, 2, SamplingParams(do_sample=False)):
+            pass
+    finally:
+        for h in hooks:
+            h.remove()
+    packages = aoti.Packages(os.path.join(workdir, "native-nodes"))
+    bad = []
+    for name in host:
+        args, want = seen[name]
+        runner, residents = nodes.native_package(packages, getattr(split, name), engine.external, args)
+        got = runner(*args, *residents)
+        want = list(want) if isinstance(want, (tuple, list)) else [want]
+        got = list(got) if isinstance(got, (tuple, list)) else [got]
+        if len(got) != len(want) or not all(torch.equal(g, w) for g, w in zip(got, want)):
+            bad.append(name)
+    print(f"native nodes: {len(host) - len(bad)} of {len(host)} host nodes (experts, n-gram) bit-identical as "
+          f"AOTInductor packages on the native kernels")
+    if bad:
+        print(f"native nodes check: {bad} differ from the engine's")
+    return not bad
+
+
 def _check_plan_given():
     """The switches the coordinator sends (LoadModelRequest.plan, #394):
     read ahead of the environment and recorded as "coordinator"; only the
@@ -1785,6 +1834,8 @@ def selftest(workdir, settings):
             failed.append(name + " (expert mailboxes)")
         if name == "tiny-deepseek-v41" and not _check_expert_remote(model, prompts, settings, artifact, got):
             failed.append(name + " (expert remote)")
+        if name == "tiny-deepseek-v41" and not _check_native_nodes(model, prompts, settings, artifact, workdir):
+            failed.append(name + " (native nodes)")
         if name == "tiny-deepseek-v41" and not _check_step_graph(model, prompts, settings, artifact, workdir):
             failed.append(name + " (step graph)")
         if name == "tiny-deepseek-v41" and not _check_step_graph_pools(model, prompts, settings, artifact, workdir):

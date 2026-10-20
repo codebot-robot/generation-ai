@@ -60,11 +60,13 @@ FORMAT = "vxpu-aoti/1"  # in the cache key: a change here invalidates every pack
 NUMERICS_CONFIG = ("deterministic", "prologue_fusion", "emulate_precision_casts")
 
 
-def cache_key(sub, args):
-    """The content key of a segment's package."""
+def cache_key(sub, args, extra="", code=None):
+    """The content key of a segment's package: extra is what else it
+    depends on (a native node's lowering), code its graph's code."""
     h = hashlib.sha256()
     h.update(FORMAT.encode())
-    h.update(sub.code.encode())
+    h.update((code if code is not None else sub.code).encode())
+    h.update(extra.encode())
     for a in args:
         if isinstance(a, torch.Tensor):
             h.update(f"T{tuple(a.shape)}{a.stride()}{a.dtype}{a.device.type}".encode())
@@ -98,13 +100,13 @@ class Packages:
         self.built = self.loaded = 0
         self.build_s = 0.0
 
-    def get(self, sub, args):
+    def get(self, sub, args, extra="", code=None):
         import torch._inductor.config as inductor_config
         with inductor_config.patch(deterministic=True):
-            return self._get(sub, args)
+            return self._get(sub, args, extra, code)
 
-    def _get(self, sub, args):
-        path = os.path.join(self.cache_dir, cache_key(sub, args) + ".pt2")
+    def _get(self, sub, args, extra, code):
+        path = os.path.join(self.cache_dir, cache_key(sub, args, extra, code) + ".pt2")
         if os.path.exists(path):
             self.loaded += 1
         else:

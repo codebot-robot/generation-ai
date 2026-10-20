@@ -769,6 +769,29 @@ torch::Tensor gather_rows(const torch::Tensor& table, const torch::Tensor& indic
   return out.view(shape);
 }
 
+// The kernels a node's native package calls (#394): torch ops, so the
+// C++ AOTInductor generates for a node calls them through the dispatcher,
+// with no Python between messages. Loading this library registers them.
+// The scales arrive as their raw bytes (uint8): AOTInductor's CPU code
+// cannot name an e8m0 tensor's type, and the kernel reads them as bytes.
+static torch::Tensor fp4_moe_decode_bytes(torch::Tensor x_in, torch::Tensor weights, torch::Tensor indices,
+                                          torch::Tensor w1, torch::Tensor s1, torch::Tensor w3, torch::Tensor s3,
+                                          torch::Tensor w2, torch::Tensor s2, double swiglu_limit) {
+  auto e8m0 = [](const torch::Tensor& s) { return s.view(torch::kFloat8_e8m0fnu); };
+  return fp4_moe_decode(x_in, weights, indices, w1, e8m0(s1), w3, e8m0(s3), w2, e8m0(s2), swiglu_limit);
+}
+
+TORCH_LIBRARY(vxpu_native, m) {
+  m.def("fp4_moe_decode(Tensor x_in, Tensor weights, Tensor indices, Tensor w1, Tensor s1, Tensor w3, Tensor s3, "
+        "Tensor w2, Tensor s2, float swiglu_limit) -> Tensor");
+  m.def("gather_rows(Tensor table, Tensor indices) -> Tensor");
+}
+
+TORCH_LIBRARY_IMPL(vxpu_native, CPU, m) {
+  m.impl("fp4_moe_decode", &fp4_moe_decode_bytes);
+  m.impl("gather_rows", &gather_rows);
+}
+
 PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
   m.def("fp4_gather_mm", &fp4_gather_mm, "x[M,K] bf16 x packed fp4 experts sel[M] -> bf16 [M,N]");
   m.def("fp4_grouped_mm", &fp4_grouped_mm, "x[M,K] bf16 (sorted by expert, offs[E]) x packed fp4 experts -> bf16 [M,N]");
