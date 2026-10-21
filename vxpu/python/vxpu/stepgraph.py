@@ -191,6 +191,8 @@ class StepGraph(torch.nn.Module):
             raise RuntimeError(f"step graph: {error}")
         self._record()
         out = self._output
+        if self.runner.graph.output_names is not None:  # a range's slice (#387): its outputs by name
+            return {name: o.clone() for name, o in zip(self.runner.graph.output_names, out)}
         out = out[0] if isinstance(out, (tuple, list)) and len(out) == 1 else out
         return out.clone() if isinstance(out, torch.Tensor) else out
 

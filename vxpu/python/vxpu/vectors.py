@@ -1572,7 +1572,7 @@ def _check_slices(model, prompts, settings, artifact, plain):
     def chained(engine):
         engine._decode_run = graphs["decode"] = dataflow.Chain(engine._decode_split.split, starts)
         prefill, _ = segments.split_at_host_ops(engine._prefill)
-        engine._prefill = graphs["prefill"] = dataflow.Chain(prefill, starts)
+        engine._prefill = engine._prefill_run = graphs["prefill"] = dataflow.Chain(prefill, starts)
 
     got = _with_env({"VXPU_DATAFLOW": "1", "VXPU_DATAFLOW_PLACE": None, "VXPU_EXPERT_MAILBOXES": None,
                      "VXPU_GPU_EXPERTS": None}, record_vxpu_engine, model, "main", prompts, settings, artifact,
@@ -1603,6 +1603,53 @@ def _check_slices(model, prompts, settings, artifact, plain):
     if not same:
         print("layer ranges check: not bit-identical")
     return same
+
+
+def _check_engine_ranges(model, prompts, settings, artifact, plain):
+    """Two engines, each running a range of whole layers (#387): the head
+    engine layers up to the last legal cut (VXPU_LAYER_RANGE=0:N), the
+    other the rest (N:), each holding only its own layers' experts and
+    tables and its own sessions' state for them. The head hands each step
+    on (Engine.attach_ranges; here in one process, LocalRange), prefill and
+    decode, every prompt its own session, and a two-turn conversation in
+    one session: tokens and logits bit-identical to the plain engine's."""
+    from . import cuts
+    from .engine import Engine, LocalRange
+    cut = cuts.describe(artifact)["legal"][-1]
+    base = {"VXPU_DATAFLOW": "1", "VXPU_DATAFLOW_PLACE": None, "VXPU_EXPERT_MAILBOXES": None, "VXPU_GPU_EXPERTS": None}
+    tail = _with_env({**base, "VXPU_LAYER_RANGE": f"{cut}:"}, Engine, artifact)
+    keep = []
+    got = _with_env({**base, "VXPU_LAYER_RANGE": f"0:{cut}"}, record_vxpu_engine, model, "main", prompts, settings,
+                    artifact, keep=keep, prepare=lambda head: head.attach_ranges([LocalRange(tail, head.device)]))
+    head = keep[0]
+    misplaced = ([f"head holds layer {i}" for i, m in head.external.experts.items() if i >= cut and not m.w1.is_meta]
+                 + [f"tail holds layer {i}" for i, m in tail.external.experts.items() if i < cut and not m.w1.is_meta]
+                 + [f"head holds table {i}" for i in head.external.engram if i >= cut]
+                 + [f"tail holds table {i}" for i in tail.external.engram if i < cut])
+    same = ([p["generated_ids"] for p in got["prompts"]] == [p["generated_ids"] for p in plain["prompts"]]
+            and [p["top_logits"] for p in got["prompts"]] == [p["top_logits"] for p in plain["prompts"]])
+    # a conversation: the second turn continues the first's session (for a model whose prefill starts
+    # from position 0, the session starts over and the head resets the other range's state too)
+    from .engine import SamplingParams
+    reference = _with_env(base, Engine, artifact)
+    turns = []
+    for engine in (reference, head):
+        sid, out, ids = engine.new_session(), [], list(ID_PROMPTS[0]["ids"])
+        for turn in range(2):
+            new = [t for ev in engine.generate(sid, ids, 8, SamplingParams(do_sample=False)) for t in ev["token_ids"]]
+            out.append(new)
+            ids = ids + new + list(ID_PROMPTS[1]["ids"][:5 + turn])
+        turns.append(out)
+    if turns[0] != turns[1]:
+        print(f"engine ranges check: a two-turn conversation differs: {turns}")
+        same = False
+    print(f"two engines, layers 0-{cut - 1} and {cut}-last, the head handing each step on "
+          f"({len(tail.sessions)} sessions on the other), against the plain engine (must be bit-identical):")
+    rows, _ = compare(plain, got, strict_tokens=True)
+    print(table(plain, got, rows))
+    if misplaced or not same:
+        print(f"engine ranges check: {'not bit-identical; ' if not same else ''}{misplaced}")
+    return same and not misplaced
 
 
 def _check_native_nodes(model, prompts, settings, artifact, workdir):
@@ -1963,6 +2010,8 @@ def selftest(workdir, settings):
             failed.append(name + " (layer cuts)")
         if name == "tiny-deepseek-v41" and not _check_slices(model, prompts, settings, artifact, got):
             failed.append(name + " (layer ranges)")
+        if name == "tiny-deepseek-v41" and not _check_engine_ranges(model, prompts, settings, artifact, got):
+            failed.append(name + " (engine ranges)")
         if name == "tiny-deepseek-v41" and not _check_native_nodes(model, prompts, settings, artifact, workdir):
             failed.append(name + " (native nodes)")
         if name == "tiny-deepseek-v41" and not _check_remote_nodes(model, prompts, settings, artifact, got, workdir):

@@ -274,6 +274,8 @@ class Engine:
         self._decode_split = None
         self._resident = None  # set when the split decode keeps one bound state
         self._resident_owner = None
+        self._ranges = []  # the ranges of layers after this engine's, on other engines (attach_ranges)
+        self._current = None  # the session being generated for
         self._build()
         if self.plan["blob_dir"]:
             # the weights are loaded: the blob files' cached pages would only
@@ -304,6 +306,9 @@ class Engine:
         self._remote_layers = {i for kind, i in self.external.remote_nodes if kind == "experts"}
         remote_tables = {i for kind, i in self.external.remote_nodes if kind == "engram"}
         specs = external.get("experts", {})
+        if self.plan["layer_range"]:  # another executor runs the other ranges, with their experts (#387)
+            self._remote_layers |= {int(layer) for layer in specs if not self._in_range(int(layer))}
+            remote_tables |= {int(k) for k in external.get("engram", {}) if not self._in_range(int(k))}
         local = {int(layer) for layer in specs} - self._remote_layers
         experts, downloaded = load_expert_layers(self.manifest, specs, args, cas_dir, mm,
                                                  in_ram=self.plan["experts_placement"] == "ram", layers=local)
@@ -322,6 +327,11 @@ class Engine:
         self.bytes_fetched += downloaded
         for key in remote_tables:
             ops.ENGRAM_DIM[key] = engram[str(key)]["dim"]  # a remote table's rows' width, for shapes
+
+    def _in_range(self, layer):
+        """Whether this engine runs `layer` (all of them without a layer range)."""
+        rng = self.plan["layer_range"]
+        return rng is None or (layer >= rng[0] and (rng[1] is None or layer < rng[1]))
 
     def _connect_remote_nodes(self):
         """{(collection, index): ops.RemoteNode} for the plan's remote_nodes
@@ -474,6 +484,7 @@ class Engine:
         assert shared > 0, "prefill/decode share no cache state"
         self._bind(scratch)  # aliases -> the canonical tensors, both graphs
         self._decode_run = self._decode
+        self._prefill_run = self._prefill
         if self.compile_decode:
             strip_asserts(self._decode)
             configure_inductor(self.plan)
@@ -525,6 +536,14 @@ class Engine:
             self._resident = scratch
             self._resident_owner = None
         runner = dataflow.Runner(split.split, *split.vxpu_segments, device=self.device)
+        if self.plan["layer_range"]:  # only this engine's range of layers, decode and prefill (#387)
+            runner = dataflow.Runner(split.split, *split.vxpu_segments, device=self.device,
+                                     graph=self._range_slice(runner.graph))
+            prefill, _ = segments.split_at_host_ops(self._prefill)
+            graph = self._range_slice(dataflow.Graph.from_split(prefill))
+            self._prefill_run = dataflow.Runner(prefill, len(graph.nodes), 0, device=self.device, graph=graph)
+            print(f"[vxpu] layers {self._range_text()}: decode {len(runner.graph.nodes)} nodes, "
+                  f"prefill {len(graph.nodes)}", flush=True)
         if self.plan["dataflow_placement"]:
             kinds = dict(item.split("=", 1) for item in self.plan["dataflow_placement"].split(","))
             runner.place({n.name: kinds[n.kind] for n in runner.graph.nodes if n.kind in kinds})
@@ -537,6 +556,61 @@ class Engine:
         msg = runner.graph.describe() + (", the step one CUDA graph" if self.plan["step_graph"] else "")
         print(f"[vxpu] {msg}", flush=True)
         self.plan.note(msg)
+
+    def _range_slice(self, graph):
+        """graph's slice for this engine's layer range."""
+        first, end = self.plan["layer_range"]
+        start = graph.cut_position(first) if first > 0 else 0
+        # an END with no layer after it (END = the layer count) is the last range: it keeps the head
+        last = end is None or not any(n.host == ("experts", end) for n in graph.nodes)
+        stop = len(graph.nodes) if last else graph.cut_position(end)
+        return graph.slice(start, stop)
+
+    def _range_text(self):
+        first, end = self.plan["layer_range"]
+        return f"{first}-" + (str(end - 1) if end is not None else "last")
+
+    def range_inputs(self, phase):
+        """The names of the values this engine's range takes in a step of
+        phase ("decode" or "prefill"): step inputs, and what earlier
+        ranges made for it (cross:...)."""
+        run = self._decode_run if phase == "decode" else self._prefill_run
+        graph = getattr(run, "runner", run).graph
+        return list(graph.inputs)
+
+    def run_range(self, session_id, phase, values):
+        """Run this engine's range of layers for session_id (#387): its
+        state bound (a session this engine has not seen starts empty), the
+        decode or prefill slice run on values. Returns what the ranges after
+        it need (by name), or the step's output from the last range."""
+        with self._lock:
+            session = self.sessions.get(session_id)
+            if session is None:
+                session = self.sessions[session_id] = {
+                    "id": session_id, "messages": [], "cached_ids": [],
+                    "state": {fqn: torch.zeros(shape, dtype=dtype, device=self.device)
+                              for fqn, (shape, dtype) in self.state_specs.items()}}
+            self._bind(session["state"])
+            values = {k: v.to(self.device) if isinstance(v, torch.Tensor) else v for k, v in values.items()}
+            with self.external_scope():
+                return (self._decode_run if phase == "decode" else self._prefill_run)(**values)
+
+    def reset_range(self, session_id):
+        """Zero a session's state here: the head engine started it over."""
+        with self._lock:
+            if session_id in self.sessions:
+                self._reset_state(self.sessions[session_id])
+
+    def attach_ranges(self, ranges):
+        """Run the layers after this engine's range on ranges, in order
+        (#387): each takes the step's inputs and what the ranges before it
+        made, the last returns the step's output. A range is an object with
+        inputs(phase), run(session_id, phase, values) and reset(session_id):
+        another engine in this process (LocalRange), or one on another
+        machine."""
+        self._ranges = list(ranges)
+        self._decode_run = RangeChain(self, self._decode_run, "decode", self._ranges)
+        self._prefill_run = RangeChain(self, self._prefill_run, "prefill", self._ranges)
 
     def plan_ops(self):
         """The vxpu ops this engine's graphs call."""
@@ -556,7 +630,10 @@ class Engine:
         return self.plan.explain(self.plan_ops())
 
     def _reset_state(self, session):
-        """Zero a session's state tensors in place (the graphs stay bound)."""
+        """Zero a session's state tensors in place (the graphs stay bound),
+        here and in the ranges after this engine's (#387)."""
+        for r in self._ranges:
+            r.reset(session["id"])
         for tensor in session["state"].values():
             tensor.zero_()
         if self._resident is not None and self._resident_owner is session["state"]:
@@ -611,6 +688,7 @@ class Engine:
             session_id = f"s{self._next_id}"
             self._next_id += 1
             self.sessions[session_id] = {
+                "id": session_id,
                 "state": {
                     fqn: torch.zeros(shape, dtype=dtype,
                                      device=self.device)
@@ -736,6 +814,7 @@ class Engine:
     def _generate_scoped(self, session, ids, max_new_tokens, params,
                          extra_eos_ids, logits_sink, recorder=None):
         self._bind(session["state"])
+        self._current = session
         total_len = len(ids)
         if total_len == 0:
             raise ValueError("empty prompt")
@@ -791,7 +870,7 @@ class Engine:
                 input_ids=new_ids,
                 cache_position=torch.tensor([start], device=self.device))
         else:
-            logits = self._prefill(
+            logits = self._prefill_run(
                 input_ids=new_ids,
                 cache_position=torch.arange(start, total_len,
                                             device=self.device))
@@ -930,3 +1009,46 @@ class Sampler:
                 remove.scatter(0, sorted_idx, remove), float("-inf"))
         probs = logits.softmax(-1)
         return int(torch.multinomial(probs, 1, generator=self.generator))
+
+
+class RangeChain(torch.nn.Module):
+    """A head engine's step with the layers after its range on other
+    engines (#387): its own slice, then each range in turn, each given the
+    step's inputs and what the ranges before it made, for the session
+    being generated."""
+
+    def __init__(self, engine, local, phase, ranges):
+        super().__init__()
+        self.engine, self.local, self.phase, self.ranges = engine, local, phase, ranges
+
+    def forward(self, **step):
+        made = self.local(**step)
+        session = self.engine._current["id"]
+        for r in self.ranges:
+            out = r.run(session, self.phase, {n: step[n] if n in step else made[n] for n in r.inputs(self.phase)})
+            if not isinstance(out, dict):
+                return out
+            made.update(out)
+        return made
+
+
+class LocalRange:
+    """Another engine in this process running a range of layers, as a
+    range of a head engine's (Engine.attach_ranges): for tests, and the
+    shape of a range on another machine."""
+
+    def __init__(self, engine, device):
+        self.engine, self.device = engine, device
+
+    def inputs(self, phase):
+        return self.engine.range_inputs(phase)
+
+    def run(self, session_id, phase, values):
+        out = self.engine.run_range(session_id, phase, values)
+        if isinstance(out, dict):
+            return {k: v.to(self.device) if isinstance(v, torch.Tensor) else v for k, v in out.items()}
+        return out.to(self.device)
+
+    def reset(self, session_id):
+        self.engine.reset_range(session_id)
+
