@@ -151,14 +151,16 @@ def call(sock, node, inputs):
     sock.sendall(b"VXN1" + struct.pack("<II", node, len(inputs)))
     for t in inputs:
         _send_tensor(sock, t)
-    if _recv_exact(sock, 4) != b"VXR1":
-        raise ConnectionError("not a node server reply")
+    if _recv_exact(sock, 4) != b"VXR2":
+        raise ConnectionError("not a node server reply (VXR2)")
     (status,) = struct.unpack("<I", _recv_exact(sock, 4))
     if status:
         (length,) = struct.unpack("<I", _recv_exact(sock, 4))
         raise RuntimeError(f"node {node}: {_recv_exact(sock, length).decode()}")
     (count,) = struct.unpack("<I", _recv_exact(sock, 4))
-    return [_recv_tensor(sock) for _ in range(count)]
+    outputs = [_recv_tensor(sock) for _ in range(count)]
+    _recv_exact(sock, 16)  # the server's read and run times
+    return outputs
 
 
 def connect(address):
@@ -169,7 +171,60 @@ def connect(address):
     return sock
 
 
+ECHO_NODE = 0xFFFFFFFF  # replies with the request's tensors (node_server.cpp's kEchoNode)
+
+
+def echo(address, nbytes=8192, count=1000):
+    """Round trips to a node server's echo node through the native client,
+    each sending and getting back nbytes (a decode step's experts message
+    is ~8 KB): the wire's own cost, with no work. Returns microseconds per
+    round trip, sorted."""
+    import time
+    k = kernels.load()
+    if k is None:
+        raise RuntimeError(f"the echo needs the CPU kernels: {kernels.why_not()}")
+    host, port = address.rsplit(":", 1)
+    client = k.NodeClient(host, int(port))
+    payload = torch.zeros(nbytes, dtype=torch.uint8)
+    for _ in range(min(count, 100)):  # warm the connection
+        client.call(ECHO_NODE, [payload])
+    times = []
+    for _ in range(count):
+        t = time.perf_counter()
+        client.call(ECHO_NODE, [payload])
+        times.append((time.perf_counter() - t) * 1e6)
+    return sorted(times)
+
+
+def main(argv=None):
+    """python -m vxpu.nodeserver echo HOST:PORT [--bytes N] [--count N] | serve-echo [--port N]"""
+    import argparse
+    parser = argparse.ArgumentParser(prog="python -m vxpu.nodeserver")
+    sub = parser.add_subparsers(dest="cmd", required=True)
+    e = sub.add_parser("echo", help="round trips to a node server's echo node: the wire, with no work")
+    e.add_argument("address")
+    e.add_argument("--bytes", type=int, default=8192)
+    e.add_argument("--count", type=int, default=1000)
+    se = sub.add_parser("serve-echo", help="a node server with no nodes, only the echo node, until interrupted")
+    se.add_argument("--port", type=int, default=50061)
+    args = parser.parse_args(argv)
+    if args.cmd == "serve-echo":
+        import time
+        server = kernels.load().NodeServer(args.port, [], [])
+        print(f"[vxpu] echo node server on port {server.port()}", flush=True)
+        while True:
+            time.sleep(3600)
+    times = echo(args.address, args.bytes, args.count)
+    pct = {p: times[min(len(times) - 1, int(p / 100 * len(times)))] for p in (50, 90, 99)}
+    print(json.dumps({"address": args.address, "bytes": args.bytes, "count": args.count,
+                      "us_p50": round(pct[50], 1), "us_p90": round(pct[90], 1), "us_p99": round(pct[99], 1)}))
+
+
 # c10::ScalarType codes, as the server reads and writes them
 _DTYPE_CODES = {torch.uint8: 0, torch.int8: 1, torch.int16: 2, torch.int32: 3, torch.int64: 4, torch.float16: 5,
                 torch.float32: 6, torch.float64: 7, torch.bool: 11, torch.bfloat16: 15}
 _CODE_DTYPES = {v: k for k, v in _DTYPE_CODES.items()}
+
+
+if __name__ == "__main__":
+    main()

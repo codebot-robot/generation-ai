@@ -31,13 +31,18 @@
 // The wire format, both ways, little-endian (tcp:// mailboxes):
 //
 //   request   "VXN1"  u32 node  u32 count  count x tensor
-//   reply     "VXR1"  u32 status (0: ok)   then, ok: u32 count, count x tensor
+//   reply     "VXR2"  u32 status (0: ok)   then, ok: u32 count, count x tensor,
+//                                                    i64 read_ns, i64 run_ns
 //                                          else: u32 length, the error text
 //   tensor    u8 dtype (c10::ScalarType)  u8 ndim  ndim x i64 size  raw bytes
 //
 // A node is called with the message's tensors and then its residents, the
 // tensors it reads that never travel (the banks of an experts node, the
-// table of an n-gram node), and replies with the package's outputs.
+// table of an n-gram node), and replies with the package's outputs. The
+// reply says how long the server took to read the request (from its first
+// byte) and to run the node, so the caller can tell the wire from the
+// work (#409). Node kEchoNode replies with the request's tensors: the
+// round trip with no work, for measuring the wire.
 
 #include <torch/extension.h>
 #include <torch/csrc/inductor/aoti_package/model_package_loader.h>
@@ -70,6 +75,7 @@
 namespace {
 
 constexpr uint32_t kMaxTensors = 64;
+constexpr uint32_t kEchoNode = 0xFFFFFFFF;
 constexpr uint8_t kMaxDims = 8;
 constexpr int64_t kMaxBytes = int64_t(1) << 32;  // a message's tensor; a decode step's are kilobytes
 
@@ -103,6 +109,11 @@ T read_value(int fd) {
 template <typename T>
 void write_value(int fd, T v) {
   write_exact(fd, &v, sizeof(v));
+}
+
+int64_t now_ns() {
+  return std::chrono::duration_cast<std::chrono::nanoseconds>(
+             std::chrono::steady_clock::now().time_since_epoch()).count();
 }
 
 at::Tensor read_tensor(int fd) {
@@ -251,24 +262,31 @@ class NodeServer {
       for (;;) {
         char magic[4];
         read_exact(conn, magic, 4);
+        const int64_t t0 = now_ns();
         if (std::memcmp(magic, "VXN1", 4) != 0) throw std::runtime_error("not a node message");
         uint32_t index = read_value<uint32_t>(conn);
         uint32_t count = read_value<uint32_t>(conn);
         if (count > kMaxTensors) throw std::runtime_error("too many tensors");
         std::vector<at::Tensor> inputs;
         for (uint32_t i = 0; i < count; ++i) inputs.push_back(read_tensor(conn));
+        const int64_t t1 = now_ns();
         std::vector<at::Tensor> outputs;
         std::string error;
         try {
-          if (index >= nodes_.size()) throw std::runtime_error("no such node");
-          Node& node = *nodes_[index];
-          inputs.insert(inputs.end(), node.residents.begin(), node.residents.end());
-          std::lock_guard<std::mutex> lock(node.mu);
-          outputs = node.loader->run(inputs);
+          if (index == kEchoNode) {
+            outputs = inputs;
+          } else {
+            if (index >= nodes_.size()) throw std::runtime_error("no such node");
+            Node& node = *nodes_[index];
+            inputs.insert(inputs.end(), node.residents.begin(), node.residents.end());
+            std::lock_guard<std::mutex> lock(node.mu);
+            outputs = node.loader->run(inputs);
+          }
         } catch (const std::exception& e) {
           error = e.what();
         }
-        write_exact(conn, "VXR1", 4);
+        const int64_t t2 = now_ns();
+        write_exact(conn, "VXR2", 4);
         if (!error.empty()) {
           write_value<uint32_t>(conn, 1);
           write_value<uint32_t>(conn, static_cast<uint32_t>(error.size()));
@@ -278,6 +296,8 @@ class NodeServer {
         write_value<uint32_t>(conn, 0);
         write_value<uint32_t>(conn, static_cast<uint32_t>(outputs.size()));
         for (const auto& t : outputs) write_tensor(conn, t);
+        write_value<int64_t>(conn, t1 - t0);
+        write_value<int64_t>(conn, t2 - t1);
         messages_++;
       }
     } catch (const std::exception&) {
@@ -320,6 +340,9 @@ class NodeClient {
     }
   }
 
+  // The last call's server times: reading the request, running the node (ns).
+  std::pair<int64_t, int64_t> server_times() const { return {read_ns_, run_ns_}; }
+
  private:
   // a long prefill's experts on a CPU take seconds; a server silent for
   // two minutes is gone
@@ -356,7 +379,7 @@ class NodeClient {
     for (const auto& t : inputs) write_tensor(fd_, t);
     char magic[4];
     read_exact(fd_, magic, 4);
-    TORCH_CHECK(std::memcmp(magic, "VXR1", 4) == 0, "node client: not a node server reply");
+    TORCH_CHECK(std::memcmp(magic, "VXR2", 4) == 0, "node client: not a node server reply (VXR2)");
     if (read_value<uint32_t>(fd_) != 0) {
       uint32_t length = read_value<uint32_t>(fd_);
       std::string error(length, '\0');
@@ -367,6 +390,8 @@ class NodeClient {
     TORCH_CHECK(count <= kMaxTensors, "node client: too many tensors");
     std::vector<at::Tensor> outputs;
     for (uint32_t i = 0; i < count; ++i) outputs.push_back(read_tensor(fd_));
+    read_ns_ = read_value<int64_t>(fd_);
+    run_ns_ = read_value<int64_t>(fd_);
     return outputs;
   }
 
@@ -374,14 +399,10 @@ class NodeClient {
   int64_t port_;
   int fd_ = -1;
   std::mutex mu_;
+  int64_t read_ns_ = 0, run_ns_ = 0;
 };
 
 namespace {
-
-int64_t now_ns() {
-  return std::chrono::duration_cast<std::chrono::nanoseconds>(
-             std::chrono::steady_clock::now().time_since_epoch()).count();
-}
 
 void spin_pause() {
 #if defined(__x86_64__)
@@ -401,7 +422,8 @@ void spin_pause() {
 // address, as a node server runs it) or by a node server (remote: a
 // NodeClient and the server's node index). Per node and step it records,
 // in steady-clock ns: when it saw the GPU's flag, when the reply was in
-// the outbox, and when it raised the flag back.
+// the outbox, and when it raised the flag back; for a remote node also
+// the server's own times (reading the request, running the node).
 class StepHost {
  public:
   explicit StepHost(at::Tensor flags) : flags_(std::move(flags)) {
@@ -430,7 +452,7 @@ class StepHost {
   void start() {
     TORCH_CHECK(!thread_.joinable(), "step host: already started");
     TORCH_CHECK(flags_.numel() >= 2 * static_cast<int64_t>(boxes_.size()), "step host: two flags per host node");
-    times_ = at::zeros({static_cast<int64_t>(boxes_.size()), 3}, at::kLong);
+    times_ = at::zeros({static_cast<int64_t>(boxes_.size()), 5}, at::kLong);
     thread_ = std::thread([this] { loop(); });
   }
 
@@ -453,8 +475,10 @@ class StepHost {
     return e;
   }
 
-  // [nodes, 3] int64: per host node of the last step, when the GPU's flag
-  // was seen, when the reply was ready, when the flag was raised back.
+  // [nodes, 5] int64: per host node of the last step, when the GPU's flag
+  // was seen, when the reply was ready, when the flag was raised back
+  // (steady-clock ns), and for a remote node the server's read and run
+  // times (ns; 0 for a local node).
   at::Tensor times() const { return times_; }
 
   bool running() const { return thread_.joinable(); }
@@ -506,10 +530,13 @@ class StepHost {
             spin_pause();
           }
           flag[2 * i] = 0;
-          t[3 * i] = now_ns();
+          t[5 * i] = now_ns();
           std::vector<at::Tensor> out;
           if (box.client) {
             out = box.client->call(box.node, box.inputs);
+            auto [read_ns, run_ns] = box.client->server_times();
+            t[5 * i + 3] = read_ns;
+            t[5 * i + 4] = run_ns;
           } else {
             std::vector<at::Tensor> args(box.inputs);
             args.insert(args.end(), box.residents.begin(), box.residents.end());
@@ -517,10 +544,10 @@ class StepHost {
           }
           TORCH_CHECK(!out.empty(), "host node ", i, ": no reply");
           box.outbox.copy_(out[0].view(box.outbox.sizes()));
-          t[3 * i + 1] = now_ns();
-          std::atomic_thread_fence(std::memory_order_seq_cst);  // the reply before the flag
+          t[5 * i + 1] = now_ns();
+          t[5 * i + 2] = now_ns();  // as the flag goes up: before it, so the step's reader never sees it unwritten
+          std::atomic_thread_fence(std::memory_order_seq_cst);  // the reply (and the times) before the flag
           flag[2 * i + 1] = 1;
-          t[3 * i + 2] = now_ns();
         }
       } catch (const std::exception& e) {
         {
@@ -550,7 +577,8 @@ class StepHost {
 void register_node_server(pybind11::module& m) {
   pybind11::class_<NodeClient, std::shared_ptr<NodeClient>>(m, "NodeClient")
       .def(pybind11::init<const std::string&, int64_t>())
-      .def("call", &NodeClient::call, pybind11::call_guard<pybind11::gil_scoped_release>());
+      .def("call", &NodeClient::call, pybind11::call_guard<pybind11::gil_scoped_release>())
+      .def("server_times", &NodeClient::server_times);
   pybind11::class_<NodeServer>(m, "NodeServer", pybind11::dynamic_attr())
       .def(pybind11::init<int64_t, const std::vector<std::string>&, const std::vector<std::vector<at::Tensor>>&>(),
            pybind11::call_guard<pybind11::gil_scoped_release>())

@@ -330,31 +330,47 @@ class StepGraph(torch.nn.Module):
         return answers
 
     def _record(self):
-        """The step's host ops into telemetry, from the step host's clock
-        (impl_ms: from the GPU's flag seen to the reply in the outbox)."""
+        """The step's host ops into telemetry (#409), from the step host's
+        clock and the GPU's:
+          impl_ms        from the GPU's flag seen to the reply in the outbox
+                         (the step host's work: the node, or the call)
+          crossing_ms    the GPU's round trip (raising its flag to seeing the
+                         reply's) less the step host's time between seeing
+                         the flag and raising it back: both PCIe crossings
+                         and the flags' notice, nothing else
+        and for a node on a node server
+          server_run_ms  the server running the node
+          wire_ms        impl_ms less the server's run: the network both ways,
+                         serialization, the server reading the request"""
         from . import ops
         rec = ops._recorder()
         if rec is None:
             return
         times = self._host.times()
-        for (kind, layer, remote, i, slot_maps, start), t in zip(self._box_info, times.tolist()):
+        for (kind, layer, remote, i, slot_maps, start), t, (sent, back) in zip(self._box_info, times.tolist(),
+                                                                             self._events):
             impl_ms = (t[1] - t[0]) / 1e6
+            crossing_ms = sent.elapsed_time(back) - (t[2] - t[0]) / 1e6
+            fields = {"impl_ms": impl_ms, "crossing_ms": crossing_ms}
+            if remote:
+                fields.update(server_run_ms=t[4] / 1e6, wire_ms=impl_ms - t[4] / 1e6)
             if kind == "engram":
-                rec.host_op("engram_rows", total_ms=impl_ms)
+                rec.host_op("engram_rows", total_ms=impl_ms, **{k: v for k, v in fields.items() if k != "impl_ms"})
                 continue
             if remote:
-                rec.host_op("moe_experts", impl_ms=impl_ms, remote_pairs=float(i.numel()))
+                rec.host_op("moe_experts", remote_pairs=float(i.numel()), **fields)
             else:
                 held = torch.zeros_like(i, dtype=torch.bool)
                 for slots in slot_maps or ():
                     held |= slots[i - start] >= 0
                 n_held = int(held.sum())
-                rec.host_op("moe_experts", impl_ms=impl_ms, gpu_pairs=float(n_held), cpu_pairs=float(i.numel() - n_held))
+                rec.host_op("moe_experts", gpu_pairs=float(n_held), cpu_pairs=float(i.numel() - n_held), **fields)
             rec.selected_experts(layer, i.flatten().tolist())
 
     def _capture_all(self, graph, mailboxes, boxes, pooled, peers, driver, flags, F, flag, side, dev, resolve,
                      produced, host_nodes, answers):
         from . import aoti
+        events = []  # per host node: (sent, back), timing events recorded in the graph
         g = torch.cuda.CUDAGraph()
         with torch.cuda.graph(g):
             stream = torch.cuda.current_stream()
@@ -386,9 +402,13 @@ class StepGraph(torch.nn.Module):
                 for p, a in zip(pinned, args_):
                     if isinstance(a, torch.Tensor):
                         p.copy_(a, non_blocking=True)
+                sent, back = (torch.cuda.Event(enable_timing=True, external=True) for _ in range(2))
+                sent.record(stream)  # the GPU's side of the crossing: from raising its flag to seeing the reply's
                 driver.write_value(stream, flag(i, 0), 1)
                 driver.wait_value(stream, flag(i, 1), 1)
                 driver.write_value(stream, flag(i, 1), 0)
+                back.record(stream)
+                events.append((sent, back))
                 reply = torch.empty_like(like, device=dev)
                 reply.copy_(outbox, non_blocking=True)
                 if moe is not None:  # per-pair replies: each from whoever holds the expert, then the k-order sum
@@ -433,7 +453,7 @@ class StepGraph(torch.nn.Module):
         host.start()
         # all at once: a capture that fails leaves the step graph as it was, and the next step tries again
         self.graph, self._output, self._peer_graphs, self._host = g, output, peer_graphs, host
-        self._flags, self._box_info = flags, info
+        self._flags, self._box_info, self._events = flags, info, events
         # what the graphs use that lives outside their memory pools (the pinned boxes, the other
         # GPUs' inboxes, flags and reply buffers, the slot maps' copies): freed, that memory would
         # be reused under the graphs. The Python worker held it through its mailboxes.
