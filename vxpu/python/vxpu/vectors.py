@@ -301,7 +301,7 @@ def record_deepseek_eager(model, revision, prompts, settings):
 
 
 def record_vxpu_engine(model, revision, prompts, settings, artifact, device="cpu",
-                       compile_decode=False, telemetry=False, keep=None):
+                       compile_decode=False, telemetry=False, keep=None, prepare=None):
     """Candidate: the executor's engine in this process (no cluster).
     telemetry=True keeps each prompt's execution telemetry with it; keep,
     a list, receives the engine (for checks of its state afterwards)."""
@@ -309,6 +309,8 @@ def record_vxpu_engine(model, revision, prompts, settings, artifact, device="cpu
     from .engine import Engine, SamplingParams
     tok = _tokenizer(model, revision, prompts)
     engine = Engine(artifact, device=device, compile_decode=compile_decode)
+    if prepare is not None:  # a check's change to the loaded engine, before it generates
+        prepare(engine)
     if keep is not None:
         keep.append(engine)
     out = []
@@ -1556,6 +1558,53 @@ def _check_cuts(artifact):
     return ok
 
 
+def _check_slices(model, prompts, settings, artifact, plain):
+    """The step as ranges of whole layers (dataflow.Chain, #387): decode and
+    prefill each cut where cuts.py allows (the tiny DeepSeek's: before
+    layers 1 and 3), the ranges run in turn, each taking only the step's
+    inputs and what the ranges before it made for it. The same segments
+    on the same arguments: tokens and logits bit-identical to the plain
+    engine's."""
+    from . import cuts, dataflow, segments
+    starts = cuts.describe(artifact)["legal"]
+    graphs = {}
+
+    def chained(engine):
+        engine._decode_run = graphs["decode"] = dataflow.Chain(engine._decode_split.split, starts)
+        prefill, _ = segments.split_at_host_ops(engine._prefill)
+        engine._prefill = graphs["prefill"] = dataflow.Chain(prefill, starts)
+
+    got = _with_env({"VXPU_DATAFLOW": "1", "VXPU_DATAFLOW_PLACE": None, "VXPU_EXPERT_MAILBOXES": None,
+                     "VXPU_GPU_EXPERTS": None}, record_vxpu_engine, model, "main", prompts, settings, artifact,
+                    prepare=chained)
+    same = ([p["generated_ids"] for p in got["prompts"]] == [p["generated_ids"] for p in plain["prompts"]]
+            and [p["top_logits"] for p in got["prompts"]] == [p["top_logits"] for p in plain["prompts"]])
+    # in one process the ranges share the state tensors, so the tokens would match at any cut; what
+    # lets them run on different machines is that no state is read by two ranges, as cuts.py says
+    with open(os.path.join(artifact, "binding.json")) as f:
+        state = set(json.load(f)["state"])
+
+    def shared(chain):
+        per = [r.graph.residents() & state for r in chain.runners]
+        return sorted(set().union(*(a & b for i, a in enumerate(per) for b in per[i + 1:])))
+
+    overlap = shared(graphs["decode"]) + shared(graphs["prefill"])
+    illegal = sorted(set(range(1, max(starts) + 1)) - set(starts))
+    wrong = shared(dataflow.Chain(graphs["decode"].split, illegal)) if illegal else ["(no illegal cut to try)"]
+    if overlap or not wrong:
+        print(f"layer ranges check: state read by two ranges: {overlap}; at the illegal cuts {illegal}: {wrong}")
+        same = False
+    ranges = ", ".join(f"{len(r.graph.nodes)} nodes" for r in graphs["decode"].runners)
+    print(f"the step as {len(starts) + 1} ranges of whole layers, starting at layers 0, "
+          f"{', '.join(map(str, starts))} (decode: {ranges}; no state read by two ranges, where cutting before "
+          f"layer {illegal} would share {', '.join(wrong)}), against the plain engine (must be bit-identical):")
+    rows, _ = compare(plain, got, strict_tokens=True)
+    print(table(plain, got, rows))
+    if not same:
+        print("layer ranges check: not bit-identical")
+    return same
+
+
 def _check_native_nodes(model, prompts, settings, artifact, workdir):
     """The decode step's host nodes served native (nodes.py,
     nodeserver.py, #394): a node server for every experts and n-gram node,
@@ -1912,6 +1961,8 @@ def selftest(workdir, settings):
             failed.append(name + " (expert mailboxes)")
         if name == "tiny-deepseek-v41" and not _check_cuts(artifact):
             failed.append(name + " (layer cuts)")
+        if name == "tiny-deepseek-v41" and not _check_slices(model, prompts, settings, artifact, got):
+            failed.append(name + " (layer ranges)")
         if name == "tiny-deepseek-v41" and not _check_native_nodes(model, prompts, settings, artifact, workdir):
             failed.append(name + " (native nodes)")
         if name == "tiny-deepseek-v41" and not _check_remote_nodes(model, prompts, settings, artifact, got, workdir):
