@@ -26,10 +26,11 @@ fi
 
 REPO_ROOT="$(git rev-parse --show-toplevel)"
 
-# the Go protos (pkg/api/v1alpha1); the Python stubs (python/vxpu/vxpu_pb2*.py)
-# come from the executor image's grpcio-tools, to match its protobuf runtime
+# Generate the Go code for the executor's and the machine agent's protos, in
+# pkg/api/v1alpha1. The Python stubs (python/vxpu/vxpu_pb2*.py) come from the
+# executor image's grpcio-tools instead, so they match its protobuf runtime.
 cd "${REPO_ROOT}/vxpu"
 ap tool protoc -- -I . \
   --go_out=. --go_opt=module=github.com/gke-labs/generation-ai/vxpu \
   --go-grpc_out=. --go-grpc_opt=module=github.com/gke-labs/generation-ai/vxpu \
-  proto/vxpu.proto
+  proto/vxpu.proto proto/agent.proto

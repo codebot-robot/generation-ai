@@ -326,6 +326,21 @@ http://10.128.0.9:8080` (an internal load balancer, say). The executor
 image keys compiled artifacts (`vxpu register`): pin it by digest, since
 a rebuilt tag such as `:latest` reuses what the previous build compiled.
 
+Or give it a weights disk (#407). A weights disk holds the checkpoint's
+files, and the VM attaches it instead of copying the files:
+
+```sh
+# Once per checkpoint, a factory VM copies the files onto a disk, and we snapshot it.
+vxpu disk build --project P --zone Z --image ds-flash --bucket gs://BUCKET --manifest ARTIFACT/manifest.json
+# For each executor VM, make a disk from the snapshot in its zone, attach it read-only,
+# and have the VM's agent mount it.
+vxpu disk attach --project P --zone Z --vm VM --image ds-flash --disk ds-flash-z --agent VM_IP:50052
+```
+
+`attach` prints the blob directory to give the executor as
+`VXPU_BLOB_DIR`. The VM runs `vxpu-agent` as root (`cmd/vxpu-agent`), the
+per-machine agent that mounts the disk and checks it against its index.
+
 ## Weights: the store
 
 Weights are pulled from the Hub once and kept in the cluster's weight

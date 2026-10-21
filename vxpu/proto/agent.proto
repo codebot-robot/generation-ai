@@ -1,0 +1,68 @@
+// Copyright 2026 Google LLC
+//
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+//     http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
+
+
+syntax = "proto3";
+
+package vxpu;
+
+option go_package = "github.com/gke-labs/generation-ai/vxpu/pkg/api/v1alpha1;v1alpha1";
+
+// Agent runs as root on every machine the coordinator uses (#384). It does
+// the work that needs the machine itself. For now, that means mounting the
+// disks that carry a checkpoint's weights (#407). Later it will also set up
+// the rest of the machine: the local SSD, the weights an executor needs, and
+// the executor itself.
+service Agent {
+  // MountWeights mounts a weights disk read-only, after the coordinator has
+  // attached it under device_name. It then checks the disk against its
+  // index: every file must be present at its size and, with verify, have
+  // its sha256. The executor reads the files in place, with VXPU_BLOB_DIR
+  // set to blob_dir. Calling it again for a mounted disk does nothing more.
+  rpc MountWeights(MountWeightsRequest) returns (MountWeightsResponse);
+  // UnmountWeights unmounts the disk. The coordinator calls it before it
+  // detaches the disk.
+  rpc UnmountWeights(UnmountWeightsRequest) returns (UnmountWeightsResponse);
+}
+
+message MountWeightsRequest {
+  // The device name the disk is attached under. The agent finds the disk
+  // at /dev/disk/by-id/google-<device_name>.
+  string device_name = 1;
+  // If set, the agent reads every file and checks its sha256. This reads
+  // the whole disk, so it's slow, but it also measures the disk's read
+  // throughput.
+  bool verify = 2;
+}
+
+message MountWeightsResponse {
+  // Where the agent mounted the disk, and the disk's blob directory, which
+  // holds one file per checkpoint file, named by its sha256.
+  string mount_dir = 1;
+  string blob_dir = 2;
+  // The files the disk's index lists, by sha256, with their sizes.
+  map<string, int64> files = 3;
+  int64 total_bytes = 4;
+  // How long mounting and checking took, and, with verify, how long reading
+  // and hashing every file took. total_bytes / verify_seconds gives the
+  // disk's read throughput on this machine.
+  double mount_seconds = 5;
+  double verify_seconds = 6;
+}
+
+message UnmountWeightsRequest {
+  string device_name = 1;
+}
+
+message UnmountWeightsResponse {}
