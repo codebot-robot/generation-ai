@@ -234,7 +234,9 @@ class StepGraph(torch.nn.Module):
         for node in host_nodes:
             dev_ = runner._devices[node.name]
             example = [runner._arg(r, dev_, inputs) for r in node.args]
-            like = next(t for (p, _, _), t in runner.inboxes.items() if p == node.name)
+            like = next((t for (p, _, _), t in runner.inboxes.items() if p == node.name), None)
+            if like is None:  # its output only leaves the slice (#387): no inbox, shaped as returned
+                like = runner.returned[node.name]
             out_like, peer_boxes = like, {}
             if node.kind == "experts":
                 layer, where = _experts_call(getattr(self.split, node.name))

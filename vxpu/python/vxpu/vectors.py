@@ -1652,6 +1652,63 @@ def _check_engine_ranges(model, prompts, settings, artifact, plain):
     return same and not misplaced
 
 
+def _cuda():
+    import torch
+    return torch.cuda.is_available()
+
+
+def _check_range_server(model, prompts, settings, artifact, plain, device="cpu"):
+    """A range of whole layers over the network (#387): an engine running
+    the layers from the last legal cut on, served on a local port
+    (rangeserver.serve), and the head engine running the layers before it
+    sending each step there (RemoteRange): prefill, decode, every prompt its
+    own session, and a two-turn conversation. Tokens and logits
+    bit-identical to the plain engine's (device: cpu, or cuda with the step
+    graph, where the range's decode steps replay natively)."""
+    from . import cuts, rangeserver
+    from .engine import Engine, SamplingParams
+    cut = cuts.describe(artifact)["legal"][-1]
+    base = {"VXPU_DATAFLOW": "1", "VXPU_DATAFLOW_PLACE": None, "VXPU_EXPERT_MAILBOXES": None, "VXPU_GPU_EXPERTS": None}
+    kw = {}
+    if device != "cpu":
+        base.update({"VXPU_SEGMENT_RUNTIME": "aoti", "VXPU_STEP_GRAPH": "1"})
+        kw = {"device": device, "compile_decode": True}
+    if device != "cpu":  # the reference: one engine, the same step graph on the same GPU
+        plain = _with_env(base, record_vxpu_engine, model, "main", prompts, settings, artifact, **kw)
+    tail = _with_env({**base, "VXPU_LAYER_RANGE": f"{cut}:"}, Engine, artifact, **kw)
+    server = rangeserver.serve(tail)
+    try:
+        keep = []
+        address = f"tcp://127.0.0.1:{server.port()}"
+        got = _with_env({**base, "VXPU_LAYER_RANGE": f"0:{cut}"}, record_vxpu_engine, model, "main", prompts, settings,
+                        artifact, keep=keep, prepare=lambda h: h.attach_ranges([rangeserver.RemoteRange(address, h.device)]),
+                        **kw)
+        head = keep[0]
+        sid, turns, ids = head.new_session(), [], list(ID_PROMPTS[0]["ids"])
+        for turn in range(2):
+            new = [t for ev in head.generate(sid, ids, 8, SamplingParams(do_sample=False)) for t in ev["token_ids"]]
+            turns.append(new)
+            ids = ids + new + list(ID_PROMPTS[1]["ids"][:5 + turn])
+        messages, native = server.messages(), server.native_steps()
+    finally:
+        server.stop()
+    reference = _with_env(base, Engine, artifact, **kw)
+    sid, want, ids = reference.new_session(), [], list(ID_PROMPTS[0]["ids"])
+    for turn in range(2):
+        new = [t for ev in reference.generate(sid, ids, 8, SamplingParams(do_sample=False)) for t in ev["token_ids"]]
+        want.append(new)
+        ids = ids + new + list(ID_PROMPTS[1]["ids"][:5 + turn])
+    same = ([p["generated_ids"] for p in got["prompts"]] == [p["generated_ids"] for p in plain["prompts"]]
+            and [p["top_logits"] for p in got["prompts"]] == [p["top_logits"] for p in plain["prompts"]] and turns == want)
+    print(f"a range of layers {cut}-last on a range server over tcp://, the head sending each step ({messages} messages, "
+          f"{native} decode steps replayed natively), against the plain engine (must be bit-identical):")
+    rows, _ = compare(plain, got, strict_tokens=True)
+    print(table(plain, got, rows))
+    if not same:
+        print(f"range server check: not bit-identical (conversation {turns} against {want})")
+    return same
+
+
 def _check_native_nodes(model, prompts, settings, artifact, workdir):
     """The decode step's host nodes served native (nodes.py,
     nodeserver.py, #394): a node server for every experts and n-gram node,
@@ -2012,6 +2069,11 @@ def selftest(workdir, settings):
             failed.append(name + " (layer ranges)")
         if name == "tiny-deepseek-v41" and not _check_engine_ranges(model, prompts, settings, artifact, got):
             failed.append(name + " (engine ranges)")
+        if name == "tiny-deepseek-v41" and not _check_range_server(model, prompts, settings, artifact, got):
+            failed.append(name + " (range server)")
+        if name == "tiny-deepseek-v41" and _cuda() and not _check_range_server(model, prompts, settings, artifact, got,
+                                                                                device="cuda"):
+            failed.append(name + " (range server, step graph)")
         if name == "tiny-deepseek-v41" and not _check_native_nodes(model, prompts, settings, artifact, workdir):
             failed.append(name + " (native nodes)")
         if name == "tiny-deepseek-v41" and not _check_remote_nodes(model, prompts, settings, artifact, got, workdir):
