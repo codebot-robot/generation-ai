@@ -64,8 +64,9 @@ type Artifact struct {
 	// what a decode step reads of the dense weights (all but the
 	// embedding table, which it only indexes): fp8 weights, and the rest
 	DecodeFP8Bytes, DecodeOtherBytes int64
-	TopK                             int // routed experts each token selects in each layer
-	EngramLayers                     int // layers with an n-gram table (a host op each, like the experts)
+	TopK                             int   // routed experts each token selects in each layer
+	EngramLayers                     int   // layers with an n-gram table (a host op each, like the experts)
+	Engram                           []int // which layers those are, when known
 }
 
 // Layer is one layer's routed experts.
@@ -124,6 +125,14 @@ func ReadArtifact(manifestJSON, bindingJSON []byte) (Artifact, error) {
 	}
 	a := Artifact{Experts: map[int]Layer{}, TopK: max(manifest.Config.NumExpertsPerTok, manifest.Config.TextConfig.NumExpertsPerTok),
 		EngramLayers: len(binding.External.Engram)}
+	for key := range binding.External.Engram {
+		layer, err := strconv.Atoi(key)
+		if err != nil {
+			return Artifact{}, fmt.Errorf("n-gram table of layer %q: %w", key, err)
+		}
+		a.Engram = append(a.Engram, layer)
+	}
+	sort.Ints(a.Engram)
 	for name, t := range binding.Bound {
 		a.DenseBytes += t.Length
 		switch {
@@ -174,8 +183,12 @@ type Plan struct {
 	// serves, as nodes of the decode step, to the engine's mailboxes
 	// (ServeNodes).
 	ExpertExecutors map[string][]int `json:"expert_executors,omitempty"`
-	Reasons         []string         `json:"reasons"`
-	Prediction      Prediction       `json:"prediction"`
+	// Paged is the layers whose experts fit no machine's RAM: they stay
+	// on the engine, paged from its disk (which the cost model does not
+	// price).
+	Paged      []int      `json:"paged_layers,omitempty"`
+	Reasons    []string   `json:"reasons"`
+	Prediction Prediction `json:"prediction"`
 }
 
 // Executor is another executor the coordinator may give experts to.
@@ -281,6 +294,7 @@ func spread(p *Plan, a Artifact, probe *machines.Probe, others []Executor) map[i
 			held[0], held[len(held)-1], gb(bytes), other.Address, describe(other.Probe), gb(other.Probe.RAMBytes)))
 	}
 	if next < len(layers) {
+		p.Paged = layers[next:]
 		var short int64
 		for _, layer := range layers[next:] {
 			short += int64(a.Experts[layer].Experts) * a.Experts[layer].BytesPerExpert

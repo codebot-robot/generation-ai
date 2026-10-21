@@ -70,9 +70,33 @@ becomes the selected implementation, its Triton kernels visible to the
 compiler. Dense segments then compile ahead of time with AOTInductor
 (`aoti.py`), cached per artifact, plan and machine.
 
-**Direction.** The planner chooses between plans by cost. That needs a
-model of the hardware (#349) and the engine's own statistics (§5), and in
-the end it owns all placement (§4, §6; #316, #387).
+The planner also generates the layouts a model could run in on a set of
+machines and ranks them by the cost model (`planner.Candidates`, #409),
+without running anything:
+- **one machine:** it runs the step and holds every expert;
+- **experts spread:** one machine runs the step, every layer's dense half
+  on its GPU, and other machines' node servers serve the experts it
+  can't hold, a network round trip per remote layer;
+- **layer ranges:** each of a few machines runs a contiguous range of
+  whole layers, dense half and experts, on its own GPU and RAM, so a
+  token crosses the network once per range.
+
+`vxpu explain --artifact DIR --machines g2-standard-48:2,c3d-standard-60:2`
+lists them with their predicted parts. The cost model is calibrated from
+measurement: the network wire per call, the GPU-CPU crossings, each
+machine's dense and expert rates. A CPU's dense half (attention, the
+compressor, the hyper-connections) runs at 6.65 GB/s on a c3d-standard-60
+against 203 GB/s on an L4. So for DeepSeek-V4.1-Flash on a g2-standard-24
+and two c3d-standard-60s, the model rejects moving whole layers to the
+c3ds (1050 against 115 ms/token), and on two g2-standard-48s it picks a
+layer range on each (66 against 97). The planner arrives at the layout
+from the measurements, not from a rule written for it. Layer ranges need
+a node server that runs whole layers, dense half and KV cache included
+(#387), before the executors can run them.
+
+**Direction.** The planner chooses between plans by cost, the cost model
+grows to time to start, cost to start and cost per minute (#349), and in
+the end the planner owns all placement (§4, §6; #316, #387).
 
 The planner is part of the coordinator, and the coordinator is Go, next
 to the router: it manages cloud machines and runs across the cluster,
