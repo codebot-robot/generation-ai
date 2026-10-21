@@ -1540,12 +1540,13 @@ def _check_node_client():
 def _check_native_nodes(model, prompts, settings, artifact, workdir):
     """The decode step's host nodes served native (nodes.py,
     nodeserver.py, #394): a node server for every experts and n-gram node,
-    each lowered to the native kernels and compiled by AOTInductor, sent
-    the inputs the engine gave it in a decode step over TCP, replies
-    bit-identically what the engine's node returned."""
+    each lowered to the native kernels and compiled by AOTInductor (the
+    experts nodes, one package for all layers), sent the inputs the engine
+    gave it in a decode step over TCP, replies bit-identically what the
+    engine's node returned."""
     import time
     import torch
-    from . import nodeserver
+    from . import nodes, nodeserver
     from .engine import SamplingParams
     keep = []
     _with_env({"VXPU_DATAFLOW": "1", "VXPU_DATAFLOW_PLACE": None, "VXPU_EXPERT_MAILBOXES": None,
@@ -1572,6 +1573,11 @@ def _check_native_nodes(model, prompts, settings, artifact, workdir):
             h.remove()
     server = nodeserver.start(artifact, host, cache_dir=os.path.join(workdir, "native-nodes"))
     bad, calls = [], 0
+    # every experts layer's node is the same code on its own banks: one package
+    kinds = nodes.host_calls(split)
+    experts = {path for name, path in zip(host, server.packages) if kinds[name][0] == "experts"}
+    if len(experts) != 1:
+        bad.append(f"{len(experts)} packages for the experts nodes")
     t = time.perf_counter()
     idle = nodeserver.connect(f"127.0.0.1:{server.port()}")  # still connected when the server stops
     try:

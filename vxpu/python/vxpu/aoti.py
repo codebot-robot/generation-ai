@@ -27,11 +27,14 @@ aoti):
            deterministic mode: no choice that changes numerics is made by
            timing kernels on the device, so a package computes the same
            bits whichever machine built it (and costs nothing measurable).
-           Packages are cached on disk under a key of the segment's code,
-           its argument shapes, dtypes and strides, the kernels' source,
-           the torch version, the GPU and the inductor settings that
-           change numerics: the compiled plan, reused by every later load
-           of the same artifact on the same kind of machine
+           Packages are cached on disk under a key of the segment's code
+           with its values named by position (so the layers that compute
+           the same thing on different weights share one package), its
+           argument shapes, dtypes and strides, the kernels' source, the
+           torch version, the device it is compiled for (the GPU, or the
+           CPU's features) and the inductor settings that change
+           numerics: the compiled plan, reused by every later load of the
+           same artifact on the same kind of machine
   graph    the package is loaded single-threaded (the default runner's
            model pool queries CUDA events, which a capture forbids); the
            first call runs it eagerly, the second captures it into a CUDA
@@ -60,12 +63,56 @@ FORMAT = "vxpu-aoti/1"  # in the cache key: a change here invalidates every pack
 NUMERICS_CONFIG = ("deterministic", "prologue_fusion", "emulate_precision_casts")
 
 
+def canonical_code(sub, args_of=None):
+    """The segment's graph with its values named by position: what it
+    computes, without the names it was given. Layer 9's attention and
+    layer 10's differ only in names (their weights are arguments), so
+    they share one package. Targets and literal arguments are kept, so
+    graphs that compute different things stay apart. args_of: {node:
+    args} to render in place of a node's own (a native node's host call,
+    whose module index the lowering consumes)."""
+    names = {n: f"v{i}" for i, n in enumerate(sub.graph.nodes)}
+    lines = []
+    for n in sub.graph.nodes:
+        t = n.target
+        if n.op == "placeholder":
+            target = ""  # an input's name: its position is what counts
+        elif isinstance(t, str):
+            target = t
+        elif isinstance(t, torch._ops.OpOverload):
+            target = str(t)
+        else:
+            target = f"{getattr(t, '__module__', '')}.{getattr(t, '__qualname__', repr(t))}"
+        args = (args_of or {}).get(n, n.args)
+        render = torch.fx.node.map_arg((args, n.kwargs), lambda a: names[a])
+        lines.append(f"{names[n]} = {n.op} {target} {render!r}")
+    return "\n".join(lines)
+
+
+def _target_device(args):
+    """What a package is compiled for: the GPU (its name, compute
+    capability, CUDA version) when it runs on one, else the CPU, which
+    inductor compiles for natively (-march=native): its feature flags."""
+    for a in args:
+        if isinstance(a, torch.Tensor) and a.is_cuda:
+            props = torch.cuda.get_device_properties(a.device)
+            return f"{props.name} {props.major}.{props.minor} cuda {torch.version.cuda}"
+    try:
+        with open("/proc/cpuinfo") as f:
+            flags = next((line for line in f if line.startswith(("flags", "Features"))), "")
+    except OSError:
+        import platform
+        flags = platform.processor()
+    return "cpu " + " ".join(sorted(flags.split(":", 1)[-1].split()))
+
+
 def cache_key(sub, args, extra="", code=None):
     """The content key of a segment's package: extra is what else it
-    depends on (a native node's lowering), code its graph's code."""
+    depends on (a native node's lowering), code its graph's code (by
+    default canonical_code)."""
     h = hashlib.sha256()
     h.update(FORMAT.encode())
-    h.update((code if code is not None else sub.code).encode())
+    h.update((code if code is not None else canonical_code(sub)).encode())
     h.update(extra.encode())
     for a in args:
         if isinstance(a, torch.Tensor):
@@ -78,9 +125,7 @@ def cache_key(sub, args, extra="", code=None):
     import torch._inductor.config as inductor_config
     for name in NUMERICS_CONFIG:  # inductor settings that change what a package computes
         h.update(f"{name}={getattr(inductor_config, name, None)}".encode())
-    if torch.cuda.is_available():
-        props = torch.cuda.get_device_properties(torch.cuda.current_device())
-        h.update(f"{props.name} {props.major}.{props.minor}".encode())
+    h.update(_target_device(args).encode())
     return h.hexdigest()[:32]
 
 

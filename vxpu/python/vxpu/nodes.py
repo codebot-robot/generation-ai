@@ -30,8 +30,10 @@ torch ops and native kernels only and compiles to a package as well:
 The tensors the lowering reads (the banks, the tables) are the node's
 residents: they become arguments after the node's inputs, passed by
 address on every call, never copied into the package. The package is
-cached like a dense segment's, under a key of the node's code, its
-arguments' shapes and the native kernels' source.
+cached like a dense segment's, under a key of the node's code (without
+the layer it reads), the lowering's constants, its arguments' shapes and
+the native kernels' source: every experts layer of a model is one
+package, built once.
 
 The lowerings are the implementations the engine selects for a decode
 step on the CPU (ops.py: cpu-fused, host-parallel), with the same kernels
@@ -45,7 +47,7 @@ import inspect
 
 import torch
 
-from . import kernels
+from . import aoti, kernels
 
 _registered = False
 
@@ -72,7 +74,9 @@ def _register_fakes():
 
 # ---------------------------------------------------------------------------
 # the lowerings: (the host op's arguments, its module) -> (a function of the
-# op's tensor arguments and the residents, the residents)
+# op's tensor arguments and the residents, the residents, the constants the
+# function computes with: with the code and the shapes, all the package
+# depends on, so layers with the same constants share it)
 
 def _lower_moe_experts(moe):
     # the scales as their bytes: the native op reads them so (an e8m0
@@ -86,7 +90,7 @@ def _lower_moe_experts(moe):
         # layer's first expert, the weights in fp32
         sel = (indices - start).to(torch.int64)
         return torch.ops.vxpu_native.fp4_moe_decode(x_in, weights.float(), sel, w1, s1, w3, s3, w2, s2, limit)
-    return fn, residents
+    return fn, residents, (start, limit)
 
 
 def _scale_float(scale):
@@ -114,7 +118,7 @@ def _lower_engram_rows(embed):
         scales = torch.ops.vxpu_native.gather_rows(scale, local)
         values = values.float().unflatten(-1, (-1, block)) * _scale_float(scales).unsqueeze(-1)
         return values.flatten(-2).to(torch.bfloat16).masked_fill(mask.unsqueeze(-1), 0)
-    return fn, residents
+    return fn, residents, (start, end, block)
 
 
 # host op target -> (which of external's collections its integer argument
@@ -162,9 +166,12 @@ class NativeNode(torch.nn.Module):
         kind, lower, self.token_dims = LOWERINGS[_host_op(call.target)]
         index = next(a for a in call.args if isinstance(a, int))
         module = getattr(external, kind)[index]
-        self.fn, self.residents = lower(module)
+        self.fn, self.residents, constants = lower(module)
         self.n_inputs = len([n for n in sub.graph.nodes if n.op == "placeholder"])
-        self.description = f"{_host_op(call.target)}({index}) via {lower.__name__}"
+        # not the module's index: the residents are arguments, so every
+        # layer's node with the same constants is the same package
+        self.description = f"{_host_op(call.target)} via {lower.__name__}{constants!r}"
+        self.code = aoti.canonical_code(sub, args_of={call: tuple(a for a in call.args if not isinstance(a, int))})
 
     def forward(self, *args):
         inputs, residents = args[:self.n_inputs], args[self.n_inputs:]
@@ -181,7 +188,7 @@ class NativeNode(torch.nn.Module):
 
     def cache_extra(self):
         """What the package depends on besides the node's code and shapes:
-        the lowering and the native kernels' source."""
+        the lowering, its constants and the native kernels' source."""
         h = hashlib.sha256(self.description.encode())
         h.update(inspect.getsource(inspect.getmodule(NativeNode)).encode())
         for source in kernels.SOURCES:
@@ -206,7 +213,7 @@ def native_package(packages, sub, external, inputs):
         spec.append({dim: tokens})
     args = examples + list(node.residents)
     dynamic = {"args": tuple(spec) + (None,) * len(node.residents)}
-    return packages.path(node, args, extra=node.cache_extra() + "tokens", code=sub.code,
+    return packages.path(node, args, extra=node.cache_extra() + "tokens", code=node.code,
                          dynamic_shapes=dynamic), node.residents
 
 

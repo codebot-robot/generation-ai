@@ -284,7 +284,8 @@ computes.
 - Across machines, a node runs on a node server (`nodeserver.py`,
   `csrc/node_server.cpp`, #394): the node compiled to an AOTInductor
   package, a host op lowered to the native kernels (`nodes.py`), its
-  residents loaded once, answering its mailbox over TCP (`tcp://`, a
+  residents loaded once and passed by address (so every layer's experts
+  node is the same package, compiled once), answering its mailbox over TCP (`tcp://`, a
   small binary framing) with no Python per message. The engine's side is
   a native client, reached from the host op itself, so node by node,
   the dataflow runner, the step graph and prefill all reach it. The
