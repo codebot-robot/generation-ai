@@ -2,7 +2,7 @@ module github.com/gke-labs/generation-ai/modelstore
 
 go 1.27.0
 
-toolchain go1.27.2
+toolchain go1.27.3
 
 require (
 	cloud.google.com/go/storage v1.69.0

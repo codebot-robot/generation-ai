@@ -2,7 +2,7 @@ module github.com/gke-labs/generation-ai/experiments/scalingpolicy
 
 go 1.27.0
 
-toolchain go1.27.2
+toolchain go1.27.3
 
 require (
 	github.com/bradfitz/gomemcache v0.0.0-20250403215159-8d39553ac7cf
