@@ -278,17 +278,25 @@ computes.
 - The routed experts are nodes too: a token's (token, k) pairs go to the
   experts' owners, and the replies are summed in a fixed order, so the
   result does not depend on who answered.
-- On one machine, the whole step can be one CUDA graph: host ops become
-  mailboxes the GPU waits on itself (a flag in pinned memory), with no
-  Python in between.
+- On one machine, the whole step is one CUDA graph (`stepgraph.py`):
+  host ops become mailboxes the GPU waits on itself (a flag in pinned
+  memory). The step host, a native thread (#409), answers them: it sees
+  a node's flag, runs the node on the pinned inputs (its native package,
+  or a node server through the native client), writes the reply and
+  raises the flag back. No Python runs between the GPU's flag and the
+  reply, and the step host times each crossing.
+- Code on the data path, per message or per step, is native from the
+  start, with its timers built in: we don't build a Python version to
+  measure first and replace later. Python sets things up (graphs,
+  lowerings, packages, residents) and gets out of the way.
 - Across machines, a node runs on a node server (`nodeserver.py`,
   `csrc/node_server.cpp`, #394): the node compiled to an AOTInductor
   package, a host op lowered to the native kernels (`nodes.py`), its
   residents loaded once and passed by address (so every layer's experts
   node is the same package, compiled once), answering its mailbox over TCP (`tcp://`, a
   small binary framing) with no Python per message. The engine's side is
-  a native client, reached from the host op itself, so node by node,
-  the dataflow runner, the step graph and prefill all reach it. The
+  a native client: the step host calls it directly, and node by node,
+  the dataflow runner and prefill reach it from the host op. The
   coordinator places nodes by name: an executor describes the decode
   step's nodes (`DescribeNodes`) and serves those it is given
   (`ServeNodes`). Remote nodes are bit-identical to local ones. RDMA

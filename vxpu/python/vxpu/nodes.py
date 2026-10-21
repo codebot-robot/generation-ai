@@ -27,6 +27,11 @@ torch ops and native kernels only and compiles to a package as well:
   vxpu::engram_rows   vxpu_native::gather_rows on the table and its
                       scales, dequantized with torch ops
 
+and, for the step graph's experts node on a layer whose hot experts GPU
+pools hold (stepgraph.py, #409), vxpu_native::fp4_moe_decode_cold: one
+reply per (token, k) pair, the pairs no pool holds, as mailboxes.CpuOwner
+computes them.
+
 The tensors the lowering reads (the banks, the tables) are the node's
 residents: they become arguments after the node's inputs, passed by
 address on every call, never copied into the package. The package is
@@ -38,8 +43,10 @@ package, built once.
 The lowerings are the implementations the engine selects for a decode
 step on the CPU (ops.py: cpu-fused, host-parallel), with the same kernels
 on the same arguments, so a native node is bit-identical to the node run
-in the engine. A node server (next) loads the package and runs it on the
-messages its mailboxes receive, with no Python in between.
+in the engine. Two native runners load the packages and run them with no
+Python in between: a node server (nodeserver.py), on the messages its
+mailboxes receive over TCP, and the engine's step host (stepgraph.py), on
+the step graph's mailboxes for the host nodes the engine keeps.
 """
 
 import hashlib
@@ -64,6 +71,10 @@ def _register_fakes():
     @torch.library.register_fake("vxpu_native::fp4_moe_decode")
     def _(x_in, weights, indices, w1, s1, w3, s3, w2, s2, swiglu_limit):
         return x_in.new_empty((x_in.shape[0], x_in.shape[1]), dtype=torch.float32)
+
+    @torch.library.register_fake("vxpu_native::fp4_moe_decode_cold")
+    def _(x_in, weights, indices, held, w1, s1, w3, s3, w2, s2, swiglu_limit):
+        return x_in.new_empty((indices.shape[0], indices.shape[1], x_in.shape[1]), dtype=torch.float32)
 
     @torch.library.register_fake("vxpu_native::gather_rows")
     def _(table, indices):
@@ -91,6 +102,25 @@ def _lower_moe_experts(moe):
         sel = (indices - start).to(torch.int64)
         return torch.ops.vxpu_native.fp4_moe_decode(x_in, weights.float(), sel, w1, s1, w3, s3, w2, s2, limit)
     return fn, residents, (start, limit)
+
+
+def _lower_moe_experts_cold(moe, slot_maps):
+    """The routed experts of a layer whose hot experts GPU pools hold
+    (the step graph, #409): one reply per (token, k) pair, zero for the
+    pairs a pool holds, as stepgraph's mailboxes expect. slot_maps: each
+    pool's slot_cpu (expert - start -> slot, -1 if not held), residents
+    passed by address, so a move of an expert is seen by the next call."""
+    residents = [moe.w1, moe.w1_scale.view(torch.uint8), moe.w3, moe.w3_scale.view(torch.uint8),
+                 moe.w2, moe.w2_scale.view(torch.uint8)] + list(slot_maps)
+    start, limit = int(moe.experts_start_idx), float(moe.swiglu_limit)
+
+    def fn(x_in, weights, indices, w1, s1, w3, s3, w2, s2, *maps):
+        sel = (indices - start).to(torch.int64)
+        held = torch.zeros_like(sel, dtype=torch.bool)
+        for slots in maps:
+            held = held | (slots[sel] >= 0)
+        return torch.ops.vxpu_native.fp4_moe_decode_cold(x_in, weights, sel, held, w1, s1, w3, s3, w2, s2, limit)
+    return fn, residents, (start, limit, len(slot_maps))
 
 
 def _scale_float(scale):
@@ -153,9 +183,11 @@ def host_call(sub):
 
 class NativeNode(torch.nn.Module):
     """A host node with its host op lowered: called with the node's
-    inputs, then its residents."""
+    inputs, then its residents. slot_maps: for an experts node whose layer
+    has GPU pools, the pools' slot maps (one reply per pair, the cold ones
+    only: _lower_moe_experts_cold)."""
 
-    def __init__(self, sub, external):
+    def __init__(self, sub, external, slot_maps=None):
         super().__init__()
         _register_fakes()
         self.sub = sub
@@ -166,7 +198,13 @@ class NativeNode(torch.nn.Module):
         kind, lower, self.token_dims = LOWERINGS[_host_op(call.target)]
         index = next(a for a in call.args if isinstance(a, int))
         module = getattr(external, kind)[index]
-        self.fn, self.residents, constants = lower(module)
+        if slot_maps:
+            if kind != "experts":
+                raise ValueError(f"slot maps are for experts nodes, not {kind}")
+            lower = _lower_moe_experts_cold
+            self.fn, self.residents, constants = lower(module, slot_maps)
+        else:
+            self.fn, self.residents, constants = lower(module)
         self.n_inputs = len([n for n in sub.graph.nodes if n.op == "placeholder"])
         # not the module's index: the residents are arguments, so every
         # layer's node with the same constants is the same package
@@ -197,11 +235,12 @@ class NativeNode(torch.nn.Module):
         return h.hexdigest()
 
 
-def native_package(packages, sub, external, inputs):
+def native_package(packages, sub, external, inputs, slot_maps=None):
     """The package file of a host node (built first if not cached), for
     any number of tokens, and its residents: run it on its inputs, then
-    its residents. inputs: the node's decode-step inputs (their shapes)."""
-    node = NativeNode(sub, external)
+    its residents. inputs: the node's decode-step inputs (their shapes).
+    slot_maps: NativeNode's."""
+    node = NativeNode(sub, external, slot_maps)
     # exported on two tokens, with the token dimension dynamic: one token
     # would be specialized (torch.export fixes dimensions of size 1)
     tokens = torch.export.Dim("tokens", min=1, max=1 << 16)

@@ -215,18 +215,21 @@ On DeepSeek-V4.1-Flash the graph is 85 nodes (43 dense, 40 experts,
   packages (`python/vxpu/nodeserver.py`; the coordinator starts them with
   `ServeNodes` and sets this). The engine does not load those nodes'
   banks or tables, and the results are bit-identical.
-- **`VXPU_STEP_GRAPH=1`** (CUDA, with `VXPU_DATAFLOW=1` and
-  `VXPU_SEGMENT_RUNTIME=aoti`) captures the whole decode step in one CUDA
-  graph (`python/vxpu/stepgraph.py`):
+- **`VXPU_STEP_GRAPH=1`** (CUDA, with `VXPU_DATAFLOW=1`,
+  `VXPU_SEGMENT_RUNTIME=aoti` and the CPU kernels) captures the whole
+  decode step in one CUDA graph (`python/vxpu/stepgraph.py`):
   - the dense nodes are their AOTInductor packages;
   - each host op is a mailbox in the graph: the GPU copies the inputs to
-    pinned memory and raises a flag (`cuStreamWriteValue32`); a CPU
-    worker answers and raises a flag back; the GPU waits on that flag
+    pinned memory and raises a flag (`cuStreamWriteValue32`); the step
+    host, a native thread (`csrc/node_server.cpp`), runs the node (its
+    native package, or a node server's through the native client) and
+    raises a flag back; the GPU waits on that flag
     (`cuStreamWaitValue32`) and copies the reply in;
-  - hot experts in a GPU pool run inside the graph while the CPU answers
-    the rest.
+  - hot experts in a GPU pool run inside the graph while the step host
+    answers the rest.
 
-  Python launches a step and waits for its end.
+  Python launches a step and waits for its end; no Python runs between a
+  host op's flag and its reply.
 
 Measured on DeepSeek-V4.1-Flash (a g4-standard-96, two RTX PRO 6000s; ten
 prompts none of which were in the traffic the placements came from):

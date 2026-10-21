@@ -12,11 +12,21 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-// A node server (#394): dataflow nodes, as AOTInductor packages, answering
-// their mailboxes over TCP with no Python between messages. Python builds
-// the packages and loads the nodes' residents (nodes.py, nodeserver.py),
-// then starts the server; from there, a message is read, run and answered
-// by the threads here.
+// The native data path of a decode step's host nodes: no Python between
+// messages.
+//
+//   NodeServer  (#394) dataflow nodes, as AOTInductor packages, answering
+//               their mailboxes over TCP. Python builds the packages and
+//               loads the nodes' residents (nodes.py, nodeserver.py), then
+//               starts the server; from there, a message is read, run and
+//               answered by the threads here.
+//   NodeClient  the engine's side of a tcp:// mailbox.
+//   StepHost    (#409) the engine's side of the step graph's mailboxes
+//               (stepgraph.py): a thread that waits for each host node's
+//               flag from the GPU, runs the node (its native package here,
+//               or a node server's through a NodeClient) on the pinned
+//               inputs, writes the reply into the pinned outbox and raises
+//               the flag back, timing each step of the crossing.
 //
 // The wire format, both ways, little-endian (tcp:// mailboxes):
 //
@@ -41,6 +51,7 @@
 
 #include <atomic>
 #include <chrono>
+#include <condition_variable>
 #include <cstring>
 #include <functional>
 #include <memory>
@@ -51,6 +62,10 @@
 #include <string>
 #include <thread>
 #include <vector>
+
+#if defined(__x86_64__)
+#include <immintrin.h>
+#endif
 
 namespace {
 
@@ -361,8 +376,179 @@ class NodeClient {
   std::mutex mu_;
 };
 
+namespace {
+
+int64_t now_ns() {
+  return std::chrono::duration_cast<std::chrono::nanoseconds>(
+             std::chrono::steady_clock::now().time_since_epoch()).count();
+}
+
+void spin_pause() {
+#if defined(__x86_64__)
+  _mm_pause();
+#else
+  std::this_thread::yield();
+#endif
+}
+
+}  // namespace
+
+// StepHost answers the step graph's host nodes, in step order, once per
+// step. Host node i owns two int32 flags in pinned memory the GPU can
+// see: flags[2i] (to the CPU: its inputs are in the pinned inboxes) and
+// flags[2i+1] (from the CPU: the reply is in the pinned outbox). Each
+// node is answered by its own native package (local: residents passed by
+// address, as a node server runs it) or by a node server (remote: a
+// NodeClient and the server's node index). Per node and step it records,
+// in steady-clock ns: when it saw the GPU's flag, when the reply was in
+// the outbox, and when it raised the flag back.
+class StepHost {
+ public:
+  explicit StepHost(at::Tensor flags) : flags_(std::move(flags)) {
+    TORCH_CHECK(flags_.dtype() == at::kInt && flags_.is_contiguous() && flags_.is_pinned(),
+                "step host: the flags must be pinned contiguous int32");
+  }
+
+  ~StepHost() { stop(); }
+
+  void add_local(const std::vector<at::Tensor>& inputs, const at::Tensor& outbox, const std::string& package,
+                 const std::vector<at::Tensor>& residents) {
+    auto box = make_box(inputs, outbox);
+    box->loader = std::make_unique<torch::inductor::AOTIModelPackageLoader>(package);
+    box->residents = residents;
+    boxes_.push_back(std::move(box));
+  }
+
+  void add_remote(const std::vector<at::Tensor>& inputs, const at::Tensor& outbox,
+                  std::shared_ptr<NodeClient> client, int64_t node) {
+    auto box = make_box(inputs, outbox);
+    box->client = std::move(client);
+    box->node = node;
+    boxes_.push_back(std::move(box));
+  }
+
+  void start() {
+    TORCH_CHECK(!thread_.joinable(), "step host: already started");
+    TORCH_CHECK(flags_.numel() >= 2 * static_cast<int64_t>(boxes_.size()), "step host: two flags per host node");
+    times_ = at::zeros({static_cast<int64_t>(boxes_.size()), 3}, at::kLong);
+    thread_ = std::thread([this] { loop(); });
+  }
+
+  // One step: the GPU is about to raise the first flag.
+  void go() {
+    {
+      std::lock_guard<std::mutex> lock(mu_);
+      ++steps_requested_;
+    }
+    cv_.notify_one();
+  }
+
+  // After the GPU finished the step: the error of the step's failed node
+  // ("" if none). A failure raises every from-CPU flag, so the GPU never
+  // waits forever; the caller then clears the flags before the next step.
+  std::string take_error() {
+    std::lock_guard<std::mutex> lock(mu_);
+    std::string e;
+    std::swap(e, error_);
+    return e;
+  }
+
+  // [nodes, 3] int64: per host node of the last step, when the GPU's flag
+  // was seen, when the reply was ready, when the flag was raised back.
+  at::Tensor times() const { return times_; }
+
+  bool running() const { return thread_.joinable(); }
+
+  void stop() {
+    {
+      std::lock_guard<std::mutex> lock(mu_);
+      stopping_ = true;
+    }
+    halt_ = true;  // also ends a wait on a GPU flag that will never come (a step the GPU abandoned)
+    cv_.notify_one();
+    if (thread_.joinable()) thread_.join();
+  }
+
+ private:
+  struct Box {
+    std::vector<at::Tensor> inputs;  // pinned, filled by the GPU
+    at::Tensor outbox;               // pinned, read by the GPU
+    std::unique_ptr<torch::inductor::AOTIModelPackageLoader> loader;
+    std::vector<at::Tensor> residents;
+    std::shared_ptr<NodeClient> client;
+    int64_t node = 0;
+  };
+
+  std::unique_ptr<Box> make_box(const std::vector<at::Tensor>& inputs, const at::Tensor& outbox) {
+    for (const auto& t : inputs) TORCH_CHECK(t.is_pinned(), "step host: inputs must be pinned");
+    TORCH_CHECK(outbox.is_pinned() && outbox.is_contiguous(), "step host: the outbox must be pinned and contiguous");
+    auto box = std::make_unique<Box>();
+    box->inputs = inputs;
+    box->outbox = outbox;
+    return box;
+  }
+
+  void loop() {
+    volatile int32_t* flag = flags_.data_ptr<int32_t>();
+    int64_t* t = times_.data_ptr<int64_t>();
+    for (;;) {
+      {
+        std::unique_lock<std::mutex> lock(mu_);
+        cv_.wait(lock, [this] { return stopping_ || steps_done_ < steps_requested_; });
+        if (stopping_) return;
+      }
+      size_t i = 0;
+      try {
+        for (; i < boxes_.size(); ++i) {
+          Box& box = *boxes_[i];
+          while (flag[2 * i] != 1) {
+            if (halt_.load(std::memory_order_relaxed)) return;
+            spin_pause();
+          }
+          flag[2 * i] = 0;
+          t[3 * i] = now_ns();
+          std::vector<at::Tensor> out;
+          if (box.client) {
+            out = box.client->call(box.node, box.inputs);
+          } else {
+            std::vector<at::Tensor> args(box.inputs);
+            args.insert(args.end(), box.residents.begin(), box.residents.end());
+            out = box.loader->run(args);
+          }
+          TORCH_CHECK(!out.empty(), "host node ", i, ": no reply");
+          box.outbox.copy_(out[0].view(box.outbox.sizes()));
+          t[3 * i + 1] = now_ns();
+          std::atomic_thread_fence(std::memory_order_seq_cst);  // the reply before the flag
+          flag[2 * i + 1] = 1;
+          t[3 * i + 2] = now_ns();
+        }
+      } catch (const std::exception& e) {
+        {
+          std::lock_guard<std::mutex> lock(mu_);
+          error_ = "host node " + std::to_string(i) + ": " + e.what();
+        }
+        std::atomic_thread_fence(std::memory_order_seq_cst);
+        for (size_t k = 0; k < boxes_.size(); ++k) flag[2 * k + 1] = 1;  // release the GPU
+      }
+      std::lock_guard<std::mutex> lock(mu_);
+      ++steps_done_;
+    }
+  }
+
+  at::Tensor flags_;
+  at::Tensor times_;
+  std::vector<std::unique_ptr<Box>> boxes_;
+  std::thread thread_;
+  std::mutex mu_;
+  std::condition_variable cv_;
+  int64_t steps_requested_ = 0, steps_done_ = 0;
+  bool stopping_ = false;
+  std::atomic<bool> halt_{false};
+  std::string error_;
+};
+
 void register_node_server(pybind11::module& m) {
-  pybind11::class_<NodeClient>(m, "NodeClient")
+  pybind11::class_<NodeClient, std::shared_ptr<NodeClient>>(m, "NodeClient")
       .def(pybind11::init<const std::string&, int64_t>())
       .def("call", &NodeClient::call, pybind11::call_guard<pybind11::gil_scoped_release>());
   pybind11::class_<NodeServer>(m, "NodeServer", pybind11::dynamic_attr())
@@ -371,4 +557,14 @@ void register_node_server(pybind11::module& m) {
       .def("port", &NodeServer::port)
       .def("messages", &NodeServer::messages)
       .def("stop", &NodeServer::stop, pybind11::call_guard<pybind11::gil_scoped_release>());
+  pybind11::class_<StepHost>(m, "StepHost")
+      .def(pybind11::init<at::Tensor>())
+      .def("add_local", &StepHost::add_local, pybind11::call_guard<pybind11::gil_scoped_release>())
+      .def("add_remote", &StepHost::add_remote)
+      .def("start", &StepHost::start)
+      .def("go", &StepHost::go)
+      .def("take_error", &StepHost::take_error)
+      .def("times", &StepHost::times)
+      .def("running", &StepHost::running)
+      .def("stop", &StepHost::stop, pybind11::call_guard<pybind11::gil_scoped_release>());
 }
