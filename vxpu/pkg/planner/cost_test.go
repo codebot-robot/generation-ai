@@ -83,6 +83,52 @@ func TestPredict_HeroRun(t *testing.T) {
 	}
 }
 
+// TestPredict_L4Run: the model against the L4 run (#409): DeepSeek on a
+// g2-standard-24 (two L4s) in the step graph, its own layers 0-8 with
+// their hottest experts on the L4s (a ~75% share of their selections,
+// most on the second GPU), layers 9-35 and 36-39 on two c3d-standard-60
+// node servers. Measured 119.9 ms/token over 10 prompts.
+func TestPredict_L4Run(t *testing.T) {
+	a := deepseek()
+	a.DecodeFP8Bytes, a.DecodeOtherBytes, a.TopK, a.EngramLayers = 6_836_715_520, 1_686_144_448, 6, 2
+	g2 := &machines.Probe{Device: "cuda", GPU: "NVIDIA L4", GPUMemoryBytes: 23_659_151_360, GPUCount: 2, RAMBytes: 101e9}
+	c3d := machines.Probe{Device: "cpu", CPU: "AMD EPYC 9B14", CPUThreads: 60, RAMBytes: 253e9}
+	gpus := []map[string]any{{"layers": map[string][]int{}}, {"layers": map[string][]int{}}}
+	counts := map[int]map[int]int64{}
+	for layer := range 9 {
+		counts[layer] = map[int]int64{}
+		for e := range 384 {
+			counts[layer][e] = 1
+		}
+		for e := range 91 { // held: 10x the traffic of the rest, 91 x 10 / (91 x 10 + 293) = 76%
+			counts[layer][e] = 10
+			g := 1
+			if e < 2 {
+				g = 0
+			}
+			gpus[g]["layers"].(map[string][]int)[itoa(layer)] = append(gpus[g]["layers"].(map[string][]int)[itoa(layer)], e)
+		}
+	}
+	placement, err := json.Marshal(map[string]any{"gpus": gpus})
+	if err != nil {
+		t.Fatal(err)
+	}
+	remote := map[string][]int{"10.0.0.2:50051": {}, "10.0.0.3:50051": {}}
+	for layer := 9; layer < 40; layer++ {
+		addr := "10.0.0.2:50051"
+		if layer >= 36 {
+			addr = "10.0.0.3:50051"
+		}
+		remote[addr] = append(remote[addr], layer)
+	}
+	plan := Plan{Switches: map[string]string{"VXPU_STEP_GRAPH": "1", "VXPU_GPU_EXPERTS": string(placement)}, ExpertExecutors: remote}
+	pr := Predict(a, plan, g2, map[string]machines.Probe{"10.0.0.2:50051": c3d, "10.0.0.3:50051": c3d}, counts)
+	t.Logf("predicted %.1f ms/token (%v), measured 119.9", pr.MsPerToken, pr.Parts)
+	if off := math.Abs(pr.MsPerToken-119.9) / 119.9; off > 0.10 {
+		t.Errorf("predicted %.1f ms/token (%v), measured 119.9: off by %.0f%%", pr.MsPerToken, pr.Parts, 100*off)
+	}
+}
+
 func TestPredict_NotInTheCatalog(t *testing.T) {
 	pr := Predict(deepseek(), Plan{}, &machines.Probe{CPU: "Intel Xeon Platinum 8281"}, nil, nil)
 	if pr.MsPerToken != 0 || len(pr.Basis) != 1 {
@@ -114,7 +160,7 @@ func TestPredict_ExecutorWithoutAGPU(t *testing.T) {
 // TestPredict_DenseModel: a model with no routed experts is predicted too.
 func TestPredict_DenseModel(t *testing.T) {
 	probe := machines.Probe{Device: "cuda", GPU: "NVIDIA L4", GPUMemoryBytes: 23_580_000_000, GPUCount: 2, RAMBytes: 96e9}
-	p := Choose(Artifact{DenseBytes: 16e9, DecodeOtherBytes: 16e9, Experts: map[int]Layer{}}, &probe, nil, nil)
+	p := Choose(Artifact{DenseBytes: 16e9, DecodeOtherBytes: 16e9, Experts: map[int]Layer{}}, &probe, nil, nil, nil)
 	if p.Prediction.MsPerToken <= 0 {
 		t.Errorf("no prediction for a dense model: %+v", p.Prediction)
 	}

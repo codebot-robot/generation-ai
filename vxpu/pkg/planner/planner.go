@@ -25,6 +25,7 @@ package planner
 import (
 	"encoding/json"
 	"fmt"
+	"maps"
 	"sort"
 	"strconv"
 	"strings"
@@ -188,7 +189,8 @@ type Executor struct {
 // the experts over, given the model's recorded decode selections (layer
 // -> expert -> count). The experts go to RAM first, the engine's and then
 // the others' (spread), then the hottest of the engine's to its GPUs.
-func Choose(a Artifact, probe *machines.Probe, others []Executor, counts map[int]map[int]int64) Plan {
+func Choose(a Artifact, probe *machines.Probe, others []Executor, counts map[int]map[int]int64,
+	hints map[string]string) Plan {
 	p := Plan{Switches: map[string]string{}}
 	if len(a.Experts) == 0 {
 		p.Reasons = append(p.Reasons, "experts: the model has no routed experts held outside its graphs")
@@ -207,7 +209,11 @@ func Choose(a Artifact, probe *machines.Probe, others []Executor, counts map[int
 	for _, o := range others {
 		machinesOf[o.Address] = o.Probe
 	}
-	p.Prediction = Predict(a, p, probe, machinesOf, counts)
+	// predicted as the executor will run it: the registered plan's
+	// switches (hints) win over the planner's, as the router applies them
+	sent := Plan{Switches: maps.Clone(p.Switches), ExpertExecutors: p.ExpertExecutors}
+	maps.Copy(sent.Switches, hints)
+	p.Prediction = Predict(a, sent, probe, machinesOf, counts)
 	return p
 }
 
