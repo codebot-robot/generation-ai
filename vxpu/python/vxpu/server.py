@@ -59,21 +59,37 @@ class ExecutorServicer(vxpu_pb2_grpc.ExecutorServicer):
         self.lock = threading.Lock()
         self.node_server = None  # ((artifact digest, nodes), the NodeServer) this executor serves (ServeNodes)
         self.serve_lock = threading.Lock()  # one ServeNodes at a time, start to finish
+        self.range_server = None  # (the engine, its RangeServer): the loaded engine's range of layers (ServeRange)
         threading.Thread(target=self._reap_idle, daemon=True).start()
 
     def _touch(self):
         self.last_used = time.time()
 
+    def _drop_engine(self):
+        """Drop the loaded engine, and stop the range server serving it
+        (ServeRange), if any. The caller holds self.lock."""
+        if self.range_server is not None:
+            self.range_server[1].stop()
+            self.range_server = None
+        self.engine = None
+        self.digest = None
+
     def _reap_idle(self):
+        range_messages = 0
         while True:
             time.sleep(5)
             with self.lock:
+                if self.range_server is not None:  # steps another engine sends this one's range count as use
+                    n = self.range_server[1].messages()
+                    if n != range_messages:
+                        range_messages = n
+                        self._touch()
                 idle = time.time() - self.last_used
                 if self.engine is not None and idle > self.keep_alive_s:
                     print(f"[vxpu] evicting model after {idle:.0f}s idle",
                           flush=True)
-                    self.engine = None
-                    self.digest = None
+                    self._drop_engine()
+                    range_messages = 0
                     gc.collect()
                     if torch.cuda.is_available():
                         torch.cuda.empty_cache()
@@ -134,8 +150,7 @@ class ExecutorServicer(vxpu_pb2_grpc.ExecutorServicer):
                     return vxpu_pb2.LoadModelResponse(success=True)
 
                 # Reset currently resident engine so NewSession will wait for this load.
-                self.engine = None
-                self.digest = None
+                self._drop_engine()
                 self.loading = digest
                 self.load_error = None
                 gc.collect()
@@ -181,13 +196,20 @@ class ExecutorServicer(vxpu_pb2_grpc.ExecutorServicer):
         return artifact_dir, digest
 
     def DescribeNodes(self, request, context):
-        """The artifact's decode step as nodes, for the coordinator (#394)."""
-        from . import nodes
+        """Describe the artifact's decode step as nodes, for the coordinator
+        (#394). If the request includes the prefill graph, also say where the
+        step can be cut into ranges of whole layers (cuts.py, #387)."""
+        from . import cuts, nodes
         try:
             artifact_dir, _ = self._artifact_dir(request)
             described = nodes.describe(nodes.decode_split(artifact_dir), json.loads(request.manifest_json),
                                        json.loads(request.binding_json))
-            return vxpu_pb2.DescribeNodesResponse(nodes_json=json.dumps(described))
+            cuts_json = ""
+            if request.prefill_graph:
+                with open(os.path.join(artifact_dir, "prefill.pt2"), "wb") as f:
+                    f.write(request.prefill_graph)
+                cuts_json = json.dumps(cuts.describe(artifact_dir))
+            return vxpu_pb2.DescribeNodesResponse(nodes_json=json.dumps(described), cuts_json=cuts_json)
         except Exception as e:  # noqa: BLE001
             print(f"[vxpu] DescribeNodes error: {e}", file=sys.stderr, flush=True)
             context.set_code(grpc.StatusCode.INTERNAL)
@@ -234,6 +256,35 @@ class ExecutorServicer(vxpu_pb2_grpc.ExecutorServicer):
             context.set_code(grpc.StatusCode.INTERNAL)
             context.set_details(str(e))
             return vxpu_pb2.ServeNodesResponse()
+
+    def ServeRange(self, request, context):
+        """Serve the loaded engine's range of whole layers (set by its plan's
+        VXPU_LAYER_RANGE) on a port of this machine, for the engine that runs
+        the layers before it (rangeserver.py, #387). There is one server per
+        loaded engine. Answers FAILED_PRECONDITION while the engine is still
+        loading."""
+        from . import rangeserver
+        with self.lock:
+            engine = self.engine
+            if engine is None and self.load_error and not self.loading:  # final: the caller stops waiting
+                context.set_code(grpc.StatusCode.INTERNAL)
+                context.set_details(f"model load failed: {self.load_error}")
+                return vxpu_pb2.ServeRangeResponse()
+            if engine is None:
+                context.set_code(grpc.StatusCode.FAILED_PRECONDITION)
+                context.set_details("no engine loaded yet" + (" (loading)" if self.loading else ""))
+                return vxpu_pb2.ServeRangeResponse()
+            rng = engine.plan["layer_range"]
+            if rng is None or rng[0] == 0:
+                context.set_code(grpc.StatusCode.FAILED_PRECONDITION)
+                context.set_details("the loaded engine does not run a range after the first (VXPU_LAYER_RANGE=START:END, START > 0)")
+                return vxpu_pb2.ServeRangeResponse()
+            if self.range_server is None or self.range_server[0] is not engine:
+                if self.range_server is not None:
+                    self.range_server[1].stop()
+                self.range_server = (engine, rangeserver.serve(engine))
+            text = f"{rng[0]}:" + ("" if rng[1] is None else str(rng[1]))
+            return vxpu_pb2.ServeRangeResponse(port=self.range_server[1].port(), layer_range=text)
 
     def Describe(self, request, context):
         """What this executor runs on, for the coordinator's machine

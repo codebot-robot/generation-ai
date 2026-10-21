@@ -202,6 +202,16 @@ being scanned and the best found so far drawn coloured by machine, with
 network crossings in red. `dev/tasks/record-plan-search` records it as a
 video.
 
+The router runs the layer ranges layout when the cost model ranks it
+first, on its own. By hand, start each later range on its executor and
+point the head at them:
+
+```sh
+VXPU_LAYER_RANGE=20: ...                                # an executor running layers 20 to the last;
+                                                        # ServeRange gives its port
+VXPU_LAYER_RANGE=0:20 VXPU_REMOTE_RANGES=20:=tcp://HOST:PORT ...   # the head
+```
+
 ## The dataflow executor: segments, experts and mailboxes
 
 A decode step split at its host ops is a dataflow graph (#372,

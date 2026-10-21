@@ -39,8 +39,10 @@ import (
 //	                to the first for the next step), k hops instead of one
 //	                per remote layer
 //
-// The executors can run the first two today; a layer range on a node
-// server, its dense half and KV cache included, is #387.
+// The executors can run all three layouts. For layer ranges, each range on
+// another machine runs in an engine of its own (VXPU_LAYER_RANGE), which
+// serves its range to the first engine (rangeserver.py, #387). A range
+// starts only where the step can be cut.
 
 // Node is a machine a candidate can use.
 type Node struct {
@@ -57,6 +59,9 @@ type Placement struct {
 	// experts) or "layers" (a range of whole layers).
 	Role   string `json:"role"`
 	Layers []int  `json:"layers,omitempty"`
+	// Switches are the plan switches this machine's engine runs with. For a
+	// layer range, they turn on the step graph and place its GPU experts.
+	Switches map[string]string `json:"switches,omitempty"`
 }
 
 // Candidate is one layout, predicted.
@@ -98,6 +103,35 @@ func Candidates(a Artifact, fleet []Node, counts map[int]map[int]int64) []Candid
 	order := byLayerCost(a, fleet)
 	for k := 2; k <= len(order) && k <= len(a.Experts); k++ {
 		out = append(out, layerRanges(a, order[:k], counts))
+	}
+	sort.SliceStable(out, func(i, j int) bool {
+		fi, fj := out[i].Infeasible == "", out[j].Infeasible == ""
+		if fi != fj {
+			return fi
+		}
+		return out[i].Prediction.MsPerToken < out[j].Prediction.MsPerToken
+	})
+	return out
+}
+
+// CandidatesFor returns the layouts that start on engine, the executor the
+// router is loading a model onto, and may use the free executors in others.
+// In the experts-spread layout (or one-machine, with no others), engine runs
+// the whole step. In layer-ranges layouts, engine runs the first range.
+// The cheapest layout comes first.
+func CandidatesFor(a Artifact, engine Node, others []Node, counts map[int]map[int]int64, hints map[string]string) []Candidate {
+	var executors []Executor
+	for _, n := range others {
+		executors = append(executors, Executor{Address: n.Name, Probe: n.Probe})
+	}
+	spread := expertsSpread(a, engine, executors, counts)
+	if spread.Plan != nil { // apply the registered plan's switches, as the router does
+		maps.Copy(spread.Plan.Switches, hints)
+	}
+	out := []Candidate{spread}
+	order := byLayerCost(a, others)
+	for k := 1; k <= len(order) && k < len(a.Experts); k++ {
+		out = append(out, layerRanges(a, append([]Node{engine}, order[:k]...), counts))
 	}
 	sort.SliceStable(out, func(i, j int) bool {
 		fi, fj := out[i].Infeasible == "", out[j].Infeasible == ""
@@ -227,7 +261,7 @@ func part(a Artifact, layers []int, n int) Artifact {
 
 func layerRanges(a Artifact, nodes []Node, counts map[int]map[int]int64) Candidate {
 	layers := layersOf(a)
-	c := Candidate{Kind: "layer-ranges", NotYet: "a node server running a range of whole layers, dense half and KV cache included (#387)"}
+	c := Candidate{Kind: "layer-ranges", Runnable: true}
 	// each machine's capacity, in layers of experts (and, without a GPU, its share of the dense weights)
 	perLayer := int64(a.Experts[layers[0]].Experts) * a.Experts[layers[0]].BytesPerExpert
 	caps := make([]int, len(nodes))
@@ -305,7 +339,8 @@ func layerRanges(a Artifact, nodes []Node, counts map[int]map[int]int64) Candida
 			pr.Basis = append(pr.Basis, "  "+b)
 		}
 		c.Reasons = append(c.Reasons, plan.Reasons...)
-		c.Placements = append(c.Placements, Placement{Node: n.Name, Machine: machineName(n.Probe), Role: "layers", Layers: rng})
+		c.Placements = append(c.Placements, Placement{Node: n.Name, Machine: machineName(n.Probe), Role: "layers", Layers: rng,
+			Switches: plan.Switches})
 		summary = append(summary, fmt.Sprintf("%s on %s", span(rng), n.Name))
 	}
 	pr.Parts["hops"] = float64(len(nodes)) * remoteMs

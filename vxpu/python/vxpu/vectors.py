@@ -1658,14 +1658,18 @@ def _cuda():
 
 
 def _check_range_server(model, prompts, settings, artifact, plain, device="cpu"):
-    """A range of whole layers over the network (#387): an engine running
-    the layers from the last legal cut on, served on a local port
-    (rangeserver.serve), and the head engine running the layers before it
-    sending each step there (RemoteRange): prefill, decode, every prompt its
-    own session, and a two-turn conversation. Tokens and logits
-    bit-identical to the plain engine's (device: cpu, or cuda with the step
-    graph, where the range's decode steps replay natively)."""
-    from . import cuts, rangeserver
+    """Check a range of whole layers served over the network (#387), set up
+    the way the coordinator sets it up:
+    - an executor loads the model with the layers from the last legal cut
+      onward (LoadModel with VXPU_LAYER_RANGE) and serves them on a local
+      port (ServeRange, rangeserver.py);
+    - the head engine's plan names that port (VXPU_REMOTE_RANGES), and it
+      sends each step there: prefills and decode steps, each prompt in its
+      own session, and a two-turn conversation.
+    Tokens and logits must be bit-identical to the plain engine's. On cuda
+    (with the step graph) the range's decode steps run natively in C++."""
+    import time
+    from . import cuts
     from .engine import Engine, SamplingParams
     cut = cuts.describe(artifact)["legal"][-1]
     base = {"VXPU_DATAFLOW": "1", "VXPU_DATAFLOW_PLACE": None, "VXPU_EXPERT_MAILBOXES": None, "VXPU_GPU_EXPERTS": None}
@@ -1675,14 +1679,49 @@ def _check_range_server(model, prompts, settings, artifact, plain, device="cpu")
         kw = {"device": device, "compile_decode": True}
     if device != "cpu":  # the reference: one engine, the same step graph on the same GPU
         plain = _with_env(base, record_vxpu_engine, model, "main", prompts, settings, artifact, **kw)
-    tail = _with_env({**base, "VXPU_LAYER_RANGE": f"{cut}:"}, Engine, artifact, **kw)
-    server = rangeserver.serve(tail)
+    # the other range as the coordinator starts it: an executor loads the model with its range
+    # (LoadModel, VXPU_LAYER_RANGE) and serves it (ServeRange); the head is wired by its plan
+    from . import vxpu_pb2
+    from .server import ExecutorServicer
+
+    class Context:
+        code = details = None
+
+        def set_code(self, code):
+            self.code = code
+
+        def set_details(self, details):
+            self.details = details
+
+    files = {}
+    for name in ("manifest.json", "binding.json", "prefill.pt2", "decode.pt2"):
+        with open(os.path.join(artifact, name), "rb") as f:
+            files[name] = f.read()
+    executor = ExecutorServicer(work_dir=tempfile.mkdtemp(prefix="vxpu-range-"), device=device,
+                                compile_decode=device != "cpu")
+    plan = {k: v for k, v in {**base, "VXPU_LAYER_RANGE": f"{cut}:"}.items() if v is not None}
+    ctx = Context()
+    executor.LoadModel(vxpu_pb2.LoadModelRequest(manifest_json=files["manifest.json"].decode(),
+                                                 binding_json=files["binding.json"].decode(),
+                                                 prefill_graph=files["prefill.pt2"], decode_graph=files["decode.pt2"],
+                                                 plan=plan), ctx)
+    port = 0
+    for _ in range(600):
+        ctx = Context()
+        resp = executor.ServeRange(vxpu_pb2.ServeRangeRequest(), ctx)
+        if resp.port:
+            port = resp.port
+            break
+        time.sleep(1)
+    if not port:
+        print(f"range server check: ServeRange never answered: {ctx.code} {ctx.details}")
+        return False
+    server = executor.range_server[1]
     try:
         keep = []
-        address = f"tcp://127.0.0.1:{server.port()}"
-        got = _with_env({**base, "VXPU_LAYER_RANGE": f"0:{cut}"}, record_vxpu_engine, model, "main", prompts, settings,
-                        artifact, keep=keep, prepare=lambda h: h.attach_ranges([rangeserver.RemoteRange(address, h.device)]),
-                        **kw)
+        address = f"tcp://127.0.0.1:{port}"
+        got = _with_env({**base, "VXPU_LAYER_RANGE": f"0:{cut}", "VXPU_REMOTE_RANGES": f"{cut}:={address}"},
+                        record_vxpu_engine, model, "main", prompts, settings, artifact, keep=keep, **kw)
         head = keep[0]
         sid, turns, ids = head.new_session(), [], list(ID_PROMPTS[0]["ids"])
         for turn in range(2):

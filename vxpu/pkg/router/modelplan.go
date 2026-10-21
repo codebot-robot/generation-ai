@@ -19,6 +19,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"slices"
 	"sort"
 	"strings"
 	"time"
@@ -128,7 +129,13 @@ type modelPlan struct {
 	// the engine's mailboxes for nodes other executors serve:
 	// name=tcp://host:port/index
 	RemoteNodes []string `json:"remote_nodes,omitempty"`
-	Reasons     []string `json:"reasons"`
+	// RemoteRanges lists the ranges of whole layers that other executors run
+	// after the engine's own range (#387), each as START:END=tcp://host:port.
+	RemoteRanges []string `json:"remote_ranges,omitempty"`
+	// Candidates lists the layouts the planner priced, cheapest first. vxpu
+	// explain shows them.
+	Candidates []candidateSummary `json:"candidates,omitempty"`
+	Reasons    []string           `json:"reasons"`
 	// the decode time the cost model predicts for the plan (before the
 	// registered plan's switches; telemetry measures it)
 	Prediction planner.Prediction `json:"prediction"`
@@ -137,7 +144,7 @@ type modelPlan struct {
 // planLoad chooses the switches a load of model sends: the planner's,
 // from the artifact, the executor's machine and the model's recorded
 // selections, with the registered plan's switches (hints) over them.
-func (s *Server) planLoad(ctx context.Context, model string, manifest, binding, decode []byte, hints map[string]string,
+func (s *Server) planLoad(ctx context.Context, model string, manifest, binding, prefill, decode []byte, hints map[string]string,
 	info *executorInfo) map[string]string {
 	log := klog.FromContext(ctx)
 	var probe *machines.Probe
@@ -169,6 +176,28 @@ func (s *Server) planLoad(ctx context.Context, model string, manifest, binding, 
 		s.releaseHelpersLocked(engine) // its experts are placed again
 		s.mu.Unlock()
 		free := s.freeExecutors(ctx, engine)
+		if info != nil && len(free) > 0 && len(prefill) > 0 { // ask where the step can be cut into ranges of whole layers
+			if err := s.readCuts(ctx, info, &artifact, manifest, binding, prefill, decode); err != nil {
+				mp.Reasons = append(mp.Reasons, fmt.Sprintf("planner: where the step can be cut is not known (%v): no layer ranges", err))
+				artifact.Cuts = []int{} // no cuts: the planner starts a range only where it knows the cut is safe
+			}
+		}
+		ranges, loaded := s.chooseRanges(ctx, model, artifact, info, free, counts, hints, manifest, binding, prefill, decode, &mp)
+		if ranges != nil {
+			for k, v := range hints { // the registered plan's switches override the planner's, as below
+				ranges[k] = v
+			}
+			s.mu.Lock()
+			if s.plans == nil {
+				s.plans = map[string]modelPlan{}
+			}
+			s.plans[statsKey(model)] = mp
+			s.mu.Unlock()
+			log.Info("Planned the load", "model", model, "machine", mp.Machine, "layout", "layer-ranges",
+				"predictedMsPerToken", mp.Prediction.MsPerToken, "ranges", mp.RemoteRanges, "reasons", mp.Reasons)
+			return ranges
+		}
+		free = slices.DeleteFunc(free, func(e planner.Executor) bool { return slices.Contains(loaded, e.Address) }) // these executors now hold ranges
 		p := planner.Choose(artifact, probe, free, counts, hints)
 		mp.Switches, mp.Reasons, mp.Prediction = p.Switches, append(mp.Reasons, p.Reasons...), p.Prediction
 		// the other executors serve the experts nodes of their layers, on a
@@ -250,4 +279,4 @@ func sortedKeys[V any](m map[string]V) []string {
 // routerOwnedSwitches are the plan switches only the router sets: which
 // node servers an engine trusts is the router's to wire (the executors it
 // asked to serve them), never a client's to name.
-var routerOwnedSwitches = []string{"VXPU_REMOTE_NODES"}
+var routerOwnedSwitches = []string{"VXPU_REMOTE_NODES", "VXPU_REMOTE_RANGES", "VXPU_LAYER_RANGE"}

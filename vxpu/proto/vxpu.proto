@@ -72,6 +72,12 @@ service Executor {
   // nodes on a port of this machine: a native node server (nodeserver.py)
   // that answers their tcp:// mailboxes. Answers once they are loaded.
   rpc ServeNodes(ServeNodesRequest) returns (ServeNodesResponse) {}
+  // ServeRange (executor only) serves the loaded engine's range of whole
+  // layers on a port of this machine, for the engine that runs the layers
+  // before it (rangeserver.py, #387). LoadModel sets the range, through the
+  // plan's VXPU_LAYER_RANGE. ServeRange returns FAILED_PRECONDITION while the
+  // engine is still loading.
+  rpc ServeRange(ServeRangeRequest) returns (ServeRangeResponse) {}
 }
 
 message LoadModelRequest {
@@ -238,12 +244,18 @@ message DescribeNodesRequest {
   string manifest_json = 1;
   string binding_json = 2;
   bytes decode_graph = 3;
+  // If set, the response also says where the step can be cut into ranges of
+  // whole layers. A cut must be legal in both the decode and prefill graphs.
+  bytes prefill_graph = 4;
 }
 
 message DescribeNodesResponse {
   // [{name, kind, layers, and for a host node collection, index,
   // resident_bytes}], as JSON.
   string nodes_json = 1;
+  // Where the step can be cut into ranges of whole layers (cuts.py), as
+  // JSON. It's empty if the request didn't include the prefill graph.
+  string cuts_json = 2;
 }
 
 message ServeNodesRequest {
@@ -257,4 +269,14 @@ message ServeNodesRequest {
 message ServeNodesResponse {
   // The port the nodes are served on, on the executor's own address.
   int32 port = 1;
+}
+
+message ServeRangeRequest {}
+
+message ServeRangeResponse {
+  // The port the executor serves the range on, at its own address.
+  int32 port = 1;
+  // The layers the range covers, as START:END. An empty END means the last
+  // layer.
+  string layer_range = 2;
 }

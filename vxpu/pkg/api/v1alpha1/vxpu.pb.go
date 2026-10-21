@@ -1123,10 +1123,13 @@ func (x *ExplainModelResponse) GetPlanJson() string {
 }
 
 type DescribeNodesRequest struct {
-	state         protoimpl.MessageState `protogen:"open.v1"`
-	ManifestJson  string                 `protobuf:"bytes,1,opt,name=manifest_json,json=manifestJson,proto3" json:"manifest_json,omitempty"`
-	BindingJson   string                 `protobuf:"bytes,2,opt,name=binding_json,json=bindingJson,proto3" json:"binding_json,omitempty"`
-	DecodeGraph   []byte                 `protobuf:"bytes,3,opt,name=decode_graph,json=decodeGraph,proto3" json:"decode_graph,omitempty"`
+	state        protoimpl.MessageState `protogen:"open.v1"`
+	ManifestJson string                 `protobuf:"bytes,1,opt,name=manifest_json,json=manifestJson,proto3" json:"manifest_json,omitempty"`
+	BindingJson  string                 `protobuf:"bytes,2,opt,name=binding_json,json=bindingJson,proto3" json:"binding_json,omitempty"`
+	DecodeGraph  []byte                 `protobuf:"bytes,3,opt,name=decode_graph,json=decodeGraph,proto3" json:"decode_graph,omitempty"`
+	// If set, the response also says where the step can be cut into ranges of
+	// whole layers. A cut must be legal in both the decode and prefill graphs.
+	PrefillGraph  []byte `protobuf:"bytes,4,opt,name=prefill_graph,json=prefillGraph,proto3" json:"prefill_graph,omitempty"`
 	unknownFields protoimpl.UnknownFields
 	sizeCache     protoimpl.SizeCache
 }
@@ -1182,11 +1185,21 @@ func (x *DescribeNodesRequest) GetDecodeGraph() []byte {
 	return nil
 }
 
+func (x *DescribeNodesRequest) GetPrefillGraph() []byte {
+	if x != nil {
+		return x.PrefillGraph
+	}
+	return nil
+}
+
 type DescribeNodesResponse struct {
 	state protoimpl.MessageState `protogen:"open.v1"`
 	// [{name, kind, layers, and for a host node collection, index,
 	// resident_bytes}], as JSON.
-	NodesJson     string `protobuf:"bytes,1,opt,name=nodes_json,json=nodesJson,proto3" json:"nodes_json,omitempty"`
+	NodesJson string `protobuf:"bytes,1,opt,name=nodes_json,json=nodesJson,proto3" json:"nodes_json,omitempty"`
+	// Where the step can be cut into ranges of whole layers (cuts.py), as
+	// JSON. It's empty if the request didn't include the prefill graph.
+	CutsJson      string `protobuf:"bytes,2,opt,name=cuts_json,json=cutsJson,proto3" json:"cuts_json,omitempty"`
 	unknownFields protoimpl.UnknownFields
 	sizeCache     protoimpl.SizeCache
 }
@@ -1224,6 +1237,13 @@ func (*DescribeNodesResponse) Descriptor() ([]byte, []int) {
 func (x *DescribeNodesResponse) GetNodesJson() string {
 	if x != nil {
 		return x.NodesJson
+	}
+	return ""
+}
+
+func (x *DescribeNodesResponse) GetCutsJson() string {
+	if x != nil {
+		return x.CutsJson
 	}
 	return ""
 }
@@ -1342,6 +1362,97 @@ func (x *ServeNodesResponse) GetPort() int32 {
 	return 0
 }
 
+type ServeRangeRequest struct {
+	state         protoimpl.MessageState `protogen:"open.v1"`
+	unknownFields protoimpl.UnknownFields
+	sizeCache     protoimpl.SizeCache
+}
+
+func (x *ServeRangeRequest) Reset() {
+	*x = ServeRangeRequest{}
+	mi := &file_proto_vxpu_proto_msgTypes[20]
+	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+	ms.StoreMessageInfo(mi)
+}
+
+func (x *ServeRangeRequest) String() string {
+	return protoimpl.X.MessageStringOf(x)
+}
+
+func (*ServeRangeRequest) ProtoMessage() {}
+
+func (x *ServeRangeRequest) ProtoReflect() protoreflect.Message {
+	mi := &file_proto_vxpu_proto_msgTypes[20]
+	if x != nil {
+		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+		if ms.LoadMessageInfo() == nil {
+			ms.StoreMessageInfo(mi)
+		}
+		return ms
+	}
+	return mi.MessageOf(x)
+}
+
+// Deprecated: Use ServeRangeRequest.ProtoReflect.Descriptor instead.
+func (*ServeRangeRequest) Descriptor() ([]byte, []int) {
+	return file_proto_vxpu_proto_rawDescGZIP(), []int{20}
+}
+
+type ServeRangeResponse struct {
+	state protoimpl.MessageState `protogen:"open.v1"`
+	// The port the executor serves the range on, at its own address.
+	Port int32 `protobuf:"varint,1,opt,name=port,proto3" json:"port,omitempty"`
+	// The layers the range covers, as START:END. An empty END means the last
+	// layer.
+	LayerRange    string `protobuf:"bytes,2,opt,name=layer_range,json=layerRange,proto3" json:"layer_range,omitempty"`
+	unknownFields protoimpl.UnknownFields
+	sizeCache     protoimpl.SizeCache
+}
+
+func (x *ServeRangeResponse) Reset() {
+	*x = ServeRangeResponse{}
+	mi := &file_proto_vxpu_proto_msgTypes[21]
+	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+	ms.StoreMessageInfo(mi)
+}
+
+func (x *ServeRangeResponse) String() string {
+	return protoimpl.X.MessageStringOf(x)
+}
+
+func (*ServeRangeResponse) ProtoMessage() {}
+
+func (x *ServeRangeResponse) ProtoReflect() protoreflect.Message {
+	mi := &file_proto_vxpu_proto_msgTypes[21]
+	if x != nil {
+		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+		if ms.LoadMessageInfo() == nil {
+			ms.StoreMessageInfo(mi)
+		}
+		return ms
+	}
+	return mi.MessageOf(x)
+}
+
+// Deprecated: Use ServeRangeResponse.ProtoReflect.Descriptor instead.
+func (*ServeRangeResponse) Descriptor() ([]byte, []int) {
+	return file_proto_vxpu_proto_rawDescGZIP(), []int{21}
+}
+
+func (x *ServeRangeResponse) GetPort() int32 {
+	if x != nil {
+		return x.Port
+	}
+	return 0
+}
+
+func (x *ServeRangeResponse) GetLayerRange() string {
+	if x != nil {
+		return x.LayerRange
+	}
+	return ""
+}
+
 var File_proto_vxpu_proto protoreflect.FileDescriptor
 
 const file_proto_vxpu_proto_rawDesc = "" +
@@ -1447,21 +1558,28 @@ const file_proto_vxpu_proto_rawDesc = "" +
 	"\x13ExplainModelRequest\x12\x14\n" +
 	"\x05model\x18\x01 \x01(\tR\x05model\"3\n" +
 	"\x14ExplainModelResponse\x12\x1b\n" +
-	"\tplan_json\x18\x01 \x01(\tR\bplanJson\"\x81\x01\n" +
+	"\tplan_json\x18\x01 \x01(\tR\bplanJson\"\xa6\x01\n" +
 	"\x14DescribeNodesRequest\x12#\n" +
 	"\rmanifest_json\x18\x01 \x01(\tR\fmanifestJson\x12!\n" +
 	"\fbinding_json\x18\x02 \x01(\tR\vbindingJson\x12!\n" +
-	"\fdecode_graph\x18\x03 \x01(\fR\vdecodeGraph\"6\n" +
+	"\fdecode_graph\x18\x03 \x01(\fR\vdecodeGraph\x12#\n" +
+	"\rprefill_graph\x18\x04 \x01(\fR\fprefillGraph\"S\n" +
 	"\x15DescribeNodesResponse\x12\x1d\n" +
 	"\n" +
-	"nodes_json\x18\x01 \x01(\tR\tnodesJson\"\x94\x01\n" +
+	"nodes_json\x18\x01 \x01(\tR\tnodesJson\x12\x1b\n" +
+	"\tcuts_json\x18\x02 \x01(\tR\bcutsJson\"\x94\x01\n" +
 	"\x11ServeNodesRequest\x12#\n" +
 	"\rmanifest_json\x18\x01 \x01(\tR\fmanifestJson\x12!\n" +
 	"\fbinding_json\x18\x02 \x01(\tR\vbindingJson\x12!\n" +
 	"\fdecode_graph\x18\x03 \x01(\fR\vdecodeGraph\x12\x14\n" +
 	"\x05nodes\x18\x04 \x03(\tR\x05nodes\"(\n" +
 	"\x12ServeNodesResponse\x12\x12\n" +
-	"\x04port\x18\x01 \x01(\x05R\x04port2\xaa\x05\n" +
+	"\x04port\x18\x01 \x01(\x05R\x04port\"\x13\n" +
+	"\x11ServeRangeRequest\"I\n" +
+	"\x12ServeRangeResponse\x12\x12\n" +
+	"\x04port\x18\x01 \x01(\x05R\x04port\x12\x1f\n" +
+	"\vlayer_range\x18\x02 \x01(\tR\n" +
+	"layerRange2\xed\x05\n" +
 	"\bExecutor\x12>\n" +
 	"\tLoadModel\x12\x16.vxpu.LoadModelRequest\x1a\x17.vxpu.LoadModelResponse\"\x00\x12J\n" +
 	"\rRegisterModel\x12\x1a.vxpu.RegisterModelRequest\x1a\x1b.vxpu.RegisterModelResponse\"\x00\x12A\n" +
@@ -1474,7 +1592,9 @@ const file_proto_vxpu_proto_rawDesc = "" +
 	"\fExplainModel\x12\x19.vxpu.ExplainModelRequest\x1a\x1a.vxpu.ExplainModelResponse\"\x00\x12J\n" +
 	"\rDescribeNodes\x12\x1a.vxpu.DescribeNodesRequest\x1a\x1b.vxpu.DescribeNodesResponse\"\x00\x12A\n" +
 	"\n" +
-	"ServeNodes\x12\x17.vxpu.ServeNodesRequest\x1a\x18.vxpu.ServeNodesResponse\"\x00BBZ@github.com/gke-labs/generation-ai/vxpu/pkg/api/v1alpha1;v1alpha1b\x06proto3"
+	"ServeNodes\x12\x17.vxpu.ServeNodesRequest\x1a\x18.vxpu.ServeNodesResponse\"\x00\x12A\n" +
+	"\n" +
+	"ServeRange\x12\x17.vxpu.ServeRangeRequest\x1a\x18.vxpu.ServeRangeResponse\"\x00BBZ@github.com/gke-labs/generation-ai/vxpu/pkg/api/v1alpha1;v1alpha1b\x06proto3"
 
 var (
 	file_proto_vxpu_proto_rawDescOnce sync.Once
@@ -1488,7 +1608,7 @@ func file_proto_vxpu_proto_rawDescGZIP() []byte {
 	return file_proto_vxpu_proto_rawDescData
 }
 
-var file_proto_vxpu_proto_msgTypes = make([]protoimpl.MessageInfo, 22)
+var file_proto_vxpu_proto_msgTypes = make([]protoimpl.MessageInfo, 24)
 var file_proto_vxpu_proto_goTypes = []any{
 	(*LoadModelRequest)(nil),      // 0: vxpu.LoadModelRequest
 	(*LoadModelResponse)(nil),     // 1: vxpu.LoadModelResponse
@@ -1510,12 +1630,14 @@ var file_proto_vxpu_proto_goTypes = []any{
 	(*DescribeNodesResponse)(nil), // 17: vxpu.DescribeNodesResponse
 	(*ServeNodesRequest)(nil),     // 18: vxpu.ServeNodesRequest
 	(*ServeNodesResponse)(nil),    // 19: vxpu.ServeNodesResponse
-	nil,                           // 20: vxpu.LoadModelRequest.PlanEntry
-	nil,                           // 21: vxpu.RegisterModelRequest.PlanEntry
+	(*ServeRangeRequest)(nil),     // 20: vxpu.ServeRangeRequest
+	(*ServeRangeResponse)(nil),    // 21: vxpu.ServeRangeResponse
+	nil,                           // 22: vxpu.LoadModelRequest.PlanEntry
+	nil,                           // 23: vxpu.RegisterModelRequest.PlanEntry
 }
 var file_proto_vxpu_proto_depIdxs = []int32{
-	20, // 0: vxpu.LoadModelRequest.plan:type_name -> vxpu.LoadModelRequest.PlanEntry
-	21, // 1: vxpu.RegisterModelRequest.plan:type_name -> vxpu.RegisterModelRequest.PlanEntry
+	22, // 0: vxpu.LoadModelRequest.plan:type_name -> vxpu.LoadModelRequest.PlanEntry
+	23, // 1: vxpu.RegisterModelRequest.plan:type_name -> vxpu.RegisterModelRequest.PlanEntry
 	0,  // 2: vxpu.Executor.LoadModel:input_type -> vxpu.LoadModelRequest
 	2,  // 3: vxpu.Executor.RegisterModel:input_type -> vxpu.RegisterModelRequest
 	4,  // 4: vxpu.Executor.NewSession:input_type -> vxpu.NewSessionRequest
@@ -1526,18 +1648,20 @@ var file_proto_vxpu_proto_depIdxs = []int32{
 	14, // 9: vxpu.Executor.ExplainModel:input_type -> vxpu.ExplainModelRequest
 	16, // 10: vxpu.Executor.DescribeNodes:input_type -> vxpu.DescribeNodesRequest
 	18, // 11: vxpu.Executor.ServeNodes:input_type -> vxpu.ServeNodesRequest
-	1,  // 12: vxpu.Executor.LoadModel:output_type -> vxpu.LoadModelResponse
-	3,  // 13: vxpu.Executor.RegisterModel:output_type -> vxpu.RegisterModelResponse
-	5,  // 14: vxpu.Executor.NewSession:output_type -> vxpu.NewSessionResponse
-	7,  // 15: vxpu.Executor.Chat:output_type -> vxpu.ChatResponse
-	9,  // 16: vxpu.Executor.Generate:output_type -> vxpu.GenerateResponse
-	11, // 17: vxpu.Executor.GetModelStats:output_type -> vxpu.GetModelStatsResponse
-	13, // 18: vxpu.Executor.Describe:output_type -> vxpu.DescribeResponse
-	15, // 19: vxpu.Executor.ExplainModel:output_type -> vxpu.ExplainModelResponse
-	17, // 20: vxpu.Executor.DescribeNodes:output_type -> vxpu.DescribeNodesResponse
-	19, // 21: vxpu.Executor.ServeNodes:output_type -> vxpu.ServeNodesResponse
-	12, // [12:22] is the sub-list for method output_type
-	2,  // [2:12] is the sub-list for method input_type
+	20, // 12: vxpu.Executor.ServeRange:input_type -> vxpu.ServeRangeRequest
+	1,  // 13: vxpu.Executor.LoadModel:output_type -> vxpu.LoadModelResponse
+	3,  // 14: vxpu.Executor.RegisterModel:output_type -> vxpu.RegisterModelResponse
+	5,  // 15: vxpu.Executor.NewSession:output_type -> vxpu.NewSessionResponse
+	7,  // 16: vxpu.Executor.Chat:output_type -> vxpu.ChatResponse
+	9,  // 17: vxpu.Executor.Generate:output_type -> vxpu.GenerateResponse
+	11, // 18: vxpu.Executor.GetModelStats:output_type -> vxpu.GetModelStatsResponse
+	13, // 19: vxpu.Executor.Describe:output_type -> vxpu.DescribeResponse
+	15, // 20: vxpu.Executor.ExplainModel:output_type -> vxpu.ExplainModelResponse
+	17, // 21: vxpu.Executor.DescribeNodes:output_type -> vxpu.DescribeNodesResponse
+	19, // 22: vxpu.Executor.ServeNodes:output_type -> vxpu.ServeNodesResponse
+	21, // 23: vxpu.Executor.ServeRange:output_type -> vxpu.ServeRangeResponse
+	13, // [13:24] is the sub-list for method output_type
+	2,  // [2:13] is the sub-list for method input_type
 	2,  // [2:2] is the sub-list for extension type_name
 	2,  // [2:2] is the sub-list for extension extendee
 	0,  // [0:2] is the sub-list for field type_name
@@ -1556,7 +1680,7 @@ func file_proto_vxpu_proto_init() {
 			GoPackagePath: reflect.TypeOf(x{}).PkgPath(),
 			RawDescriptor: unsafe.Slice(unsafe.StringData(file_proto_vxpu_proto_rawDesc), len(file_proto_vxpu_proto_rawDesc)),
 			NumEnums:      0,
-			NumMessages:   22,
+			NumMessages:   24,
 			NumExtensions: 0,
 			NumServices:   1,
 		},

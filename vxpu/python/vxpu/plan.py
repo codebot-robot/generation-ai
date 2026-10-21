@@ -75,7 +75,7 @@ _given = contextvars.ContextVar("vxpu_plan_given", default=None)
 COORDINATOR_SWITCHES = frozenset({
     "VXPU_FUSED_EXPERTS", "VXPU_SPLIT_DECODE", "VXPU_COMPILE_MODE", "VXPU_SPLIT_COMPILE", "VXPU_DIRECT_HOST_OPS",
     "VXPU_LOWER_DECODE", "VXPU_SEGMENT_RUNTIME", "VXPU_EXPERT_MAILBOXES", "VXPU_REMOTE_NODES", "VXPU_DATAFLOW",
-    "VXPU_STEP_GRAPH", "VXPU_LAYER_RANGE",
+    "VXPU_STEP_GRAPH", "VXPU_LAYER_RANGE", "VXPU_REMOTE_RANGES",
     "VXPU_DATAFLOW_PLACE", "VXPU_GPU_EXPERTS", "VXPU_GPU_EXPERTS_MOVES", "VXPU_GPU_EXPERTS_REQUEST_WEIGHT",
     "VXPU_EXPERTS_IN_RAM", "VXPU_BF16_WEIGHT_CACHE", "VXPU_BF16_CACHE_HEADROOM_GB",
 })
@@ -352,12 +352,19 @@ class Plan:
         self._set("layer_range", rng, src, (),
                   "run only layers START..END-1 of the step (START:END, END empty for the last layer): their slice of "
                   "decode and prefill, their experts and n-gram tables; other executors run the other ranges (#387)")
+        ranges, src = env_text("VXPU_REMOTE_RANGES", None)
+        self._set("remote_ranges", ranges, src, (),
+                  "where other executors serve the ranges of layers after this engine's range, in order, as "
+                  "START:END=tcp://host:port,... (an empty END means the last layer). This engine sends each step "
+                  "on to them (rangeserver.py, #387)")
         on, src = env_flag("VXPU_DATAFLOW", False)
         self._set("dataflow", on, src, (True, False),
                   "run the decode step as a dataflow graph: its segments as nodes, each fired when the inboxes "
                   "its inputs are written into are full (dataflow.py, the reference runner; #372)")
         if self["layer_range"] is not None and not on:  # a range is a slice of the dataflow graph
             raise ConfigError("VXPU_LAYER_RANGE requires VXPU_DATAFLOW=1")
+        if self["remote_ranges"] and not on:
+            raise ConfigError("VXPU_REMOTE_RANGES requires VXPU_DATAFLOW=1")
         on, src = env_flag("VXPU_STEP_GRAPH", False)
         if on and not (cuda and self["dataflow"] and self["segment_runtime"] == "aoti" and self["kernels"]):
             on, src = False, "requires CUDA, dataflow, segment_runtime=aoti and the CPU kernels (the step host)"
