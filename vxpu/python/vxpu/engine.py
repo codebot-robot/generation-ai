@@ -85,6 +85,30 @@ def external_files_dir(external_dir, manifest):
         manifest["source"], sort_keys=True).encode()).hexdigest()[:16])
 
 
+def load_engram_tables(manifest, specs_by_layer, cas_dir, mmap_root, layers=None):
+    """The n-gram tables of an artifact's layers (binding external.engram;
+    `layers` limits them), each as the model's own embedding module on the
+    host: ({layer: module}, bytes fetched). Memory-mapped from files under
+    mmap_root when set, read row by row at random (no readahead, #364).
+    The engine and a node server (nodeserver.py) load them the same way."""
+    from . import deepseek_v41 as ds
+    tables, fetched = {}, 0
+    for key, spec in specs_by_layer.items():
+        layer = int(key)
+        if layers is not None and layer not in layers:
+            continue
+        weight, n = fetch_tensor(manifest["tensors"][spec["weight"]], manifest["files"], cas_dir, mmap_dir=mmap_root)
+        fetched += n
+        scale, n = fetch_tensor(manifest["tensors"][spec["scale"]], manifest["files"], cas_dir, mmap_dir=mmap_root)
+        fetched += n
+        if mmap_root:
+            advise_random(weight)
+            advise_random(scale)
+        tables[layer] = ds.host_engram(layer, spec["num_embeddings"], spec["dim"], weight, scale)
+        ops.ENGRAM_DIM[layer] = spec["dim"]
+    return tables, fetched
+
+
 def load_expert_layers(manifest, specs_by_layer, args, cas_dir, mmap_root, in_ram, layers=None):
     """The expert banks of an artifact's layers (binding external.experts;
     `layers` limits them), each assembled as the model's own MoE module
@@ -290,16 +314,9 @@ class Engine:
             self._place_hot_experts(self.plan["gpu_experts"])
         if self.plan["expert_mailboxes"] and self.external.experts:
             self._attach_mailboxes()
-        for layer, spec in external.get("engram", {}).items():
-            weight, downloaded = fetch_tensor(self.manifest["tensors"][spec["weight"]], self.manifest["files"], cas_dir, mmap_dir=mm)
-            self.bytes_fetched += downloaded
-            scale, downloaded = fetch_tensor(self.manifest["tensors"][spec["scale"]], self.manifest["files"], cas_dir, mmap_dir=mm)
-            self.bytes_fetched += downloaded
-            if mm:  # memory-mapped, read row by row at random: no readahead (#364)
-                advise_random(weight)
-                advise_random(scale)
-            self.external.engram[int(layer)] = ds.host_engram(int(layer), spec["num_embeddings"], spec["dim"], weight, scale)
-            ops.ENGRAM_DIM[int(layer)] = spec["dim"]
+        tables, downloaded = load_engram_tables(self.manifest, external.get("engram", {}), cas_dir, mm)
+        self.external.engram.update(tables)
+        self.bytes_fetched += downloaded
 
     def _connect_expert_servers(self):
         """The expert servers of the plan's expert_remote, connected."""

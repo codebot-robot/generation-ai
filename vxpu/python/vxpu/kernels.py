@@ -33,7 +33,7 @@ _module = None
 _error = None
 _enabled = True
 
-SOURCES = [os.path.join(os.path.dirname(__file__), "csrc", "fp4_kernels.cpp")]
+SOURCES = [os.path.join(os.path.dirname(__file__), "csrc", name) for name in ("fp4_kernels.cpp", "node_server.cpp")]
 
 
 def set_enabled(on):
