@@ -159,13 +159,13 @@ func (l *Local) PutRef(ctx context.Context, key string, value []byte) error {
 		return err
 	}
 	discard := func(err error) error {
-		// the temp is worthless after a failed write: report the first error, log the rest
-		log := klog.FromContext(ctx)
+		// the temp is worthless after a failed write: return the write's
+		// error with the close's, log a failed removal of the temp
 		if cerr := tmp.Close(); cerr != nil && !errors.Is(cerr, os.ErrClosed) {
-			log.Error(cerr, "closing temp ref", "path", tmp.Name())
+			err = errors.Join(err, fmt.Errorf("closing temp ref %s: %w", tmp.Name(), cerr))
 		}
 		if rerr := os.Remove(tmp.Name()); rerr != nil && !errors.Is(rerr, os.ErrNotExist) {
-			log.Error(rerr, "removing temp ref", "path", tmp.Name())
+			klog.FromContext(ctx).Error(rerr, "removing temp ref", "path", tmp.Name())
 		}
 		return err
 	}
