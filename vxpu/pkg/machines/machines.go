@@ -173,6 +173,10 @@ func matchGPU(p Probe, at func(string) *Machine) *Machine {
 		return at("a3-highgpu-8g")
 	case strings.Contains(gpu, "a100") && p.GPUCount <= 1:
 		return at("a2-highgpu-1g")
+	case strings.Contains(gpu, "l4") && p.GPUCount == 2:
+		return at("g2-standard-24")
+	case strings.Contains(gpu, "l4") && p.GPUCount == 4:
+		return at("g2-standard-48")
 	case isM4Pro(gpu):
 		return at("mac-m4-pro")
 	}

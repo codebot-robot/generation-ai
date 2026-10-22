@@ -175,8 +175,9 @@
    "gpu": null,
    "gpu_count": 0,
    "measured": {
-    "fp4_expert_decode_kernel_bytes_per_sec": 121000000000.0,
-    "gcs_blob_fetch_bytes_per_sec": 1400000000.0
+    "cpu_expert_kernel_bytes_per_sec": 121000000000.0,
+    "gcs_blob_fetch_bytes_per_sec": 1400000000.0,
+    "gcs_checkpoint_copy_pd_ssd_bytes_per_sec": 630000000.0
    },
    "name": "c3d-standard-60",
    "network": {
@@ -188,6 +189,70 @@
    },
    "ram_bytes": 257698037760,
    "storage": null
+  },
+  "g2-standard-24": {
+   "cpu": {
+    "cores": 12,
+    "memory_bandwidth_bytes_per_sec": 140800000000.0,
+    "model": "Intel(R) Xeon(R) CPU @ 2.20GHz (Cascade Lake)",
+    "simd": "avx512",
+    "threads": 24
+   },
+   "description": "GCP G2 instance with 2x NVIDIA L4 GPUs (24 GB each)",
+   "gpu": {
+    "memory_bandwidth_bytes_per_sec": 300000000000.0,
+    "memory_bytes": 23659151360,
+    "name": "NVIDIA L4",
+    "pcie_bandwidth_bytes_per_sec": 32000000000.0,
+    "pcie_gen": 4,
+    "pcie_lanes": 16,
+    "peak_compute_flops": {
+     "bf16": 121000000000000.0,
+     "fp32": 30300000000000.0,
+     "fp8": 242000000000000.0
+    },
+    "sm_count": 58
+   },
+   "gpu_count": 2,
+   "measured": {
+    "cpu_expert_kernel_bytes_per_sec": 52150000000.0,
+    "gcs_checkpoint_copy_bytes_per_sec": 830000000.0,
+    "gcs_to_ram_bytes_per_sec": 1280000000.0,
+    "gpu_gemv_bytes_per_sec": 252000000000.0,
+    "local_ssd_write_bytes_per_sec": 820000000.0
+   },
+   "name": "g2-standard-24",
+   "ram_bytes": 101236568064
+  },
+  "g2-standard-48": {
+   "cpu": {
+    "cores": 24,
+    "memory_bandwidth_bytes_per_sec": 140800000000.0,
+    "model": "Intel(R) Xeon(R) CPU @ 2.20GHz (Cascade Lake)",
+    "simd": "avx512",
+    "threads": 48
+   },
+   "description": "GCP G2 instance with 4x NVIDIA L4 GPUs (24 GB each)",
+   "gpu": {
+    "memory_bandwidth_bytes_per_sec": 300000000000.0,
+    "memory_bytes": 23659151360,
+    "name": "NVIDIA L4",
+    "pcie_bandwidth_bytes_per_sec": 32000000000.0,
+    "pcie_gen": 4,
+    "pcie_lanes": 16,
+    "peak_compute_flops": {
+     "bf16": 121000000000000.0,
+     "fp32": 30300000000000.0,
+     "fp8": 242000000000000.0
+    },
+    "sm_count": 58
+   },
+   "gpu_count": 4,
+   "measured": {
+    "gpu_gemv_bytes_per_sec": 252000000000.0
+   },
+   "name": "g2-standard-48",
+   "ram_bytes": 206158430208
   },
   "g4-standard-48": {
    "cpu": {
@@ -219,7 +284,9 @@
     "sm_count": 188
    },
    "gpu_count": 1,
-   "measured": null,
+   "measured": {
+    "gpu_gemv_bytes_per_sec": 754000000000.0
+   },
    "name": "g4-standard-48",
    "network": {
     "bandwidth_bytes_per_sec": 6250000000.0
@@ -270,9 +337,10 @@
    "gpu_count": 2,
    "measured": {
     "checkpoint_load_bytes_per_sec": 2830000000.0,
-    "cpu_fp4_expert_kernel_effective_bytes_per_sec": 209000000000.0,
+    "cpu_expert_kernel_bytes_per_sec": 209000000000.0,
     "gcs_blob_fetch_bytes_per_sec": 1700000000.0,
     "gcs_checkpoint_copy_bytes_per_sec": 2890000000.0,
+    "gpu_gemv_bytes_per_sec": 754000000000.0,
     "local_ssd_read_bytes_per_sec": 5440000000.0,
     "local_ssd_read_iops": 1330000.0,
     "usable_gpu_memory_bytes": 102641958912
@@ -326,7 +394,7 @@
    },
    "gpu_count": 1,
    "measured": {
-    "fp4_expert_decode_kernel_bytes_per_sec": 52000000000.0
+    "cpu_expert_kernel_bytes_per_sec": 52000000000.0
    },
    "name": "mac-m4-pro",
    "network": {

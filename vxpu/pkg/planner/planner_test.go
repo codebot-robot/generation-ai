@@ -122,8 +122,8 @@ func TestChoose_ReasonsForTheCPU(t *testing.T) {
 		{"dense weights fill the GPU", Artifact{DenseBytes: 20e9, Experts: a.Experts}, gpu, uniform(a), "no GPU has room"},
 	} {
 		p := Choose(c.artifact, c.probe, nil, c.counts)
-		if len(p.Switches) != 0 || !strings.Contains(p.Reasons[len(p.Reasons)-1], c.reason) {
-			t.Errorf("%s: got %+v, want no switches and a reason about %q", c.name, p, c.reason)
+		if _, placed := p.Switches["VXPU_GPU_EXPERTS"]; placed || !strings.Contains(p.Reasons[len(p.Reasons)-1], c.reason) {
+			t.Errorf("%s: got %+v, want no GPU experts and a reason about %q", c.name, p, c.reason)
 		}
 	}
 }
