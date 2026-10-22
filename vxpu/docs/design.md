@@ -98,6 +98,14 @@ ones the shapes miss. `vxpu explain --serve` shows it running. Layer ranges need
 a node server that runs whole layers, dense half and KV cache included
 (#387), before the executors can run them.
 
+Not every layer boundary can start a range (`cuts.py`): a cut must not
+separate state a layer writes every step from the layers that read it.
+DeepSeek-V4.1-Flash's layers 2, 8, 14 and 20 write compressed KV caches
+read by the layers after them (layer 20's by every layer to 39), so its
+step can only be cut before layers 1, 2, 8, 14 and 20, with about 72 KB
+crossing a cut each decode step. The planner and the search only start
+ranges there.
+
 **Direction.** The planner chooses between plans by cost, the cost model
 grows to time to start, cost to start and cost per minute (#349), and in
 the end the planner owns all placement (§4, §6; #316, #387).

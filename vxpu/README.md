@@ -185,6 +185,7 @@ To see how a model would run on machines you could get, without running
 it, rank the planner's candidate layouts by the cost model (#409):
 
 ```sh
+python -m vxpu.cuts ARTIFACT_DIR > ARTIFACT_DIR/cuts.json  # where the step can be cut into ranges
 vxpu explain --artifact ARTIFACT_DIR --machines g2-standard-48:2,c3d-standard-60:2 \
   [--records records.jsonl]   # recorded traffic (vxpu stats --records), for GPU experts
 ```

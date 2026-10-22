@@ -120,3 +120,26 @@ func TestSearch_FewLayers(t *testing.T) {
 		sr.Step()
 	}
 }
+
+// The search keeps to the legal cuts too: every range its best layouts
+// start, they start at a legal cut.
+func TestSearch_OnlyAtLegalCuts(t *testing.T) {
+	a := deepseekFull()
+	a.Cuts, a.Uncuttable = []int{1, 2, 8, 14, 20}, map[int]string{21: "layer 20's compressed KV cache"}
+	s := NewScorer(a, fleetOf(t, "g2-standard-48", "g2-standard-48", "c3d-standard-60", "c3d-standard-60"), nil)
+	sr := NewSearch(s, 10, 1)
+	for range 20000 {
+		sr.Step()
+	}
+	for _, sc := range sr.Top {
+		for i, d := range sc.Layout.Dense {
+			if d != sc.Layout.Dense[(i+len(sc.Layout.Dense)-1)%len(sc.Layout.Dense)] && !a.CanStart(i) {
+				t.Errorf("%s (%.1f ms) starts a range at layer %d", s.Describe(sc.Layout), sc.Ms, i)
+			}
+		}
+	}
+	t.Logf("best: %s %.1f ms (%s)", sr.Top[0].Kind, sr.Top[0].Ms, s.Describe(sr.Top[0].Layout))
+	if sr.Top[0].Kind != "layer-ranges (2)" {
+		t.Errorf("best: %+v", sr.Top[0])
+	}
+}
