@@ -1,0 +1,38 @@
+# Copyright 2026 Google LLC
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
+name: g2-standard-48
+description: GCP G2 instance with 4x NVIDIA L4 GPUs (24 GB each)
+cpu:
+  cores: 24
+  memory_bandwidth_bytes_per_sec: 140.8e9
+  model: "Intel(R) Xeon(R) CPU @ 2.20GHz (Cascade Lake)"
+  simd: avx512
+  threads: 48
+ram_bytes: 206158430208  # 192 GiB
+gpu_count: 4
+gpu:
+  memory_bandwidth_bytes_per_sec: 300e9
+  memory_bytes: 23659151360  # 22.03 GiB
+  name: NVIDIA L4
+  pcie_bandwidth_bytes_per_sec: 32e9
+  pcie_gen: 4
+  pcie_lanes: 16
+  peak_compute_flops:
+    bf16: 121e12
+    fp32: 30.3e12
+    fp8: 242e12
+  sm_count: 58
+measured:
+  gpu_gemv_bytes_per_sec: 203e9

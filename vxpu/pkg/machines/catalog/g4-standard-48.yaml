@@ -1,0 +1,55 @@
+# Copyright 2026 Google LLC
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
+name: g4-standard-48
+description: GCP G4 instance with 1x NVIDIA RTX PRO 6000 Blackwell Server Edition GPU
+cpu:
+  cache_sizes:
+    l1d: 1179648  # 1152 KiB
+    l1i: 786.432e3
+    l2: 25165824  # 24 MiB
+    l3: 100663296  # 96 MiB
+  cores: 24
+  memory_bandwidth_bytes_per_sec: 144e9
+  model: AMD EPYC 9B45 (Turin)
+  simd: avx512
+  threads: 48
+ram_bytes: 193273528320  # 180 GiB
+gpu_count: 1
+gpu:
+  memory_bandwidth_bytes_per_sec: 1.597e12
+  memory_bytes: 103079215104  # 96 GiB
+  name: NVIDIA RTX PRO 6000
+  pcie_bandwidth_bytes_per_sec: 63e9
+  pcie_gen: 5
+  pcie_lanes: 16
+  peak_compute_flops:
+    bf16: 500e12
+    fp32: 125e12
+    fp8: 1008e12
+  sm_count: 188
+storage:
+  capacity_bytes: 1.5e12
+  devices: 4
+  read_bandwidth_bytes_per_sec: 2621440000  # 2500 MiB/s
+  read_iops: 600e3
+  write_bandwidth_bytes_per_sec: 1384120320  # 1320 MiB/s
+  write_iops: 300e3
+network:
+  bandwidth_bytes_per_sec: 6.25e9
+price:
+  on_demand_usd_per_hour: 4.5
+  spot_usd_per_hour: 1.7149
+measured:
+  gpu_gemv_bytes_per_sec: 754e9
