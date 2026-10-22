@@ -1618,7 +1618,8 @@ def _check_plan_given():
         raise SystemExit("plan: without the coordinator, the environment's switch should apply")
     for bad in ({"VXPU_NO_SUCH_SWITCH": "1"}, {"VXPU_KERNEL_THREADS": "4"}, {"VXPU_KERNELS": "0"},
                 {"VXPU_BLOB_DIR": "/tmp/x"}, {"VXPU_AOTI_CACHE_DIR": "/tmp/x"}, {"VXPU_FUSED_EXPERTS": " "},
-                {"VXPU_GPU_EXPERTS": "/etc/placement.json"}, {"VXPU_FUSED_EXPERTS": "maybe"}):
+                {"VXPU_GPU_EXPERTS": "/etc/placement.json"}, {"VXPU_GPU_EXPERTS": "{not json"},
+                {"VXPU_GPU_EXPERTS": "[1, 2]"}, {"VXPU_FUSED_EXPERTS": "maybe"}):
         try:
             Plan("cpu", triton_available=False, given=bad)
         except ConfigError:
@@ -1626,6 +1627,26 @@ def _check_plan_given():
         raise SystemExit(f"plan: {bad} should be refused")
     if experts_gpu.load_placement('{"format": "vxpu-placement/2", "gpus": [{"layers": {"3": [1, 2]}}]}') != [{3: [1, 2]}]:
         raise SystemExit("placement: an inline placement should parse like a file")
+    # LoadModel answers every refusal as INVALID_ARGUMENT (final: the router doesn't retry), a
+    # switch's own check (a plain ValueError) included, before it touches the artifact
+    import grpc
+    from . import vxpu_pb2
+    from .server import ExecutorServicer
+
+    class Context:
+        code = details = None
+
+        def set_code(self, code):
+            self.code = code
+
+        def set_details(self, details):
+            self.details = details
+
+    ctx = Context()
+    ExecutorServicer(work_dir=tempfile.mkdtemp(prefix="vxpu-plan-"), device="cpu").LoadModel(
+        vxpu_pb2.LoadModelRequest(plan={"VXPU_DATAFLOW_PLACE": "experts"}), ctx)
+    if ctx.code != grpc.StatusCode.INVALID_ARGUMENT:
+        raise SystemExit(f"plan: LoadModel answered a refused plan with {ctx.code} ({ctx.details})")
     print("plan check: the coordinator's switches win over the environment's; others, empty ones and paths are refused")
 
 

@@ -154,6 +154,11 @@ func (s *Server) RegisterModel(ctx context.Context, req *pb.RegisterModelRequest
 	if s.weightStore == nil {
 		return nil, status.Error(codes.FailedPrecondition, "registering models by name needs modelstore (deploy it, or start the router with --modelstore)")
 	}
+	for k, v := range req.Plan { // every load would refuse it: say so now, before anything is imported
+		if strings.TrimSpace(v) == "" {
+			return nil, status.Errorf(codes.InvalidArgument, "plan switch %s is empty: leave it out instead", k)
+		}
+	}
 	revision := req.Revision
 	if revision == "" {
 		revision = "main"

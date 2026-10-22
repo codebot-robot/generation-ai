@@ -277,6 +277,15 @@ func TestRegisterModel_AlreadyCompiled(t *testing.T) {
 	}
 }
 
+// An empty switch would be refused by every load: registering refuses it.
+func TestRegisterModel_EmptySwitchRefused(t *testing.T) {
+	s, _ := newCatalogServer(t, &fakeModelstore{compiled: true})
+	_, err := s.RegisterModel(t.Context(), &pb.RegisterModelRequest{Model: "org/M", Plan: map[string]string{"VXPU_EXPERT_MAILBOXES": " "}})
+	if status.Code(err) != codes.InvalidArgument {
+		t.Errorf("err %v, want InvalidArgument", err)
+	}
+}
+
 func TestRegisterModel_PlanGoesWithEveryLoad(t *testing.T) {
 	ctx := t.Context()
 	s, _ := newCatalogServer(t, &fakeModelstore{compiled: true})
