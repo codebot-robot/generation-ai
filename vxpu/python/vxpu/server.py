@@ -39,7 +39,7 @@ import torch
 
 from . import vxpu_pb2, vxpu_pb2_grpc
 from .engine import Engine, SamplingParams
-from .plan import ConfigError, Plan, probe_hardware
+from .plan import Plan, probe_hardware
 
 MAX_MESSAGE_BYTES = 128 * 1024 * 1024
 
@@ -112,16 +112,17 @@ class ExecutorServicer(vxpu_pb2_grpc.ExecutorServicer):
             plan_given = dict(request.plan)
             try:  # a plan this executor refuses fails the call, not the load behind it
                 Plan(self.device, compile_decode=self.compile_decode, given=plan_given)
-            except ConfigError as e:
+            except ValueError as e:  # ConfigError, and the plain ValueErrors of a switch's own checks
                 context.set_code(grpc.StatusCode.INVALID_ARGUMENT)
                 context.set_details(f"plan refused: {e}")
                 return vxpu_pb2.LoadModelResponse(success=False)
-            digest = hashlib.sha256(
+            # the files are the artifact's alone; the engine is the artifact under its plan
+            artifact_digest = hashlib.sha256(
                 request.manifest_json.encode()
                 + request.binding_json.encode()
                 + request.prefill_graph
-                + request.decode_graph
-                + json.dumps(plan_given, sort_keys=True).encode()).hexdigest()
+                + request.decode_graph).hexdigest()
+            digest = hashlib.sha256((artifact_digest + json.dumps(plan_given, sort_keys=True)).encode()).hexdigest()
             with self.lock:
                 self._touch()
                 if self.engine is not None and digest == self.digest:
@@ -140,7 +141,7 @@ class ExecutorServicer(vxpu_pb2_grpc.ExecutorServicer):
                 if torch.cuda.is_available():
                     torch.cuda.empty_cache()
 
-                artifact_dir = os.path.join(self.work_dir, digest[:16])
+                artifact_dir = os.path.join(self.work_dir, artifact_digest[:16])
                 os.makedirs(artifact_dir, exist_ok=True)
                 for name, data in (
                         ("manifest.json", request.manifest_json.encode()),

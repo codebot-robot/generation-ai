@@ -264,8 +264,14 @@ class Plan:
         empty = sorted(k for k, v in given.items() if not v.strip())
         if empty:
             raise ConfigError(f"the coordinator set {', '.join(empty)} to nothing: leave a switch out instead")
-        if not given.get("VXPU_GPU_EXPERTS", "{").lstrip().startswith("{"):
-            raise ConfigError("the coordinator's VXPU_GPU_EXPERTS must be the placement itself (JSON), not a path")
+        if "VXPU_GPU_EXPERTS" in given:  # checked here, so a bad one fails the call, not the load
+            try:
+                placement = json.loads(given["VXPU_GPU_EXPERTS"])
+            except (ValueError, RecursionError):  # nested past the interpreter's limit: refused too
+                placement = None
+            if not isinstance(placement, dict):
+                raise ConfigError("the coordinator's VXPU_GPU_EXPERTS must be the placement itself (a JSON object), "
+                                  "not a path")
         token = _given.set(given)
         try:
             self._choose(device, compile_decode, external_dir, triton_available)
