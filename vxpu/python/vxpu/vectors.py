@@ -1470,6 +1470,34 @@ def _check_mover_lifetime():
         raise SystemExit("expert mover: its worker thread outlived it")
 
 
+def _check_plan_given():
+    """The switches the coordinator sends (LoadModelRequest.plan, #394):
+    read ahead of the environment and recorded as "coordinator"; only the
+    execution and placement switches are taken (not the machine's paths,
+    bucket or expert servers, nor what only the kernels read), never
+    empty, and a placement only inline; a placement inline parses like a
+    file."""
+    from . import experts_gpu
+    from .plan import ConfigError, Plan
+    got = _with_env({"VXPU_FUSED_EXPERTS": "1"}, Plan, "cpu", triton_available=False,
+                    given={"VXPU_FUSED_EXPERTS": "0"})
+    if got.choices["fused_experts"].value is not False or got.choices["fused_experts"].source != "coordinator":
+        raise SystemExit(f"plan: the coordinator's switch should win over the environment's: {got.choices['fused_experts']}")
+    if _with_env({"VXPU_FUSED_EXPERTS": "0"}, Plan, "cpu", triton_available=False).choices["fused_experts"].source != "env":
+        raise SystemExit("plan: without the coordinator, the environment's switch should apply")
+    for bad in ({"VXPU_NO_SUCH_SWITCH": "1"}, {"VXPU_KERNEL_THREADS": "4"}, {"VXPU_KERNELS": "0"},
+                {"VXPU_BLOB_DIR": "/tmp/x"}, {"VXPU_EXPERT_REMOTE": "evil:1"}, {"VXPU_FUSED_EXPERTS": " "},
+                {"VXPU_GPU_EXPERTS": "/etc/placement.json"}, {"VXPU_FUSED_EXPERTS": "maybe"}):
+        try:
+            Plan("cpu", triton_available=False, given=bad)
+        except ConfigError:
+            continue
+        raise SystemExit(f"plan: {bad} should be refused")
+    if experts_gpu.load_placement('{"format": "vxpu-placement/2", "gpus": [{"layers": {"3": [1, 2]}}]}') != [{3: [1, 2]}]:
+        raise SystemExit("placement: an inline placement should parse like a file")
+    print("plan check: the coordinator's switches win over the environment's; others, empty ones and paths are refused")
+
+
 def _check_hardware():
     import json
     from .hardware import CATALOG, probe, _match_catalog, Machine, CPU
@@ -1622,6 +1650,7 @@ def selftest(workdir, settings):
     _check_mover_lifetime()
     _check_compile_plan()
     _check_hardware()
+    _check_plan_given()
     _check_compile_names()
     os.makedirs(workdir, exist_ok=True)
     _check_host_reads(workdir)

@@ -36,11 +36,15 @@ const (
 )
 
 type LoadModelRequest struct {
-	state         protoimpl.MessageState `protogen:"open.v1"`
-	ManifestJson  string                 `protobuf:"bytes,1,opt,name=manifest_json,json=manifestJson,proto3" json:"manifest_json,omitempty"`
-	BindingJson   string                 `protobuf:"bytes,2,opt,name=binding_json,json=bindingJson,proto3" json:"binding_json,omitempty"`
-	PrefillGraph  []byte                 `protobuf:"bytes,3,opt,name=prefill_graph,json=prefillGraph,proto3" json:"prefill_graph,omitempty"`
-	DecodeGraph   []byte                 `protobuf:"bytes,4,opt,name=decode_graph,json=decodeGraph,proto3" json:"decode_graph,omitempty"`
+	state        protoimpl.MessageState `protogen:"open.v1"`
+	ManifestJson string                 `protobuf:"bytes,1,opt,name=manifest_json,json=manifestJson,proto3" json:"manifest_json,omitempty"`
+	BindingJson  string                 `protobuf:"bytes,2,opt,name=binding_json,json=bindingJson,proto3" json:"binding_json,omitempty"`
+	PrefillGraph []byte                 `protobuf:"bytes,3,opt,name=prefill_graph,json=prefillGraph,proto3" json:"prefill_graph,omitempty"`
+	DecodeGraph  []byte                 `protobuf:"bytes,4,opt,name=decode_graph,json=decodeGraph,proto3" json:"decode_graph,omitempty"`
+	// The plan the coordinator chose for this load: switches by name
+	// (VXPU_GPU_EXPERTS, VXPU_EXPERT_MAILBOXES, ...) with the values the
+	// environment would hold, read ahead of the environment (#394).
+	Plan          map[string]string `protobuf:"bytes,5,rep,name=plan,proto3" json:"plan,omitempty" protobuf_key:"bytes,1,opt,name=key" protobuf_val:"bytes,2,opt,name=value"`
 	unknownFields protoimpl.UnknownFields
 	sizeCache     protoimpl.SizeCache
 }
@@ -103,6 +107,13 @@ func (x *LoadModelRequest) GetDecodeGraph() []byte {
 	return nil
 }
 
+func (x *LoadModelRequest) GetPlan() map[string]string {
+	if x != nil {
+		return x.Plan
+	}
+	return nil
+}
+
 type LoadModelResponse struct {
 	state         protoimpl.MessageState `protogen:"open.v1"`
 	Success       bool                   `protobuf:"varint,1,opt,name=success,proto3" json:"success,omitempty"`
@@ -152,7 +163,11 @@ type RegisterModelRequest struct {
 	// A Hugging Face repository id, e.g. "deepseek-ai/DeepSeek-V4.1-Flash".
 	Model string `protobuf:"bytes,1,opt,name=model,proto3" json:"model,omitempty"`
 	// Branch, tag or commit; empty means "main".
-	Revision      string `protobuf:"bytes,2,opt,name=revision,proto3" json:"revision,omitempty"`
+	Revision string `protobuf:"bytes,2,opt,name=revision,proto3" json:"revision,omitempty"`
+	// Switches the coordinator sets whenever it loads this model (see
+	// LoadModelRequest.plan). Replaces the model's previous plan; empty
+	// leaves it as it is.
+	Plan          map[string]string `protobuf:"bytes,3,rep,name=plan,proto3" json:"plan,omitempty" protobuf_key:"bytes,1,opt,name=key" protobuf_val:"bytes,2,opt,name=value"`
 	unknownFields protoimpl.UnknownFields
 	sizeCache     protoimpl.SizeCache
 }
@@ -199,6 +214,13 @@ func (x *RegisterModelRequest) GetRevision() string {
 		return x.Revision
 	}
 	return ""
+}
+
+func (x *RegisterModelRequest) GetPlan() map[string]string {
+	if x != nil {
+		return x.Plan
+	}
+	return nil
 }
 
 type RegisterModelResponse struct {
@@ -931,17 +953,25 @@ var File_proto_vxpu_proto protoreflect.FileDescriptor
 
 const file_proto_vxpu_proto_rawDesc = "" +
 	"\n" +
-	"\x10proto/vxpu.proto\x12\x04vxpu\"\xa2\x01\n" +
+	"\x10proto/vxpu.proto\x12\x04vxpu\"\x91\x02\n" +
 	"\x10LoadModelRequest\x12#\n" +
 	"\rmanifest_json\x18\x01 \x01(\tR\fmanifestJson\x12!\n" +
 	"\fbinding_json\x18\x02 \x01(\tR\vbindingJson\x12#\n" +
 	"\rprefill_graph\x18\x03 \x01(\fR\fprefillGraph\x12!\n" +
-	"\fdecode_graph\x18\x04 \x01(\fR\vdecodeGraph\"-\n" +
+	"\fdecode_graph\x18\x04 \x01(\fR\vdecodeGraph\x124\n" +
+	"\x04plan\x18\x05 \x03(\v2 .vxpu.LoadModelRequest.PlanEntryR\x04plan\x1a7\n" +
+	"\tPlanEntry\x12\x10\n" +
+	"\x03key\x18\x01 \x01(\tR\x03key\x12\x14\n" +
+	"\x05value\x18\x02 \x01(\tR\x05value:\x028\x01\"-\n" +
 	"\x11LoadModelResponse\x12\x18\n" +
-	"\asuccess\x18\x01 \x01(\bR\asuccess\"H\n" +
+	"\asuccess\x18\x01 \x01(\bR\asuccess\"\xbb\x01\n" +
 	"\x14RegisterModelRequest\x12\x14\n" +
 	"\x05model\x18\x01 \x01(\tR\x05model\x12\x1a\n" +
-	"\brevision\x18\x02 \x01(\tR\brevision\"\xbc\x01\n" +
+	"\brevision\x18\x02 \x01(\tR\brevision\x128\n" +
+	"\x04plan\x18\x03 \x03(\v2$.vxpu.RegisterModelRequest.PlanEntryR\x04plan\x1a7\n" +
+	"\tPlanEntry\x12\x10\n" +
+	"\x03key\x18\x01 \x01(\tR\x03key\x12\x14\n" +
+	"\x05value\x18\x02 \x01(\tR\x05value:\x028\x01\"\xbc\x01\n" +
 	"\x15RegisterModelResponse\x12\x14\n" +
 	"\x05model\x18\x01 \x01(\tR\x05model\x12\x1a\n" +
 	"\brevision\x18\x02 \x01(\tR\brevision\x12\x16\n" +
@@ -1039,7 +1069,7 @@ func file_proto_vxpu_proto_rawDescGZIP() []byte {
 	return file_proto_vxpu_proto_rawDescData
 }
 
-var file_proto_vxpu_proto_msgTypes = make([]protoimpl.MessageInfo, 12)
+var file_proto_vxpu_proto_msgTypes = make([]protoimpl.MessageInfo, 14)
 var file_proto_vxpu_proto_goTypes = []any{
 	(*LoadModelRequest)(nil),      // 0: vxpu.LoadModelRequest
 	(*LoadModelResponse)(nil),     // 1: vxpu.LoadModelResponse
@@ -1053,25 +1083,29 @@ var file_proto_vxpu_proto_goTypes = []any{
 	(*GenerateResponse)(nil),      // 9: vxpu.GenerateResponse
 	(*GetModelStatsRequest)(nil),  // 10: vxpu.GetModelStatsRequest
 	(*GetModelStatsResponse)(nil), // 11: vxpu.GetModelStatsResponse
+	nil,                           // 12: vxpu.LoadModelRequest.PlanEntry
+	nil,                           // 13: vxpu.RegisterModelRequest.PlanEntry
 }
 var file_proto_vxpu_proto_depIdxs = []int32{
-	0,  // 0: vxpu.Executor.LoadModel:input_type -> vxpu.LoadModelRequest
-	2,  // 1: vxpu.Executor.RegisterModel:input_type -> vxpu.RegisterModelRequest
-	4,  // 2: vxpu.Executor.NewSession:input_type -> vxpu.NewSessionRequest
-	6,  // 3: vxpu.Executor.Chat:input_type -> vxpu.ChatRequest
-	8,  // 4: vxpu.Executor.Generate:input_type -> vxpu.GenerateRequest
-	10, // 5: vxpu.Executor.GetModelStats:input_type -> vxpu.GetModelStatsRequest
-	1,  // 6: vxpu.Executor.LoadModel:output_type -> vxpu.LoadModelResponse
-	3,  // 7: vxpu.Executor.RegisterModel:output_type -> vxpu.RegisterModelResponse
-	5,  // 8: vxpu.Executor.NewSession:output_type -> vxpu.NewSessionResponse
-	7,  // 9: vxpu.Executor.Chat:output_type -> vxpu.ChatResponse
-	9,  // 10: vxpu.Executor.Generate:output_type -> vxpu.GenerateResponse
-	11, // 11: vxpu.Executor.GetModelStats:output_type -> vxpu.GetModelStatsResponse
-	6,  // [6:12] is the sub-list for method output_type
-	0,  // [0:6] is the sub-list for method input_type
-	0,  // [0:0] is the sub-list for extension type_name
-	0,  // [0:0] is the sub-list for extension extendee
-	0,  // [0:0] is the sub-list for field type_name
+	12, // 0: vxpu.LoadModelRequest.plan:type_name -> vxpu.LoadModelRequest.PlanEntry
+	13, // 1: vxpu.RegisterModelRequest.plan:type_name -> vxpu.RegisterModelRequest.PlanEntry
+	0,  // 2: vxpu.Executor.LoadModel:input_type -> vxpu.LoadModelRequest
+	2,  // 3: vxpu.Executor.RegisterModel:input_type -> vxpu.RegisterModelRequest
+	4,  // 4: vxpu.Executor.NewSession:input_type -> vxpu.NewSessionRequest
+	6,  // 5: vxpu.Executor.Chat:input_type -> vxpu.ChatRequest
+	8,  // 6: vxpu.Executor.Generate:input_type -> vxpu.GenerateRequest
+	10, // 7: vxpu.Executor.GetModelStats:input_type -> vxpu.GetModelStatsRequest
+	1,  // 8: vxpu.Executor.LoadModel:output_type -> vxpu.LoadModelResponse
+	3,  // 9: vxpu.Executor.RegisterModel:output_type -> vxpu.RegisterModelResponse
+	5,  // 10: vxpu.Executor.NewSession:output_type -> vxpu.NewSessionResponse
+	7,  // 11: vxpu.Executor.Chat:output_type -> vxpu.ChatResponse
+	9,  // 12: vxpu.Executor.Generate:output_type -> vxpu.GenerateResponse
+	11, // 13: vxpu.Executor.GetModelStats:output_type -> vxpu.GetModelStatsResponse
+	8,  // [8:14] is the sub-list for method output_type
+	2,  // [2:8] is the sub-list for method input_type
+	2,  // [2:2] is the sub-list for extension type_name
+	2,  // [2:2] is the sub-list for extension extendee
+	0,  // [0:2] is the sub-list for field type_name
 }
 
 func init() { file_proto_vxpu_proto_init() }
@@ -1087,7 +1121,7 @@ func file_proto_vxpu_proto_init() {
 			GoPackagePath: reflect.TypeOf(x{}).PkgPath(),
 			RawDescriptor: unsafe.Slice(unsafe.StringData(file_proto_vxpu_proto_rawDesc), len(file_proto_vxpu_proto_rawDesc)),
 			NumEnums:      0,
-			NumMessages:   12,
+			NumMessages:   14,
 			NumExtensions: 0,
 			NumServices:   1,
 		},

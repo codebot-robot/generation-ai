@@ -73,6 +73,8 @@ type Server struct {
 	externalModel map[string]string   // external executor address -> model key it holds
 	modelEndpoint map[string]string   // model key -> external executor address
 	loadedTags    map[string]string   // compiled artifact tag -> model key loaded from it
+	loadedHints   map[string]string   // compiled artifact tag -> the registered plan it was loaded under (hintsKey)
+	hints         map[string]string   // statsKey(model) -> its registered plan, as last stored or read (hintsKey)
 	keyModel      map[string]modelRef // model key -> the named model it serves (stats.go)
 	stats         *statsStore         // statistics for models served by name, nil without modelstore
 	// externalModelstoreURL is modelstore's address for external executors
@@ -453,6 +455,9 @@ func (s *Server) getOrStartPod(ctx context.Context, modelID string, want *Placem
 }
 
 func (s *Server) LoadModel(ctx context.Context, req *pb.LoadModelRequest) (*pb.LoadModelResponse, error) {
+	if len(req.Plan) > 0 { // sessions find their executor by the artifact alone (modelKey), so one plan per artifact
+		return nil, status.Error(codes.InvalidArgument, "a plan comes with a model loaded by name (vxpu register --plan), not with an artifact")
+	}
 	modelKey := artifactKey(req.ManifestJson)
 	peerKey := getPeerKey(ctx)
 	if peerKey != "unknown" {
@@ -480,7 +485,7 @@ func artifactKey(manifestJSON string) string {
 func (s *Server) loadArtifact(ctx context.Context, req *pb.LoadModelRequest, external bool) (string, error) {
 	log := klog.FromContext(ctx)
 	modelKey := artifactKey(req.ManifestJson)
-	log.Info("Loading artifact", "model_key", modelKey, "external", external)
+	log.Info("Loading artifact", "model_key", modelKey, "external", external, "plan", planSwitches(req.Plan))
 
 	if s.blobServer == nil {
 		return "", status.Errorf(codes.Internal, "blobserver is not initialized")
@@ -511,6 +516,7 @@ func (s *Server) loadArtifact(ctx context.Context, req *pb.LoadModelRequest, ext
 		BindingJson:  req.BindingJson,
 		PrefillGraph: req.PrefillGraph,
 		DecodeGraph:  req.DecodeGraph,
+		Plan:         req.Plan,
 	}
 
 	var endpoint string
@@ -554,7 +560,7 @@ func (s *Server) loadArtifact(ctx context.Context, req *pb.LoadModelRequest, ext
 		loadCtx, cancel := context.WithTimeout(ctx, 30*time.Second)
 		_, loadErr = client.LoadModel(loadCtx, reqCopy)
 		cancel()
-		if loadErr == nil {
+		if loadErr == nil || status.Code(loadErr) == codes.InvalidArgument { // a refused plan stays refused
 			break
 		}
 		log.Info("Waiting for executor gRPC server to accept LoadModel", "attempt", i, "error", loadErr.Error())

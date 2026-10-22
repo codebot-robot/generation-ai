@@ -39,13 +39,22 @@ An engine builds a physical plan when it loads an artifact
 - **Hardware:** the device, the GPU and its memory, the CPU, SIMD level, RAM.
 - **Choices:** compile and split the decode graph, where the experts live,
   whether to use the CPU kernels, and so on. Each records its value and
-  where the value came from: a default, the environment, an argument.
+  where the value came from: a default, the environment, an argument, or
+  the coordinator.
 - **Implementations:** every op the graphs call (`vxpu::moe_experts`,
   `vxpu::fp8_linear`, ...) has registered implementations in preference
   order, each with the devices it runs on, when it applies, and its
   numerics class: *bit-identical* to the model's own computation, or
   equal up to *rounding*. Ops dispatch through the plan, and the plan
   records what each input shape got.
+
+The coordinator can set the plan's switches. A model registered with
+`vxpu register --plan VXPU_NAME=VALUE` keeps that plan in modelstore, and
+the router sends it with every load of the model (`LoadModelRequest.plan`,
+#394). The executor reads those switches ahead of its environment and
+refuses any it may not take (paths and endpoints on its own machine stay its own). The plan is part of what an executor
+loads, so a new plan loads the model again. Today a person writes the
+plan. The planner (below) is what will write it.
 
 The plan can be lowered into the decode graph (`lower.py`): each op call
 becomes the selected implementation, its Triton kernels visible to the

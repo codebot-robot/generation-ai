@@ -39,6 +39,7 @@ import torch
 
 from . import vxpu_pb2, vxpu_pb2_grpc
 from .engine import Engine, SamplingParams
+from .plan import ConfigError, Plan
 
 MAX_MESSAGE_BYTES = 128 * 1024 * 1024
 
@@ -75,14 +76,15 @@ class ExecutorServicer(vxpu_pb2_grpc.ExecutorServicer):
                     if torch.cuda.is_available():
                         torch.cuda.empty_cache()
 
-    def _load(self, digest, artifact_dir, total_bytes):
+    def _load(self, digest, artifact_dir, total_bytes, plan_given):
         try:
             print(f"[vxpu] loading {digest[:12]} "
                   f"({total_bytes / 1e9:.1f} GB of weights to rehydrate)",
                   flush=True)
             started = time.time()
             engine = Engine(artifact_dir, device=self.device,
-                            compile_decode=self.compile_decode)
+                            compile_decode=self.compile_decode,
+                            plan_given=plan_given)
             with self.lock:
                 if self.loading == digest:
                     self.engine = engine
@@ -104,11 +106,21 @@ class ExecutorServicer(vxpu_pb2_grpc.ExecutorServicer):
         NewSession, which reports FAILED_PRECONDITION until ready. No
         long-held RPC, so tunnels (port-forward) never sit idle."""
         try:
+            # the coordinator's plan is part of what is loaded: the same
+            # artifact under another plan is another engine
+            plan_given = dict(request.plan)
+            try:  # a plan this executor refuses fails the call, not the load behind it
+                Plan(self.device, compile_decode=self.compile_decode, given=plan_given)
+            except ConfigError as e:
+                context.set_code(grpc.StatusCode.INVALID_ARGUMENT)
+                context.set_details(f"plan refused: {e}")
+                return vxpu_pb2.LoadModelResponse(success=False)
             digest = hashlib.sha256(
                 request.manifest_json.encode()
                 + request.binding_json.encode()
                 + request.prefill_graph
-                + request.decode_graph).hexdigest()
+                + request.decode_graph
+                + json.dumps(plan_given, sort_keys=True).encode()).hexdigest()
             with self.lock:
                 self._touch()
                 if self.engine is not None and digest == self.digest:
@@ -142,7 +154,7 @@ class ExecutorServicer(vxpu_pb2_grpc.ExecutorServicer):
                             for f in manifest["files"].values())
                 threading.Thread(
                     target=self._load,
-                    args=(digest, artifact_dir, total),
+                    args=(digest, artifact_dir, total, plan_given),
                     daemon=True).start()
                 return vxpu_pb2.LoadModelResponse(success=True)
         except Exception as e:  # noqa: BLE001

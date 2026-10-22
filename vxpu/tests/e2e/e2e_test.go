@@ -298,5 +298,16 @@ func testByName(t *testing.T, h *Harness, gitRoot, vxpuBin string, env []string)
 	if !strings.Contains(out, "already compiled") {
 		t.Errorf("a second register should find the compiled artifact, got:\n%s", out)
 	}
+	// The coordinator's plan (#394): a switch set at register goes with
+	// the next load, which the executor counts as a new engine, and its
+	// plan records the switch as the coordinator's.
+	out = run("register", "--plan", "VXPU_FUSED_EXPERTS=0", model)
+	if !strings.Contains(out, "plan: map[VXPU_FUSED_EXPERTS:0]") {
+		t.Errorf("register --plan should report the plan, got:\n%s", out)
+	}
+	run("ask", "--model", model, "Is the sky blue?")
+	if logs := h.GetPodLogs("app=vxpu-external-executor", "default"); !strings.Contains(logs, "fused_experts=False (coordinator)") {
+		t.Errorf("the executor should have reloaded the model under the coordinator's plan; its logs:\n%s", logs)
+	}
 	h.DeletePod("vxpu-external-executor", "default")
 }

@@ -21,6 +21,7 @@ import (
 	"net"
 	"net/http"
 	"net/http/httptest"
+	"reflect"
 	"strings"
 	"sync"
 	"testing"
@@ -53,16 +54,30 @@ type fakeModelstore struct {
 	manifests map[string][]byte // name:tag -> manifest
 }
 
-// registry serves the generic registry routes statistics use; false if
-// r is not one of them.
+// registry serves the generic registry routes statistics and plans use,
+// and the file route plans are read by; false if r is not one of them.
 func (f *fakeModelstore) registry(w http.ResponseWriter, r *http.Request) bool {
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	if f.blobs == nil {
 		f.blobs, f.manifests = map[string][]byte{}, map[string][]byte{}
 	}
+	if name, file, ok := strings.Cut(strings.TrimPrefix(r.URL.Path, "/"), "/resolve/"); ok && strings.HasPrefix(name, "vxpu-plans/") {
+		tag, title, _ := strings.Cut(file, "/")
+		var m weightstore.Manifest
+		if err := json.Unmarshal(f.manifests[name+":"+tag], &m); err == nil {
+			for _, l := range m.Layers {
+				if l.Annotations["org.opencontainers.image.title"] == title {
+					_, _ = w.Write(f.blobs[l.Digest])
+					return true
+				}
+			}
+		}
+		http.NotFound(w, r)
+		return true
+	}
 	path := strings.TrimPrefix(r.URL.Path, "/v2/")
-	if !strings.HasPrefix(path, "vxpu-stats/") {
+	if !strings.HasPrefix(path, "vxpu-stats/") && !strings.HasPrefix(path, "vxpu-plans/") {
 		return false
 	}
 	switch {
@@ -144,13 +159,19 @@ type loadingExecutor struct {
 	mu           sync.Mutex
 	loads        int
 	evicted      bool
-	loadFailed   bool   // its asynchronous load failed: NewSession says so until the next LoadModel
-	lastManifest string // the manifest of the last LoadModel
+	loadFailed   bool              // its asynchronous load failed: NewSession says so until the next LoadModel
+	lastManifest string            // the manifest of the last LoadModel
+	lastPlan     map[string]string // the plan of the last LoadModel
+	refused      int               // LoadModels refused for their plan
 }
 
 func (e *loadingExecutor) LoadModel(_ context.Context, req *pb.LoadModelRequest) (*pb.LoadModelResponse, error) {
 	e.mu.Lock()
 	defer e.mu.Unlock()
+	if _, bad := req.Plan["VXPU_REFUSED"]; bad { // as the executor refuses a switch it may not take
+		e.refused++
+		return nil, status.Error(codes.InvalidArgument, "plan refused: VXPU_REFUSED")
+	}
 	if string(req.DecodeGraph) != "graph" || !strings.Contains(req.ManifestJson, "/blobs/abc") {
 		return nil, status.Error(codes.InvalidArgument, "unexpected artifact")
 	}
@@ -158,6 +179,7 @@ func (e *loadingExecutor) LoadModel(_ context.Context, req *pb.LoadModelRequest)
 	e.evicted = false
 	e.loadFailed = false
 	e.lastManifest = req.ManifestJson
+	e.lastPlan = req.Plan
 	return &pb.LoadModelResponse{Success: true}, nil
 }
 
@@ -228,6 +250,63 @@ func TestRegisterModel_AlreadyCompiled(t *testing.T) {
 	}
 	if jobs, _ := clientset.BatchV1().Jobs("ns").List(t.Context(), metav1.ListOptions{}); len(jobs.Items) != 0 {
 		t.Errorf("no compile job expected, got %d", len(jobs.Items))
+	}
+}
+
+func TestRegisterModel_PlanGoesWithEveryLoad(t *testing.T) {
+	ctx := t.Context()
+	s, _ := newCatalogServer(t, &fakeModelstore{compiled: true})
+	executor := &loadingExecutor{}
+	s.UseExternalExecutors([]string{startExecutor(t, executor)})
+
+	plan := map[string]string{"VXPU_EXPERT_MAILBOXES": "1"}
+	if _, err := s.RegisterModel(ctx, &pb.RegisterModelRequest{Model: "org/M", Plan: plan}); err != nil {
+		t.Fatalf("RegisterModel: %v", err)
+	}
+	if _, err := s.NewSession(ctx, &pb.NewSessionRequest{Model: "org/M"}); err != nil {
+		t.Fatalf("NewSession: %v", err)
+	}
+	if !reflect.DeepEqual(executor.lastPlan, plan) {
+		t.Errorf("the executor got plan %v, want %v", executor.lastPlan, plan)
+	}
+	// a new plan reloads the model under it; registering without one keeps it
+	plan = map[string]string{"VXPU_EXPERT_MAILBOXES": "0"}
+	if _, err := s.RegisterModel(ctx, &pb.RegisterModelRequest{Model: "org/M", Plan: plan}); err != nil {
+		t.Fatalf("RegisterModel: %v", err)
+	}
+	if _, err := s.RegisterModel(ctx, &pb.RegisterModelRequest{Model: "org/M"}); err != nil {
+		t.Fatalf("RegisterModel: %v", err)
+	}
+	if _, err := s.NewSession(ctx, &pb.NewSessionRequest{Model: "org/M"}); err != nil {
+		t.Fatalf("NewSession: %v", err)
+	}
+	if executor.loads != 2 || !reflect.DeepEqual(executor.lastPlan, plan) {
+		t.Errorf("after a new plan: %d loads with plan %v, want 2 with %v", executor.loads, executor.lastPlan, plan)
+	}
+}
+
+func TestLoadModel_RefusesAPlan(t *testing.T) {
+	s, _ := newCatalogServer(t, &fakeModelstore{})
+	_, err := s.LoadModel(t.Context(), &pb.LoadModelRequest{ManifestJson: testManifest, Plan: map[string]string{"VXPU_DATAFLOW": "1"}})
+	if status.Code(err) != codes.InvalidArgument {
+		t.Errorf("a plan with an artifact: got %v, want INVALID_ARGUMENT (plans come with loads by name)", err)
+	}
+}
+
+func TestRegisterModel_RefusedPlanFailsOnce(t *testing.T) {
+	ctx := t.Context()
+	s, _ := newCatalogServer(t, &fakeModelstore{compiled: true})
+	executor := &loadingExecutor{}
+	s.UseExternalExecutors([]string{startExecutor(t, executor)})
+	if _, err := s.RegisterModel(ctx, &pb.RegisterModelRequest{Model: "org/M", Plan: map[string]string{"VXPU_REFUSED": "1"}}); err != nil {
+		t.Fatalf("RegisterModel: %v", err)
+	}
+	// final, not retried: the caller sees why at once
+	if _, err := s.NewSession(ctx, &pb.NewSessionRequest{Model: "org/M"}); status.Code(err) != codes.InvalidArgument {
+		t.Errorf("a refused plan: got %v, want INVALID_ARGUMENT", err)
+	}
+	if executor.refused != 1 {
+		t.Errorf("the refused load should not be retried, it was tried %d times", executor.refused)
 	}
 }
 

@@ -44,6 +44,7 @@ artifact without loading its weights.
 
 import argparse
 import collections
+import contextvars
 import dataclasses
 import json
 import math
@@ -58,22 +59,49 @@ import threading
 TRUE = ("1", "true", "on", "yes")
 FALSE = ("0", "false", "off", "no")
 
+# The switches the coordinator set for the engine being built
+# (LoadModelRequest.plan): the same names and values as the environment's,
+# read ahead of it, with source "coordinator" (#394).
+_given = contextvars.ContextVar("vxpu_plan_given", default=None)
+
+# The switches the coordinator may set: how the engine runs the model and
+# where it holds the experts. Not the ones naming the machine's own
+# resources (directories, the weight bucket, expert servers to trust):
+# those stay with whoever runs the executor. Nor the ones the kernels
+# read for themselves at first use (VXPU_KERNELS, VXPU_KERNEL_THREADS),
+# which a value from the coordinator would not reach.
+COORDINATOR_SWITCHES = frozenset({
+    "VXPU_FUSED_EXPERTS", "VXPU_SPLIT_DECODE", "VXPU_COMPILE_MODE", "VXPU_SPLIT_COMPILE", "VXPU_DIRECT_HOST_OPS",
+    "VXPU_LOWER_DECODE", "VXPU_SEGMENT_RUNTIME", "VXPU_EXPERT_MAILBOXES", "VXPU_DATAFLOW", "VXPU_STEP_GRAPH",
+    "VXPU_DATAFLOW_PLACE", "VXPU_GPU_EXPERTS", "VXPU_GPU_EXPERTS_MOVES", "VXPU_GPU_EXPERTS_REQUEST_WEIGHT",
+    "VXPU_EXPERTS_IN_RAM", "VXPU_BF16_WEIGHT_CACHE", "VXPU_BF16_CACHE_HEADROOM_GB",
+})
+
 
 class ConfigError(ValueError):
     """A switch with a value the parser does not understand."""
 
 
+def _raw(name):
+    """A switch's text and where it came from: the coordinator, else the
+    environment."""
+    given = _given.get()
+    if given is not None and name in given:
+        return given[name], "coordinator"
+    return os.environ.get(name), "env"
+
+
 def env_flag(name, default, extra_false=()):
     """A boolean switch: 1/true/on/yes or 0/false/off/no, any case;
     anything else is an error rather than a guess. Returns (value, source)."""
-    raw = os.environ.get(name)
+    raw, src = _raw(name)
     if raw is None or raw == "":
         return default, "default"
     v = raw.strip().lower()
     if v in TRUE:
-        return True, "env"
+        return True, src
     if v in FALSE or v in extra_false:
-        return False, "env"
+        return False, src
     raise ConfigError(f"{name}={raw!r}: expected one of {', '.join(TRUE + FALSE + tuple(extra_false))}")
 
 
@@ -82,7 +110,7 @@ def env_number(name, default, kind=float, minimum=None):
     ASCII digits (what C's atol reads the same way: the CPU kernels read
     VXPU_KERNEL_THREADS themselves); floats must be finite. Returns
     (value, source)."""
-    raw = os.environ.get(name)
+    raw, src = _raw(name)
     if raw is None or raw == "":
         return default, "default"
     text = raw.strip()
@@ -96,25 +124,25 @@ def env_number(name, default, kind=float, minimum=None):
         raise ConfigError(f"{name}={raw!r}: must be a finite number")
     if minimum is not None and value < minimum:
         raise ConfigError(f"{name}={raw!r}: must be at least {minimum}")
-    return value, "env"
+    return value, src
 
 
 def env_choice(name, default, allowed):
     """A switch with a fixed set of values; refuses anything else.
     Returns (value, source)."""
-    raw = os.environ.get(name)
+    raw, src = _raw(name)
     if raw is None or raw == "":
         return default, "default"
     if raw.strip() not in allowed:
         raise ConfigError(f"{name}={raw!r}: expected one of {', '.join(allowed)}")
-    return raw.strip(), "env"
+    return raw.strip(), src
 
 
 def env_text(name, default):
-    raw = os.environ.get(name)
+    raw, src = _raw(name)
     if raw is None or raw == "":
         return default, "default"
-    return raw, "env"
+    return raw, src
 
 
 # ---------------------------------------------------------------------------
@@ -222,7 +250,26 @@ MAX_SHAPES_RECORDED = 64
 class Plan:
     """The physical plan of one engine. See the module docstring."""
 
-    def __init__(self, device, compile_decode=False, external_dir=None, triton_available=None):
+    def __init__(self, device, compile_decode=False, external_dir=None, triton_available=None, given=None):
+        """given: the switches the coordinator set ({VXPU_NAME: value}),
+        read ahead of the environment."""
+        given = dict(given or {})
+        refused = sorted(set(given) - COORDINATOR_SWITCHES)
+        if refused:
+            raise ConfigError(f"the coordinator may not set {', '.join(refused)} (it may set "
+                              f"{', '.join(sorted(COORDINATOR_SWITCHES))})")
+        empty = sorted(k for k, v in given.items() if not v.strip())
+        if empty:
+            raise ConfigError(f"the coordinator set {', '.join(empty)} to nothing: leave a switch out instead")
+        if not given.get("VXPU_GPU_EXPERTS", "{").lstrip().startswith("{"):
+            raise ConfigError("the coordinator's VXPU_GPU_EXPERTS must be the placement itself (JSON), not a path")
+        token = _given.set(given)
+        try:
+            self._choose(device, compile_decode, external_dir, triton_available)
+        finally:
+            _given.reset(token)
+
+    def _choose(self, device, compile_decode, external_dir, triton_available):
         self.device = str(device)
         self.device_type = self.device.split(":")[0]
         self.hardware = probe_hardware(device)
@@ -344,7 +391,7 @@ class Plan:
             # banks on the GPU would cost its memory and never run
             hot, src = None, "requires CUDA, Triton and the CPU kernels"
         self._set("gpu_experts", hot, src, (),
-                  "a placement file (per GPU, {layer: [expert ids]}, from expert_stats --placement-gb): those experts "
+                  "a placement, inline JSON or a file (per GPU, {layer: [expert ids]}, from expert_stats --placement-gb): those experts "
                   "are held on the GPUs and computed there alongside the CPU's (experts_gpu.py)")
         moves, src = env_number("VXPU_GPU_EXPERTS_MOVES", 0, int, minimum=0)
         if moves and not hot:
@@ -440,7 +487,7 @@ class Plan:
         lines = [f"plan on {hw['device']}: {hw.get('gpu', hw['cpu'])}"
                  + (f", {hw['gpu_memory_bytes'] / 1e9:.0f} GB" if "gpu_memory_bytes" in hw else "")
                  + f", {hw.get('ram_bytes', 0) / 1e9:.0f} GB RAM, {hw['cpu_threads']} CPU threads, {hw['simd']}"]
-        lines.append("  " + ", ".join(f"{k}={c['value']}" + ("" if c["source"] in ("default", "probe") else f" ({c['source']})")
+        lines.append("  " + ", ".join(f"{k}={_brief(c['value'])}" + ("" if c["source"] in ("default", "probe") else f" ({c['source']})")
                                       for k, c in e["choices"].items()))
         for op, row in e["ops"].items():
             here = [i["name"] for i in row["implementations"] if i["on_this_device"]]
@@ -448,6 +495,12 @@ class Plan:
             lines.append(f"  {op}: {' > '.join(here) or '-'}" + (f"   selected: {', '.join(got)}" if got else ""))
         lines += [f"  note: {n}" for n in e["notes"]]
         return "\n".join(lines)
+
+
+def _brief(value, limit=80):
+    """A choice's value for a log line: an inline placement is long."""
+    text = str(value)
+    return text if len(text) <= limit else f"{text[:limit // 2]}... ({len(text)} chars)"
 
 
 # choices whose values are paths on the executor's own disk: a record
