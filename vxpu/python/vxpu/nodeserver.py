@@ -99,7 +99,8 @@ def start(artifact_dir, names, port=0, cache_dir=None):
             raise ValueError(f"{name} is not a host node of this artifact's decode step")
         subs.append(sub)
     external = _residents(artifact_dir, subs)
-    cache = aoti.Packages(cache_dir or os.path.join(os.path.expanduser("~"), ".cache", "vxpu", "aoti"))
+    from .plan import Plan
+    cache = aoti.Packages(cache_dir or Plan("cpu")["aoti_cache_dir"])  # the dense segments' cache too
     paths, residents = [], []
     for sub in subs:
         path, res = nodes.native_package(cache, sub, external, _example_inputs(sub))

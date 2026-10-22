@@ -125,7 +125,10 @@ type modelPlan struct {
 	// the layers other executors serve to the engine's mailboxes, by
 	// where they answer
 	ExpertExecutors map[string][]int `json:"expert_executors,omitempty"`
-	Reasons         []string         `json:"reasons"`
+	// the engine's mailboxes for nodes other executors serve:
+	// name=tcp://host:port/index
+	RemoteNodes []string `json:"remote_nodes,omitempty"`
+	Reasons     []string `json:"reasons"`
 	// the decode time the cost model predicts for the plan (before the
 	// registered plan's switches; telemetry measures it)
 	Prediction planner.Prediction `json:"prediction"`
@@ -134,7 +137,7 @@ type modelPlan struct {
 // planLoad chooses the switches a load of model sends: the planner's,
 // from the artifact, the executor's machine and the model's recorded
 // selections, with the registered plan's switches (hints) over them.
-func (s *Server) planLoad(ctx context.Context, model string, manifest, binding []byte, hints map[string]string,
+func (s *Server) planLoad(ctx context.Context, model string, manifest, binding, decode []byte, hints map[string]string,
 	info *executorInfo) map[string]string {
 	log := klog.FromContext(ctx)
 	var probe *machines.Probe
@@ -168,36 +171,38 @@ func (s *Server) planLoad(ctx context.Context, model string, manifest, binding [
 		free := s.freeExecutors(ctx, engine)
 		p := planner.Choose(artifact, probe, free, counts)
 		mp.Switches, mp.Reasons, mp.Prediction = p.Switches, append(mp.Reasons, p.Reasons...), p.Prediction
-		// the other executors load their layers and answer on a port each;
-		// the engine's mailboxes are wired to them
-		var remotes []string
-		repredict := false
-		for _, addr := range sortedKeys(p.ExpertExecutors) {
-			layers := p.ExpertExecutors[addr]
-			remote, err := s.serveExperts(ctx, engine, addr, manifest, binding, layers)
+		// the other executors serve the experts nodes of their layers, on a
+		// port each; the engine's mailboxes for those nodes are wired to them
+		if len(p.ExpertExecutors) > 0 {
+			planned := sortedKeys(p.ExpertExecutors) // serveNodesOf answers in this order
+			remote, err := s.serveNodesOf(ctx, model, info, manifest, binding, decode, p.ExpertExecutors)
 			if err != nil {
-				mp.Reasons = append(mp.Reasons, fmt.Sprintf("experts: %s could not serve layers %v (%v): the engine holds them", addr, layers, err))
-				delete(p.ExpertExecutors, addr)
-				repredict = true
-				continue
+				mp.Reasons = append(mp.Reasons, fmt.Sprintf("experts: their nodes could not be placed (%v): the engine holds them", err))
 			}
-			remotes = append(remotes, remote)
-			if mp.ExpertExecutors == nil {
-				mp.ExpertExecutors = map[string][]int{}
+			served := map[string][]int{}
+			for i, r := range remote {
+				mp.Reasons = append(mp.Reasons, r.reason)
+				if r.err != nil {
+					continue
+				}
+				served[planned[i]] = r.layers
+				if mp.ExpertExecutors == nil {
+					mp.ExpertExecutors = map[string][]int{}
+				}
+				mp.ExpertExecutors[r.address] = r.layers
+				mp.RemoteNodes = append(mp.RemoteNodes, r.entries...)
 			}
-			mp.ExpertExecutors[remote] = layers
-		}
-		if repredict { // the engine holds what an executor could not serve: price that
-			others := map[string]machines.Probe{}
-			for _, e := range free {
-				others[e.Address] = e.Probe
+			if len(mp.RemoteNodes) > 0 {
+				mp.Switches["VXPU_REMOTE_NODES"] = strings.Join(mp.RemoteNodes, ",")
 			}
-			mp.Prediction = planner.Predict(artifact, p, probe, others, counts)
-		}
-		if len(remotes) > 0 {
-			mp.Switches["VXPU_EXPERT_REMOTE"] = strings.Join(remotes, ",")
-		} else {
-			delete(mp.Switches, "VXPU_EXPERT_MAILBOXES") // only for the other executors
+			if len(served) < len(planned) { // the engine holds what an executor could not serve: price that
+				p.ExpertExecutors = served
+				others := map[string]machines.Probe{}
+				for _, e := range free {
+					others[e.Address] = e.Probe
+				}
+				mp.Prediction = planner.Predict(artifact, p, probe, others, counts)
+			}
 		}
 	}
 	for k, v := range hints {
@@ -243,6 +248,6 @@ func sortedKeys[V any](m map[string]V) []string {
 }
 
 // routerOwnedSwitches are the plan switches only the router sets: which
-// expert servers an engine trusts is the router's to wire (the executors
-// it asked to serve them), never a client's to name.
-var routerOwnedSwitches = []string{"VXPU_EXPERT_REMOTE"}
+// node servers an engine trusts is the router's to wire (the executors it
+// asked to serve them), never a client's to name.
+var routerOwnedSwitches = []string{"VXPU_REMOTE_NODES"}

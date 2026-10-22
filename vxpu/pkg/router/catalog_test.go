@@ -170,15 +170,24 @@ type loadingExecutor struct {
 	lastPlan     map[string]string // the plan of the last LoadModel
 	refused      int               // LoadModels refused for their plan
 	probe        string            // what Describe says (default: a g4-standard-96)
-	served       []int32           // the layers of the last ServeExperts
-	servedFrom   string            // the manifest of the last ServeExperts
+	served       []string          // the nodes of the last ServeNodes
+	servedFrom   string            // the manifest of the last ServeNodes
 }
 
-func (e *loadingExecutor) ServeExperts(_ context.Context, req *pb.ServeExpertsRequest) (*pb.ServeExpertsResponse, error) {
+// DescribeNodes: two layers of experts, each its own node, as a split
+// decode step names them.
+func (e *loadingExecutor) DescribeNodes(context.Context, *pb.DescribeNodesRequest) (*pb.DescribeNodesResponse, error) {
+	return &pb.DescribeNodesResponse{NodesJson: `[{"name":"submod_0","kind":"dense"},` +
+		`{"name":"submod_1","kind":"experts","collection":"experts","index":0,"resident_bytes":4000000000},` +
+		`{"name":"submod_2","kind":"dense"},` +
+		`{"name":"submod_3","kind":"experts","collection":"experts","index":1,"resident_bytes":4000000000}]`}, nil
+}
+
+func (e *loadingExecutor) ServeNodes(_ context.Context, req *pb.ServeNodesRequest) (*pb.ServeNodesResponse, error) {
 	e.mu.Lock()
 	defer e.mu.Unlock()
-	e.served, e.servedFrom = req.Layers, req.ManifestJson
-	return &pb.ServeExpertsResponse{Port: 7000}, nil
+	e.served, e.servedFrom = req.Nodes, req.ManifestJson
+	return &pb.ServeNodesResponse{Port: 7000}, nil
 }
 
 func (e *loadingExecutor) Describe(context.Context, *pb.DescribeRequest) (*pb.DescribeResponse, error) {
@@ -415,13 +424,13 @@ func TestNewSessionByName_SpreadsExpertsOverExecutors(t *testing.T) {
 	if _, err := s.NewSession(ctx, &pb.NewSessionRequest{Model: "org/M"}); err != nil {
 		t.Fatalf("NewSession: %v", err)
 	}
-	if !reflect.DeepEqual(helper.served, []int32{1}) {
-		t.Errorf("the other executor should serve layer 1, served %v", helper.served)
+	if !reflect.DeepEqual(helper.served, []string{"submod_3"}) {
+		t.Errorf("the other executor should serve layer 1's experts node, served %v", helper.served)
 	}
 	if !strings.Contains(helper.servedFrom, "/blobs/abc") {
 		t.Errorf("the expert executor should read the weights from where the engine does (the rewritten manifest): %s", helper.servedFrom)
 	}
-	want := map[string]string{"VXPU_EXPERT_MAILBOXES": "1", "VXPU_EXPERT_REMOTE": "127.0.0.1:7000"}
+	want := map[string]string{"VXPU_REMOTE_NODES": "submod_3=tcp://127.0.0.1:7000/0"}
 	if !reflect.DeepEqual(engine.lastPlan, want) {
 		t.Errorf("the engine's plan: got %v, want %v", engine.lastPlan, want)
 	}
@@ -429,10 +438,10 @@ func TestNewSessionByName_SpreadsExpertsOverExecutors(t *testing.T) {
 		t.Errorf("the expert executor should not be loaded as an engine: %d loads", helper.loads)
 	}
 	explained, err := s.ExplainModel(ctx, &pb.ExplainModelRequest{Model: "org/M"})
-	if err != nil || !strings.Contains(explained.PlanJson, "answering the engine's mailboxes") {
+	if err != nil || !strings.Contains(explained.PlanJson, "serves the nodes of layers 1-1") {
 		t.Errorf("ExplainModel: %v\n%v", err, explained)
 	}
-	// a client cannot name the expert servers an engine trusts
+	// a client cannot name the node servers an engine trusts
 	if _, err := s.RegisterModel(ctx, &pb.RegisterModelRequest{Model: "org/M", Plan: want}); status.Code(err) != codes.InvalidArgument {
 		t.Errorf("a registered plan naming expert servers: got %v, want INVALID_ARGUMENT", err)
 	}

@@ -65,17 +65,17 @@ FALSE = ("0", "false", "off", "no")
 _given = contextvars.ContextVar("vxpu_plan_given", default=None)
 
 # The switches the coordinator may set: how the engine runs the model,
-# where it holds the experts, and the expert servers it wired them to
-# (VXPU_EXPERT_REMOTE: other executors it asked to serve experts; the
-# router never forwards it from a client's plan). Not the ones naming the
+# where it holds the experts, and the node servers it wired them to
+# (VXPU_REMOTE_NODES: other executors it asked to serve nodes; the router
+# never forwards it from a client's plan). Not the ones naming the
 # machine's own resources (directories, the weight bucket): those stay
 # with whoever runs the executor. Nor the ones the kernels
 # read for themselves at first use (VXPU_KERNELS, VXPU_KERNEL_THREADS),
 # which a value from the coordinator would not reach.
 COORDINATOR_SWITCHES = frozenset({
     "VXPU_FUSED_EXPERTS", "VXPU_SPLIT_DECODE", "VXPU_COMPILE_MODE", "VXPU_SPLIT_COMPILE", "VXPU_DIRECT_HOST_OPS",
-    "VXPU_LOWER_DECODE", "VXPU_SEGMENT_RUNTIME", "VXPU_EXPERT_MAILBOXES", "VXPU_EXPERT_REMOTE", "VXPU_REMOTE_NODES",
-    "VXPU_DATAFLOW", "VXPU_STEP_GRAPH",
+    "VXPU_LOWER_DECODE", "VXPU_SEGMENT_RUNTIME", "VXPU_EXPERT_MAILBOXES", "VXPU_REMOTE_NODES", "VXPU_DATAFLOW",
+    "VXPU_STEP_GRAPH",
     "VXPU_DATAFLOW_PLACE", "VXPU_GPU_EXPERTS", "VXPU_GPU_EXPERTS_MOVES", "VXPU_GPU_EXPERTS_REQUEST_WEIGHT",
     "VXPU_EXPERTS_IN_RAM", "VXPU_BF16_WEIGHT_CACHE", "VXPU_BF16_CACHE_HEADROOM_GB",
 })
@@ -336,12 +336,6 @@ class Plan:
         self._set("expert_mailboxes", on, src, (True, False),
                   "decode's routed experts as mailboxes (mailboxes.py, #372): each (token, k) pair answered by its "
                   "expert's owner (the CPU, a GPU pool), the replies summed in k order whoever answered")
-        remote, src = env_text("VXPU_EXPERT_REMOTE", None)
-        if remote and not self["expert_mailboxes"]:
-            remote, src = None, "requires expert_mailboxes"
-        self._set("expert_remote", remote, src, (),
-                  "expert servers (host:port[,host:port]; expert_server.py) answering the mailboxes of the layers "
-                  "they hold, for the pairs no GPU pool holds")
         nodes, src = env_text("VXPU_REMOTE_NODES", None)
         self._set("remote_nodes", nodes, src, (),
                   "host nodes node servers serve (name=tcp://host:port/index[,...]; nodeserver.py): their residents "

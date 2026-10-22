@@ -63,11 +63,15 @@ service Executor {
   // ExplainModel (router only) returns the plan the coordinator chose for
   // a model's last load by name, and why (#394).
   rpc ExplainModel(ExplainModelRequest) returns (ExplainModelResponse) {}
-  // ServeExperts (executor only) loads some layers' routed experts of an
-  // artifact and serves them to other executors' mailboxes on a port of
-  // this machine (expert_server.py): how the coordinator spreads a model's
-  // experts over executors (#394). Answers once the banks are loaded.
-  rpc ServeExperts(ServeExpertsRequest) returns (ServeExpertsResponse) {}
+  // DescribeNodes (executor only) describes an artifact's decode step as
+  // a dataflow graph: its nodes in call order, and for a host node what
+  // it reads and how many bytes that is (#394). The coordinator places
+  // nodes from it.
+  rpc DescribeNodes(DescribeNodesRequest) returns (DescribeNodesResponse) {}
+  // ServeNodes (executor only) serves some of an artifact's decode-step
+  // nodes on a port of this machine: a native node server (nodeserver.py)
+  // that answers their tcp:// mailboxes. Answers once they are loaded.
+  rpc ServeNodes(ServeNodesRequest) returns (ServeNodesResponse) {}
 }
 
 message LoadModelRequest {
@@ -230,14 +234,27 @@ message ExplainModelResponse {
 }
 
 
-message ServeExpertsRequest {
+message DescribeNodesRequest {
   string manifest_json = 1;
   string binding_json = 2;
-  // The layers whose experts to hold.
-  repeated int32 layers = 3;
+  bytes decode_graph = 3;
 }
 
-message ServeExpertsResponse {
-  // The port the experts are served on, on the executor's own address.
+message DescribeNodesResponse {
+  // [{name, kind, layers, and for a host node collection, index,
+  // resident_bytes}], as JSON.
+  string nodes_json = 1;
+}
+
+message ServeNodesRequest {
+  string manifest_json = 1;
+  string binding_json = 2;
+  bytes decode_graph = 3;
+  // The nodes to serve, by name; a message's node index is its position.
+  repeated string nodes = 4;
+}
+
+message ServeNodesResponse {
+  // The port the nodes are served on, on the executor's own address.
   int32 port = 1;
 }

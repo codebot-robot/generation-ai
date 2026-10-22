@@ -142,9 +142,6 @@ func TestChoose_SpreadsExpertsOverMachines(t *testing.T) {
 	if len(remote) != 20 || remote[0] != 20 || remote[19] != 39 || len(p.ExpertExecutors) != 1 {
 		t.Errorf("want layers 20-39 on the first CPU VM and nothing on the second, got %v", p.ExpertExecutors)
 	}
-	if p.Switches["VXPU_EXPERT_MAILBOXES"] != "1" {
-		t.Errorf("the engine needs its mailboxes for the remote layers: %v", p.Switches)
-	}
 	var placement struct {
 		Gpus []struct{ Layers map[string][]int }
 	}

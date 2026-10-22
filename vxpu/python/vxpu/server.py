@@ -57,7 +57,8 @@ class ExecutorServicer(vxpu_pb2_grpc.ExecutorServicer):
         self.last_used = time.time()
         self.keep_alive_s = keep_alive_s
         self.lock = threading.Lock()
-        self.experts = None  # ((checkpoint, layers), expert_server.Server) this executor serves (ServeExperts)
+        self.node_server = None  # ((artifact digest, nodes), the NodeServer) this executor serves (ServeNodes)
+        self.serve_lock = threading.Lock()  # one ServeNodes at a time, start to finish
         threading.Thread(target=self._reap_idle, daemon=True).start()
 
     def _touch(self):
@@ -166,50 +167,73 @@ class ExecutorServicer(vxpu_pb2_grpc.ExecutorServicer):
             context.set_details(str(e))
             return vxpu_pb2.LoadModelResponse(success=False)
 
-    def ServeExperts(self, request, context):
-        """Serve some layers' experts of an artifact to other executors'
-        mailboxes (expert_server.py), on a port of this machine: how the
-        coordinator spreads a model's experts over executors (#394). The
-        banks are loaded before it answers. One set at a time: a new one
-        replaces the old. Like the expert server, no authentication: the
-        executors' network is private."""
-        from . import expert_server, kernels
+    def _artifact_dir(self, request):
+        """The artifact a ServeNodes or DescribeNodes request carries, in
+        the work directory (its manifest, binding and decode graph)."""
+        digest = hashlib.sha256(request.manifest_json.encode() + request.binding_json.encode()
+                                + request.decode_graph).hexdigest()
+        artifact_dir = os.path.join(self.work_dir, "nodes-" + digest[:16])
+        os.makedirs(artifact_dir, exist_ok=True)
+        for name, data in (("manifest.json", request.manifest_json.encode()),
+                           ("binding.json", request.binding_json.encode()), ("decode.pt2", request.decode_graph)):
+            with open(os.path.join(artifact_dir, name), "wb") as f:
+                f.write(data)
+        return artifact_dir, digest
+
+    def DescribeNodes(self, request, context):
+        """The artifact's decode step as nodes, for the coordinator (#394)."""
+        from . import nodes
         try:
-            manifest = json.loads(request.manifest_json)
-            layers = sorted(set(request.layers))
-            key = (expert_server.checkpoint_id(manifest), tuple(layers))
-            with self.lock:
-                if self.experts is not None and self.experts[0] == key:
-                    return vxpu_pb2.ServeExpertsResponse(port=self.experts[1].server_address[1])
-            artifact_dir = os.path.join(self.work_dir, "experts-" + key[0][:16])
-            os.makedirs(artifact_dir, exist_ok=True)
-            for name, data in (("manifest.json", request.manifest_json), ("binding.json", request.binding_json)):
-                with open(os.path.join(artifact_dir, name), "w") as f:
-                    f.write(data)
-            experts, _ = expert_server.load(artifact_dir, set(layers))
-            missing = sorted(set(layers) - set(experts))
-            if not layers or missing:
-                context.set_code(grpc.StatusCode.INVALID_ARGUMENT)
-                context.set_details(f"the artifact places no experts externally for layers {missing or layers}")
-                return vxpu_pb2.ServeExpertsResponse()
-            if kernels.load() is None:
-                context.set_code(grpc.StatusCode.FAILED_PRECONDITION)
-                context.set_details("the CPU kernels are unavailable")
-                return vxpu_pb2.ServeExpertsResponse()
-            server = expert_server.Server(("0.0.0.0", 0), experts, key[0])
-            threading.Thread(target=server.serve_forever, name="vxpu-expert-server", daemon=True).start()
-            with self.lock:
-                old, self.experts = self.experts, (key, server)
-            if old is not None:
-                old[1].shutdown()
-                old[1].server_close()
-            print(f"[vxpu] serving experts of layers {layers} on port {server.server_address[1]}", flush=True)
-            return vxpu_pb2.ServeExpertsResponse(port=server.server_address[1])
+            artifact_dir, _ = self._artifact_dir(request)
+            described = nodes.describe(nodes.decode_split(artifact_dir), json.loads(request.manifest_json),
+                                       json.loads(request.binding_json))
+            return vxpu_pb2.DescribeNodesResponse(nodes_json=json.dumps(described))
         except Exception as e:  # noqa: BLE001
-            print(f"[vxpu] ServeExperts error: {e}", file=sys.stderr, flush=True)
+            print(f"[vxpu] DescribeNodes error: {e}", file=sys.stderr, flush=True)
             context.set_code(grpc.StatusCode.INTERNAL)
             context.set_details(str(e))
-            return vxpu_pb2.ServeExpertsResponse()
+            return vxpu_pb2.DescribeNodesResponse()
+
+    def ServeNodes(self, request, context):
+        """Serve some of an artifact's decode-step nodes natively on a port
+        of this machine (nodeserver.py): how the coordinator spreads a
+        model over executors (#394). The nodes' residents are loaded and
+        their packages built (or found cached) before it answers. One set
+        at a time: a new one replaces the old, which stops first, so the
+        two sets' residents never need to fit together. A second call for
+        the same set waits for the first and gets its port. Like the
+        executor itself, no authentication: the executors' network is
+        private."""
+        from . import nodeserver
+        try:
+            artifact_dir, digest = self._artifact_dir(request)
+            key = (digest, tuple(request.nodes))
+            with self.serve_lock:
+                with self.lock:
+                    current = self.node_server
+                    if current is not None and current[0] == key:
+                        return vxpu_pb2.ServeNodesResponse(port=current[1].port())
+                    self.node_server = None
+                if current is not None:
+                    current[1].stop()
+                server = nodeserver.start(artifact_dir, list(request.nodes))
+                if not context.is_active():  # the caller gave up: no engine will be wired to these
+                    server.stop()
+                    context.set_code(grpc.StatusCode.CANCELLED)
+                    context.set_details("the caller went away while the nodes loaded")
+                    return vxpu_pb2.ServeNodesResponse()
+                with self.lock:
+                    self.node_server = (key, server)
+            return vxpu_pb2.ServeNodesResponse(port=server.port())
+        except ValueError as e:
+            context.set_code(grpc.StatusCode.INVALID_ARGUMENT)
+            context.set_details(str(e))
+            return vxpu_pb2.ServeNodesResponse()
+        except Exception as e:  # noqa: BLE001
+            print(f"[vxpu] ServeNodes error: {e}", file=sys.stderr, flush=True)
+            context.set_code(grpc.StatusCode.INTERNAL)
+            context.set_details(str(e))
+            return vxpu_pb2.ServeNodesResponse()
 
     def Describe(self, request, context):
         """What this executor runs on, for the coordinator's machine

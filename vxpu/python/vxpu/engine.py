@@ -78,7 +78,7 @@ def external_files_dir(external_dir, manifest):
     """Where an artifact's memory-mapped external tensors live under the
     plan's external_dir (None: none). The files are keyed by the model's
     manifest, so two artifacts of one checkpoint share them and another
-    checkpoint cannot. The engine and the expert server use the same."""
+    checkpoint cannot. The engine and a node server use the same."""
     if not external_dir:
         return None
     return os.path.join(external_dir, hashlib.sha256(json.dumps(
@@ -114,7 +114,7 @@ def load_expert_layers(manifest, specs_by_layer, args, cas_dir, mmap_root, in_ra
     `layers` limits them), each assembled as the model's own MoE module
     on the host: ({layer: module}, bytes fetched). Memory-mapped from
     files under mmap_root unless in_ram. The engine and the expert
-    server (expert_server.py) load them the same way."""
+    server (nodeserver.py) load them the same way."""
     from . import deepseek_v41 as ds
     out, fetched = {}, 0
     for layer, specs in specs_by_layer.items():
@@ -297,15 +297,11 @@ class Engine:
         # when the node has the 272 GB, so residency is guaranteed rather
         # than left to the page cache; the kernels are memory-bound and
         # want the bytes resident.
-        # Layers an expert server holds (expert_remote) are not loaded
-        # here: their modules keep the meta banks they are built with, and
-        # every call of theirs goes to the server through the mailboxes.
-        self._remotes = self._connect_expert_servers()
-        self._remote_layers = {layer for r in self._remotes for layer in r.layers}
         # Nodes a node server serves (remote_nodes): their residents are not
-        # loaded here, and their host ops send their inputs to the server.
+        # loaded here (an experts layer's module keeps the meta banks it is
+        # built with), and their host ops send their inputs to the server.
         self.external.remote_nodes = self._connect_remote_nodes()
-        self._remote_layers |= {i for kind, i in self.external.remote_nodes if kind == "experts"}
+        self._remote_layers = {i for kind, i in self.external.remote_nodes if kind == "experts"}
         remote_tables = {i for kind, i in self.external.remote_nodes if kind == "engram"}
         specs = external.get("experts", {})
         local = {int(layer) for layer in specs} - self._remote_layers
@@ -355,25 +351,18 @@ class Engine:
         print(f"[vxpu] remote nodes: {', '.join(f'{k}.{i}' for k, i in sorted(remote))}", flush=True)
         return remote
 
-    def _connect_expert_servers(self):
-        """The expert servers of the plan's expert_remote, connected."""
-        from . import mailboxes
-        from .expert_server import checkpoint_id
-        return [mailboxes.RemoteOwner(a, checkpoint=checkpoint_id(self.manifest))
-                for a in (self.plan["expert_remote"] or "").split(",") if a]
-
     def _attach_mailboxes(self):
         """Decode's experts as mailboxes (mailboxes.py): per layer, the GPU
-        pools of its residency, an expert server holding it (expert_remote)
-        or the CPU here for the rest."""
+        pools of its residency, and the CPU here for the rest. (A layer a
+        node server serves never reaches its mailboxes.)"""
         from . import mailboxes
-        remotes = self._remotes
         owners = collections.Counter()
         for layer, moe in self.external.experts.items():
-            remote = next((r for r in remotes if layer in r.layers), None)
+            if layer in self._remote_layers:
+                continue
             res = getattr(moe, "_vxpu_hot", None)
-            moe._vxpu_mailboxes = mailboxes.Layer(moe, layer, residency=res, remote=remote)
-            owners[remote.name if remote else "cpu"] += 1
+            moe._vxpu_mailboxes = mailboxes.Layer(moe, layer, residency=res)
+            owners["cpu"] += 1
             for pool in (res.pools if res else []):
                 owners[str(pool.device)] += 1
         msg = "expert mailboxes, layers per owner: " + ", ".join(f"{k} {v}" for k, v in sorted(owners.items()))
@@ -389,7 +378,7 @@ class Engine:
             raise ValueError(f"the placement names {len(gpus)} GPUs; {len(devices)} are visible")
         for layer, moe in self.external.experts.items():
             if layer in self._remote_layers:
-                continue  # its banks are on an expert server, not here to copy from
+                continue  # a node server holds its banks: none here to copy from
             by_device = [(dev, gpu.get(layer)) for dev, gpu in zip(devices, gpus)]
             if any(ids for _, ids in by_device):
                 moe._vxpu_hot = experts_gpu.Residency(moe, by_device)

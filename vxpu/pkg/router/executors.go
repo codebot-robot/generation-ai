@@ -160,10 +160,82 @@ func (s *Server) releaseHelpersLocked(engine string) {
 	}
 }
 
-// serveExperts asks the executor at addr to serve layers of the artifact
-// to the mailboxes of the engine at engine, and returns where (host:port).
-// The executor is claimed for that engine first, and freed if it fails.
-func (s *Server) serveExperts(ctx context.Context, engine, addr string, manifest, binding []byte, layers []int) (string, error) {
+// remoteNodes is one executor's share of a model's nodes, as placed.
+type remoteNodes struct {
+	address string   // where they answer: host:port
+	layers  []int    // the experts layers whose nodes they are
+	entries []string // the engine's mailboxes for them: name=tcp://host:port/index
+	reason  string
+	err     error
+}
+
+// serveNodesOf has each executor (by address) serve the experts nodes of
+// its layers: the decode step's nodes, as the engine's executor describes
+// them (DescribeNodes), named by layer, then ServeNodes on each.
+func (s *Server) serveNodesOf(ctx context.Context, model string, engine *executorInfo, manifest, binding, decode []byte,
+	layersByExecutor map[string][]int) ([]remoteNodes, error) {
+	if engine == nil {
+		return nil, fmt.Errorf("the engine's executor did not describe itself")
+	}
+	conn, err := dialExecutor(engine.Endpoint)
+	if err != nil {
+		return nil, err
+	}
+	describeCtx, cancel := context.WithTimeout(ctx, 5*time.Minute) // it loads the decode graph, without weights
+	described, err := pb.NewExecutorClient(conn).DescribeNodes(describeCtx, &pb.DescribeNodesRequest{
+		ManifestJson: string(manifest), BindingJson: string(binding), DecodeGraph: decode})
+	cancel()
+	closeConn(ctx, conn)
+	if err != nil {
+		return nil, fmt.Errorf("DescribeNodes: %w", err)
+	}
+	var nodes []struct {
+		Name       string `json:"name"`
+		Collection string `json:"collection"`
+		Index      int    `json:"index"`
+	}
+	if err := json.Unmarshal([]byte(described.NodesJson), &nodes); err != nil {
+		return nil, fmt.Errorf("DescribeNodes: %w", err)
+	}
+	experts := map[int]string{} // layer -> its experts node
+	for _, n := range nodes {
+		if n.Collection == "experts" {
+			experts[n.Index] = n.Name
+		}
+	}
+	var out []remoteNodes
+	for _, addr := range sortedKeys(layersByExecutor) {
+		layers := layersByExecutor[addr]
+		r := remoteNodes{layers: layers}
+		var names []string
+		for _, layer := range layers {
+			name, ok := experts[layer]
+			if !ok {
+				r.err = fmt.Errorf("layer %d has no experts node", layer)
+				break
+			}
+			names = append(names, name)
+		}
+		if r.err == nil {
+			r.address, r.err = s.serveNodes(ctx, engine.Endpoint, addr, manifest, binding, decode, names)
+		}
+		if r.err != nil {
+			r.reason = fmt.Sprintf("experts: %s could not serve layers %v (%v): the engine holds them", addr, layers, r.err)
+		} else {
+			for i, name := range names {
+				r.entries = append(r.entries, fmt.Sprintf("%s=tcp://%s/%d", name, r.address, i))
+			}
+			r.reason = fmt.Sprintf("experts: %s serves the nodes of layers %d-%d at tcp://%s", addr, layers[0], layers[len(layers)-1], r.address)
+		}
+		out = append(out, r)
+	}
+	return out, nil
+}
+
+// serveNodes asks the executor at addr to serve nodes of the artifact to
+// the engine at engine, and returns where (host:port). The executor is
+// claimed for that engine first, and freed if it fails.
+func (s *Server) serveNodes(ctx context.Context, engine, addr string, manifest, binding, decode []byte, names []string) (string, error) {
 	if !s.claimHelper(addr, engine) {
 		return "", fmt.Errorf("%s serves another engine's experts", addr)
 	}
@@ -182,13 +254,10 @@ func (s *Server) serveExperts(ctx context.Context, engine, addr string, manifest
 		return "", err
 	}
 	defer closeConn(ctx, conn)
-	req := &pb.ServeExpertsRequest{ManifestJson: string(manifest), BindingJson: string(binding)}
-	for _, layer := range layers {
-		req.Layers = append(req.Layers, int32(layer))
-	}
-	callCtx, cancel := context.WithTimeout(ctx, 30*time.Minute) // it loads the banks first
+	callCtx, cancel := context.WithTimeout(ctx, 30*time.Minute) // it loads the residents and builds the packages first
 	defer cancel()
-	resp, err := pb.NewExecutorClient(conn).ServeExperts(callCtx, req)
+	resp, err := pb.NewExecutorClient(conn).ServeNodes(callCtx, &pb.ServeNodesRequest{
+		ManifestJson: string(manifest), BindingJson: string(binding), DecodeGraph: decode, Nodes: names})
 	if err != nil {
 		return "", err
 	}
