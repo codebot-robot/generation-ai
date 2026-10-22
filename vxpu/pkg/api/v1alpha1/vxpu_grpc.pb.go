@@ -41,6 +41,7 @@ const (
 	Executor_GetModelStats_FullMethodName = "/vxpu.Executor/GetModelStats"
 	Executor_Describe_FullMethodName      = "/vxpu.Executor/Describe"
 	Executor_ExplainModel_FullMethodName  = "/vxpu.Executor/ExplainModel"
+	Executor_ServeExperts_FullMethodName  = "/vxpu.Executor/ServeExperts"
 )
 
 // ExecutorClient is the client API for Executor service.
@@ -92,6 +93,11 @@ type ExecutorClient interface {
 	// ExplainModel (router only) returns the plan the coordinator chose for
 	// a model's last load by name, and why (#394).
 	ExplainModel(ctx context.Context, in *ExplainModelRequest, opts ...grpc.CallOption) (*ExplainModelResponse, error)
+	// ServeExperts (executor only) loads some layers' routed experts of an
+	// artifact and serves them to other executors' mailboxes on a port of
+	// this machine (expert_server.py): how the coordinator spreads a model's
+	// experts over executors (#394). Answers once the banks are loaded.
+	ServeExperts(ctx context.Context, in *ServeExpertsRequest, opts ...grpc.CallOption) (*ServeExpertsResponse, error)
 }
 
 type executorClient struct {
@@ -191,6 +197,16 @@ func (c *executorClient) ExplainModel(ctx context.Context, in *ExplainModelReque
 	return out, nil
 }
 
+func (c *executorClient) ServeExperts(ctx context.Context, in *ServeExpertsRequest, opts ...grpc.CallOption) (*ServeExpertsResponse, error) {
+	cOpts := append([]grpc.CallOption{grpc.StaticMethod()}, opts...)
+	out := new(ServeExpertsResponse)
+	err := c.cc.Invoke(ctx, Executor_ServeExperts_FullMethodName, in, out, cOpts...)
+	if err != nil {
+		return nil, err
+	}
+	return out, nil
+}
+
 // ExecutorServer is the server API for Executor service.
 // All implementations must embed UnimplementedExecutorServer
 // for forward compatibility.
@@ -240,6 +256,11 @@ type ExecutorServer interface {
 	// ExplainModel (router only) returns the plan the coordinator chose for
 	// a model's last load by name, and why (#394).
 	ExplainModel(context.Context, *ExplainModelRequest) (*ExplainModelResponse, error)
+	// ServeExperts (executor only) loads some layers' routed experts of an
+	// artifact and serves them to other executors' mailboxes on a port of
+	// this machine (expert_server.py): how the coordinator spreads a model's
+	// experts over executors (#394). Answers once the banks are loaded.
+	ServeExperts(context.Context, *ServeExpertsRequest) (*ServeExpertsResponse, error)
 	mustEmbedUnimplementedExecutorServer()
 }
 
@@ -273,6 +294,9 @@ func (UnimplementedExecutorServer) Describe(context.Context, *DescribeRequest) (
 }
 func (UnimplementedExecutorServer) ExplainModel(context.Context, *ExplainModelRequest) (*ExplainModelResponse, error) {
 	return nil, status.Error(codes.Unimplemented, "method ExplainModel not implemented")
+}
+func (UnimplementedExecutorServer) ServeExperts(context.Context, *ServeExpertsRequest) (*ServeExpertsResponse, error) {
+	return nil, status.Error(codes.Unimplemented, "method ServeExperts not implemented")
 }
 func (UnimplementedExecutorServer) mustEmbedUnimplementedExecutorServer() {}
 func (UnimplementedExecutorServer) testEmbeddedByValue()                  {}
@@ -432,6 +456,24 @@ func _Executor_ExplainModel_Handler(srv interface{}, ctx context.Context, dec fu
 	return interceptor(ctx, in, info, handler)
 }
 
+func _Executor_ServeExperts_Handler(srv interface{}, ctx context.Context, dec func(interface{}) error, interceptor grpc.UnaryServerInterceptor) (interface{}, error) {
+	in := new(ServeExpertsRequest)
+	if err := dec(in); err != nil {
+		return nil, err
+	}
+	if interceptor == nil {
+		return srv.(ExecutorServer).ServeExperts(ctx, in)
+	}
+	info := &grpc.UnaryServerInfo{
+		Server:     srv,
+		FullMethod: Executor_ServeExperts_FullMethodName,
+	}
+	handler := func(ctx context.Context, req interface{}) (interface{}, error) {
+		return srv.(ExecutorServer).ServeExperts(ctx, req.(*ServeExpertsRequest))
+	}
+	return interceptor(ctx, in, info, handler)
+}
+
 // Executor_ServiceDesc is the grpc.ServiceDesc for Executor service.
 // It's only intended for direct use with grpc.RegisterService,
 // and not to be introspected or modified (even as a copy)
@@ -466,6 +508,10 @@ var Executor_ServiceDesc = grpc.ServiceDesc{
 		{
 			MethodName: "ExplainModel",
 			Handler:    _Executor_ExplainModel_Handler,
+		},
+		{
+			MethodName: "ServeExperts",
+			Handler:    _Executor_ServeExperts_Handler,
 		},
 	},
 	Streams: []grpc.StreamDesc{

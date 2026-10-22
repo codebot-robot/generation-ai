@@ -57,6 +57,7 @@ class ExecutorServicer(vxpu_pb2_grpc.ExecutorServicer):
         self.last_used = time.time()
         self.keep_alive_s = keep_alive_s
         self.lock = threading.Lock()
+        self.experts = None  # ((checkpoint, layers), expert_server.Server) this executor serves (ServeExperts)
         threading.Thread(target=self._reap_idle, daemon=True).start()
 
     def _touch(self):
@@ -163,6 +164,51 @@ class ExecutorServicer(vxpu_pb2_grpc.ExecutorServicer):
             context.set_code(grpc.StatusCode.INTERNAL)
             context.set_details(str(e))
             return vxpu_pb2.LoadModelResponse(success=False)
+
+    def ServeExperts(self, request, context):
+        """Serve some layers' experts of an artifact to other executors'
+        mailboxes (expert_server.py), on a port of this machine: how the
+        coordinator spreads a model's experts over executors (#394). The
+        banks are loaded before it answers. One set at a time: a new one
+        replaces the old. Like the expert server, no authentication: the
+        executors' network is private."""
+        from . import expert_server, kernels
+        try:
+            manifest = json.loads(request.manifest_json)
+            layers = sorted(set(request.layers))
+            key = (expert_server.checkpoint_id(manifest), tuple(layers))
+            with self.lock:
+                if self.experts is not None and self.experts[0] == key:
+                    return vxpu_pb2.ServeExpertsResponse(port=self.experts[1].server_address[1])
+            artifact_dir = os.path.join(self.work_dir, "experts-" + key[0][:16])
+            os.makedirs(artifact_dir, exist_ok=True)
+            for name, data in (("manifest.json", request.manifest_json), ("binding.json", request.binding_json)):
+                with open(os.path.join(artifact_dir, name), "w") as f:
+                    f.write(data)
+            experts, _ = expert_server.load(artifact_dir, set(layers))
+            missing = sorted(set(layers) - set(experts))
+            if not layers or missing:
+                context.set_code(grpc.StatusCode.INVALID_ARGUMENT)
+                context.set_details(f"the artifact places no experts externally for layers {missing or layers}")
+                return vxpu_pb2.ServeExpertsResponse()
+            if kernels.load() is None:
+                context.set_code(grpc.StatusCode.FAILED_PRECONDITION)
+                context.set_details("the CPU kernels are unavailable")
+                return vxpu_pb2.ServeExpertsResponse()
+            server = expert_server.Server(("0.0.0.0", 0), experts, key[0])
+            threading.Thread(target=server.serve_forever, name="vxpu-expert-server", daemon=True).start()
+            with self.lock:
+                old, self.experts = self.experts, (key, server)
+            if old is not None:
+                old[1].shutdown()
+                old[1].server_close()
+            print(f"[vxpu] serving experts of layers {layers} on port {server.server_address[1]}", flush=True)
+            return vxpu_pb2.ServeExpertsResponse(port=server.server_address[1])
+        except Exception as e:  # noqa: BLE001
+            print(f"[vxpu] ServeExperts error: {e}", file=sys.stderr, flush=True)
+            context.set_code(grpc.StatusCode.INTERNAL)
+            context.set_details(str(e))
+            return vxpu_pb2.ServeExpertsResponse()
 
     def Describe(self, request, context):
         """What this executor runs on, for the coordinator's machine
