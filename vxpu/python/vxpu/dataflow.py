@@ -290,6 +290,9 @@ class Runner(torch.nn.Module):
                 value = out if index is None else out[index]
                 for d in devices:  # one inbox per consumer device
                     key = (node.name, index, d)
+                    if not isinstance(value, torch.Tensor):  # a number a segment computed (a prefill's length)
+                        self.inboxes[key] = value
+                        continue
                     # allocated once, then the same address every step (a decode step's shapes never
                     # change; a prefill's, its length, do: then again)
                     if key not in self.inboxes or self.inboxes[key].shape != value.shape:

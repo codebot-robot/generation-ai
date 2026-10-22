@@ -75,7 +75,7 @@ _given = contextvars.ContextVar("vxpu_plan_given", default=None)
 COORDINATOR_SWITCHES = frozenset({
     "VXPU_FUSED_EXPERTS", "VXPU_SPLIT_DECODE", "VXPU_COMPILE_MODE", "VXPU_SPLIT_COMPILE", "VXPU_DIRECT_HOST_OPS",
     "VXPU_LOWER_DECODE", "VXPU_SEGMENT_RUNTIME", "VXPU_EXPERT_MAILBOXES", "VXPU_REMOTE_NODES", "VXPU_DATAFLOW",
-    "VXPU_STEP_GRAPH",
+    "VXPU_STEP_GRAPH", "VXPU_LAYER_RANGE",
     "VXPU_DATAFLOW_PLACE", "VXPU_GPU_EXPERTS", "VXPU_GPU_EXPERTS_MOVES", "VXPU_GPU_EXPERTS_REQUEST_WEIGHT",
     "VXPU_EXPERTS_IN_RAM", "VXPU_BF16_WEIGHT_CACHE", "VXPU_BF16_CACHE_HEADROOM_GB",
 })
@@ -340,10 +340,24 @@ class Plan:
         self._set("remote_nodes", nodes, src, (),
                   "host nodes node servers serve (name=tcp://host:port/index[,...]; nodeserver.py): their residents "
                   "are not loaded here, and their host ops send their inputs to the server's mailbox")
+        rng, src = env_text("VXPU_LAYER_RANGE", None)
+        if rng:
+            try:
+                first, _, last = rng.partition(":")
+                rng = (int(first), int(last) if last else None)
+                if rng[0] < 0 or (rng[1] is not None and rng[1] <= rng[0]):
+                    raise ValueError
+            except ValueError:
+                raise ConfigError(f"VXPU_LAYER_RANGE={rng!r}: START:END (END exclusive, or empty for the last layer)")
+        self._set("layer_range", rng, src, (),
+                  "run only layers START..END-1 of the step (START:END, END empty for the last layer): their slice of "
+                  "decode and prefill, their experts and n-gram tables; other executors run the other ranges (#387)")
         on, src = env_flag("VXPU_DATAFLOW", False)
         self._set("dataflow", on, src, (True, False),
                   "run the decode step as a dataflow graph: its segments as nodes, each fired when the inboxes "
                   "its inputs are written into are full (dataflow.py, the reference runner; #372)")
+        if self["layer_range"] is not None and not on:  # a range is a slice of the dataflow graph
+            raise ConfigError("VXPU_LAYER_RANGE requires VXPU_DATAFLOW=1")
         on, src = env_flag("VXPU_STEP_GRAPH", False)
         if on and not (cuda and self["dataflow"] and self["segment_runtime"] == "aoti" and self["kernels"]):
             on, src = False, "requires CUDA, dataflow, segment_runtime=aoti and the CPU kernels (the step host)"
