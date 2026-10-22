@@ -68,10 +68,12 @@ the end it owns all placement (§4, §6; #316, #387).
 The planner is part of the coordinator, and the coordinator is Go, next
 to the router: it manages cloud machines and runs across the cluster,
 and Go is the usual language for that. So the machine database the
-planner reasons over moves to Go with it. That includes the hardware
-model and machine catalog, which start in Python (`hardware.py`, #353).
-The executors stay Python, where torch and the kernels are, and report
-what they measure.
+planner reasons over is Go too (`pkg/machines`, #394): the machines vXPU
+knows, with their CPUs, GPUs, memory, bandwidths, local storage, prices
+and what we measured on them (`vxpu machines` lists them). Each executor
+describes the machine it runs on (the `Describe` RPC: its own probe), and
+the router matches that to the database. The executors stay Python,
+where torch and the kernels are, and report what they measure.
 
 ## 2. Models by name, and executors
 

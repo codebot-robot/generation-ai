@@ -70,13 +70,14 @@ type Server struct {
 	// there when any are configured (external.go).
 	externalExecutors []string
 	// catalog state for models served by name (catalog.go), under mu
-	externalModel map[string]string   // external executor address -> model key it holds
-	modelEndpoint map[string]string   // model key -> external executor address
-	loadedTags    map[string]string   // compiled artifact tag -> model key loaded from it
-	loadedHints   map[string]string   // compiled artifact tag -> the registered plan it was loaded under (hintsKey)
-	hints         map[string]string   // statsKey(model) -> its registered plan, as last stored or read (hintsKey)
-	keyModel      map[string]modelRef // model key -> the named model it serves (stats.go)
-	stats         *statsStore         // statistics for models served by name, nil without modelstore
+	externalModel map[string]string       // external executor address -> model key it holds
+	modelEndpoint map[string]string       // model key -> external executor address
+	loadedTags    map[string]string       // compiled artifact tag -> model key loaded from it
+	loadedHints   map[string]string       // compiled artifact tag -> the registered plan it was loaded under (hintsKey)
+	hints         map[string]string       // statsKey(model) -> its registered plan, as last stored or read (hintsKey)
+	keyModel      map[string]modelRef     // model key -> the named model it serves (stats.go)
+	executors     map[string]executorInfo // endpoint -> what it runs on (executors.go)
+	stats         *statsStore             // statistics for models served by name, nil without modelstore
 	// externalModelstoreURL is modelstore's address for external executors
 	// (VMs outside the cluster, which cannot resolve its Service), when set
 	externalModelstoreURL string
@@ -538,6 +539,10 @@ func (s *Server) loadArtifact(ctx context.Context, req *pb.LoadModelRequest, ext
 			return "", status.Errorf(codes.Internal, "failed to get or start pod: %v", err)
 		}
 		endpoint = fmt.Sprintf("%s:%d", podIP, s.executorPort)
+		// a pod's shape depends on the model it was started for, and pod IPs are reused: describe it afresh
+		s.mu.Lock()
+		delete(s.executors, endpoint)
+		s.mu.Unlock()
 	}
 	maxMsgSize := 128 * 1024 * 1024
 	conn, err := grpc.NewClient(
@@ -574,6 +579,7 @@ func (s *Server) loadArtifact(ctx context.Context, req *pb.LoadModelRequest, ext
 	if external && len(s.externalExecutors) > 0 {
 		s.placedExternally(modelKey, endpoint)
 	}
+	s.describeExecutor(ctx, client, endpoint)
 	log.Info("Successfully loaded model on executor", "model_key", modelKey, "endpoint", endpoint)
 	return modelKey, nil
 }

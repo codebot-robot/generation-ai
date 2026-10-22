@@ -165,6 +165,11 @@ type loadingExecutor struct {
 	refused      int               // LoadModels refused for their plan
 }
 
+func (e *loadingExecutor) Describe(context.Context, *pb.DescribeRequest) (*pb.DescribeResponse, error) {
+	return &pb.DescribeResponse{HardwareJson: `{"device":"cuda","cpu":"AMD EPYC 9B45 48-Core Processor",` +
+		`"cpu_threads":96,"simd":"avx512","gpu":"NVIDIA RTX PRO 6000","gpu_count":2}`}, nil
+}
+
 func (e *loadingExecutor) LoadModel(_ context.Context, req *pb.LoadModelRequest) (*pb.LoadModelResponse, error) {
 	e.mu.Lock()
 	defer e.mu.Unlock()
@@ -268,6 +273,15 @@ func TestRegisterModel_PlanGoesWithEveryLoad(t *testing.T) {
 	}
 	if !reflect.DeepEqual(executor.lastPlan, plan) {
 		t.Errorf("the executor got plan %v, want %v", executor.lastPlan, plan)
+	}
+	// the coordinator asked the executor what it runs on (#394)
+	for endpoint, info := range s.executors {
+		if info.Machine == nil || info.Machine.Name != "g4-standard-96" {
+			t.Errorf("executor %s: matched %+v, want g4-standard-96", endpoint, info.Machine)
+		}
+	}
+	if len(s.executors) != 1 {
+		t.Errorf("want the one executor described, got %d", len(s.executors))
 	}
 	// a new plan reloads the model under it; registering without one keeps it
 	plan = map[string]string{"VXPU_EXPERT_MAILBOXES": "0"}
