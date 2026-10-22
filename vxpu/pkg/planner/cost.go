@@ -34,15 +34,18 @@ import (
 //	         over GPU bandwidth, the rest over the CPU expert kernel's,
 //	         the two in parallel; on another executor, its CPU's
 //	host ops a crossing per experts or n-gram layer between the step and
-//	         the host; per layer with GPU experts, their kernels and the
-//	         combine; a layer on another executor, a network round trip
+//	         the host; an n-gram lookup; per layer with GPU experts, their
+//	         kernels and the combine; a layer on another executor, the
+//	         wire (a network round trip, serialization) and its CPU
 //	segments without the step graph, Python launching each dense segment
 //
 // The constants are measured. The hero run (DeepSeek-V4.1-Flash on two
 // RTX PRO 6000s, #377-#381) gives 35.9 ms/token with every expert on the
 // CPU in the step graph, 26.4 with 68 GB of experts on GPU0, 26.6 with
-// 163 GB on both GPUs, and node by node 47.3 and 33.5; the model
-// reproduces each within 9% (cost_test.go).
+// 163 GB on both GPUs, and node by node 47.3 and 33.5. The L4 run (two
+// L4s, experts layers 9-39 on two c3d-standard-60s, #409) gives 119.9 in
+// the step graph, with the step host's timers splitting every hop. The
+// model reproduces each within 10% (cost_test.go).
 const (
 	// gemvEfficiency is the share of a GPU's memory bandwidth decode's
 	// GEMVs reach where the catalog has no measurement: 252 of 300 GB/s
@@ -54,12 +57,18 @@ const (
 	// expert kernel reaches, where it was not measured on the machine:
 	// 209 of 288 GB/s on a g4-standard-96, 121 of 154 on a c3d-standard-60.
 	cpuKernelEfficiency = 0.73
-	crossingMs          = 0.07 // per host op: the step hands it to the host and takes its reply
-	gpuExpertsMs        = 0.14 // per layer with GPU experts in the step graph: their kernels and the combine
-	gpuExpertsNodesMs   = 0.11 // the same, node by node
-	peerGPUMs           = 0.15 // per layer with experts on a GPU other than the engine's
-	remoteMs            = 0.35 // per layer on another executor: a TCP round trip (0.2-0.3 ms on loopback, #376)
-	segmentMs           = 0.22 // per dense segment without the step graph: (20.7 - 11.3 ms) / 43 segments
+	crossingMs          = 0.012 // per host op: the GPU's flag to the step host and the reply's back (#409: GPU events less host time)
+	engramMs            = 1.0   // per n-gram lookup: the host-parallel gather of a token's rows (#366; 2.0 ms for 2 on the L4 run)
+	gpuExpertsMs        = 0.14  // per layer with GPU experts in the step graph: their kernels and the combine
+	gpuExpertsNodesMs   = 0.11  // the same, node by node
+	peerGPUMs           = 0.15  // per layer with experts on a GPU other than the engine's
+	// remoteMs is the wire per layer on another executor: the network both
+	// ways, serialization, the server reading the request (#409: 1.10 ms
+	// measured between a g2-standard-24 and a c3d-standard-60 in one zone).
+	// It depends on the pair: ping there was 0.70-0.85 ms, but 0.20 ms
+	// between the two c3ds; the planner should measure the pair it places.
+	remoteMs  = 1.10
+	segmentMs = 0.22 // per dense segment without the step graph: (20.7 - 11.3 ms) / 43 segments
 )
 
 // Prediction is a plan's predicted decode time, by part.
@@ -106,6 +115,9 @@ func Predict(a Artifact, p Plan, engine *machines.Probe, others map[string]machi
 	}
 	hostOps := len(a.Experts) + a.EngramLayers
 	pr.Parts["crossings"] = float64(hostOps) * crossingMs
+	if a.EngramLayers > 0 {
+		pr.Parts["n-gram"] = float64(a.EngramLayers) * engramMs
+	}
 	if !graph {
 		pr.Parts["segments"] = float64(hostOps+1) * segmentMs
 	}
@@ -155,7 +167,7 @@ func Predict(a Artifact, p Plan, engine *machines.Probe, others map[string]machi
 		a.TopK, gb(int64(cpuBW))))
 	for addr := range p.ExpertExecutors {
 		if om := machines.Match(others[addr]); om != nil {
-			pr.Basis = append(pr.Basis, fmt.Sprintf("experts on %s (%s): its CPU at %.0f GB/s, %.2f ms a layer for the network",
+			pr.Basis = append(pr.Basis, fmt.Sprintf("experts on %s (%s): its CPU at %.0f GB/s, %.2f ms a layer for the wire",
 				addr, om.Name, gb(int64(cpuKernelBandwidth(om))), remoteMs))
 		}
 	}

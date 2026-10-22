@@ -169,7 +169,7 @@ func (s *Server) planLoad(ctx context.Context, model string, manifest, binding, 
 		s.releaseHelpersLocked(engine) // its experts are placed again
 		s.mu.Unlock()
 		free := s.freeExecutors(ctx, engine)
-		p := planner.Choose(artifact, probe, free, counts)
+		p := planner.Choose(artifact, probe, free, counts, hints)
 		mp.Switches, mp.Reasons, mp.Prediction = p.Switches, append(mp.Reasons, p.Reasons...), p.Prediction
 		// the other executors serve the experts nodes of their layers, on a
 		// port each; the engine's mailboxes for those nodes are wired to them

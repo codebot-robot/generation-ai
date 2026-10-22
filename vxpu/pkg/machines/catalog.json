@@ -218,7 +218,7 @@
     "cpu_expert_kernel_bytes_per_sec": 52150000000.0,
     "gcs_checkpoint_copy_bytes_per_sec": 830000000.0,
     "gcs_to_ram_bytes_per_sec": 1280000000.0,
-    "gpu_gemv_bytes_per_sec": 252000000000.0,
+    "gpu_gemv_bytes_per_sec": 203000000000.0,
     "local_ssd_write_bytes_per_sec": 820000000.0
    },
    "name": "g2-standard-24",
@@ -249,7 +249,7 @@
    },
    "gpu_count": 4,
    "measured": {
-    "gpu_gemv_bytes_per_sec": 252000000000.0
+    "gpu_gemv_bytes_per_sec": 203000000000.0
    },
    "name": "g2-standard-48",
    "ram_bytes": 206158430208
