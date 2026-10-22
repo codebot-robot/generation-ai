@@ -74,8 +74,8 @@ _given = contextvars.ContextVar("vxpu_plan_given", default=None)
 # which a value from the coordinator would not reach.
 COORDINATOR_SWITCHES = frozenset({
     "VXPU_FUSED_EXPERTS", "VXPU_SPLIT_DECODE", "VXPU_COMPILE_MODE", "VXPU_SPLIT_COMPILE", "VXPU_DIRECT_HOST_OPS",
-    "VXPU_LOWER_DECODE", "VXPU_SEGMENT_RUNTIME", "VXPU_EXPERT_MAILBOXES", "VXPU_EXPERT_REMOTE", "VXPU_DATAFLOW",
-    "VXPU_STEP_GRAPH",
+    "VXPU_LOWER_DECODE", "VXPU_SEGMENT_RUNTIME", "VXPU_EXPERT_MAILBOXES", "VXPU_EXPERT_REMOTE", "VXPU_REMOTE_NODES",
+    "VXPU_DATAFLOW", "VXPU_STEP_GRAPH",
     "VXPU_DATAFLOW_PLACE", "VXPU_GPU_EXPERTS", "VXPU_GPU_EXPERTS_MOVES", "VXPU_GPU_EXPERTS_REQUEST_WEIGHT",
     "VXPU_EXPERTS_IN_RAM", "VXPU_BF16_WEIGHT_CACHE", "VXPU_BF16_CACHE_HEADROOM_GB",
 })
@@ -342,6 +342,10 @@ class Plan:
         self._set("expert_remote", remote, src, (),
                   "expert servers (host:port[,host:port]; expert_server.py) answering the mailboxes of the layers "
                   "they hold, for the pairs no GPU pool holds")
+        nodes, src = env_text("VXPU_REMOTE_NODES", None)
+        self._set("remote_nodes", nodes, src, (),
+                  "host nodes node servers serve (name=tcp://host:port/index[,...]; nodeserver.py): their residents "
+                  "are not loaded here, and their host ops send their inputs to the server's mailbox")
         on, src = env_flag("VXPU_DATAFLOW", False)
         self._set("dataflow", on, src, (True, False),
                   "run the decode step as a dataflow graph: its segments as nodes, each fired when the inboxes "

@@ -302,6 +302,11 @@ class Engine:
         # every call of theirs goes to the server through the mailboxes.
         self._remotes = self._connect_expert_servers()
         self._remote_layers = {layer for r in self._remotes for layer in r.layers}
+        # Nodes a node server serves (remote_nodes): their residents are not
+        # loaded here, and their host ops send their inputs to the server.
+        self.external.remote_nodes = self._connect_remote_nodes()
+        self._remote_layers |= {i for kind, i in self.external.remote_nodes if kind == "experts"}
+        remote_tables = {i for kind, i in self.external.remote_nodes if kind == "engram"}
         specs = external.get("experts", {})
         local = {int(layer) for layer in specs} - self._remote_layers
         experts, downloaded = load_expert_layers(self.manifest, specs, args, cas_dir, mm,
@@ -314,9 +319,41 @@ class Engine:
             self._place_hot_experts(self.plan["gpu_experts"])
         if self.plan["expert_mailboxes"] and self.external.experts:
             self._attach_mailboxes()
-        tables, downloaded = load_engram_tables(self.manifest, external.get("engram", {}), cas_dir, mm)
+        engram = external.get("engram", {})
+        tables, downloaded = load_engram_tables(self.manifest, engram, cas_dir, mm,
+                                                layers={int(k) for k in engram} - remote_tables)
         self.external.engram.update(tables)
         self.bytes_fetched += downloaded
+        for key in remote_tables:
+            ops.ENGRAM_DIM[key] = engram[str(key)]["dim"]  # a remote table's rows' width, for shapes
+
+    def _connect_remote_nodes(self):
+        """{(collection, index): ops.RemoteNode} for the plan's remote_nodes
+        (name=tcp://host:port/index, ...): the host node of each name, from
+        the decode graph split as it is split everywhere, and a connection
+        per server."""
+        from . import kernels, nodes
+        spec = self.plan["remote_nodes"]
+        if not spec:
+            return {}
+        calls = nodes.host_calls(nodes.decode_split(self.artifact_dir))
+        k = kernels.load()
+        if k is None:
+            raise RuntimeError(f"remote_nodes: the node client needs the CPU kernels: {kernels.why_not()}")
+        clients, remote = {}, {}
+        for item in spec.split(","):
+            name, address = item.split("=", 1)
+            if name not in calls:
+                raise ValueError(f"remote_nodes: {name} is not a host node of this artifact's decode step")
+            if not address.startswith("tcp://"):
+                raise ValueError(f"remote_nodes: {address}: only tcp:// mailboxes so far")
+            server, index = address[len("tcp://"):].rsplit("/", 1)
+            if server not in clients:
+                host, port = server.rsplit(":", 1)
+                clients[server] = k.NodeClient(host, int(port))
+            remote[calls[name]] = ops.RemoteNode(clients[server], int(index), address)
+        print(f"[vxpu] remote nodes: {', '.join(f'{k}.{i}' for k, i in sorted(remote))}", flush=True)
+        return remote
 
     def _connect_expert_servers(self):
         """The expert servers of the plan's expert_remote, connected."""

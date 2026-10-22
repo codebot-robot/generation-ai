@@ -52,6 +52,8 @@ class External:
     def __init__(self):
         self.experts = {}
         self.engram = {}
+        # host nodes a node server serves: (collection, index) -> RemoteNode
+        self.remote_nodes = {}
         # fp8 dense weights dequantized to bf16 on first use on a GPU, keyed
         # by the weight's storage address (see fp8_linear): engine-owned so
         # the copies go with the engine, and shared by its two graphs
@@ -94,6 +96,25 @@ def _plan(device_type):
     return plan if plan is not None else default_plan(device_type)
 
 
+class RemoteNode:
+    """A host node served by a node server (nodeserver.py): its host op
+    sends the op's tensors to the node's mailbox (address, the server's
+    node index) and returns the reply, on the inputs' device."""
+
+    def __init__(self, client, index, address):
+        self.client, self.index, self.address = client, index, address
+
+    def __call__(self, *tensors):
+        out = self.client.call(self.index, [t.cpu() for t in tensors])
+        return out[0].to(tensors[0].device)
+
+
+def _remote(what, key):
+    """The node server that serves what[key], if one does."""
+    ext = getattr(_active, "external", None)
+    return getattr(ext, "remote_nodes", {}).get((what, key)) if ext is not None else None
+
+
 def _current(what, key):
     ext = getattr(_active, "external", None)
     table = getattr(ext, what, None) if ext is not None else None
@@ -114,6 +135,15 @@ def moe_experts(x_in: torch.Tensor, weights: torch.Tensor, indices: torch.Tensor
     same choice the exporter made per graph."""
     if x_in.is_meta:  # a graph walked on the meta device (loading, device passes): shape only
         return x_in.new_empty((x_in.shape[0], x_in.shape[1]), dtype=torch.float32)
+    remote = _remote("experts", layer)
+    if remote is not None:  # a node server holds the layer: its mailbox computes it
+        rec = _recorder()
+        t0 = time.perf_counter() if rec is not None else 0.0
+        y = remote(x_in, weights, indices)
+        if rec is not None:
+            rec.host_op("moe_experts", impl_ms=(time.perf_counter() - t0) * 1e3, remote_pairs=float(indices.numel()))
+            rec.selected_experts(layer, indices.flatten().tolist())
+        return y
     moe = _current("experts", layer)
     host = moe.w1.device if not moe.w1.is_meta else torch.device("cpu")  # meta: the banks are on an expert server
     # decode-sized inputs cross through the engine's pinned buffers; a
@@ -333,6 +363,14 @@ def engram_rows(indices: torch.Tensor, table: int) -> torch.Tensor:
     to bf16 [..., dim], what the module's lookup returns."""
     if indices.is_meta:
         return indices.new_empty(tuple(indices.shape) + (ENGRAM_DIM[table],), dtype=torch.bfloat16)
+    remote = _remote("engram", table)
+    if remote is not None:  # a node server holds the table
+        rec = _recorder()
+        t0 = time.perf_counter() if rec is not None else 0.0
+        out = remote(indices)
+        if rec is not None:
+            rec.host_op("engram_rows", total_ms=(time.perf_counter() - t0) * 1e3)
+        return out
     embed = _current("engram", table)
     host = embed.weight.device
     impl = _plan(host.type).select("vxpu::engram_rows", host.type)
