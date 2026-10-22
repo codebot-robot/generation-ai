@@ -175,6 +175,7 @@
    "gpu": null,
    "gpu_count": 0,
    "measured": {
+    "cpu_dense_bytes_per_sec": 6650000000.0,
     "cpu_expert_kernel_bytes_per_sec": 121000000000.0,
     "gcs_blob_fetch_bytes_per_sec": 1400000000.0,
     "gcs_checkpoint_copy_pd_ssd_bytes_per_sec": 630000000.0

@@ -141,6 +141,16 @@ type Probe struct {
 	GPUCount       int    `json:"gpu_count,omitempty"`
 }
 
+// ProbeOf is what an executor on m would report (Match(ProbeOf(m)) is m):
+// for planning on machines not yet running (vxpu explain --machines).
+func ProbeOf(m *Machine) Probe {
+	p := Probe{Device: "cpu", CPU: m.CPU.Model, CPUThreads: m.CPU.Threads, SIMD: m.CPU.SIMD, RAMBytes: m.RAMBytes}
+	if m.GPU != nil && m.GPUCount > 0 {
+		p.Device, p.GPU, p.GPUMemoryBytes, p.GPUCount = "cuda", m.GPU.Name, m.GPU.MemoryBytes, m.GPUCount
+	}
+	return p
+}
+
 // Match finds the catalog machine a probe describes, or nil. An unknown
 // accelerator or host CPU does not borrow another machine's numbers: a
 // GPU must also have the catalog's memory (within 5%), which tells apart

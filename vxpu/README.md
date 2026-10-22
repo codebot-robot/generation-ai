@@ -179,9 +179,20 @@ doesn't understand: `VXPU_KERNELS`, `VXPU_FUSED_EXPERTS`,
 `VXPU_GPU_EXPERTS_REQUEST_WEIGHT`, `VXPU_EXPERT_MAILBOXES`, `VXPU_DATAFLOW`,
 `VXPU_DATAFLOW_PLACE`, `VXPU_STEP_GRAPH`; and `VXPU_EXTERNAL_DIR`,
 `VXPU_AOTI_CACHE_DIR`, `VXPU_GPU_EXPERTS` and `VXPU_REMOTE_NODES`, taken as
-given. Choosing between plans by cost, and
-deployment hints, come next (#316, #332, #349). `vxpu machines [NAME]`
-shows the machine database (`pkg/machines`).
+given. `vxpu machines [NAME]` shows the machine database (`pkg/machines`).
+
+To see how a model would run on machines you could get, without running
+it, rank the planner's candidate layouts by the cost model (#409):
+
+```sh
+vxpu explain --artifact ARTIFACT_DIR --machines g2-standard-48:2,c3d-standard-60:2 \
+  [--records records.jsonl]   # recorded traffic (vxpu stats --records), for GPU experts
+```
+
+It lists every layout (one machine; one machine running the step with
+other machines serving experts; ranges of whole layers on several
+machines) with its predicted ms/token, the parts it adds up from and
+what each number rests on. `--json` gives them in full.
 
 ## The dataflow executor: segments, experts and mailboxes
 

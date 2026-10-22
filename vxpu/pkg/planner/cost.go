@@ -107,11 +107,10 @@ func Predict(a Artifact, p Plan, engine *machines.Probe, others map[string]machi
 		pr.Basis = append(pr.Basis, fmt.Sprintf("dense: %.1f GB a step (the fp8 weights read as they are) at %.0f GB/s on %s",
 			gb(bytes), gb(int64(bw)), m.GPU.Name))
 	} else {
-		bw := cpuKernelBandwidth(m)
+		bw, basis := cpuDenseBandwidth(m)
 		bytes := a.DecodeFP8Bytes + a.DecodeOtherBytes
 		pr.Parts["dense"] = ms(bytes, bw)
-		pr.Basis = append(pr.Basis, fmt.Sprintf("dense: %.1f GB a step on the CPU at %.0f GB/s (estimated: "+
-			"the CPU's dense kernels are not measured)", gb(bytes), gb(int64(bw))))
+		pr.Basis = append(pr.Basis, fmt.Sprintf("dense: %.1f GB a step on the CPU at %.1f GB/s (%s)", gb(bytes), bw/1e9, basis))
 	}
 	hostOps := len(a.Experts) + a.EngramLayers
 	pr.Parts["crossings"] = float64(hostOps) * crossingMs
@@ -186,6 +185,26 @@ func gemvBandwidth(m *machines.Machine) float64 {
 		return v
 	}
 	return gemvEfficiency * m.GPU.MemoryBandwidthBytesPerSec
+}
+
+// cpuDenseBandwidth is what a decode step's dense half runs at on m's
+// CPU, in weight bytes a second: measured, or the c3d-standard-60's. On a
+// CPU it is not memory-bound (the c3d's: 9.9 GB in 1.49 s, 6.65 GB/s,
+// against the 121 GB/s its expert kernel reads at): attention, the
+// compressor and the hyper-connections are CPU ops, so scaling another
+// CPU's memory bandwidth would not estimate it.
+func cpuDenseBandwidth(m *machines.Machine) (float64, string) {
+	if v, ok := m.Measured["cpu_dense_bytes_per_sec"].(float64); ok {
+		return v, "measured on " + m.Name
+	}
+	c3d, err := machines.Lookup("c3d-standard-60")
+	if err != nil {
+		return cpuKernelBandwidth(m), fmt.Sprintf("estimated: the CPU's dense kernels are not measured (%v)", err)
+	}
+	if v, ok := c3d.Measured["cpu_dense_bytes_per_sec"].(float64); ok {
+		return v, "estimated: measured on a c3d-standard-60, not on " + m.Name
+	}
+	return cpuKernelBandwidth(m), "estimated: the CPU's dense kernels are not measured"
 }
 
 // cpuKernelBandwidth is what the fp4 expert kernel reads at on m's CPU:

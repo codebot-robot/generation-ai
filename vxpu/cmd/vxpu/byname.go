@@ -224,11 +224,18 @@ func cmdExplain(ctx context.Context, args []string) error {
 	flags := flag.NewFlagSet("explain", flag.ContinueOnError)
 	pod := flags.String("pod", "vxpu-router", "router pod name")
 	routerAddr := flags.String("router", "", "vxpu-router address (e.g. localhost:50051); if set, skips the pod and port-forward")
+	artifact := flags.String("artifact", "", "with --machines: an artifact directory (manifest.json, binding.json) to plan offline")
+	fleet := flags.String("machines", "", "plan offline on these machines, from the catalog: TYPE[:COUNT],... (e.g. g2-standard-48:2,c3d-standard-60:2)")
+	records := flags.String("records", "", "with --machines: request records (vxpu stats --records) whose expert selections place GPU experts")
+	asJSON := flags.Bool("json", false, "with --machines: every candidate in full, as JSON")
 	if err := flags.Parse(args); err != nil {
 		return err
 	}
+	if *fleet != "" {
+		return explainOffline(*artifact, *fleet, *records, *asJSON)
+	}
 	if flags.NArg() != 1 {
-		return fmt.Errorf("usage: vxpu explain [flags] REPO")
+		return fmt.Errorf("usage: vxpu explain [flags] REPO | vxpu explain --artifact DIR --machines TYPE[:COUNT],...")
 	}
 	ctx, cancel := context.WithTimeout(ctx, time.Minute)
 	defer cancel()
