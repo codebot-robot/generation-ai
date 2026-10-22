@@ -542,10 +542,12 @@ class Engine:
         """The vxpu ops this engine's graphs call."""
         found = set()
         for module in (self._prefill, self._decode):
-            for node in module.graph.nodes:
-                target = str(node.target)
-                if node.op == "call_function" and target.startswith("vxpu."):
-                    found.add("vxpu::" + target.split(".")[1])
+            for _, sub in module.named_modules():  # a split module's ops are in its segments
+                graph = getattr(sub, "graph", None)
+                for node in graph.nodes if isinstance(graph, torch.fx.Graph) else ():
+                    target = str(node.target)
+                    if node.op == "call_function" and target.startswith("vxpu."):
+                        found.add("vxpu::" + target.split(".")[1])
         return found
 
     def explain(self):

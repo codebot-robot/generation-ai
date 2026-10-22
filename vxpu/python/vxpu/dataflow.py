@@ -67,12 +67,13 @@ class Ref:
 class Node:
     """One segment of the step."""
 
-    def __init__(self, name, kind, layers, args, kwargs):
+    def __init__(self, name, kind, layers, args, kwargs, host=None):
         self.name = name
         self.kind = kind  # "dense", "experts" or "engram"
         self.layers = layers
         self.args = args  # [Ref]
         self.kwargs = kwargs  # {name: Ref}
+        self.host = host  # a host node's (collection, index): ("experts", 3) for layer 3's experts
 
     def refs(self):
         return list(self.args) + list(self.kwargs.values())
@@ -85,17 +86,20 @@ class Graph:
     """The nodes of a split decode step in call order, its step inputs,
     and the reference of what it returns."""
 
-    def __init__(self, nodes, inputs, output):
+    def __init__(self, nodes, inputs, output, output_names=None):
         self.nodes = nodes
         self.by_name = {n.name: n for n in nodes}
         self.inputs = inputs
         self.output = output  # Ref, or a tuple of Refs
+        # a slice's (slice()) outputs by the name the next slice takes them as; None: the step's output
+        self.output_names = output_names
 
     @classmethod
     def from_split(cls, split):
         """The graph of a module split at its host ops (split_module's
         output: placeholders, get_attr, call_module per segment, getitem
         to unpack a segment's outputs, output)."""
+        from . import nodes as native_nodes
         from .telemetry import segment_info
         info = {seg["name"]: seg for seg in segment_info(split)}
         refs, nodes, inputs, output = {}, [], [], None
@@ -115,8 +119,11 @@ class Graph:
                 refs[fx] = Ref("resident", name=fx.target)
             elif fx.op == "call_module":
                 seg = info[fx.target]
+                sub = getattr(split, fx.target)
+                sub = getattr(sub, "_orig_mod", sub)
+                host = native_nodes.host_call(sub) if seg["kind"] != "dense" and native_nodes.is_native(sub) else None
                 nodes.append(Node(fx.target, seg["kind"], seg["layers"],
-                                  [ref(a) for a in fx.args], {k: ref(v) for k, v in fx.kwargs.items()}))
+                                  [ref(a) for a in fx.args], {k: ref(v) for k, v in fx.kwargs.items()}, host))
                 refs[fx] = Ref("edge", node=fx.target)
             elif fx.op == "call_function" and fx.target is operator.getitem:
                 base = refs[fx.args[0]]
@@ -138,6 +145,55 @@ class Graph:
                     out.setdefault((r.node, r.index), []).append(node.name)
         return out
 
+    def cut_position(self, layer):
+        """Where a range starting at experts layer `layer` begins: right
+        after layer-1's experts node (cuts.py says where that is legal)."""
+        for i, n in enumerate(self.nodes):
+            if n.host == ("experts", layer - 1):
+                return i + 1
+        raise KeyError(f"dataflow: no experts node for layer {layer - 1}")
+
+    def slice(self, start, end):
+        """Nodes start..end-1 as a graph of their own (#387): an edge from
+        a node before start becomes a step input, named after the value
+        (cross:NODE or cross:NODE:INDEX); the outputs are every value made
+        before end that the rest of the step reads (passing through values
+        made before start, so slices chain), named the same way, or the
+        step's output for the last slice."""
+        inside = {n.name for n in self.nodes[start:end]}
+        cross = {}
+
+        def name(r):
+            return f"cross:{r.node}" + ("" if r.index is None else f":{r.index}")
+
+        def rewrite(r):
+            if isinstance(r, (tuple, list)):
+                return type(r)(rewrite(x) for x in r)
+            if isinstance(r, Ref) and r.kind == "edge" and r.node not in inside:
+                cross[(r.node, r.index)] = name(r)
+                return Ref("input", name=name(r))
+            return r
+
+        nodes = [Node(n.name, n.kind, n.layers, [rewrite(a) for a in n.args],
+                      {k: rewrite(v) for k, v in n.kwargs.items()}, n.host) for n in self.nodes[start:end]]
+        if end >= len(self.nodes):
+            output, names = rewrite(self.output), None
+        else:
+            made_before = {n.name for n in self.nodes[:end]}
+            needed = []
+            for r in _flat([n.refs() for n in self.nodes[end:]] + [self.output]):
+                if isinstance(r, Ref) and r.kind == "edge" and r.node in made_before and (r.node, r.index) not in needed:
+                    needed.append((r.node, r.index))
+            output = tuple(rewrite(Ref("edge", node=p, index=i)) for p, i in needed)
+            names = [name(Ref("edge", node=p, index=i)) for p, i in needed]
+        used = {r.name for n in nodes for r in _flat(n.refs()) if isinstance(r, Ref) and r.kind == "input"}
+        inputs = [i for i in self.inputs if i in used] + sorted(set(cross.values()))
+        return Graph(nodes, inputs, output, names)
+
+    def residents(self):
+        """The resident tensors (weights, state) this graph's nodes read."""
+        return {r.name for n in self.nodes for r in _flat(n.refs()) if isinstance(r, Ref) and r.kind == "resident"}
+
     def describe(self):
         kinds = collections.Counter(n.kind for n in self.nodes)
         return (f"dataflow: {len(self.nodes)} nodes ("
@@ -153,11 +209,11 @@ class Runner(torch.nn.Module):
     Stands in for segments.Split in the engine (the same split, the same
     recorder hooks and calling convention)."""
 
-    def __init__(self, split, total, compiled, placement=None, device=None):
+    def __init__(self, split, total, compiled, placement=None, device=None, graph=None):
         super().__init__()
         self.split = split  # the modules and the resident tensors live here
         self.vxpu_segments = (total, compiled)
-        self.graph = Graph.from_split(split)
+        self.graph = graph if graph is not None else Graph.from_split(split)  # or a slice of it
         self.placement = dict(placement or {})  # node name -> device; default: where its resident tensors are (place)
         self.device = torch.device(device) if device is not None else None
         self.recorder = None
@@ -234,7 +290,9 @@ class Runner(torch.nn.Module):
                 value = out if index is None else out[index]
                 for d in devices:  # one inbox per consumer device
                     key = (node.name, index, d)
-                    if key not in self.inboxes:  # allocated once, then the same address every step
+                    # allocated once, then the same address every step (a decode step's shapes never
+                    # change; a prefill's, its length, do: then again)
+                    if key not in self.inboxes or self.inboxes[key].shape != value.shape:
                         self.inboxes[key] = torch.empty_like(value, device=d)
                     self.inboxes[key].copy_(value)
                 for consumer, n in consumers:
@@ -245,7 +303,9 @@ class Runner(torch.nn.Module):
             raise RuntimeError(f"dataflow: {len(self.graph.nodes) - fired} nodes never had all their inputs")
         if recorder is not None:
             recorder.end_step()
-        result = self._resolve(self.graph.output, returned)
+        result = self._resolve(self.graph.output, returned, inputs)
+        if self.graph.output_names is not None:  # a slice: its outputs by name, for the next
+            return dict(zip(self.graph.output_names, result))
         result = result[0] if isinstance(result, (tuple, list)) and len(result) == 1 else result
         return result.clone() if isinstance(result, torch.Tensor) else result
 
@@ -260,12 +320,40 @@ class Runner(torch.nn.Module):
             return _attr(self.split, r.name)
         return self.inboxes[(r.node, r.index, device)]
 
-    def _resolve(self, out, returned):
+    def _resolve(self, out, returned, inputs):
         if isinstance(out, (tuple, list)):
-            return type(out)(self._resolve(o, returned) for o in out)
+            return type(out)(self._resolve(o, returned, inputs) for o in out)
         if isinstance(out, Ref) and out.kind == "edge":
             value = returned[out.node]
             return value if out.index is None else value[out.index]
+        if isinstance(out, Ref) and out.kind == "input":  # a value passing through a slice
+            return inputs[out.name]
+        return out
+
+
+class Chain(torch.nn.Module):
+    """A step run as ranges of whole layers in turn (#387), each a slice of
+    one split graph: the first range takes the step's inputs, each next one
+    the step's inputs and what the ranges before it made for it, the last
+    returns the step's output. In one process here; a range on another
+    machine takes the same inputs and returns the same outputs. starts: the
+    layers the ranges after the first begin at (where cuts.py allows)."""
+
+    def __init__(self, split, starts, device=None):
+        super().__init__()
+        graph = Graph.from_split(split)
+        bounds = [0] + [graph.cut_position(layer) for layer in starts] + [len(graph.nodes)]
+        self.split, self.inputs = split, graph.inputs
+        self.runners = torch.nn.ModuleList(Runner(split, len(graph.nodes), 0, device=device, graph=graph.slice(a, b))
+                                           for a, b in zip(bounds, bounds[1:]))
+
+    def forward(self, *args, **kwargs):
+        step = dict(zip(self.inputs, args), **kwargs)
+        made = {}
+        for runner in self.runners:
+            out = runner(**{name: step[name] if name in step else made[name] for name in runner.graph.inputs})
+            if isinstance(out, dict):
+                made.update(out)
         return out
 
 
