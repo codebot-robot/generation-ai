@@ -12,6 +12,9 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+// Package v1alpha1 is the ScalingPolicy API.
+// +kubebuilder:object:generate=true
+// +groupName=generation-ai.gke.io
 package v1alpha1
 
 import (
