@@ -194,6 +194,13 @@ other machines serving experts; ranges of whole layers on several
 machines) with its predicted ms/token, the parts it adds up from and
 what each number rests on. `--json` gives them in full.
 
+`--serve :8080` shows the planner searching instead: every layer's dense
+half and experts each on some machine, random layouts and changes to the
+best ones scored by the cost model at a few hundred a second, the layout
+being scanned and the best found so far drawn coloured by machine, with
+network crossings in red. `dev/tasks/record-plan-search` records it as a
+video.
+
 ## The dataflow executor: segments, experts and mailboxes
 
 A decode step split at its host ops is a dataflow graph (#372,

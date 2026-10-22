@@ -228,11 +228,12 @@ func cmdExplain(ctx context.Context, args []string) error {
 	fleet := flags.String("machines", "", "plan offline on these machines, from the catalog: TYPE[:COUNT],... (e.g. g2-standard-48:2,c3d-standard-60:2)")
 	records := flags.String("records", "", "with --machines: request records (vxpu stats --records) whose expert selections place GPU experts")
 	asJSON := flags.Bool("json", false, "with --machines: every candidate in full, as JSON")
+	serve := flags.String("serve", "", "with --machines: show the planner searching layouts live, on this address (e.g. :8080)")
 	if err := flags.Parse(args); err != nil {
 		return err
 	}
 	if *fleet != "" {
-		return explainOffline(*artifact, *fleet, *records, *asJSON)
+		return explainOffline(ctx, *artifact, *fleet, *records, *asJSON, *serve)
 	}
 	if flags.NArg() != 1 {
 		return fmt.Errorf("usage: vxpu explain [flags] REPO | vxpu explain --artifact DIR --machines TYPE[:COUNT],...")

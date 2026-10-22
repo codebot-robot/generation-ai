@@ -1,0 +1,127 @@
+#!/usr/bin/env python3
+# Copyright 2026 Google LLC
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
+"""Record the planner's live plan search (vxpu explain --serve) as a video.
+
+Starts `vxpu explain --serve` for an artifact on a set of machines, opens
+the page in a headless Chromium (Playwright) that records it, and after
+--seconds writes the recording and an mp4:
+
+    dev/tasks/record-plan-search --artifact /path/to/artifact \
+        --machines g2-standard-48:2,c3d-standard-60:2 --out /tmp/plan-search
+
+Nothing runs on any machine: the planner proposes layouts and the cost
+model prices them. --query passes the page's settings (steps=N layouts
+scored per frame, ms=N between frames, start=best to perturb the best
+candidate). --vxpu is the vxpu binary (default: go run ./cmd/vxpu from
+this checkout). Requires: pip install playwright imageio-ffmpeg &&
+python -m playwright install chromium.
+"""
+
+import argparse
+import os
+import shutil
+import signal
+import socket
+import subprocess
+import sys
+import time
+import urllib.request
+
+from playwright.sync_api import sync_playwright
+
+HERE = os.path.dirname(os.path.abspath(__file__))
+VXPU = os.path.dirname(os.path.dirname(HERE))
+
+
+def free_port():
+    with socket.socket() as s:
+        s.bind(("127.0.0.1", 0))
+        return s.getsockname()[1]
+
+
+def start_server(args, port, log):
+    cmd = (args.vxpu.split() if args.vxpu else ["go", "run", "./cmd/vxpu"]) + [
+        "explain", "--artifact", args.artifact, "--machines", args.machines, "--serve", f"127.0.0.1:{port}"]
+    if args.records:
+        cmd += ["--records", args.records]
+    # its own process group: `go run` passes SIGTERM on to the server it built only as a group
+    proc = subprocess.Popen(cmd, cwd=VXPU, stdout=log, stderr=subprocess.STDOUT, start_new_session=True)
+    for _ in range(600):  # go run compiles first
+        if proc.poll() is not None:
+            sys.exit(f"vxpu explain --serve exited ({proc.returncode}); see {log.name}")
+        try:
+            urllib.request.urlopen(f"http://127.0.0.1:{port}/meta", timeout=1).read()
+            return proc
+        except OSError:
+            time.sleep(0.5)
+    proc.kill()
+    sys.exit(f"vxpu explain --serve did not come up; see {log.name}")
+
+
+def record(url, out_dir, seconds, width, height):
+    with sync_playwright() as p:
+        browser = p.chromium.launch()
+        context = browser.new_context(viewport={"width": width, "height": height},
+                                      record_video_dir=out_dir, record_video_size={"width": width, "height": height})
+        page = context.new_page()
+        page.goto(url)
+        time.sleep(seconds)
+        page.screenshot(path=os.path.join(out_dir, "plan-search-final.png"))
+        video = page.video.path()
+        context.close()
+        browser.close()
+    final = os.path.join(out_dir, "plan-search.webm")
+    shutil.move(video, final)
+    return final
+
+
+def to_mp4(webm, fps=30):
+    import imageio_ffmpeg
+    mp4 = os.path.splitext(webm)[0] + ".mp4"
+    subprocess.check_call([imageio_ffmpeg.get_ffmpeg_exe(), "-y", "-loglevel", "error", "-i", webm,
+                           "-vf", f"fps={fps}", "-an", "-c:v", "libx264", "-pix_fmt", "yuv420p", "-crf", "20", mp4])
+    return mp4
+
+
+def main():
+    parser = argparse.ArgumentParser(description=__doc__.split("\n\n")[0])
+    parser.add_argument("--artifact", required=True, help="artifact directory (manifest.json, binding.json)")
+    parser.add_argument("--machines", required=True, help="TYPE[:COUNT],... from the machine catalog")
+    parser.add_argument("--records", help="request records (vxpu stats --records) for GPU experts")
+    parser.add_argument("--out", required=True, help="directory for the recording")
+    parser.add_argument("--seconds", type=float, default=45)
+    parser.add_argument("--query", default="steps=40", help="the page's settings, as a query string")
+    parser.add_argument("--vxpu", help="the vxpu binary (default: go run ./cmd/vxpu)")
+    parser.add_argument("--width", type=int, default=1600)
+    parser.add_argument("--height", type=int, default=900)
+    args = parser.parse_args()
+    if args.width % 2 or args.height % 2:
+        parser.error("--width and --height must be even (the mp4 encoder needs it)")
+    os.makedirs(args.out, exist_ok=True)
+    port = free_port()
+    with open(os.path.join(args.out, "vxpu.log"), "w") as log:
+        server = start_server(args, port, log)
+        try:
+            webm = record(f"http://127.0.0.1:{port}/?{args.query}", args.out, args.seconds, args.width, args.height)
+        finally:
+            os.killpg(server.pid, signal.SIGTERM)
+            server.wait(timeout=10)
+    print(f"recording: {webm}")
+    print(f"mp4: {to_mp4(webm)}")
+
+
+if __name__ == "__main__":
+    main()

@@ -17,6 +17,7 @@ package main
 import (
 	"bufio"
 	"bytes"
+	"context"
 	"encoding/json"
 	"fmt"
 	"os"
@@ -34,7 +35,7 @@ import (
 // (planner.Candidates, #409) without running anything: the artifact says
 // what the model reads, the machine catalog what each machine does, the
 // cost model what each layout costs.
-func explainOffline(artifactDir, fleetSpec, recordsPath string, asJSON bool) error {
+func explainOffline(ctx context.Context, artifactDir, fleetSpec, recordsPath string, asJSON bool, serve string) error {
 	if artifactDir == "" {
 		return fmt.Errorf("--machines needs --artifact")
 	}
@@ -61,6 +62,17 @@ func explainOffline(artifactDir, fleetSpec, recordsPath string, asJSON bool) err
 		}
 	}
 	cands := planner.Candidates(a, fleet, counts)
+	if serve != "" {
+		var src struct {
+			Source struct {
+				Repo string `json:"repo"`
+			} `json:"source"`
+		}
+		if err := json.Unmarshal(manifest, &src); err != nil {
+			return fmt.Errorf("manifest: %w", err)
+		}
+		return serveSearch(ctx, serve, src.Source.Repo, a, fleet, counts, cands)
+	}
 	if asJSON {
 		enc := json.NewEncoder(os.Stdout)
 		enc.SetIndent("", "  ")

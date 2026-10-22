@@ -1,0 +1,257 @@
+<!DOCTYPE html>
+<!--
+Copyright 2026 Google LLC
+
+Licensed under the Apache License, Version 2.0 (the "License");
+you may not use this file except in compliance with the License.
+You may obtain a copy of the License at
+
+    http://www.apache.org/licenses/LICENSE-2.0
+
+Unless required by applicable law or agreed to in writing, software
+distributed under the License is distributed on an "AS IS" BASIS,
+WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+See the License for the specific language governing permissions and
+limitations under the License.
+-->
+<!--
+The plan search, live (vxpu explain --serve, #409). The planner proposes
+layouts of an LLM on a set of machines (every layer's dense half and its
+experts each on some machine), the cost model prices each one, and the
+best are kept. Each layer is a column: its dense half on top, its experts
+below, coloured by the machine that runs them (hatched: a machine without
+a GPU). Red marks a network crossing: a layer whose experts are on another
+machine, or a move to another machine between layers.
+-->
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<title>vXPU plan search</title>
+<style>
+  :root { --fg: #39ff88; --dim: #1f7a4a; --bg: #050a07; --red: #ff3b3b; --amber: #ffb000; }
+  * { box-sizing: border-box; }
+  body { margin: 0; background: var(--bg); color: var(--fg); font: 14px/1.35 "SF Mono", Menlo, Consolas, monospace;
+         overflow: hidden; height: 100vh; }
+  body::after { content: ""; position: fixed; inset: 0; pointer-events: none;
+                background: repeating-linear-gradient(0deg, rgba(0,0,0,.18) 0 1px, transparent 1px 3px); }
+  header { padding: 14px 22px 8px; border-bottom: 1px solid var(--dim); }
+  h1 { margin: 0; font-size: 22px; letter-spacing: 3px; }
+  h1 span { color: var(--dim); }
+  .sub { color: #8fd9ad; margin-top: 4px; }
+  .stats { margin-top: 6px; color: var(--amber); }
+  main { display: grid; grid-template-columns: 1fr 470px; gap: 18px; padding: 14px 22px 60px; }
+  .panel { border: 1px solid var(--dim); padding: 10px 14px; position: relative; }
+  .panel h2 { margin: 0 0 8px; font-size: 13px; letter-spacing: 4px; color: var(--dim); }
+  .scan { position: relative; overflow: hidden; }
+  .sweep { position: absolute; top: 0; bottom: 0; width: 60px; pointer-events: none;
+           background: linear-gradient(90deg, transparent, rgba(57,255,136,.25), transparent);
+           animation: sweep 1.1s linear infinite; }
+  @keyframes sweep { from { left: -60px; } to { left: 100%; } }
+  canvas { display: block; width: 100%; }
+  canvas.strip { height: 150px; }
+  .verdict { font-size: 20px; margin-top: 8px; min-height: 28px; }
+  .verdict .ms { font-size: 30px; }
+  .reject { color: var(--red); }
+  .worse { color: var(--amber); }
+  .good { color: var(--fg); }
+  .text { color: #8fd9ad; font-size: 12px; height: 32px; overflow: hidden; margin-top: 4px; }
+  .best { margin-top: 14px; }
+  .stamp { position: absolute; right: 18px; top: -6px; border: 4px solid var(--fg); color: var(--fg);
+           padding: 4px 14px; font-size: 34px; letter-spacing: 6px; transform: rotate(-8deg) scale(.2);
+           opacity: 0; pointer-events: none; }
+  .stamp.on { animation: stamp 1.6s ease-out; }
+  @keyframes stamp { 0% { opacity: 0; transform: rotate(-8deg) scale(2.4); }
+                     15% { opacity: 1; transform: rotate(-8deg) scale(1); }
+                     80% { opacity: 1; } 100% { opacity: 0; transform: rotate(-8deg) scale(1); } }
+  .parts { display: flex; height: 18px; margin-top: 10px; border: 1px solid var(--dim); }
+  .parts div { height: 100%; font-size: 10px; color: #000; overflow: hidden; white-space: nowrap; padding-left: 3px; }
+  .legend-parts { font-size: 11px; color: #8fd9ad; margin-top: 4px; }
+  table { width: 100%; border-collapse: collapse; }
+  td { padding: 3px 4px; vertical-align: middle; }
+  td.r { color: var(--dim); width: 22px; }
+  td.ms { width: 84px; text-align: right; }
+  td.k { font-size: 11px; color: #8fd9ad; width: 120px; }
+  tr.fresh td { animation: fresh 1.2s; }
+  @keyframes fresh { from { background: rgba(57,255,136,.35); } to { background: transparent; } }
+  footer { position: fixed; bottom: 0; left: 0; right: 0; padding: 8px 22px 12px; border-top: 1px solid var(--dim);
+           display: flex; flex-wrap: wrap; gap: 18px; font-size: 12px; }
+  .sw { display: inline-block; width: 14px; height: 14px; vertical-align: -2px; margin-right: 6px; border: 1px solid #000; }
+  .ref { font-size: 11px; color: #8fd9ad; margin-top: 12px; }
+</style>
+</head>
+<body>
+<header>
+  <h1>vXPU <span>//</span> PLAN SEARCH</h1>
+  <div class="sub" id="sub">connecting...</div>
+  <div class="stats" id="stats"></div>
+</header>
+<main>
+  <div>
+    <div class="panel scan">
+      <h2>SCANNING LAYOUT</h2>
+      <div class="sweep"></div>
+      <canvas id="probe" class="strip"></canvas>
+      <div class="verdict" id="verdict"></div>
+      <div class="text" id="probeText"></div>
+    </div>
+    <div class="panel best">
+      <h2>BEST MATCH</h2>
+      <div class="stamp" id="stamp">MATCH</div>
+      <canvas id="best" class="strip"></canvas>
+      <div class="verdict" id="bestVerdict"></div>
+      <div class="text" id="bestText"></div>
+      <div class="parts" id="parts"></div>
+      <div class="legend-parts" id="partsLegend"></div>
+    </div>
+  </div>
+  <div class="panel">
+    <h2>TOP 10 · MS/TOKEN PREDICTED</h2>
+    <table id="top"></table>
+    <div class="ref" id="ref"></div>
+  </div>
+</main>
+<footer id="legend"></footer>
+<script>
+const GPU_COLORS = ["#00e5ff", "#76ff03", "#ffd600", "#ff6d00", "#40c4ff", "#eeff41"];
+const CPU_COLORS = ["#b388ff", "#a1887f", "#90a4ae", "#ce93d8", "#bcaaa4", "#9fa8da"];
+const PART_COLORS = {"dense": "#00e5ff", "experts local": "#76ff03", "experts remote": "#ffd600", "wire": "#ff3b3b",
+                     "hops": "#ff6d00", "crossings": "#b388ff", "n-gram": "#90a4ae", "segments": "#a1887f"};
+let meta = null, colors = [], cpu = [], bestMs = 0, lastTop = "";
+
+function patternFor(ctx, color) {
+  const c = document.createElement("canvas"); c.width = c.height = 8;
+  const x = c.getContext("2d");
+  x.fillStyle = color; x.fillRect(0, 0, 8, 8);
+  x.strokeStyle = "rgba(0,0,0,.55)"; x.lineWidth = 2;
+  x.beginPath(); x.moveTo(0, 8); x.lineTo(8, 0); x.stroke();
+  return ctx.createPattern(c, "repeat");
+}
+
+// drawLayout: a column a layer, dense half on top, experts below; red where the network is crossed
+function drawLayout(canvas, layout, opts = {}) {
+  const ctx = canvas.getContext("2d");
+  const dpr = window.devicePixelRatio || 1;
+  const w = canvas.clientWidth, h = 150;
+  if (canvas.width !== w * dpr) { canvas.width = w * dpr; canvas.height = h * dpr; }
+  ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
+  ctx.clearRect(0, 0, w, h);
+  if (!layout) return;
+  const n = layout.dense.length, cw = w / n, rowH = (h - 34) / 2, top = 16;
+  ctx.font = "10px Menlo, monospace";
+  for (let i = 0; i < n; i++) {
+    const x = i * cw, d = layout.dense[i], e = layout.experts[i];
+    ctx.fillStyle = cpu[d] ? patternFor(ctx, colors[d]) : colors[d];
+    ctx.fillRect(x + 1, top, cw - 2, rowH - 3);
+    ctx.fillStyle = cpu[e] ? patternFor(ctx, colors[e]) : colors[e];
+    ctx.fillRect(x + 1, top + rowH + 3, cw - 2, rowH - 3);
+    if (d !== e) { // the experts are on another machine: a round trip
+      ctx.strokeStyle = "#ff3b3b"; ctx.lineWidth = 2;
+      ctx.beginPath(); ctx.moveTo(x + cw / 2, top + rowH - 6); ctx.lineTo(x + cw / 2, top + rowH + 6); ctx.stroke();
+      ctx.fillStyle = "#ff3b3b"; ctx.beginPath(); ctx.arc(x + cw / 2, top + rowH, 3, 0, 7); ctx.fill();
+    }
+    const prev = layout.dense[(i + n - 1) % n];
+    if (prev !== d) { // the step moves to another machine: a hop
+      ctx.fillStyle = "#ff3b3b"; ctx.fillRect(x - 1.5, top - 6, 3, 2 * rowH + 12);
+    }
+    if (meta.engram && meta.engram.includes(i)) {
+      ctx.fillStyle = "#e0e0e0"; ctx.fillText("n", x + cw / 2 - 3, top - 4);
+    }
+    if (i % 5 === 0) { ctx.fillStyle = "#1f7a4a"; ctx.fillText(String(i), x + 2, h - 4); }
+  }
+  ctx.fillStyle = "#1f7a4a";
+  ctx.fillText("dense", 2, top + 11); ctx.fillText("experts", 2, top + rowH + 14);
+}
+
+function drawMini(canvas, layout) {
+  const ctx = canvas.getContext("2d");
+  const w = canvas.width, h = canvas.height, n = layout.dense.length, cw = w / n;
+  ctx.clearRect(0, 0, w, h);
+  for (let i = 0; i < n; i++) {
+    const d = layout.dense[i], e = layout.experts[i];
+    ctx.fillStyle = cpu[d] ? patternFor(ctx, colors[d]) : colors[d]; ctx.fillRect(i * cw, 0, cw, h / 2 - 1);
+    ctx.fillStyle = cpu[e] ? patternFor(ctx, colors[e]) : colors[e]; ctx.fillRect(i * cw, h / 2 + 1, cw, h / 2 - 1);
+    if (layout.dense[(i + n - 1) % n] !== d) { ctx.fillStyle = "#ff3b3b"; ctx.fillRect(i * cw - 1, 0, 2, h); }
+  }
+}
+
+function fmt(ms) { return ms >= 1000 ? (ms / 1000).toFixed(2) + " s" : ms.toFixed(1) + " ms"; }
+
+function showParts(parts, total) {
+  const bar = document.getElementById("parts"), legend = document.getElementById("partsLegend");
+  bar.innerHTML = ""; legend.innerHTML = "";
+  Object.entries(parts).sort((a, b) => b[1] - a[1]).forEach(([k, v]) => {
+    const div = document.createElement("div");
+    div.style.width = (100 * v / total) + "%"; div.style.background = PART_COLORS[k] || "#888";
+    div.textContent = v / total > 0.08 ? k : "";
+    bar.appendChild(div);
+    legend.innerHTML += `<span style="color:${PART_COLORS[k] || "#888"}">■</span> ${k} ${v.toFixed(1)}  `;
+  });
+}
+
+async function start() {
+  meta = await (await fetch("meta")).json();
+  meta.machines.forEach((m, i) => {
+    cpu.push(!m.gpu);
+    colors.push(m.gpu ? GPU_COLORS[i % GPU_COLORS.length] : CPU_COLORS[i % CPU_COLORS.length]);
+  });
+  const counts = {};
+  meta.machines.forEach(m => counts[m.machine] = (counts[m.machine] || 0) + 1);
+  document.getElementById("sub").textContent = `${meta.model} · ${meta.layers} layers · on ` +
+    Object.entries(counts).map(([m, c]) => `${c}x ${m}`).join(", ");
+  document.getElementById("legend").innerHTML = meta.machines.map((m, i) =>
+    `<span><span class="sw" style="background:${colors[i]}${cpu[i] ? ";background-image:repeating-linear-gradient(45deg,rgba(0,0,0,.5) 0 2px,transparent 2px 6px)" : ""}"></span>` +
+    `${m.name} · ${m.gpu || "CPU only"} · ${m.ram_gb.toFixed(0)} GB RAM</span>`).join("") +
+    `<span><span class="sw" style="background:#ff3b3b"></span>network crossing</span>`;
+  if (meta.candidates && meta.candidates.length) {
+    document.getElementById("ref").innerHTML = "structured candidates (vxpu explain):<br>" +
+      meta.candidates.slice(0, 4).map(c => `${fmt(c.ms_per_token)} · ${c.kind}`).join("<br>");
+  }
+  const es = new EventSource("events" + location.search);
+  es.onmessage = ev => {
+    const e = JSON.parse(ev.data), p = e.probe;
+    document.getElementById("stats").textContent =
+      `layouts scanned ${e.scanned.toLocaleString()} · feasible ${e.feasible.toLocaleString()} · ` +
+      `${Math.round(e.scanned / Math.max(e.elapsed_s, 0.001)).toLocaleString()}/s · elapsed ${e.elapsed_s.toFixed(0)} s`;
+    drawLayout(document.getElementById("probe"), p.layout);
+    const v = document.getElementById("verdict");
+    if (!p.feasible) {
+      v.innerHTML = `<span class="reject">REJECTED · ${p.why}</span>`;
+    } else {
+      const best = e.top.length ? e.top[0].ms_per_token : p.ms_per_token;
+      const cls = p.ms_per_token <= best * 1.0001 ? "good" : (p.ms_per_token < best * 1.5 ? "worse" : "reject");
+      v.innerHTML = `<span class="${cls}"><span class="ms">${fmt(p.ms_per_token)}</span> · ${p.kind} · ${p.hops} network crossings</span>`;
+    }
+    document.getElementById("probeText").textContent = e.probe_text;
+    if (e.top.length) {
+      const b = e.top[0];
+      drawLayout(document.getElementById("best"), b.layout);
+      document.getElementById("bestVerdict").innerHTML =
+        `<span class="good"><span class="ms">${fmt(b.ms_per_token)}</span> · ${b.kind} · ${b.hops} network crossings</span>`;
+      if (e.best_text) document.getElementById("bestText").textContent = e.best_text;
+      showParts(b.parts_ms, b.ms_per_token);
+      if (e.new_best) {
+        const s = document.getElementById("stamp");
+        s.classList.remove("on"); void s.offsetWidth; s.classList.add("on");
+      }
+      const key = e.top.map(t => t.ms_per_token.toFixed(3)).join(",");
+      if (key !== lastTop) {
+        const old = lastTop.split(",");
+        lastTop = key;
+        const table = document.getElementById("top");
+        table.innerHTML = "";
+        e.top.forEach((t, i) => {
+          const tr = document.createElement("tr");
+          if (!old.includes(t.ms_per_token.toFixed(3))) tr.className = "fresh";
+          tr.innerHTML = `<td class="r">${i + 1}</td><td class="ms">${fmt(t.ms_per_token)}</td>` +
+                         `<td class="k">${t.kind}</td><td><canvas width="210" height="22"></canvas></td>`;
+          table.appendChild(tr);
+          drawMini(tr.querySelector("canvas"), t.layout);
+        });
+      }
+    }
+  };
+}
+start();
+</script>
+</body>
+</html>

@@ -90,7 +90,11 @@ against 203 GB/s on an L4. So for DeepSeek-V4.1-Flash on a g2-standard-24
 and two c3d-standard-60s, the model rejects moving whole layers to the
 c3ds (1050 against 115 ms/token), and on two g2-standard-48s it picks a
 layer range on each (66 against 97). The planner arrives at the layout
-from the measurements, not from a rule written for it. Layer ranges need
+from the measurements, not from a rule written for it. The same holds
+beyond the three shapes: a search over every layer's two placements
+(`planner.Search`: random layouts and changes to the best, kept as in
+simulated annealing) finds the same layouts, and occasionally better
+ones the shapes miss. `vxpu explain --serve` shows it running. Layer ranges need
 a node server that runs whole layers, dense half and KV cache included
 (#387), before the executors can run them.
 
