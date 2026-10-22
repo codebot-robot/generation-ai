@@ -145,6 +145,13 @@ def _hc_sinkhorn_op(mixes, hc_scale, hc_base, hc_mult=4, sinkhorn_iters=20, eps=
     return torch.ops.vxpu.hc_sinkhorn(mixes, hc_scale, hc_base, hc_mult, sinkhorn_iters, eps)
 
 
+def _rotary_op(x, freqs_cis, inverse=False):
+    """The fork's apply_rotary_emb signature, routed to vxpu::rotary."""
+    y = torch.ops.vxpu.rotary(x, freqs_cis, inverse)
+    x.copy_(y)
+    return x
+
+
 def _head_forward(self, x, full_logits=False):
     """ParallelHead.forward (single process) with the linear as
     vxpu::head_linear over the bf16 weight."""
@@ -187,6 +194,10 @@ def set_external(model, on):
     if not hasattr(ds, "_vxpu_hc_split_sinkhorn"):
         ds._vxpu_hc_split_sinkhorn = ds.hc_split_sinkhorn
     ds.hc_split_sinkhorn = _hc_sinkhorn_op if on else ds._vxpu_hc_split_sinkhorn
+    # rotary embeddings: swapped for vxpu::rotary while tracing and restored after
+    if not hasattr(ds, "_vxpu_apply_rotary_emb"):
+        ds._vxpu_apply_rotary_emb = ds.apply_rotary_emb
+    ds.apply_rotary_emb = _rotary_op if on else ds._vxpu_apply_rotary_emb
     if getattr(ds, "world_size", 1) == 1:
         _set_head(model.head, on)
     for layer in model.layers:

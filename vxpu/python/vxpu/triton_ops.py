@@ -281,6 +281,59 @@ def fp8_gemv(x, weight, scale, group_rows=None, out_dtype=torch.bfloat16, block_
     return y
 
 
+if triton is not None:
+    @triton.jit
+    def _rotary_kernel(x_ptr, cos_ptr, sin_ptr, y_ptr,
+                       d, H, S,
+                       BD: tl.constexpr):
+        pid = tl.program_id(0).to(tl.int64)
+        D = d // 2
+        s_idx = (pid // H) % S
+        cols = tl.arange(0, BD)
+        mask = cols < D
+
+        off_re = pid * d + cols * 2
+        off_im = pid * d + cols * 2 + 1
+        x_re = tl.load(x_ptr + off_re, mask=mask).to(tl.float32)
+        x_im = tl.load(x_ptr + off_im, mask=mask).to(tl.float32)
+
+        off_cs = s_idx * D + cols
+        c = tl.load(cos_ptr + off_cs, mask=mask).to(tl.float32)
+        s = tl.load(sin_ptr + off_cs, mask=mask).to(tl.float32)
+
+        out_re = x_re * c - x_im * s
+        out_im = x_re * s + x_im * c
+
+        tl.store(y_ptr + off_re, out_re.to(y_ptr.dtype.element_ty), mask=mask)
+        tl.store(y_ptr + off_im, out_im.to(y_ptr.dtype.element_ty), mask=mask)
+
+
+def rotary(x, cos, sin, traced=False):
+    """Rotate element pairs in x (last dim d) by cos and sin [s, d/2] using
+    a single Triton kernel."""
+    assert x.is_cuda and x.shape[-1] % 2 == 0
+    if x.ndim not in (3, 4):
+        raise ValueError(f"rotary: x must have rank 3 [b, s, d] or 4 [b, s, h, d], got {x.ndim} {tuple(x.shape)}")
+    d = x.shape[-1]
+    D = d // 2
+    S = x.shape[1]
+    if cos.shape != (S, D) or sin.shape != (S, D):
+        raise ValueError(f"rotary: x {tuple(x.shape)} needs cos and sin [{S}, {D}], "
+                         f"got cos {tuple(cos.shape)} and sin {tuple(sin.shape)}")
+    H = x.shape[2] if x.ndim == 4 else 1
+    n_rows = x.numel() // d
+    xc = x.contiguous()
+    cos_c = cos.contiguous()
+    sin_c = sin.contiguous()
+    y = torch.empty(xc.shape, dtype=x.dtype, device=x.device)
+    if n_rows and D:
+        BD = triton.next_power_of_2(D)
+        kernel, ctx = _launcher(_rotary_kernel, x.device, traced)
+        with ctx:
+            kernel[(n_rows,)](xc, cos_c, sin_c, y, d, H, S, BD=BD)
+    return y
+
+
 # ---------------------------------------------------------------------------
 # the traced forms, as torch ops (the plan's lowering calls these)
 
@@ -303,6 +356,10 @@ if triton is not None:
                      out_dtype: torch.dtype) -> torch.Tensor:
         return fp8_gemv(x, weight, scale, group_rows or None, out_dtype, traced=True)
 
+    @torch.library.triton_op("vxpu_triton::rotary", mutates_args=())
+    def _rotary_op(x: torch.Tensor, cos: torch.Tensor, sin: torch.Tensor) -> torch.Tensor:
+        return rotary(x, cos, sin, traced=True)
+
 
 def _lowered_fp8_gemv(x, weight, scale, group_rows=None, out_dtype=torch.bfloat16):
     return torch.ops.vxpu_triton.fp8_gemv(x, weight, scale, group_rows or 0, out_dtype)
@@ -316,6 +373,7 @@ lowered = types.SimpleNamespace(
     hc_split_sinkhorn=lambda *a: torch.ops.vxpu_triton.hc_split_sinkhorn(*a),
     linear_f32=lambda x, weight: torch.ops.vxpu_triton.linear_f32(x, weight),
     fp8_gemv=_lowered_fp8_gemv,
+    rotary=lambda x, cos, sin: torch.ops.vxpu_triton.rotary(x, cos, sin),
 )
 
 

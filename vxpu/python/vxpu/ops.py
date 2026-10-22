@@ -659,6 +659,54 @@ def _(x, weight):
     return x.new_empty(tuple(x.shape[:-1]) + (weight.shape[0],), dtype=torch.float32)
 
 
+# ---------------------------------------------------------------------------
+# rotary: rotary embedding for interleaved complex pairs
+
+@custom_op("vxpu::rotary", mutates_args=())
+def rotary(x: torch.Tensor, freqs_cis: torch.Tensor, inverse: bool = False) -> torch.Tensor:
+    """Rotate adjacent element pairs in x by the angles encoded in freqs_cis
+    (complex64). Accepts [b, s, d] and [b, s, h, d]; inverse conjugates the
+    rotation. The reference implementation uses the fork's complex arithmetic;
+    on CUDA the gpu-triton implementation rotates interleaved pairs in
+    registers via a Triton kernel, lowered through vxpu_triton::rotary."""
+    if x.is_meta:
+        return torch.empty_like(x)
+    return select("vxpu::rotary", x, freqs_cis, inverse).fn(x, freqs_cis, inverse)
+
+
+def _rotary_context(x, freqs_cis, inverse=False):
+    shape = "x".join(str(d) for d in x.shape)
+    inv = " inv" if inverse else ""
+    return x.device.type, f"{shape}{inv}", {}
+
+
+@implementation("vxpu::rotary", "gpu-triton", ("cuda",), "rounding",
+                "Triton kernel: interleaved pairs rotated in registers",
+                applies=lambda plan, **_: plan["triton"], lowerable=True)
+def _rotary_triton(x, freqs_cis, inverse=False, tk=triton_ops):
+    c = freqs_cis.real
+    s = -freqs_cis.imag if inverse else freqs_cis.imag
+    return tk.rotary(x, c, s)
+
+
+@implementation("vxpu::rotary", "reference", ("cpu", "cuda"), "bit-identical",
+                "the fork's complex arithmetic", reference=True)
+def _rotary_reference(x, freqs_cis, inverse=False):
+    x_c = torch.view_as_complex(x.float().unflatten(-1, (-1, 2)))
+    if inverse:
+        freqs_cis = freqs_cis.conj()
+    if x_c.ndim == 3:
+        freqs_cis = freqs_cis.view(1, x_c.size(1), x_c.size(-1))
+    else:
+        freqs_cis = freqs_cis.view(1, x_c.size(1), 1, x_c.size(-1))
+    return torch.view_as_real(x_c * freqs_cis).flatten(-2).to(x.dtype)
+
+
+@rotary.register_fake
+def _(x, freqs_cis, inverse=False):
+    return torch.empty_like(x)
+
+
 # per op: its selection context from its arguments (device type, the key
 # recorded with the selection, what the implementations' applies() read);
 # and, where it is not fn(*args), how the op calls the implementation
@@ -667,6 +715,7 @@ SELECTION = {
     "vxpu::fp8_grouped_linear": _grouped_context,
     "vxpu::hc_sinkhorn": _sinkhorn_context,
     "vxpu::head_linear": _head_context,
+    "vxpu::rotary": _rotary_context,
 }
 CALL = {"vxpu::head_linear": _call_head}
 

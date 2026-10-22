@@ -50,6 +50,7 @@ divergence, and they stay useful under any later tolerance.
 """
 
 import argparse
+import collections
 import json
 import os
 import sys
@@ -831,6 +832,122 @@ def _check_telemetry(model, prompts, settings, artifact, plain, workdir):
     return not problems
 
 
+def _aoti_complex_proxy_fallbacks(cache_dir, prior=None):
+    """Any proxy-executor fallback on complex ops in the cached AOTInductor packages."""
+    import zipfile
+    found = collections.defaultdict(list)
+    if not os.path.exists(cache_dir):
+        return found
+    prior = prior or set()
+    for fname in os.listdir(cache_dir):
+        if not fname.endswith(".pt2") or fname.endswith(".tmp.pt2"):
+            continue
+        if prior and fname in prior:
+            continue
+        path = os.path.join(cache_dir, fname)
+        try:
+            with zipfile.ZipFile(path) as z:
+                for name in z.namelist():
+                    if name.endswith(".wrapper.json"):
+                        data = json.loads(z.read(name).decode("utf-8"))
+                        for entry in data.get("nodes", []):
+                            target = entry.get("node", {}).get("target", "")
+                            if any(k in target for k in ("conj", "complex", "clone")):
+                                found[fname].append(target)
+        except zipfile.BadZipFile:
+            continue
+    return dict(found)
+
+
+def _check_rotary():
+    """Verify vxpu::rotary: Triton and reference implementations with
+    unit-modulus RoPE angles at DeepSeek's shape ([1, 512, 64, 64] and
+    [1, 512, 64]), confirming the rounding numerics class bounded by 1 bf16 ulp
+    plus 8 fp32 ulps of the operand scale |x_re·c| + |x_im·s| across 3D and 4D
+    shapes, with and without inverse rotation, and refusing mismatched angles."""
+    import torch
+    from . import ops
+    from . import triton_ops
+
+    def operand_bound(x, f, y_ref):
+        c, s = f.real, f.imag
+        if x.ndim == 3:
+            c = c.view(1, x.size(1), -1)
+            s = s.view(1, x.size(1), -1)
+        else:
+            c = c.view(1, x.size(1), 1, -1)
+            s = s.view(1, x.size(1), 1, -1)
+        xf = x.float().unflatten(-1, (-1, 2))
+        x_re, x_im = xf[..., 0], xf[..., 1]
+        op_scale = torch.stack([x_re.abs() * c.abs() + x_im.abs() * s.abs(),
+                                x_re.abs() * s.abs() + x_im.abs() * c.abs()],
+                               dim=-1).flatten(-2)
+        exp_bf16 = torch.frexp(y_ref.float().abs())[1]
+        ulp_bf16 = torch.ldexp(torch.ones_like(op_scale), torch.clamp(exp_bf16 - 8, min=-133))
+        exp_fp32 = torch.frexp(op_scale)[1]
+        ulp_fp32 = torch.ldexp(torch.ones_like(op_scale), torch.clamp(exp_fp32 - 24, min=-149))
+        return ulp_bf16 + 8 * ulp_fp32
+
+    devices = ["cpu"]
+    if torch.cuda.is_available():
+        devices.append("cuda")
+    for dev in devices:
+        torch.manual_seed(42)
+        dim = 64
+        base = 10000.0
+        seqlen = 512
+        freqs = 1.0 / (base ** (torch.arange(0, dim, 2, device=dev, dtype=torch.float32) / dim))
+        angles = torch.outer(torch.arange(seqlen, device=dev, dtype=torch.float32), freqs)
+        f = torch.polar(torch.ones_like(angles), angles)
+
+        # 3D: [b, s, d] (e.g. kv cache projection)
+        x3 = torch.randn(1, seqlen, dim, dtype=torch.bfloat16, device=dev)
+        # 4D: [b, s, h, d] (DeepSeek-V4.1: 64 query heads, rope_head_dim=64)
+        x4 = torch.randn(1, seqlen, 64, dim, dtype=torch.bfloat16, device=dev)
+
+        for x in (x3, x4):
+            # Mismatched rank and angle shapes must be refused
+            if dev == "cuda" and triton_ops.available():
+                for bad_x in (torch.randn(seqlen, dim, device=dev), torch.randn(1, seqlen, 2, 2, dim, device=dev)):
+                    try:
+                        triton_ops.rotary(bad_x, f.real, f.imag)
+                        raise AssertionError(f"triton_ops.rotary accepted unsupported rank {bad_x.ndim}")
+                    except ValueError:
+                        pass
+                bad_cos = torch.randn(seqlen + 1, dim // 2, device=dev)
+                bad_sin = torch.randn(seqlen + 1, dim // 2, device=dev)
+                try:
+                    triton_ops.rotary(x, bad_cos, bad_sin)
+                    raise AssertionError("triton_ops.rotary accepted mismatched angle shape")
+                except ValueError:
+                    pass
+
+            for inv in (False, True):
+                y_ref = ops._rotary_reference(x, f, inv)
+                y_op = torch.ops.vxpu.rotary(x, f, inv)
+                if dev == "cuda":
+                    # On CUDA: compare Triton kernel against reference and lowered
+                    diff = (y_op.float() - y_ref.float()).abs()
+                    bound = operand_bound(x, f, y_ref)
+                    exceeds = diff > bound
+                    if exceeds.any():
+                        bad = exceeds.sum().item()
+                        max_ratio = (diff / bound).max().item()
+                        raise AssertionError(
+                            f"vxpu::rotary on {dev} (inv={inv}) diverges from reference beyond operand bound "
+                            f"(1 bf16 ulp + 8 fp32 ulps of |x_re·c| + |x_im·s|): "
+                            f"{bad}/{x.numel()} elements exceed bound, max ratio={max_ratio:.2f}")
+                    # Lowered call runs the exact same Triton kernel, so it must be bit-identical
+                    if triton_ops.available():
+                        y_lowered = triton_ops.lowered.rotary(x, f.real, -f.imag if inv else f.imag)
+                        if not torch.equal(y_op.view(torch.int16), y_lowered.view(torch.int16)):
+                            raise AssertionError(f"vxpu::rotary eager vs lowered mismatch on {dev} (inv={inv})")
+                else:
+                    # On CPU: reference is selected and bit-identical
+                    if not torch.equal(y_op.view(torch.int16), y_ref.view(torch.int16)):
+                        raise AssertionError(f"vxpu::rotary custom op dispatch mismatch on {dev} (inv={inv})")
+
+
 def _check_lowering(model, prompts, settings, artifact, workdir):
     """On a GPU: the compiled, split decode with the plan lowered into its
     segments (lower.py), and with those segments as AOTInductor packages
@@ -845,11 +962,13 @@ def _check_lowering(model, prompts, settings, artifact, workdir):
         return True
     # every switch the variants depend on is pinned, so none is inherited
     # from the environment the selftest runs in
+    aoti_cache = os.path.join(workdir, "aoti-cache")
+    prior_packages = set(os.listdir(aoti_cache)) if os.path.exists(aoti_cache) else set()
     split = {"VXPU_SPLIT_DECODE": "1", "VXPU_SPLIT_COMPILE": "1"}
     variants = {"compiled": {**split, "VXPU_SEGMENT_RUNTIME": "jit", "VXPU_LOWER_DECODE": "0"},
                 "lowered": {**split, "VXPU_SEGMENT_RUNTIME": "jit", "VXPU_LOWER_DECODE": "1"},
                 "aoti": {**split, "VXPU_SEGMENT_RUNTIME": "aoti", "VXPU_LOWER_DECODE": "1",
-                         "VXPU_AOTI_CACHE_DIR": os.path.join(workdir, "aoti-cache")}}
+                         "VXPU_AOTI_CACHE_DIR": aoti_cache}}
     intended = {"compiled": (False, "jit"), "lowered": (True, "jit"), "aoti": (True, "aoti")}  # lower_decode, runtime
     runs = {}
     for label, env in variants.items():
@@ -884,6 +1003,12 @@ def _check_lowering(model, prompts, settings, artifact, workdir):
             print(f"lowering check: the {label} run lowered nothing (report={report})")
             ok = False
             continue
+        if label == "aoti":
+            fallbacks = _aoti_complex_proxy_fallbacks(aoti_cache, prior=prior_packages)
+            if fallbacks:
+                print(f"lowering check: AOTI packages have complex proxy fallbacks: {fallbacks}")
+                ok = False
+                continue
         rows, same = compare(runs["compiled"], runs[label], strict_tokens=True)
         print(f"{label} decode against compiled, cuda:")
         print(table(runs["compiled"], runs[label], rows))
@@ -1656,6 +1781,7 @@ def selftest(workdir, settings):
     _check_host_reads(workdir)
     _check_local_blobs_copy(workdir)
     _check_expert_sim()
+    _check_rotary()
     from .export import export_artifact
     from .fixtures import tiny_fp8_moe
     models = [
