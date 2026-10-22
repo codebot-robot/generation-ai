@@ -67,6 +67,51 @@ type Artifact struct {
 	TopK                             int   // routed experts each token selects in each layer
 	EngramLayers                     int   // layers with an n-gram table (a host op each, like the experts)
 	Engram                           []int // which layers those are, when known
+	// Cuts are the layers a range of whole layers may start at (#387: no
+	// state a later layer reads crosses the cut), nil when not known (any);
+	// Uncuttable says why a layer may not.
+	Cuts       []int
+	Uncuttable map[int]string
+}
+
+// CanStart reports whether a range of whole layers may start at layer
+// (always at the first: the step's own boundary).
+func (a Artifact) CanStart(layer int) bool {
+	if a.Cuts == nil || layer == layersOf(a)[0] {
+		return true
+	}
+	for _, c := range a.Cuts {
+		if c == layer {
+			return true
+		}
+	}
+	return false
+}
+
+// ReadCuts adds the cuts `python -m vxpu.cuts` found to a.
+func ReadCuts(a *Artifact, cutsJSON []byte) error {
+	var doc struct {
+		Legal  []int `json:"legal"`
+		Decode map[string]struct {
+			Legal bool     `json:"legal"`
+			State []string `json:"state"`
+		} `json:"decode"`
+	}
+	if err := json.Unmarshal(cutsJSON, &doc); err != nil {
+		return fmt.Errorf("cuts: %w", err)
+	}
+	a.Cuts = append([]int{}, doc.Legal...)
+	a.Uncuttable = map[int]string{}
+	for key, c := range doc.Decode {
+		layer, err := strconv.Atoi(key)
+		if err != nil {
+			return fmt.Errorf("cuts: layer %q: %w", key, err)
+		}
+		if !c.Legal {
+			a.Uncuttable[layer] = "it would split " + strings.Join(c.State, ", ") + " from the layers that read it"
+		}
+	}
+	return nil
 }
 
 // Layer is one layer's routed experts.

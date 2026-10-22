@@ -247,15 +247,29 @@ func layerRanges(a Artifact, nodes []Node, counts map[int]map[int]int64) Candida
 	}
 	// contiguous ranges, the cheapest machines filled first (a step costs the sum of its layers'
 	// costs, so balance does not matter; the cheapest per layer should hold the most), every
-	// machine at least one layer
+	// machine at least one layer, each range starting where the step can be cut (#387): each
+	// machine takes the furthest legal end whose rest still fits, backing up when it doesn't
 	counts_ := make([]int, len(nodes))
-	left := len(layers)
-	for i := range nodes {
-		counts_[i] = max(1, min(caps[i], left-(len(nodes)-1-i)))
-		left -= counts_[i]
+	var fit func(i, start int) bool
+	fit = func(i, start int) bool {
+		if i == len(nodes)-1 {
+			n := len(layers) - start
+			counts_[i] = n
+			return n >= 1 && n <= caps[i]
+		}
+		for e := min(start+caps[i], len(layers)-(len(nodes)-1-i)); e > start; e-- {
+			if a.CanStart(layers[e]) {
+				counts_[i] = e - start
+				if fit(i+1, e) {
+					return true
+				}
+			}
+		}
+		return false
 	}
-	if left > 0 {
-		c.Infeasible = fmt.Sprintf("%d machines, the first filled first, leave %d layers' experts unplaced", len(nodes), left)
+	if !fit(0, 0) {
+		c.Infeasible = fmt.Sprintf("%d machines can't hold the %d layers in ranges that start where the step can be cut",
+			len(nodes), len(layers))
 		c.Summary = "layer ranges over " + names(nodes)
 		return c
 	}

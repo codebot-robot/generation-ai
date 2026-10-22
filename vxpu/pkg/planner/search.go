@@ -167,6 +167,9 @@ func (s *Scorer) Score(l Layout) Scored {
 		if prev != d {
 			sc.Parts["hops"] += remoteMs
 			sc.Hops++
+			if !s.a.CanStart(layer) && sc.Feasible {
+				sc.Feasible, sc.Why = false, fmt.Sprintf("a range can't start at layer %d: %s", layer, s.a.Uncuttable[layer])
+			}
 		}
 	}
 	for i := range s.fleet {

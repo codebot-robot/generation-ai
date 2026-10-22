@@ -229,11 +229,12 @@ func cmdExplain(ctx context.Context, args []string) error {
 	records := flags.String("records", "", "with --machines: request records (vxpu stats --records) whose expert selections place GPU experts")
 	asJSON := flags.Bool("json", false, "with --machines: every candidate in full, as JSON")
 	serve := flags.String("serve", "", "with --machines: show the planner searching layouts live, on this address (e.g. :8080)")
+	cuts := flags.String("cuts", "", "with --machines: where the step can be cut into ranges (python -m vxpu.cuts ARTIFACT > FILE; default: the artifact's cuts.json, if any)")
 	if err := flags.Parse(args); err != nil {
 		return err
 	}
 	if *fleet != "" {
-		return explainOffline(ctx, *artifact, *fleet, *records, *asJSON, *serve)
+		return explainOffline(ctx, *artifact, *fleet, *records, *cuts, *asJSON, *serve)
 	}
 	if flags.NArg() != 1 {
 		return fmt.Errorf("usage: vxpu explain [flags] REPO | vxpu explain --artifact DIR --machines TYPE[:COUNT],...")

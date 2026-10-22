@@ -1538,6 +1538,24 @@ def _check_node_client():
     return ok
 
 
+def _check_cuts(artifact):
+    """Where the step can be cut into ranges of whole layers (cuts.py,
+    #387): the tiny DeepSeek's layer 1 writes a compressed KV cache layer 2
+    reads (kv_source_layers 1 and 3), so a range may start before layers 1
+    and 3 but not 2, in decode and prefill alike, and what crosses a cut is
+    a few activations."""
+    from . import cuts
+    d = cuts.describe(artifact)
+    why = d["decode"].get(2, {}).get("state", [])
+    ok = (d["legal"] == [1, 3] and "model.layers.1.attn.compress_kv_cache" in why
+          and all(0 < c["message_bytes"] < 1 << 20 for c in d["decode"].values()))
+    print(f"layer cuts: legal before {d['legal']}; not before 2 ({', '.join(why)}); "
+          f"{d['decode'][1]['message_bytes']} bytes cross a decode cut")
+    if not ok:
+        print(f"layer cuts check: {d}")
+    return ok
+
+
 def _check_native_nodes(model, prompts, settings, artifact, workdir):
     """The decode step's host nodes served native (nodes.py,
     nodeserver.py, #394): a node server for every experts and n-gram node,
@@ -1892,6 +1910,8 @@ def selftest(workdir, settings):
             failed.append(name + " (dataflow)")
         if name == "tiny-deepseek-v41" and not _check_expert_mailboxes(model, prompts, settings, artifact, got, workdir):
             failed.append(name + " (expert mailboxes)")
+        if name == "tiny-deepseek-v41" and not _check_cuts(artifact):
+            failed.append(name + " (layer cuts)")
         if name == "tiny-deepseek-v41" and not _check_native_nodes(model, prompts, settings, artifact, workdir):
             failed.append(name + " (native nodes)")
         if name == "tiny-deepseek-v41" and not _check_remote_nodes(model, prompts, settings, artifact, got, workdir):

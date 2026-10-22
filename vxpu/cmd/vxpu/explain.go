@@ -35,7 +35,7 @@ import (
 // (planner.Candidates, #409) without running anything: the artifact says
 // what the model reads, the machine catalog what each machine does, the
 // cost model what each layout costs.
-func explainOffline(ctx context.Context, artifactDir, fleetSpec, recordsPath string, asJSON bool, serve string) error {
+func explainOffline(ctx context.Context, artifactDir, fleetSpec, recordsPath, cutsPath string, asJSON bool, serve string) error {
 	if artifactDir == "" {
 		return fmt.Errorf("--machines needs --artifact")
 	}
@@ -50,6 +50,23 @@ func explainOffline(ctx context.Context, artifactDir, fleetSpec, recordsPath str
 	a, err := planner.ReadArtifact(manifest, binding)
 	if err != nil {
 		return err
+	}
+	if cutsPath == "" { // the artifact's own, if it has one
+		switch _, err := os.Stat(filepath.Join(artifactDir, "cuts.json")); {
+		case err == nil:
+			cutsPath = filepath.Join(artifactDir, "cuts.json")
+		case !os.IsNotExist(err):
+			return err
+		}
+	}
+	if cutsPath != "" { // where the step can be cut into ranges (python -m vxpu.cuts)
+		data, err := os.ReadFile(cutsPath)
+		if err != nil {
+			return err
+		}
+		if err := planner.ReadCuts(&a, data); err != nil {
+			return err
+		}
 	}
 	fleet, err := parseFleet(fleetSpec)
 	if err != nil {

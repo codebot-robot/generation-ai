@@ -119,3 +119,35 @@ func TestCandidates_DenseModel(t *testing.T) {
 		t.Fatal("no candidates for a dense model")
 	}
 }
+
+// DeepSeek-V4.1-Flash can only be cut before layers 1, 2, 8, 14 and 20
+// (cuts.py: layers 2, 8, 14 and 20 write compressed KV caches later layers
+// read): two ranges split at 20, and every range of every layout starts
+// at one of those cuts (3 and 4 ranges fit too, cut at 8, 14 and 20).
+func TestCandidates_OnlyAtLegalCuts(t *testing.T) {
+	a := deepseekFull()
+	a.Cuts = []int{1, 2, 8, 14, 20}
+	cands := Candidates(a, fleetOf(t, "g2-standard-48", "g2-standard-48", "c3d-standard-60", "c3d-standard-60"), nil)
+	for i, c := range cands {
+		t.Logf("%d. %-15s %7.1f ms  %s %s", i+1, c.Kind, c.Prediction.MsPerToken, c.Summary, c.Infeasible)
+	}
+	best := cands[0]
+	if best.Kind != "layer-ranges" || len(best.Placements) != 2 || best.Placements[1].Layers[0] != 20 {
+		t.Fatalf("best: %+v", best)
+	}
+	more := false
+	for _, c := range cands {
+		if c.Kind != "layer-ranges" || c.Infeasible != "" {
+			continue
+		}
+		more = more || len(c.Placements) > 2
+		for _, p := range c.Placements[1:] {
+			if !a.CanStart(p.Layers[0]) {
+				t.Errorf("%s starts a range at layer %d", c.Summary, p.Layers[0])
+			}
+		}
+	}
+	if !more {
+		t.Error("no layout of more than 2 ranges fits, though 0-13, 14-19, 20-39 does")
+	}
+}
