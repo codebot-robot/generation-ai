@@ -89,6 +89,35 @@ router. A machine that runs an executor is dedicated to it.
   stage weights ahead of a load, serve them peer to peer, run the executor
   (#384).
 
+**Languages: the agent is Go, the runtime stays Python (later C++), and
+a process boundary separates them.** A worker machine runs two programs
+with different jobs:
+- **The agent** is the machine's control plane. It downloads weights and
+  stages them on local SSD, serves them to peers, starts and supervises
+  the runtime, and reports the machine and its statistics to the
+  coordinator. That is files, HTTP, gRPC and processes, which is what Go
+  and its standard library do well, and it shares code with the
+  coordinator (the weightstore client, `pkg/machines`, the protos). It
+  never loads compiled model code.
+- **The runtime** runs the steps. Everything it calls is C or C++:
+  libtorch and its AOTInductor package loader, the CUDA driver (graphs,
+  stream memory operations), our CPU kernels (`csrc/`), RDMA verbs. Today
+  it is the Python executor. With the step graph (§6), Python only
+  launches a step and waits, so it can stay Python until measurements say
+  otherwise. When it moves off Python, it moves to C++, which calls those
+  libraries with no foreign-function layer. Go would be the weakest
+  choice there: every call into C goes through cgo, C++ APIs need a C
+  shim, Go's rules for sharing memory with C get in the way of pinned
+  buffers and mailboxes, and its garbage collector can pause the step.
+  Rust's C interface costs nothing, but the hard parts are calls into C++
+  libraries, so it would add a toolchain for little gain.
+- **The boundary between them is a process boundary**, not a foreign
+  function interface: they talk over gRPC or a local socket, and the agent
+  stages weights as files that the runtime maps into memory. So neither
+  needs the other's language, the agent works the same with today's Python
+  runtime and a later C++ one, and the C++ stays small: no HTTP client,
+  downloader or process manager written in it.
+
 ## 3. Where weights live
 
 Weights are content-addressed by sha256 at every tier:
