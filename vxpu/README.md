@@ -162,9 +162,13 @@ implies lowering), each dense segment is compiled by AOTInductor into a
 package, and the engine runs the packages in its own CUDA graphs instead
 of torch.compile. Packages are built on first use and cached under
 `VXPU_AOTI_CACHE_DIR` (default `~/.cache/vxpu/aoti`), keyed by the
-segment's code, its argument shapes, the kernels' source, the torch
-version and the GPU. A later load of the same artifact on the same kind
-of machine compiles nothing: the cache holds compiled plans.
+segment's code with its values named by position, its argument shapes,
+the kernels' source, the torch version and the device it runs on (the
+GPU, or the CPU's features: inductor compiles CPU code for the machine
+it runs on). Layers that compute the same thing on different weights
+share a package: DeepSeek-V4.1-Flash's 85 decode segments are 14
+packages. A later load of the same artifact on the same kind of machine
+compiles nothing: the cache holds compiled plans.
 
 The environment switches are read by one parser, which refuses values it
 doesn't understand: `VXPU_KERNELS`, `VXPU_FUSED_EXPERTS`,

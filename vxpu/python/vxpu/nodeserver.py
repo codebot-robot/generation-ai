@@ -22,7 +22,8 @@ Python sets a node server up and then gets out of the way:
   2. the nodes' residents (the banks of the experts layers they call, the
      n-gram tables) are loaded as the engine loads them;
   3. each node is lowered and compiled to a native package (nodes.py),
-     or found in the package cache;
+     or found in the package cache: nodes that compute the same thing on
+     different residents (every experts layer) share one;
   4. the C++ NodeServer (csrc/node_server.cpp) loads the packages and
      answers the nodes' mailboxes over TCP on its own threads.
 
@@ -108,7 +109,9 @@ def start(artifact_dir, names, port=0, cache_dir=None):
         residents.append(list(res))
     server = k.NodeServer(port, paths, residents)
     server.external = external  # the residents stay alive as long as the server
-    print(f"[vxpu] node server on port {server.port()}: {', '.join(names)}", flush=True)
+    server.packages = paths
+    print(f"[vxpu] node server on port {server.port()}: {', '.join(names)} ({len(set(paths))} packages, "
+          f"{cache.built} built)", flush=True)
     return server
 
 
