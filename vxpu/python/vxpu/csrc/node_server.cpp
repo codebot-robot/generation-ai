@@ -106,10 +106,37 @@ T read_value(int fd) {
   return v;
 }
 
-template <typename T>
-void write_value(int fd, T v) {
-  write_exact(fd, &v, sizeof(v));
-}
+// A message, assembled whole and sent with one send(): written field by
+// field, a message left as ~20 small packets (TCP_NODELAY), and the
+// receiver paid for each.
+class Out {
+ public:
+  void bytes(const void* p, size_t n) {
+    auto* c = static_cast<const char*>(p);
+    buf_.insert(buf_.end(), c, c + n);
+  }
+
+  template <typename T>
+  void value(T v) {
+    bytes(&v, sizeof(v));
+  }
+
+  void tensor(const at::Tensor& t0) {
+    auto t = t0.contiguous().cpu();
+    value<uint8_t>(static_cast<uint8_t>(t.scalar_type()));
+    value<uint8_t>(static_cast<uint8_t>(t.dim()));
+    for (auto s : t.sizes()) value<int64_t>(s);
+    bytes(t.data_ptr(), static_cast<size_t>(t.numel() * t.element_size()));
+  }
+
+  void send(int fd) {
+    write_exact(fd, buf_.data(), buf_.size());
+    buf_.clear();
+  }
+
+ private:
+  std::vector<char> buf_;
+};
 
 int64_t now_ns() {
   return std::chrono::duration_cast<std::chrono::nanoseconds>(
@@ -136,14 +163,6 @@ at::Tensor read_tensor(int fd) {
   auto t = at::empty(sizes, at::TensorOptions().dtype(dtype));
   read_exact(fd, t.data_ptr(), static_cast<size_t>(bytes));
   return t;
-}
-
-void write_tensor(int fd, const at::Tensor& t0) {
-  auto t = t0.contiguous().cpu();
-  write_value<uint8_t>(fd, static_cast<uint8_t>(t.scalar_type()));
-  write_value<uint8_t>(fd, static_cast<uint8_t>(t.dim()));
-  for (auto s : t.sizes()) write_value<int64_t>(fd, s);
-  write_exact(fd, t.data_ptr(), static_cast<size_t>(t.numel() * t.element_size()));
 }
 
 struct Node {
@@ -286,18 +305,21 @@ class NodeServer {
           error = e.what();
         }
         const int64_t t2 = now_ns();
-        write_exact(conn, "VXR2", 4);
+        Out reply;
+        reply.bytes("VXR2", 4);
         if (!error.empty()) {
-          write_value<uint32_t>(conn, 1);
-          write_value<uint32_t>(conn, static_cast<uint32_t>(error.size()));
-          write_exact(conn, error.data(), error.size());
+          reply.value<uint32_t>(1);
+          reply.value<uint32_t>(static_cast<uint32_t>(error.size()));
+          reply.bytes(error.data(), error.size());
+          reply.send(conn);
           continue;
         }
-        write_value<uint32_t>(conn, 0);
-        write_value<uint32_t>(conn, static_cast<uint32_t>(outputs.size()));
-        for (const auto& t : outputs) write_tensor(conn, t);
-        write_value<int64_t>(conn, t1 - t0);
-        write_value<int64_t>(conn, t2 - t1);
+        reply.value<uint32_t>(0);
+        reply.value<uint32_t>(static_cast<uint32_t>(outputs.size()));
+        for (const auto& t : outputs) reply.tensor(t);
+        reply.value<int64_t>(t1 - t0);
+        reply.value<int64_t>(t2 - t1);
+        reply.send(conn);
         messages_++;
       }
     } catch (const std::exception&) {
@@ -373,10 +395,12 @@ class NodeClient {
   }
 
   std::vector<at::Tensor> exchange(int64_t node, const std::vector<at::Tensor>& inputs) {
-    write_exact(fd_, "VXN1", 4);
-    write_value<uint32_t>(fd_, static_cast<uint32_t>(node));
-    write_value<uint32_t>(fd_, static_cast<uint32_t>(inputs.size()));
-    for (const auto& t : inputs) write_tensor(fd_, t);
+    Out request;
+    request.bytes("VXN1", 4);
+    request.value<uint32_t>(static_cast<uint32_t>(node));
+    request.value<uint32_t>(static_cast<uint32_t>(inputs.size()));
+    for (const auto& t : inputs) request.tensor(t);
+    request.send(fd_);
     char magic[4];
     read_exact(fd_, magic, 4);
     TORCH_CHECK(std::memcmp(magic, "VXR2", 4) == 0, "node client: not a node server reply (VXR2)");
