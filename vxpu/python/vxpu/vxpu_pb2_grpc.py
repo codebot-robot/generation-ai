@@ -91,6 +91,11 @@ class ExecutorStub:
                 request_serializer=vxpu__pb2.DescribeRequest.SerializeToString,
                 response_deserializer=vxpu__pb2.DescribeResponse.FromString,
                 _registered_method=True)
+        self.ExplainModel = channel.unary_unary(
+                '/vxpu.Executor/ExplainModel',
+                request_serializer=vxpu__pb2.ExplainModelRequest.SerializeToString,
+                response_deserializer=vxpu__pb2.ExplainModelResponse.FromString,
+                _registered_method=True)
 
 
 class ExecutorServicer:
@@ -172,6 +177,14 @@ class ExecutorServicer:
         context.set_details('Method not implemented!')
         raise NotImplementedError('Method not implemented!')
 
+    def ExplainModel(self, request, context):
+        """ExplainModel (router only) returns the plan the coordinator chose for
+        a model's last load by name, and why (#394).
+        """
+        context.set_code(grpc.StatusCode.UNIMPLEMENTED)
+        context.set_details('Method not implemented!')
+        raise NotImplementedError('Method not implemented!')
+
 
 def add_ExecutorServicer_to_server(servicer, server):
     rpc_method_handlers = {
@@ -209,6 +222,11 @@ def add_ExecutorServicer_to_server(servicer, server):
                     servicer.Describe,
                     request_deserializer=vxpu__pb2.DescribeRequest.FromString,
                     response_serializer=vxpu__pb2.DescribeResponse.SerializeToString,
+            ),
+            'ExplainModel': grpc.unary_unary_rpc_method_handler(
+                    servicer.ExplainModel,
+                    request_deserializer=vxpu__pb2.ExplainModelRequest.FromString,
+                    response_serializer=vxpu__pb2.ExplainModelResponse.SerializeToString,
             ),
     }
     generic_handler = grpc.method_handlers_generic_handler(
@@ -408,6 +426,33 @@ class Executor:
             '/vxpu.Executor/Describe',
             vxpu__pb2.DescribeRequest.SerializeToString,
             vxpu__pb2.DescribeResponse.FromString,
+            options,
+            channel_credentials,
+            insecure,
+            call_credentials,
+            compression,
+            wait_for_ready,
+            timeout,
+            metadata,
+            _registered_method=True)
+
+    @staticmethod
+    def ExplainModel(request,
+            target,
+            options=(),
+            channel_credentials=None,
+            call_credentials=None,
+            insecure=False,
+            compression=None,
+            wait_for_ready=None,
+            timeout=None,
+            metadata=None):
+        return grpc.experimental.unary_unary(
+            request,
+            target,
+            '/vxpu.Executor/ExplainModel',
+            vxpu__pb2.ExplainModelRequest.SerializeToString,
+            vxpu__pb2.ExplainModelResponse.FromString,
             options,
             channel_credentials,
             insecure,

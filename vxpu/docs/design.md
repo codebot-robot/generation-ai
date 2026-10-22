@@ -52,9 +52,18 @@ The coordinator can set the plan's switches. A model registered with
 `vxpu register --plan VXPU_NAME=VALUE` keeps that plan in modelstore, and
 the router sends it with every load of the model (`LoadModelRequest.plan`,
 #394). The executor reads those switches ahead of its environment and
-refuses any it may not take (paths and endpoints on its own machine stay its own). The plan is part of what an executor
-loads, so a new plan loads the model again. Today a person writes the
-plan. The planner (below) is what will write it.
+refuses any it may not take: paths and endpoints on its own machine stay
+its own. The plan is part of what an executor loads, so a new plan
+loads the model again.
+
+The planner (`pkg/planner`) writes the rest of the plan for each load by
+name. Before loading, the router asks the executor what it runs on, and
+the planner chooses from that, from what the artifact holds (its dense
+weights, and each layer's experts and their bytes) and from what the
+model's traffic selected (§5). v0 chooses one thing: which experts the
+GPUs hold (§4). The registered plan's switches win over the planner's,
+as a person's hints. `vxpu explain MODEL` shows the switches sent and
+the reason for each choice.
 
 The plan can be lowered into the decode graph (`lower.py`): each op call
 becomes the selected implementation, its Triton kernels visible to the
@@ -158,9 +167,13 @@ held pairs on the GPUs and the rest on the CPU at the same time. Because
 weights are immutable, a GPU slot is a copy: dropping it costs nothing,
 and no copy goes back.
 
-Which experts are hot is a placement: chosen offline from the engine's
-own statistics (§5) by `expert_stats --placement-gb`, as the hottest
-experts across all layers that fit each GPU's budget. `expert_sim` replays
+Which experts are hot is a placement: the hottest experts across all
+layers, by the engine's own statistics (§5), that fit each GPU's budget.
+The planner chooses it at every load by name (§1), with each GPU's budget
+derived from the machine: its memory, less headroom, and on the engine's
+GPU less the dense weights and caches (2.5x the dense bytes, measured on
+DeepSeek). `expert_stats --placement-gb` does the same offline with
+budgets a person gives. `expert_sim` replays
 recorded traffic against placement policies before any is built: static,
 decayed, informed by the prompt, and the oracle as a bound.
 

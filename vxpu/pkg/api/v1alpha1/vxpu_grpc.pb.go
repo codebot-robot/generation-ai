@@ -40,6 +40,7 @@ const (
 	Executor_Generate_FullMethodName      = "/vxpu.Executor/Generate"
 	Executor_GetModelStats_FullMethodName = "/vxpu.Executor/GetModelStats"
 	Executor_Describe_FullMethodName      = "/vxpu.Executor/Describe"
+	Executor_ExplainModel_FullMethodName  = "/vxpu.Executor/ExplainModel"
 )
 
 // ExecutorClient is the client API for Executor service.
@@ -88,6 +89,9 @@ type ExecutorClient interface {
 	// of the machine, for the coordinator's machine database (#394).
 	// Answers with or without a model loaded.
 	Describe(ctx context.Context, in *DescribeRequest, opts ...grpc.CallOption) (*DescribeResponse, error)
+	// ExplainModel (router only) returns the plan the coordinator chose for
+	// a model's last load by name, and why (#394).
+	ExplainModel(ctx context.Context, in *ExplainModelRequest, opts ...grpc.CallOption) (*ExplainModelResponse, error)
 }
 
 type executorClient struct {
@@ -177,6 +181,16 @@ func (c *executorClient) Describe(ctx context.Context, in *DescribeRequest, opts
 	return out, nil
 }
 
+func (c *executorClient) ExplainModel(ctx context.Context, in *ExplainModelRequest, opts ...grpc.CallOption) (*ExplainModelResponse, error) {
+	cOpts := append([]grpc.CallOption{grpc.StaticMethod()}, opts...)
+	out := new(ExplainModelResponse)
+	err := c.cc.Invoke(ctx, Executor_ExplainModel_FullMethodName, in, out, cOpts...)
+	if err != nil {
+		return nil, err
+	}
+	return out, nil
+}
+
 // ExecutorServer is the server API for Executor service.
 // All implementations must embed UnimplementedExecutorServer
 // for forward compatibility.
@@ -223,6 +237,9 @@ type ExecutorServer interface {
 	// of the machine, for the coordinator's machine database (#394).
 	// Answers with or without a model loaded.
 	Describe(context.Context, *DescribeRequest) (*DescribeResponse, error)
+	// ExplainModel (router only) returns the plan the coordinator chose for
+	// a model's last load by name, and why (#394).
+	ExplainModel(context.Context, *ExplainModelRequest) (*ExplainModelResponse, error)
 	mustEmbedUnimplementedExecutorServer()
 }
 
@@ -253,6 +270,9 @@ func (UnimplementedExecutorServer) GetModelStats(context.Context, *GetModelStats
 }
 func (UnimplementedExecutorServer) Describe(context.Context, *DescribeRequest) (*DescribeResponse, error) {
 	return nil, status.Error(codes.Unimplemented, "method Describe not implemented")
+}
+func (UnimplementedExecutorServer) ExplainModel(context.Context, *ExplainModelRequest) (*ExplainModelResponse, error) {
+	return nil, status.Error(codes.Unimplemented, "method ExplainModel not implemented")
 }
 func (UnimplementedExecutorServer) mustEmbedUnimplementedExecutorServer() {}
 func (UnimplementedExecutorServer) testEmbeddedByValue()                  {}
@@ -394,6 +414,24 @@ func _Executor_Describe_Handler(srv interface{}, ctx context.Context, dec func(i
 	return interceptor(ctx, in, info, handler)
 }
 
+func _Executor_ExplainModel_Handler(srv interface{}, ctx context.Context, dec func(interface{}) error, interceptor grpc.UnaryServerInterceptor) (interface{}, error) {
+	in := new(ExplainModelRequest)
+	if err := dec(in); err != nil {
+		return nil, err
+	}
+	if interceptor == nil {
+		return srv.(ExecutorServer).ExplainModel(ctx, in)
+	}
+	info := &grpc.UnaryServerInfo{
+		Server:     srv,
+		FullMethod: Executor_ExplainModel_FullMethodName,
+	}
+	handler := func(ctx context.Context, req interface{}) (interface{}, error) {
+		return srv.(ExecutorServer).ExplainModel(ctx, req.(*ExplainModelRequest))
+	}
+	return interceptor(ctx, in, info, handler)
+}
+
 // Executor_ServiceDesc is the grpc.ServiceDesc for Executor service.
 // It's only intended for direct use with grpc.RegisterService,
 // and not to be introspected or modified (even as a copy)
@@ -424,6 +462,10 @@ var Executor_ServiceDesc = grpc.ServiceDesc{
 		{
 			MethodName: "Describe",
 			Handler:    _Executor_Describe_Handler,
+		},
+		{
+			MethodName: "ExplainModel",
+			Handler:    _Executor_ExplainModel_Handler,
 		},
 	},
 	Streams: []grpc.StreamDesc{

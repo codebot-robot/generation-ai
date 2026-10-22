@@ -60,6 +60,9 @@ service Executor {
   // of the machine, for the coordinator's machine database (#394).
   // Answers with or without a model loaded.
   rpc Describe(DescribeRequest) returns (DescribeResponse) {}
+  // ExplainModel (router only) returns the plan the coordinator chose for
+  // a model's last load by name, and why (#394).
+  rpc ExplainModel(ExplainModelRequest) returns (ExplainModelResponse) {}
 }
 
 message LoadModelRequest {
@@ -209,4 +212,14 @@ message DescribeResponse {
   // cpu_threads, simd, ram_bytes, and with a GPU gpu, gpu_memory_bytes,
   // gpu_count (vxpu/pkg/machines.Probe).
   string hardware_json = 1;
+}
+
+message ExplainModelRequest {
+  string model = 1;
+}
+
+message ExplainModelResponse {
+  // {model, machine, time, switches (sent), hints (the registered plan's,
+  // which win), reasons}, as JSON.
+  string plan_json = 1;
 }

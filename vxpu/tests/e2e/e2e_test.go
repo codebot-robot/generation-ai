@@ -313,5 +313,10 @@ func testByName(t *testing.T, h *Harness, gitRoot, vxpuBin string, env []string)
 	if logs := h.GetPodLogs("app=vxpu-external-executor", "default"); !strings.Contains(logs, "fused_experts=False (coordinator)") {
 		t.Errorf("the executor should have reloaded the model under the coordinator's plan; its logs:\n%s", logs)
 	}
+	// and the coordinator says what it chose and why
+	out = run("explain", model)
+	if !strings.Contains(out, `"VXPU_FUSED_EXPERTS": "0"`) || !strings.Contains(out, "no routed experts") {
+		t.Errorf("explain should show the registered switch and the planner's reason, got:\n%s", out)
+	}
 	h.DeletePod("vxpu-external-executor", "default")
 }

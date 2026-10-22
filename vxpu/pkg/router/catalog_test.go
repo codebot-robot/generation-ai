@@ -50,6 +50,8 @@ var testManifest = `{"format":"vxpu-manifest/v1alpha1","source":{"repo":"org/M",
 type fakeModelstore struct {
 	mu        sync.Mutex
 	compiled  bool              // the artifact for testCommit exists
+	manifest  string            // the artifact's manifest.json (default testManifest)
+	binding   string            // its binding.json (default {})
 	blobs     map[string][]byte // digest -> bytes (registry writes: statistics)
 	manifests map[string][]byte // name:tag -> manifest
 }
@@ -135,11 +137,15 @@ func (f *fakeModelstore) handler(t *testing.T) http.Handler {
 				http.NotFound(w, r)
 			}
 		case strings.HasPrefix(r.URL.Path, "/vxpu-artifacts/org/m/resolve/") && compiled:
+			manifest, binding := testManifest, `{}`
+			if f.manifest != "" {
+				manifest, binding = f.manifest, f.binding
+			}
 			switch r.URL.Path[strings.LastIndex(r.URL.Path, "/")+1:] {
 			case "manifest.json":
-				_, _ = w.Write([]byte(testManifest))
+				_, _ = w.Write([]byte(manifest))
 			case "binding.json":
-				_, _ = w.Write([]byte(`{}`))
+				_, _ = w.Write([]byte(binding))
 			default:
 				_, _ = w.Write([]byte("graph"))
 			}
@@ -167,7 +173,7 @@ type loadingExecutor struct {
 
 func (e *loadingExecutor) Describe(context.Context, *pb.DescribeRequest) (*pb.DescribeResponse, error) {
 	return &pb.DescribeResponse{HardwareJson: `{"device":"cuda","cpu":"AMD EPYC 9B45 48-Core Processor",` +
-		`"cpu_threads":96,"simd":"avx512","gpu":"NVIDIA RTX PRO 6000","gpu_count":2}`}, nil
+		`"cpu_threads":96,"simd":"avx512","gpu":"NVIDIA RTX PRO 6000","gpu_memory_bytes":102005473280,"gpu_count":2}`}, nil
 }
 
 func (e *loadingExecutor) LoadModel(_ context.Context, req *pb.LoadModelRequest) (*pb.LoadModelResponse, error) {
@@ -321,6 +327,51 @@ func TestRegisterModel_RefusedPlanFailsOnce(t *testing.T) {
 	}
 	if executor.refused != 1 {
 		t.Errorf("the refused load should not be retried, it was tried %d times", executor.refused)
+	}
+}
+
+// TestNewSessionByName_PlansFromTheModelsTraffic: the coordinator places
+// a model's experts from its recorded selections (#394): none before it
+// has traffic, the selected ones on the GPUs after.
+func TestNewSessionByName_PlansFromTheModelsTraffic(t *testing.T) {
+	ctx := t.Context()
+	// two layers of four 1 GB experts (testTelemetry selected experts 1
+	// and 2 of layer 0, and 3 of layer 1)
+	manifest := strings.Replace(testManifest, `"tensors":{}`, `"tensors":{"e":{"length":1000000000}}`, 1)
+	layer := `{"w1":{"parts":[["e"],["e"],["e"],["e"]]}}`
+	binding := `{"bound":{"embed":{"length":1000}},"external":{"experts":{"0":` + layer + `,"1":` + layer + `}}}`
+	s, _ := newCatalogServer(t, &fakeModelstore{compiled: true, manifest: manifest, binding: binding})
+	s.UseStats(1)
+	executor := &loadingExecutor{}
+	s.UseExternalExecutors([]string{startExecutor(t, executor)})
+
+	if _, err := s.NewSession(ctx, &pb.NewSessionRequest{Model: "org/M"}); err != nil {
+		t.Fatalf("NewSession: %v", err)
+	}
+	if _, placed := executor.lastPlan["VXPU_GPU_EXPERTS"]; placed {
+		t.Errorf("without traffic, nothing should be placed: %v", executor.lastPlan)
+	}
+	s.stats.record(ctx, requestRecord{Format: requestFormat, Model: "org/M", RPC: "chat", Telemetry: json.RawMessage(testTelemetry)})
+
+	executor.mu.Lock()
+	executor.evicted = true // the next load plans again
+	executor.mu.Unlock()
+	_, _ = s.NewSession(ctx, &pb.NewSessionRequest{Model: "org/M"}) // "being reloaded"
+	if _, err := s.NewSession(ctx, &pb.NewSessionRequest{Model: "org/M"}); err != nil {
+		t.Fatalf("NewSession after eviction: %v", err)
+	}
+	var placement struct {
+		Gpus []struct{ Layers map[string][]int }
+	}
+	if err := json.Unmarshal([]byte(executor.lastPlan["VXPU_GPU_EXPERTS"]), &placement); err != nil {
+		t.Fatalf("the second load should place the selected experts: %v (plan %v)", err, executor.lastPlan)
+	}
+	if got := placement.Gpus[0].Layers; !reflect.DeepEqual(got, map[string][]int{"0": {1, 2}, "1": {3}}) {
+		t.Errorf("GPU0 holds %v, want the three selected experts", got)
+	}
+	explained, err := s.ExplainModel(ctx, &pb.ExplainModelRequest{Model: "org/M"})
+	if err != nil || !strings.Contains(explained.PlanJson, "experts: 3 of 8") || !strings.Contains(explained.PlanJson, "g4-standard-96") {
+		t.Errorf("ExplainModel: %v\n%v", err, explained)
 	}
 }
 

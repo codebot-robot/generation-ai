@@ -77,6 +77,7 @@ type Server struct {
 	hints         map[string]string       // statsKey(model) -> its registered plan, as last stored or read (hintsKey)
 	keyModel      map[string]modelRef     // model key -> the named model it serves (stats.go)
 	executors     map[string]executorInfo // endpoint -> what it runs on (executors.go)
+	plans         map[string]modelPlan    // statsKey(model) -> its last load's plan (modelplan.go)
 	stats         *statsStore             // statistics for models served by name, nil without modelstore
 	// externalModelstoreURL is modelstore's address for external executors
 	// (VMs outside the cluster, which cannot resolve its Service), when set
@@ -466,7 +467,7 @@ func (s *Server) LoadModel(ctx context.Context, req *pb.LoadModelRequest) (*pb.L
 		s.peerToModel[peerKey] = modelKey
 		s.mu.Unlock()
 	}
-	if _, err := s.loadArtifact(ctx, req, false); err != nil {
+	if _, err := s.loadArtifact(ctx, req, false, nil); err != nil {
 		return nil, err
 	}
 	return &pb.LoadModelResponse{Success: true}, nil
@@ -483,7 +484,11 @@ func artifactKey(manifestJSON string) string {
 // On an external executor when external is set and the router has any
 // (#357), else on an executor pod the router starts. Returns the model
 // key sessions are routed by.
-func (s *Server) loadArtifact(ctx context.Context, req *pb.LoadModelRequest, external bool) (string, error) {
+//
+// planFor, when set, chooses the plan sent with the load, knowing what
+// the executor runs on (nil: it did not say); otherwise req's is sent.
+func (s *Server) loadArtifact(ctx context.Context, req *pb.LoadModelRequest, external bool,
+	planFor func(context.Context, *executorInfo) map[string]string) (string, error) {
 	log := klog.FromContext(ctx)
 	modelKey := artifactKey(req.ManifestJson)
 	log.Info("Loading artifact", "model_key", modelKey, "external", external, "plan", planSwitches(req.Plan))
@@ -559,6 +564,10 @@ func (s *Server) loadArtifact(ctx context.Context, req *pb.LoadModelRequest, ext
 	defer closeConn(ctx, conn)
 
 	client := pb.NewExecutorClient(conn)
+	info := s.waitForExecutor(ctx, client, endpoint)
+	if planFor != nil {
+		reqCopy.Plan = planFor(ctx, info)
+	}
 
 	var loadErr error
 	for i := 0; i < 30; i++ {
@@ -579,7 +588,6 @@ func (s *Server) loadArtifact(ctx context.Context, req *pb.LoadModelRequest, ext
 	if external && len(s.externalExecutors) > 0 {
 		s.placedExternally(modelKey, endpoint)
 	}
-	s.describeExecutor(ctx, client, endpoint)
 	log.Info("Successfully loaded model on executor", "model_key", modelKey, "endpoint", endpoint)
 	return modelKey, nil
 }

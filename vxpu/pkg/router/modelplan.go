@@ -20,7 +20,15 @@ import (
 	"errors"
 	"fmt"
 	"sort"
+	"time"
 
+	"google.golang.org/grpc/codes"
+	"google.golang.org/grpc/status"
+	"k8s.io/klog/v2"
+
+	pb "github.com/gke-labs/generation-ai/vxpu/pkg/api/v1alpha1"
+	"github.com/gke-labs/generation-ai/vxpu/pkg/machines"
+	"github.com/gke-labs/generation-ai/vxpu/pkg/planner"
 	"github.com/gke-labs/generation-ai/vxpu/pkg/weightstore"
 )
 
@@ -103,4 +111,77 @@ func planSwitches(plan map[string]string) []string {
 	}
 	sort.Strings(names)
 	return names
+}
+
+// modelPlan is the plan the coordinator chose for a model's last load,
+// and why (ExplainModel).
+type modelPlan struct {
+	Model    string            `json:"model"`
+	Machine  string            `json:"machine,omitempty"` // the executor's, as it described itself
+	Time     string            `json:"time"`
+	Switches map[string]string `json:"switches"`        // what was sent
+	Hints    map[string]string `json:"hints,omitempty"` // the registered plan's switches, which win
+	Reasons  []string          `json:"reasons"`
+}
+
+// planLoad chooses the switches a load of model sends: the planner's,
+// from the artifact, the executor's machine and the model's recorded
+// selections, with the registered plan's switches (hints) over them.
+func (s *Server) planLoad(ctx context.Context, model string, manifest, binding []byte, hints map[string]string,
+	info *executorInfo) map[string]string {
+	log := klog.FromContext(ctx)
+	var probe *machines.Probe
+	mp := modelPlan{Model: model, Time: time.Now().UTC().Format(time.RFC3339), Hints: hints, Switches: map[string]string{}}
+	if info != nil {
+		probe = &info.Probe
+		if info.Machine != nil {
+			mp.Machine = info.Machine.Name
+		}
+	}
+	if s.stats != nil { // the requests still buffered count too
+		if err := s.stats.flush(ctx, model); err != nil {
+			log.Error(err, "flushing statistics before planning", "model", model)
+		}
+	}
+	artifact, err := planner.ReadArtifact(manifest, binding)
+	if err != nil {
+		mp.Reasons = append(mp.Reasons, fmt.Sprintf("planner: could not read the artifact (%v); the registered plan only", err))
+	} else {
+		counts, err := s.expertCounts(ctx, model)
+		if err != nil {
+			mp.Reasons = append(mp.Reasons, fmt.Sprintf("planner: could not read the statistics (%v)", err))
+		}
+		p := planner.Choose(artifact, probe, counts)
+		mp.Switches, mp.Reasons = p.Switches, append(mp.Reasons, p.Reasons...)
+	}
+	for k, v := range hints {
+		if _, chosen := mp.Switches[k]; chosen {
+			mp.Reasons = append(mp.Reasons, fmt.Sprintf("%s: the registered plan's value, over the planner's", k))
+		}
+		mp.Switches[k] = v
+	}
+	s.mu.Lock()
+	if s.plans == nil {
+		s.plans = map[string]modelPlan{}
+	}
+	s.plans[statsKey(model)] = mp
+	s.mu.Unlock()
+	log.Info("Planned the load", "model", model, "machine", mp.Machine, "switches", len(mp.Switches), "reasons", mp.Reasons)
+	return mp.Switches
+}
+
+// ExplainModel returns the plan the coordinator chose for a model's last
+// load, and why.
+func (s *Server) ExplainModel(ctx context.Context, req *pb.ExplainModelRequest) (*pb.ExplainModelResponse, error) {
+	s.mu.RLock()
+	mp, ok := s.plans[statsKey(req.Model)]
+	s.mu.RUnlock()
+	if !ok {
+		return nil, status.Errorf(codes.NotFound, "%s has not been loaded by name since the router started", req.Model)
+	}
+	data, err := json.MarshalIndent(mp, "", "  ")
+	if err != nil {
+		return nil, status.Errorf(codes.Internal, "%v", err)
+	}
+	return &pb.ExplainModelResponse{PlanJson: string(data)}, nil
 }
