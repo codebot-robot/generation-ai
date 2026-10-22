@@ -56,6 +56,8 @@ import sys
 import tempfile
 import time
 
+from .export import assert_no_duplicate_constants
+
 PROMPTS = [
     {"name": "sky", "text": "Is the sky blue?"},
     {"name": "kubernetes", "text": "Write one sentence about Kubernetes."},
@@ -1538,6 +1540,81 @@ def _check_hardware():
         raise SystemExit("summary did not format non-numeric measured fields properly")
 
 
+def _check_dedup_constants(workdir):
+    """Assertions on constant deduplication: tiny-deepseek alias mapping,
+    the conflicting-names case, and the canonical-in-other-program case."""
+    import torch
+    import zipfile
+    from .export import deduplicate_constants
+
+    art = os.path.join(workdir, "tiny-deepseek-v41-artifact")
+    if os.path.exists(art):
+        with open(os.path.join(art, "binding.json")) as f:
+            binding = json.load(f)
+        aliases = binding.get("aliases", {})
+        constants = set(binding.get("constant", []))
+        for layer in (2, 3):
+            fqn = f"model.layers.{layer}.attn.freqs_cis"
+            if aliases.get(fqn) != "model.layers.1.attn.freqs_cis" or fqn in constants:
+                raise SystemExit(f"rotary table {fqn} was not deduplicated to layer 1")
+        if "model.layers.1.attn.freqs_cis" not in constants or "model.layers.0.attn.freqs_cis" not in constants:
+            raise SystemExit("canonical rotary tables missing from binding constants")
+        with zipfile.ZipFile(os.path.join(art, "decode.pt2")) as z:
+            blobs = [f for f in z.namelist() if "constants/tensor_" in f]
+            if len(blobs) > 10:
+                raise SystemExit(f"expected <= 10 constant blobs in decode.pt2, got {len(blobs)}")
+
+    class MConf(torch.nn.Module):
+        def __init__(self, c0, c1):
+            super().__init__()
+            self.register_buffer("c0", c0, persistent=False)
+            self.register_buffer("c1", c1, persistent=False)
+
+        def forward(self, x):
+            return x + self.c0 + self.c1
+
+    x, y, z = torch.tensor([1.0]), torch.tensor([2.0]), torch.tensor([3.0])
+    p_pref = torch.export.export(MConf(x, z), (torch.zeros(1),), strict=False)
+    p_dec = torch.export.export(MConf(y, x), (torch.zeros(1),), strict=False)
+    aliases = deduplicate_constants({}, p_pref, p_dec)
+    if aliases != {}:
+        raise SystemExit(f"conflicting names should not produce aliases: {aliases}")
+    if "c0" not in p_pref.constants or "c1" not in p_pref.constants:
+        raise SystemExit("constants missing from prefill after conflicting-names check")
+    if "c0" not in p_dec.constants or "c1" not in p_dec.constants:
+        raise SystemExit("constants missing from decode after conflicting-names check")
+
+    class M1(torch.nn.Module):
+        def __init__(self, t):
+            super().__init__()
+            self.register_buffer("c0", t, persistent=False)
+
+        def forward(self, x):
+            return x + self.c0
+
+    class M2(torch.nn.Module):
+        def __init__(self, t):
+            super().__init__()
+            self.register_buffer("c1", t, persistent=False)
+            self.register_buffer("c2", t, persistent=False)
+
+        def forward(self, x):
+            return x + self.c1 + self.c2
+
+    t = torch.tensor([42.0])
+    p1 = torch.export.export(M1(t), (torch.zeros(1),), strict=False)
+    p2 = torch.export.export(M2(t), (torch.zeros(1),), strict=False)
+    aliases = deduplicate_constants({}, p1, p2)
+    if aliases != {"c2": "c1"}:
+        raise SystemExit(f"expected alias c2 -> c1, got {aliases}")
+    if list(p2.constants.keys()) != ["c1"] or list(p1.constants.keys()) != ["c0"]:
+        raise SystemExit(
+            f"expected p2=['c1'], p1=['c0'], got {list(p2.constants.keys())}, {list(p1.constants.keys())}"
+        )
+    assert_no_duplicate_constants(p1)
+    assert_no_duplicate_constants(p2)
+
+
 def selftest(workdir, settings):
     """The CI tier: tiny models through export, the in-process engine,
     and a transformers reference, token-exact. No cluster."""
@@ -1572,6 +1649,8 @@ def selftest(workdir, settings):
     for name, model, prompts in models:
         artifact = os.path.join(workdir, name + "-artifact")
         export_artifact(model, artifact, max_cache_len=1024)
+        assert_no_duplicate_constants(os.path.join(artifact, "decode.pt2"))
+        assert_no_duplicate_constants(os.path.join(artifact, "prefill.pt2"))
         if name == "tiny-deepseek-v41":  # no transformers model: the fork run eagerly is the reference
             ref = record_deepseek_eager(model, "main", prompts, settings)
         else:
@@ -1607,6 +1686,7 @@ def selftest(workdir, settings):
             failed.append(name + " (telemetry)")
         if name == "tiny-deepseek-v41" and not _check_lowering(model, prompts, settings, artifact, workdir):
             failed.append(name + " (lowered)")
+    _check_dedup_constants(workdir)
     if failed:
         raise SystemExit(f"vectors differ for: {', '.join(failed)}")
     print("selftest ok:", ", ".join(m[0] for m in models))
