@@ -781,18 +781,44 @@ static torch::Tensor fp4_moe_decode_bytes(torch::Tensor x_in, torch::Tensor weig
   return fp4_moe_decode(x_in, weights, indices, w1, e8m0(s1), w3, e8m0(s3), w2, e8m0(s2), swiglu_limit);
 }
 
+// The pairs no GPU pool holds, one reply per pair (the step graph's
+// experts node on a layer with pools, #409): [n, topk, K] fp32, zero where
+// held[t, k]. The cold pairs go through fp4_moe_decode as single-pair
+// rows, gathered in row-major order, exactly as mailboxes.CpuOwner sends
+// them, so the replies are the same bits. The data-dependent count of cold
+// pairs stays inside the op: the package around it sees fixed shapes.
+static torch::Tensor fp4_moe_decode_cold_bytes(torch::Tensor x_in, torch::Tensor weights, torch::Tensor indices,
+                                               torch::Tensor held, torch::Tensor w1, torch::Tensor s1,
+                                               torch::Tensor w3, torch::Tensor s3, torch::Tensor w2,
+                                               torch::Tensor s2, double swiglu_limit) {
+  const int64_t n = indices.size(0), topk = indices.size(1);
+  auto out = torch::zeros({n, topk, x_in.size(1)}, x_in.options().dtype(torch::kFloat32));
+  auto cold = held.logical_not();
+  if (!cold.any().item<bool>()) return out;
+  auto tokens = torch::arange(n, indices.options().dtype(torch::kInt64)).view({n, 1}).expand({n, topk}).index({cold});
+  auto replies = fp4_moe_decode_bytes(x_in.index_select(0, tokens).contiguous(),
+                                      weights.index({cold}).to(torch::kFloat32).view({-1, 1}).contiguous(),
+                                      indices.index({cold}).to(torch::kInt64).view({-1, 1}).contiguous(),
+                                      w1, s1, w3, s3, w2, s2, swiglu_limit);
+  out.index_put_({cold}, replies);
+  return out;
+}
+
 TORCH_LIBRARY(vxpu_native, m) {
   m.def("fp4_moe_decode(Tensor x_in, Tensor weights, Tensor indices, Tensor w1, Tensor s1, Tensor w3, Tensor s3, "
         "Tensor w2, Tensor s2, float swiglu_limit) -> Tensor");
+  m.def("fp4_moe_decode_cold(Tensor x_in, Tensor weights, Tensor indices, Tensor held, Tensor w1, Tensor s1, "
+        "Tensor w3, Tensor s3, Tensor w2, Tensor s2, float swiglu_limit) -> Tensor");
   m.def("gather_rows(Tensor table, Tensor indices) -> Tensor");
 }
 
 TORCH_LIBRARY_IMPL(vxpu_native, CPU, m) {
   m.impl("fp4_moe_decode", &fp4_moe_decode_bytes);
+  m.impl("fp4_moe_decode_cold", &fp4_moe_decode_cold_bytes);
   m.impl("gather_rows", &gather_rows);
 }
 
-void register_node_server(pybind11::module& m);  // node_server.cpp
+void register_node_server(pybind11::module& m);  // node_server.cpp: node server, node client, step host
 
 PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
   m.def("fp4_gather_mm", &fp4_gather_mm, "x[M,K] bf16 x packed fp4 experts sel[M] -> bf16 [M,N]");

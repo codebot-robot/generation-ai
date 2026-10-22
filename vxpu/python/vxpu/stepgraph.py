@@ -30,9 +30,14 @@ Here a host op is a mailbox inside the graph instead:
         first), then wait for its from-CPU flag to be 1
         (cuStreamWaitValue32), clear it, and copy the reply from the
         pinned outbox into the consumers' inboxes on the GPU
-  CPU   a worker thread waits for each host node's to-CPU flag in turn,
-        clears it, runs the node on the pinned inputs, writes the reply
-        into the pinned outbox, then sets the from-CPU flag
+  CPU   the step host, a native thread (csrc/node_server.cpp, #409),
+        waits for each host node's to-CPU flag in turn, clears it, runs
+        the node on the pinned inputs, writes the reply into the pinned
+        outbox, then sets the from-CPU flag. A node the engine keeps runs
+        as its native package (nodes.py: the host op lowered to the
+        native kernels, its residents passed by address), one a node
+        server holds through the native client (nodeserver.py): no
+        Python between the GPU's flag and the reply
 
 So a decode step is one graph replay: the GPU runs the dense segments
 and blocks on the host ops' flags itself; Python launches the step and
@@ -49,25 +54,26 @@ writes a flag in that GPU's memory; the other GPU, waiting on the flag,
 computes, copies its per-pair replies straight back and writes a flag in
 the engine's GPU's memory. The engine's graph then takes each
 pair's reply from whoever holds the expert and sums them in k order, as
-the mailboxes do (mailboxes.py).
+the mailboxes do (mailboxes.py). The step host answers such a node's
+other pairs with nodes.py's cold lowering, reading the pools' slot maps
+in place.
 
 The first decode step after a load runs through the dataflow runner
-(loading the packages, allocating the inboxes); the second captures the
-step and replays it; later steps replay. Telemetry still records the host
-ops (the worker runs them in the engine's scope) and the steps; the
-segments' own times, which only a node-by-node run can take, are left
-out.
+(loading the packages, allocating the inboxes); the second builds the
+host nodes' packages, captures the step and replays it; later steps
+replay. Telemetry records the host ops from the step host's clock (when
+it saw each flag, when the reply was ready, when it raised the flag back)
+after the step, and the steps; the segments' own times, which only a
+node-by-node run can take, are left out.
 """
 
 import ctypes
 import gc
-import threading
-import time
 import weakref
 
 import torch
 
-from . import dataflow, triton_ops
+from . import dataflow, kernels, nodes, triton_ops
 
 CU_STREAM_WAIT_VALUE_EQ = 0x1
 CU_STREAM_WRITE_VALUE_DEFAULT = 0x0  # with a system-wide memory fence before the write
@@ -126,6 +132,16 @@ def _experts_call(sub):
     return None, None
 
 
+def _slot_maps(entry):
+    """An experts node's GPU pools' slot maps (expert - start -> slot, -1
+    where the pool does not hold it), from its pooled entry; None without
+    pools."""
+    if entry is None:
+        return None
+    _, here, peer_boxes, _, _ = entry
+    return [pool.slot_cpu for pool in list(here) + [box[0] for box in peer_boxes.values()]]
+
+
 class StepGraph(torch.nn.Module):
     """A dataflow runner's step as one CUDA graph (module docstring)."""
 
@@ -138,7 +154,7 @@ class StepGraph(torch.nn.Module):
         self._peer_graphs = []
         self.steps = 0
         self.recorder = None
-        self._worker = None
+        self._host = None
 
     def set_recorder(self, recorder):
         self.recorder = recorder
@@ -156,7 +172,7 @@ class StepGraph(torch.nn.Module):
                 gc.enable()
         for buf, a in zip(self._inputs, self._input_values(args, kwargs)):
             buf.copy_(a)
-        self._worker.go.set()
+        self._host.go()
         self.graph.replay()
         # the other GPUs' graphs after this one's: launched first, a graph
         # that opens by waiting on a flag held the launching thread ~5 ms
@@ -166,14 +182,14 @@ class StepGraph(torch.nn.Module):
         torch.cuda.current_stream().synchronize()
         for pdev, _ in self._peer_graphs:
             torch.cuda.current_stream(pdev).synchronize()
-        error = self._worker.error
-        if error is not None:
-            # the worker raised every from-CPU flag to release the GPU, and
+        error = self._host.take_error()
+        if error:
+            # the host raised every from-CPU flag to release the GPU, and
             # the to-CPU flags after the failed node are still up: the next
-            # step starts clean (the GPU is idle and the worker done)
-            self._worker.error = None
-            self._worker.view[:] = 0
-            raise error
+            # step starts clean (the GPU is idle and the host done)
+            self._flags.zero_()
+            raise RuntimeError(f"step graph: {error}")
+        self._record()
         out = self._output
         out = out[0] if isinstance(out, (tuple, list)) and len(out) == 1 else out
         return out.clone() if isinstance(out, torch.Tensor) else out
@@ -252,10 +268,11 @@ class StepGraph(torch.nn.Module):
 
         mailboxes = []  # per host node: (node, pinned inputs, kwargs, outbox, flag offset, pooled)
         side = torch.cuda.Stream(device=dev)  # this GPU's pools' kernels, forked from the step and joined back
+        answers = self._answers(host_nodes, boxes, pooled, external)  # before any capture: builds packages
         self._warm(pooled, runner, inputs, dev)
         torch.cuda.synchronize()
         self._capture_all(graph, mailboxes, boxes, pooled, peers, driver, flags, F, flag, side, dev, resolve,
-                          produced, host_nodes, external)
+                          produced, host_nodes, answers)
 
     def _warm(self, pooled, runner, inputs, dev):
         """Every kernel the captures will launch, run once first on the
@@ -286,8 +303,57 @@ class StepGraph(torch.nn.Module):
         for pdev in {d for _, _, boxes_, _, _ in pooled.values() for d in boxes_}:
             torch.cuda.synchronize(pdev)
 
+    def _answers(self, host_nodes, boxes, pooled, external):
+        """How the step host answers each host node, by name: ("remote",
+        RemoteNode) for a node a node server holds, else ("local",
+        package path, residents), its native package built (or found in
+        the package cache) here, before any capture."""
+        if kernels.load() is None:
+            raise RuntimeError(f"step graph: the step host needs the CPU kernels: {kernels.why_not()}")
+        packages = next(m.packages for _, m in self.split.named_children() if hasattr(m, "packages"))
+        remote_nodes = getattr(external, "remote_nodes", {})
+        answers = {}
+        for node in host_nodes:
+            sub = getattr(self.split, node.name)
+            pinned, _, _ = boxes[node.name]
+            if node.kwargs or not all(isinstance(p, torch.Tensor) for p in pinned):
+                raise RuntimeError(f"step graph: host node {node.name} takes more than tensors")
+            remote = remote_nodes.get(nodes.host_call(sub))
+            entry = pooled.get(node.name)
+            if remote is not None:
+                if entry is not None:
+                    raise RuntimeError(f"step graph: {node.name} is on a node server and in GPU pools")
+                answers[node.name] = ("remote", remote)
+                continue
+            path, residents = nodes.native_package(packages, sub, external, pinned, _slot_maps(entry))
+            answers[node.name] = ("local", path, residents)
+        return answers
+
+    def _record(self):
+        """The step's host ops into telemetry, from the step host's clock
+        (impl_ms: from the GPU's flag seen to the reply in the outbox)."""
+        from . import ops
+        rec = ops._recorder()
+        if rec is None:
+            return
+        times = self._host.times()
+        for (kind, layer, remote, i, slot_maps, start), t in zip(self._box_info, times.tolist()):
+            impl_ms = (t[1] - t[0]) / 1e6
+            if kind == "engram":
+                rec.host_op("engram_rows", total_ms=impl_ms)
+                continue
+            if remote:
+                rec.host_op("moe_experts", impl_ms=impl_ms, remote_pairs=float(i.numel()))
+            else:
+                held = torch.zeros_like(i, dtype=torch.bool)
+                for slots in slot_maps or ():
+                    held |= slots[i - start] >= 0
+                n_held = int(held.sum())
+                rec.host_op("moe_experts", impl_ms=impl_ms, gpu_pairs=float(n_held), cpu_pairs=float(i.numel() - n_held))
+            rec.selected_experts(layer, i.flatten().tolist())
+
     def _capture_all(self, graph, mailboxes, boxes, pooled, peers, driver, flags, F, flag, side, dev, resolve,
-                     produced, host_nodes, external):
+                     produced, host_nodes, answers):
         from . import aoti
         g = torch.cuda.CUDAGraph()
         with torch.cuda.graph(g):
@@ -352,11 +418,27 @@ class StepGraph(torch.nn.Module):
             output = resolve(graph.output)
         peer_graphs = [self._capture_peer(pdev, peers.index(pdev), driver, flags, F, host_nodes, boxes, pooled)
                        for pdev in peers]
-        worker = _Worker(self.split, mailboxes, flags, external)  # the engine's scope, for its thread
-        worker.start()
+        host = kernels.load().StepHost(flags)
+        info = []
+        for node, pinned, _, outbox, _, entry in mailboxes:  # in step order: flags 2i and 2i+1
+            answer = answers[node.name]
+            kind, layer = nodes.host_call(getattr(self.split, node.name))
+            if answer[0] == "remote":
+                host.add_remote(pinned, outbox, answer[1].client, answer[1].index)
+            else:
+                host.add_local(pinned, outbox, answer[1], answer[2])
+            start = entry[0].experts_start_idx if entry is not None else 0
+            indices = pinned[_experts_call(getattr(self.split, node.name))[1][2]] if kind == "experts" else None
+            info.append((kind, layer, answer[0] == "remote", indices, _slot_maps(entry), start))
+        host.start()
         # all at once: a capture that fails leaves the step graph as it was, and the next step tries again
-        self.graph, self._output, self._peer_graphs, self._worker = g, output, peer_graphs, worker
-        weakref.finalize(self, worker.stop)  # the engine dropped: the thread lets go of the model
+        self.graph, self._output, self._peer_graphs, self._host = g, output, peer_graphs, host
+        self._flags, self._box_info = flags, info
+        # what the graphs use that lives outside their memory pools (the pinned boxes, the other
+        # GPUs' inboxes, flags and reply buffers, the slot maps' copies): freed, that memory would
+        # be reused under the graphs. The Python worker held it through its mailboxes.
+        self._keep = (boxes, pooled, mailboxes)
+        weakref.finalize(self, host.stop)  # the engine dropped: the thread lets go of the model
 
     def _capture_peer(self, pdev, p, driver, flags, F, host_nodes, boxes, pooled):
         """Another GPU's part of the step, as its own graph: for each
@@ -385,74 +467,3 @@ class StepGraph(torch.nn.Module):
                     driver.memcpy(s, theirs, replies)
                     driver.write_value(s, flag_back.data_ptr(), 1)
         return pdev, g
-
-
-class _Worker(threading.Thread):
-    """Runs the host nodes on their pinned inboxes, in step order, each
-    when the GPU raises its to-CPU flag."""
-
-    def __init__(self, split, mailboxes, flags, external):
-        super().__init__(name="vxpu-step-graph-host", daemon=True)
-        self.split, self.mailboxes, self.flags, self.external = split, mailboxes, flags, external
-        self.view = flags.numpy()
-        self.go = threading.Event()
-        self.error = None
-        self.stopping = False
-
-    def stop(self):
-        """Ends the thread between steps (it waits on go then, not on a flag)."""
-        self.stopping = True
-        self.go.set()
-
-    def run(self):
-        from . import ops
-        with ops.bound(self.external):  # the host ops find the engine's banks and tables through it
-            self._loop()
-
-    def _loop(self):
-        while True:
-            self.go.wait()
-            self.go.clear()
-            if self.stopping:
-                return
-            try:
-                for node, pinned, kwargs, outbox, f, pooled in self.mailboxes:
-                    while self.view[f] != 1:
-                        pass
-                    self.view[f] = 0
-                    if pooled is None:
-                        out = getattr(self.split, node.name)(*pinned, **kwargs)
-                        outbox.copy_(out[0] if isinstance(out, (tuple, list)) else out)
-                    else:
-                        self._answer_cold(pooled, pinned, outbox)
-                    self.view[f + 1] = 1
-            except BaseException as e:  # the GPU would wait forever: release it, then report
-                self.error = e
-                for _, _, _, _, f, _ in self.mailboxes:
-                    self.view[f + 1] = 1
-
-    def _answer_cold(self, pooled, pinned, outbox):
-        """The pairs no in-graph pool holds, per pair, into the outbox
-        [n, topk, dim] (zero where a pool answers, in the graph). Records
-        the node as _moe_mailboxes does (ops.py), so its selections reach
-        the statistics the placements come from."""
-        from . import ops
-        from .mailboxes import CpuOwner
-        moe, here, peer_boxes, where, layer = pooled
-        rec = ops._recorder()
-        t0 = time.perf_counter()
-        x, w, i = (pinned[k] for k in where)
-        held = torch.zeros_like(i, dtype=torch.bool)
-        for pool in list(here) + [box[0] for box in peer_boxes.values()]:
-            held |= pool.slot_cpu[i - moe.experts_start_idx] >= 0
-        cold = ~held
-        outbox.zero_()
-        if cold.any():
-            n, topk = i.shape
-            tokens = torch.arange(n).view(n, 1).expand(n, topk)[cold]
-            outbox[cold] = CpuOwner().answer(moe, x, tokens, i[cold], w[cold])
-        if rec is not None:
-            n_cold = int(cold.sum())
-            rec.host_op("moe_experts", impl_ms=(time.perf_counter() - t0) * 1e3,
-                        gpu_pairs=float(i.numel() - n_cold), cpu_pairs=float(n_cold))
-            rec.selected_experts(layer, i.flatten().tolist())

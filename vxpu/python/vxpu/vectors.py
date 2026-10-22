@@ -1363,8 +1363,10 @@ def _check_expert_mailboxes(model, prompts, settings, artifact, plain, workdir):
 def _check_step_graph(model, prompts, settings, artifact, workdir):
     """On a GPU: the whole decode step in one CUDA graph (stepgraph.py),
     the AOTInductor segments and the host ops as mailboxes the GPU waits
-    on, against the same dataflow over the same segments run node by
-    node: tokens and logits bit-identical, and the step really captured.
+    on, answered by the native step host (each host node's native package,
+    #409), against the same dataflow over the same segments run node by
+    node with the host ops in the engine: tokens and logits bit-identical,
+    the step really captured, and the host thread gone with the engine.
     Skipped without CUDA."""
     import torch
     if not torch.cuda.is_available():
@@ -1386,11 +1388,10 @@ def _check_step_graph(model, prompts, settings, artifact, workdir):
     print("the decode step as one CUDA graph, against the same segments run node by node (must be bit-identical):")
     print(table(ref, got, rows))
     import gc
-    worker = keep[0]._decode_split._worker
+    host = keep[0]._decode_split._host
     keep.clear()  # the engine dropped: its step graph's host thread must let go of the model
     gc.collect()
-    worker.join(timeout=10)
-    if worker.is_alive():
+    if host.running():
         print("step graph check: the host thread outlived its engine")
         return False
     return same
@@ -1655,6 +1656,7 @@ def _check_remote_nodes(model, prompts, settings, artifact, plain, workdir):
         print(f"remote nodes check: ServeNodes failed: {ctx.code} {ctx.details}")
         return False
     server = executor.node_server[1]
+    graph_ok = True
     try:
         spec = ",".join(f"{name}=tcp://127.0.0.1:{resp.port}/{i}" for i, name in enumerate(served))
         keep = []
@@ -1663,6 +1665,8 @@ def _check_remote_nodes(model, prompts, settings, artifact, plain, workdir):
         external = keep[0].external
         loaded = [f"{kind}.{i}" for name in served for kind, i in [calls[name]]
                   if (kind == "experts" and not external.experts[i].w1.is_meta) or (kind == "engram" and i in external.engram)]
+        keep.clear()
+        graph_ok = _check_step_graph_remote(model, prompts, settings, artifact, workdir, spec)
         messages = server.messages()
     finally:
         server.stop()
@@ -1677,6 +1681,32 @@ def _check_remote_nodes(model, prompts, settings, artifact, plain, workdir):
     print(table(plain, got, rows))
     if not same:
         print("remote nodes check: not bit-identical")
+    return same and graph_ok
+
+
+def _check_step_graph_remote(model, prompts, settings, artifact, workdir, spec):
+    """On a GPU: the step graph with the node server's nodes (spec, a
+    VXPU_REMOTE_NODES value), against the step graph with every node here.
+    The step host (#409) answers both natively, through the native client
+    or the node's own package: the same kernels on the same arguments, so
+    tokens and logits must be bit-identical. Skipped without CUDA."""
+    import torch
+    if not torch.cuda.is_available():
+        return True
+    base = {"VXPU_DATAFLOW": "1", "VXPU_SEGMENT_RUNTIME": "aoti", "VXPU_AOTI_CACHE_DIR": os.path.join(workdir, "aoti"),
+            "VXPU_STEP_GRAPH": "1", "VXPU_DATAFLOW_PLACE": None, "VXPU_EXPERT_MAILBOXES": None, "VXPU_GPU_EXPERTS": None}
+    here = _with_env(base, record_vxpu_engine, model, "main", prompts, settings, artifact, device="cuda",
+                     compile_decode=True)
+    there = _with_env({**base, "VXPU_REMOTE_NODES": spec}, record_vxpu_engine, model, "main", prompts, settings,
+                      artifact, device="cuda", compile_decode=True)
+    same = ([p["generated_ids"] for p in there["prompts"]] == [p["generated_ids"] for p in here["prompts"]]
+            and [p["top_logits"] for p in there["prompts"]] == [p["top_logits"] for p in here["prompts"]])
+    rows, _ = compare(here, there, strict_tokens=True)
+    print("the step graph with host nodes on a node server, against the step graph with all of them here "
+          "(must be bit-identical):")
+    print(table(here, there, rows))
+    if not same:
+        print("step graph remote check: not bit-identical")
     return same
 
 
