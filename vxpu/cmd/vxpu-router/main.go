@@ -16,6 +16,7 @@ package main
 
 import (
 	"context"
+	"errors"
 	"flag"
 	"fmt"
 	"net"
@@ -44,6 +45,7 @@ func main() {
 	defer klog.Flush()
 
 	portFlag := flag.Int("port", 50051, "The server port")
+	adminPortFlag := flag.Int("admin-port", 0, "The admin port for Executor service (0 to disable)")
 	imageFlag := flag.String("image", "", "The executor image to run")
 	nsFlag := flag.String("namespace", "", "The Kubernetes namespace to use")
 	acceleratorFlag := flag.String("accelerator", "", "GKE accelerator label for the executor pod (e.g., nvidia-l4)")
@@ -64,6 +66,10 @@ func main() {
 	imageName := *imageFlag
 	if imageName == "" {
 		imageName = os.Getenv("VXPU_EXECUTOR_IMAGE")
+	}
+	if imageName == "" {
+		log.Error(errors.New("no executor image configured; set --image or VXPU_EXECUTOR_IMAGE"), "fatal configuration error")
+		os.Exit(1)
 	}
 
 	accelerator := *acceleratorFlag
@@ -153,7 +159,30 @@ func main() {
 			"tag reuses artifacts the previous build compiled", "image", imageName)
 	}
 	srv.UseStats(*telemetryEvery)
-	pb.RegisterExecutorServer(s, srv)
+	pb.RegisterEngineServer(s, srv)
+
+	if *adminPortFlag != 0 {
+		adminLis, err := net.Listen("tcp", fmt.Sprintf(":%d", *adminPortFlag))
+		if err != nil {
+			log.Error(err, "failed to listen on admin port", "port", *adminPortFlag)
+			os.Exit(1)
+		}
+		adminServer := grpc.NewServer(
+			grpc.MaxRecvMsgSize(maxMsgSize),
+			grpc.MaxSendMsgSize(maxMsgSize),
+			grpc.KeepaliveEnforcementPolicy(keepalive.EnforcementPolicy{
+				MinTime:             10 * time.Second,
+				PermitWithoutStream: true,
+			}),
+		)
+		pb.RegisterExecutorServer(adminServer, srv)
+		go func() {
+			log.Info("Starting vxpu-router admin gRPC server", "port", *adminPortFlag)
+			if err := adminServer.Serve(adminLis); err != nil {
+				log.Error(err, "admin server failed")
+			}
+		}()
+	}
 
 	// On SIGTERM (a pod being deleted or redeployed) write the buffered
 	// statistics before exiting, within the pod's grace period.

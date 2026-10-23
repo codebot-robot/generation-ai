@@ -89,13 +89,15 @@ class VxpuModelForCausalLM:
         self.collect_telemetry = False
 
     @classmethod
-    def from_pretrained(cls, repo_id, *, router=None, artifact_dir=None,
+    def from_pretrained(cls, repo_id, *, router=None, router_admin=None,
+                        artifact_dir=None,
                         max_cache_len=2048, revision="main", timeout=3600,
                         progress=print, **unused):
         """Export (if needed), ship, and wait for the model.
 
         router: "host:port" of a vxpu-router, or None to port-forward
         to pod/vxpu-router with kubectl (VXPU_ROUTER overrides).
+        router_admin: "host:port" of a vxpu-router admin port (VXPU_ROUTER_ADMIN overrides).
         artifact_dir: where the exported artifact lives/goes (default
         ~/.cache/vxpu/artifacts/<repo>/<revision>/<max_cache_len>). Only
         the four artifact files are ever written there.
@@ -148,6 +150,7 @@ class VxpuModelForCausalLM:
 
         forward = None
         router = router or os.environ.get("VXPU_ROUTER")
+        router_admin = router_admin or os.environ.get("VXPU_ROUTER_ADMIN")
         if not router:
             forward = PortForward(DEFAULT_ROUTER_TARGET)
             try:
@@ -156,7 +159,7 @@ class VxpuModelForCausalLM:
                 raise RuntimeError(
                     "no vxpu-router reachable: pass router='host:port', "
                     "set VXPU_ROUTER, or run `vxpu up` first") from e
-        client = Client(router, timeout=timeout)
+        client = Client(router, timeout=timeout, internal_address=router_admin)
         try:
             session = client.load_artifact(artifact_dir, progress=progress)
         except BaseException:
@@ -251,11 +254,19 @@ class VxpuModelForCausalLM:
         if streamer is not None:
             streamer.put(ids)
         new_ids = []
-        for token_id in self.session.generate_ids(
+        if self.collect_telemetry:
+            stream = self.session.execute_ids(
                 prompt, max_new_tokens=max_new_tokens, do_sample=do_sample,
                 temperature=temperature, top_k=top_k, top_p=top_p,
                 repetition_penalty=repetition_penalty,
-                eos_token_id=extra_eos, seed=seed, telemetry=self.collect_telemetry):
+                eos_token_id=extra_eos, seed=seed, telemetry=True)
+        else:
+            stream = self.session.generate_ids(
+                prompt, max_new_tokens=max_new_tokens, do_sample=do_sample,
+                temperature=temperature, top_k=top_k, top_p=top_p,
+                repetition_penalty=repetition_penalty,
+                eos_token_id=extra_eos, seed=seed)
+        for token_id in stream:
             new_ids.append(token_id)
             if streamer is not None:
                 streamer.put(torch.tensor([token_id]))

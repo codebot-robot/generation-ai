@@ -38,7 +38,7 @@ import (
 // connectRouter dials the router at addr, or ensures the router pod
 // exists (creating it with settings if needed) and port-forwards to it.
 // done closes the connection and the tunnel.
-func connectRouter(ctx context.Context, addr, pod string, settings routerSettings) (pb.ExecutorClient, func(), error) {
+func connectRouter(ctx context.Context, addr, pod string, settings routerSettings) (pb.EngineClient, func(), error) {
 	log := klog.FromContext(ctx)
 	stop := func() {}
 	if addr == "" {
@@ -61,7 +61,7 @@ func connectRouter(ctx context.Context, addr, pod string, settings routerSetting
 		stop()
 		return nil, nil, fmt.Errorf("dialing %s: %w", addr, err)
 	}
-	return pb.NewExecutorClient(conn), func() {
+	return pb.NewEngineClient(conn), func() {
 		if err := conn.Close(); err != nil {
 			log.Error(err, "closing router connection", "address", addr)
 		}
@@ -153,7 +153,7 @@ func stillLoading(err error) bool {
 // askByName opens a session on a registered model by name (the router
 // loads it the first time; NewSession reports it loading until it is)
 // and runs one chat turn.
-func askByName(ctx context.Context, client pb.ExecutorClient, repo, revision, prompt string, maxNewTokens int) error {
+func askByName(ctx context.Context, client pb.EngineClient, repo, revision, prompt string, maxNewTokens int) error {
 	started := time.Now()
 	var session *pb.NewSessionResponse
 	for {

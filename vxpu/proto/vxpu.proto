@@ -18,64 +18,92 @@ package vxpu;
 
 option go_package = "github.com/gke-labs/generation-ai/vxpu/pkg/api/v1alpha1;v1alpha1";
 
-// Executor runs models shipped as vXPU artifacts: a content-addressed
-// manifest (architecture config + weight references), weightless
-// exported graphs, and a binding classifying every graph tensor as
-// bound (weight reference), derived (computed from config), or state
-// (session-owned, zero-initialized).
-//
-// The executor never receives weights over this API: it rehydrates
-// them from the manifest's content-addressed references.
-service Executor {
+// Engine is the client-facing service for vXPU. Clients (the vxpu CLI,
+// Python client, and transformers AutoModel facade) call Engine on the
+// router for session management, chat, generation, and model metadata.
+// It is stable, versioned with care, and carries no engine internals.
+service Engine {
   // LoadModel ships the artifact. Idempotent: the artifact's content
   // digest identifies the model, and a matching digest reuses the
   // already-loaded engine.
   rpc LoadModel(LoadModelRequest) returns (LoadModelResponse) {}
-  // RegisterModel makes a model servable by name (router only): the
-  // router imports the weights into modelstore and compiles the model
-  // for its executor image (a compile job exporting the artifact into
-  // modelstore), unless that was done before. Blocks until the model is
-  // registered; idempotent.
+  // RegisterModel makes a model servable by name: the router imports
+  // the weights into modelstore and compiles the model for its executor
+  // image (a compile job exporting the artifact into modelstore), unless
+  // that was done before. Blocks until the model is registered;
+  // idempotent.
   rpc RegisterModel(RegisterModelRequest) returns (RegisterModelResponse) {}
   // NewSession allocates fresh per-session state (KV cache). With a
-  // model name (router only), the router loads that registered model
-  // if needed; while it loads, NewSession fails with FAILED_PRECONDITION
-  // and the caller retries.
+  // model name, the router loads that registered model if needed; while
+  // it loads, NewSession fails with FAILED_PRECONDITION and the caller
+  // retries.
   rpc NewSession(NewSessionRequest) returns (NewSessionResponse) {}
   // Chat runs one conversation turn in a session. Multi-turn reuses
   // the session's cache: only new suffix tokens are prefilled.
   rpc Chat(ChatRequest) returns (ChatResponse) {}
   // Generate is transformers' generate() over the wire: the client
   // owns the tokenizer and sends the full prompt as token ids; the
-  // executor runs the same torch loop (prefill, decode, HF-style
-  // sampling) in the session and streams back the new ids. The
-  // session's cache is reused for whatever prefix matches.
+  // router forwards the call to an executor, which runs the same torch
+  // loop (prefill, decode, HF-style sampling) in the session and
+  // streams back the new ids. The session's cache is reused for
+  // whatever prefix matches.
   rpc Generate(GenerateRequest) returns (stream GenerateResponse) {}
-  // GetModelStats (router only) summarises what the engine recorded
-  // about a model served by name: every request's statistics, and the
-  // execution telemetry of the requests it sampled (kept in modelstore,
-  // so they outlive the router).
+  // GetModelStats summarises what the engine recorded about a model
+  // served by name: every request's statistics, and the execution
+  // telemetry of the requests it sampled (kept in modelstore, so they
+  // outlive the router).
   rpc GetModelStats(GetModelStatsRequest) returns (GetModelStatsResponse) {}
-  // Describe reports what the executor runs on (executor only): its probe
-  // of the machine, for the coordinator's machine database (#394).
-  // Answers with or without a model loaded.
-  rpc Describe(DescribeRequest) returns (DescribeResponse) {}
-  // ExplainModel (router only) returns the plan the coordinator chose for
-  // a model's last load by name, and why (#394).
+  // ExplainModel returns the plan the coordinator chose for a model's
+  // last load by name, and why (#394).
   rpc ExplainModel(ExplainModelRequest) returns (ExplainModelResponse) {}
-  // DescribeNodes (executor only) describes an artifact's decode step as
-  // a dataflow graph: its nodes in call order, and for a host node what
-  // it reads and how many bytes that is (#394). The coordinator places
-  // nodes from it.
+}
+
+// Executor is the internal router-to-executor service. The router (and
+// later the planner or coordinator) calls Executor on executor pods for
+// model loading, execution, telemetry, node serving, and plan inspection.
+// It can change freely with the router and executors, which ship together.
+//
+// Executor runs models shipped as vXPU artifacts: a content-addressed
+// manifest (architecture config + weight references), weightless exported
+// graphs, and a binding classifying every graph tensor as bound (weight
+// reference), derived (computed from config), or state (session-owned,
+// zero-initialized).
+//
+// The executor never receives weights over this API: it rehydrates them
+// from the manifest's content-addressed references.
+service Executor {
+  // LoadModel ships the artifact. Idempotent: the artifact's content
+  // digest identifies the model, and a matching digest reuses the
+  // already-loaded engine.
+  rpc LoadModel(LoadModelRequest) returns (LoadModelResponse) {}
+  // NewSession allocates fresh per-session state (KV cache).
+  rpc NewSession(NewSessionRequest) returns (NewSessionResponse) {}
+  // ExecuteChat runs one conversation turn in a session, returning
+  // execution telemetry when requested. Multi-turn reuses the session's
+  // cache: only new suffix tokens are prefilled.
+  rpc ExecuteChat(ExecuteChatRequest) returns (ExecuteChatResponse) {}
+  // Execute runs transformers' generate() loop on the executor,
+  // optionally returning execution telemetry on the final message. The
+  // executor runs the torch loop (prefill, decode, HF-style sampling) in
+  // the session and streams back the new ids. The session's cache is
+  // reused for whatever prefix matches.
+  rpc Execute(ExecuteRequest) returns (stream ExecuteResponse) {}
+  // Describe reports what the executor runs on: its probe of the machine,
+  // for the coordinator's machine database (#394). Answers with or
+  // without a model loaded.
+  rpc Describe(DescribeRequest) returns (DescribeResponse) {}
+  // DescribeNodes describes an artifact's decode step as a dataflow graph:
+  // its nodes in call order, and for a host node what it reads and how
+  // many bytes that is (#394). The coordinator places nodes from it.
   rpc DescribeNodes(DescribeNodesRequest) returns (DescribeNodesResponse) {}
-  // ServeNodes (executor only) serves some of an artifact's decode-step
-  // nodes on a port of this machine: a native node server (nodeserver.py)
-  // that answers their tcp:// mailboxes. Answers once they are loaded.
+  // ServeNodes serves some of an artifact's decode-step nodes on a port
+  // of this machine: a native node server (nodeserver.py) that answers
+  // their tcp:// mailboxes. Answers once they are loaded.
   rpc ServeNodes(ServeNodesRequest) returns (ServeNodesResponse) {}
-  // ServeRange (executor only) serves the loaded engine's range of whole
-  // layers on a port of this machine, for the engine that runs the layers
-  // before it (rangeserver.py, #387). LoadModel sets the range, through the
-  // plan's VXPU_LAYER_RANGE. ServeRange returns FAILED_PRECONDITION while the
+  // ServeRange serves the loaded engine's range of whole layers on a
+  // port of this machine, for the engine that runs the layers before it
+  // (rangeserver.py, #387). LoadModel sets the range, through the plan's
+  // VXPU_LAYER_RANGE. ServeRange returns FAILED_PRECONDITION while the
   // engine is still loading.
   rpc ServeRange(ServeRangeRequest) returns (ServeRangeResponse) {}
 }
@@ -121,8 +149,8 @@ message RegisterModelResponse {
 }
 
 message NewSessionRequest {
-  // A registered model to open the session on (router only); empty
-  // means the model this connection last loaded with LoadModel.
+  // A registered model to open the session on; empty means the model
+  // this connection last loaded with LoadModel.
   string model = 1;
   // The model's revision; empty means "main".
   string revision = 2;
@@ -143,9 +171,6 @@ message ChatRequest {
   // the full rendered conversation each turn: the executor prefills
   // from the first token that differs from the session's cache.
   bool raw_prompt = 4;
-  // Return the executor's execution telemetry for this turn, as for
-  // GenerateRequest.telemetry.
-  optional bool telemetry = 5;
 }
 
 message ChatResponse {
@@ -155,9 +180,21 @@ message ChatResponse {
   int32 generated = 4;
   float prefill_ms = 5;
   float ms_per_token = 6;
+}
+
+// ExecuteChatRequest is the internal chat request passed to executors.
+message ExecuteChatRequest {
+  ChatRequest request = 1;
+  // Return the executor's execution telemetry for this turn.
+  optional bool telemetry = 2;
+}
+
+// ExecuteChatResponse is the internal chat response from executors.
+message ExecuteChatResponse {
+  ChatResponse response = 1;
   // When the request set telemetry: the execution telemetry as JSON
   // (format "vxpu-telemetry/1").
-  string telemetry_json = 7;
+  string telemetry_json = 2;
 }
 
 // GenerateRequest mirrors the generation parameters of
@@ -180,11 +217,6 @@ message GenerateRequest {
   repeated int32 eos_token_id = 9;
   // Seed for the executor's sampler; unset means unseeded.
   optional uint64 seed = 10;
-  // Return the executor's internal execution telemetry for this call
-  // (segment and host-op timings, expert selections, the plan; JSON in
-  // GenerateResponse.telemetry_json on the final message). For tuning
-  // execution plans; nothing is recorded when unset.
-  optional bool telemetry = 11;
 }
 
 // GenerateResponse streams newly generated ids as they are produced.
@@ -201,9 +233,26 @@ message GenerateResponse {
   int32 generated = 6;
   float prefill_ms = 7;
   float ms_per_token = 8;
+}
+
+// ExecuteRequest is the internal execution request passed to executors.
+message ExecuteRequest {
+  GenerateRequest request = 1;
+  // Return the executor's internal execution telemetry for this call
+  // (segment and host-op timings, expert selections, the plan; JSON in
+  // ExecuteResponse.telemetry_json on the final message). For tuning
+  // execution plans; nothing is recorded when unset.
+  optional bool telemetry = 2;
+}
+
+// ExecuteResponse streams newly generated ids as they are produced by
+// the executor. The final message has done=true and carries the statistics
+// and optional internal telemetry.
+message ExecuteResponse {
+  GenerateResponse response = 1;
   // On the final message when the request set telemetry: the executor's
   // execution telemetry as JSON (format "vxpu-telemetry/1").
-  string telemetry_json = 9;
+  string telemetry_json = 2;
 }
 
 message GetModelStatsRequest {
@@ -238,7 +287,6 @@ message ExplainModelResponse {
   // which win), reasons}, as JSON.
   string plan_json = 1;
 }
-
 
 message DescribeNodesRequest {
   string manifest_json = 1;

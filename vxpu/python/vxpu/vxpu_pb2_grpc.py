@@ -39,15 +39,11 @@ if _version_not_supported:
     )
 
 
-class ExecutorStub:
-    """Executor runs models shipped as vXPU artifacts: a content-addressed
-    manifest (architecture config + weight references), weightless
-    exported graphs, and a binding classifying every graph tensor as
-    bound (weight reference), derived (computed from config), or state
-    (session-owned, zero-initialized).
-
-    The executor never receives weights over this API: it rehydrates
-    them from the manifest's content-addressed references.
+class EngineStub:
+    """Engine is the client-facing service for vXPU.
+    Clients (the vxpu CLI, Python client, and transformers AutoModel facade)
+    call Engine on the router for session management, chat, generation, and model metadata.
+    It is stable, versioned with care, and carries no engine internals.
     """
 
     def __init__(self, channel):
@@ -57,88 +53,63 @@ class ExecutorStub:
             channel: A grpc.Channel.
         """
         self.LoadModel = channel.unary_unary(
-                '/vxpu.Executor/LoadModel',
+                '/vxpu.Engine/LoadModel',
                 request_serializer=vxpu__pb2.LoadModelRequest.SerializeToString,
                 response_deserializer=vxpu__pb2.LoadModelResponse.FromString,
                 _registered_method=True)
         self.RegisterModel = channel.unary_unary(
-                '/vxpu.Executor/RegisterModel',
+                '/vxpu.Engine/RegisterModel',
                 request_serializer=vxpu__pb2.RegisterModelRequest.SerializeToString,
                 response_deserializer=vxpu__pb2.RegisterModelResponse.FromString,
                 _registered_method=True)
         self.NewSession = channel.unary_unary(
-                '/vxpu.Executor/NewSession',
+                '/vxpu.Engine/NewSession',
                 request_serializer=vxpu__pb2.NewSessionRequest.SerializeToString,
                 response_deserializer=vxpu__pb2.NewSessionResponse.FromString,
                 _registered_method=True)
         self.Chat = channel.unary_unary(
-                '/vxpu.Executor/Chat',
+                '/vxpu.Engine/Chat',
                 request_serializer=vxpu__pb2.ChatRequest.SerializeToString,
                 response_deserializer=vxpu__pb2.ChatResponse.FromString,
                 _registered_method=True)
         self.Generate = channel.unary_stream(
-                '/vxpu.Executor/Generate',
+                '/vxpu.Engine/Generate',
                 request_serializer=vxpu__pb2.GenerateRequest.SerializeToString,
                 response_deserializer=vxpu__pb2.GenerateResponse.FromString,
                 _registered_method=True)
         self.GetModelStats = channel.unary_unary(
-                '/vxpu.Executor/GetModelStats',
+                '/vxpu.Engine/GetModelStats',
                 request_serializer=vxpu__pb2.GetModelStatsRequest.SerializeToString,
                 response_deserializer=vxpu__pb2.GetModelStatsResponse.FromString,
                 _registered_method=True)
-        self.Describe = channel.unary_unary(
-                '/vxpu.Executor/Describe',
-                request_serializer=vxpu__pb2.DescribeRequest.SerializeToString,
-                response_deserializer=vxpu__pb2.DescribeResponse.FromString,
-                _registered_method=True)
         self.ExplainModel = channel.unary_unary(
-                '/vxpu.Executor/ExplainModel',
+                '/vxpu.Engine/ExplainModel',
                 request_serializer=vxpu__pb2.ExplainModelRequest.SerializeToString,
                 response_deserializer=vxpu__pb2.ExplainModelResponse.FromString,
                 _registered_method=True)
-        self.DescribeNodes = channel.unary_unary(
-                '/vxpu.Executor/DescribeNodes',
-                request_serializer=vxpu__pb2.DescribeNodesRequest.SerializeToString,
-                response_deserializer=vxpu__pb2.DescribeNodesResponse.FromString,
-                _registered_method=True)
-        self.ServeNodes = channel.unary_unary(
-                '/vxpu.Executor/ServeNodes',
-                request_serializer=vxpu__pb2.ServeNodesRequest.SerializeToString,
-                response_deserializer=vxpu__pb2.ServeNodesResponse.FromString,
-                _registered_method=True)
-        self.ServeRange = channel.unary_unary(
-                '/vxpu.Executor/ServeRange',
-                request_serializer=vxpu__pb2.ServeRangeRequest.SerializeToString,
-                response_deserializer=vxpu__pb2.ServeRangeResponse.FromString,
-                _registered_method=True)
 
 
-class ExecutorServicer:
-    """Executor runs models shipped as vXPU artifacts: a content-addressed
-    manifest (architecture config + weight references), weightless
-    exported graphs, and a binding classifying every graph tensor as
-    bound (weight reference), derived (computed from config), or state
-    (session-owned, zero-initialized).
-
-    The executor never receives weights over this API: it rehydrates
-    them from the manifest's content-addressed references.
+class EngineServicer:
+    """Engine is the client-facing service for vXPU.
+    Clients (the vxpu CLI, Python client, and transformers AutoModel facade)
+    call Engine on the router for session management, chat, generation, and model metadata.
+    It is stable, versioned with care, and carries no engine internals.
     """
 
     def LoadModel(self, request, context):
-        """LoadModel ships the artifact. Idempotent: the artifact's content
-        digest identifies the model, and a matching digest reuses the
-        already-loaded engine.
+        """LoadModel accepts the artifact and loads asynchronously. Idempotent:
+        the artifact's content digest identifies the model, and a matching
+        digest reuses the already-loaded engine.
         """
         context.set_code(grpc.StatusCode.UNIMPLEMENTED)
         context.set_details('Method not implemented!')
         raise NotImplementedError('Method not implemented!')
 
     def RegisterModel(self, request, context):
-        """RegisterModel makes a model servable by name (router only): the
-        router imports the weights into modelstore and compiles the model
-        for its executor image (a compile job exporting the artifact into
-        modelstore), unless that was done before. Blocks until the model is
-        registered; idempotent.
+        """RegisterModel makes a model servable by name: the router imports
+        the weights into modelstore and compiles the model for its executor
+        image (a compile job exporting the artifact into modelstore), unless
+        that was done before. Blocks until the model is registered; idempotent.
         """
         context.set_code(grpc.StatusCode.UNIMPLEMENTED)
         context.set_details('Method not implemented!')
@@ -146,9 +117,8 @@ class ExecutorServicer:
 
     def NewSession(self, request, context):
         """NewSession allocates fresh per-session state (KV cache). With a
-        model name (router only), the router loads that registered model
-        if needed; while it loads, NewSession fails with FAILED_PRECONDITION
-        and the caller retries.
+        model name, the router loads that registered model if needed; while
+        it loads, NewSession fails with FAILED_PRECONDITION and the caller retries.
         """
         context.set_code(grpc.StatusCode.UNIMPLEMENTED)
         context.set_details('Method not implemented!')
@@ -165,72 +135,33 @@ class ExecutorServicer:
     def Generate(self, request, context):
         """Generate is transformers' generate() over the wire: the client
         owns the tokenizer and sends the full prompt as token ids; the
-        executor runs the same torch loop (prefill, decode, HF-style
-        sampling) in the session and streams back the new ids. The
-        session's cache is reused for whatever prefix matches.
+        router forwards to an executor which runs the token loop and
+        streams back the new ids.
         """
         context.set_code(grpc.StatusCode.UNIMPLEMENTED)
         context.set_details('Method not implemented!')
         raise NotImplementedError('Method not implemented!')
 
     def GetModelStats(self, request, context):
-        """GetModelStats (router only) summarises what the engine recorded
-        about a model served by name: every request's statistics, and the
-        execution telemetry of the requests it sampled (kept in modelstore,
-        so they outlive the router).
-        """
-        context.set_code(grpc.StatusCode.UNIMPLEMENTED)
-        context.set_details('Method not implemented!')
-        raise NotImplementedError('Method not implemented!')
-
-    def Describe(self, request, context):
-        """Describe reports what the executor runs on (executor only): its probe
-        of the machine, for the coordinator's machine database (#394).
-        Answers with or without a model loaded.
+        """GetModelStats summarises what the engine recorded about a model
+        served by name: every request's statistics, and the execution
+        telemetry of the requests it sampled (kept in modelstore, so they
+        outlive the router).
         """
         context.set_code(grpc.StatusCode.UNIMPLEMENTED)
         context.set_details('Method not implemented!')
         raise NotImplementedError('Method not implemented!')
 
     def ExplainModel(self, request, context):
-        """ExplainModel (router only) returns the plan the coordinator chose for
-        a model's last load by name, and why (#394).
-        """
-        context.set_code(grpc.StatusCode.UNIMPLEMENTED)
-        context.set_details('Method not implemented!')
-        raise NotImplementedError('Method not implemented!')
-
-    def DescribeNodes(self, request, context):
-        """DescribeNodes (executor only) describes an artifact's decode step as
-        a dataflow graph: its nodes in call order, and for a host node what
-        it reads and how many bytes that is (#394). The coordinator places
-        nodes from it.
-        """
-        context.set_code(grpc.StatusCode.UNIMPLEMENTED)
-        context.set_details('Method not implemented!')
-        raise NotImplementedError('Method not implemented!')
-
-    def ServeNodes(self, request, context):
-        """ServeNodes (executor only) serves some of an artifact's decode-step
-        nodes on a port of this machine: a native node server (nodeserver.py)
-        that answers their tcp:// mailboxes. Answers once they are loaded.
-        """
-        context.set_code(grpc.StatusCode.UNIMPLEMENTED)
-        context.set_details('Method not implemented!')
-        raise NotImplementedError('Method not implemented!')
-
-    def ServeRange(self, request, context):
-        """ServeRange (executor only) serves the range of whole layers the loaded
-        engine runs (a LoadModel whose plan sets VXPU_LAYER_RANGE) to the
-        engine running the layers before it, on a port of this machine
-        (rangeserver.py, #387). FAILED_PRECONDITION while the engine loads.
+        """ExplainModel returns the plan the coordinator chose for a model's
+        last load by name, and why (#394).
         """
         context.set_code(grpc.StatusCode.UNIMPLEMENTED)
         context.set_details('Method not implemented!')
         raise NotImplementedError('Method not implemented!')
 
 
-def add_ExecutorServicer_to_server(servicer, server):
+def add_EngineServicer_to_server(servicer, server):
     rpc_method_handlers = {
             'LoadModel': grpc.unary_unary_rpc_method_handler(
                     servicer.LoadModel,
@@ -262,48 +193,24 @@ def add_ExecutorServicer_to_server(servicer, server):
                     request_deserializer=vxpu__pb2.GetModelStatsRequest.FromString,
                     response_serializer=vxpu__pb2.GetModelStatsResponse.SerializeToString,
             ),
-            'Describe': grpc.unary_unary_rpc_method_handler(
-                    servicer.Describe,
-                    request_deserializer=vxpu__pb2.DescribeRequest.FromString,
-                    response_serializer=vxpu__pb2.DescribeResponse.SerializeToString,
-            ),
             'ExplainModel': grpc.unary_unary_rpc_method_handler(
                     servicer.ExplainModel,
                     request_deserializer=vxpu__pb2.ExplainModelRequest.FromString,
                     response_serializer=vxpu__pb2.ExplainModelResponse.SerializeToString,
             ),
-            'DescribeNodes': grpc.unary_unary_rpc_method_handler(
-                    servicer.DescribeNodes,
-                    request_deserializer=vxpu__pb2.DescribeNodesRequest.FromString,
-                    response_serializer=vxpu__pb2.DescribeNodesResponse.SerializeToString,
-            ),
-            'ServeNodes': grpc.unary_unary_rpc_method_handler(
-                    servicer.ServeNodes,
-                    request_deserializer=vxpu__pb2.ServeNodesRequest.FromString,
-                    response_serializer=vxpu__pb2.ServeNodesResponse.SerializeToString,
-            ),
-            'ServeRange': grpc.unary_unary_rpc_method_handler(
-                    servicer.ServeRange,
-                    request_deserializer=vxpu__pb2.ServeRangeRequest.FromString,
-                    response_serializer=vxpu__pb2.ServeRangeResponse.SerializeToString,
-            ),
     }
     generic_handler = grpc.method_handlers_generic_handler(
-            'vxpu.Executor', rpc_method_handlers)
+            'vxpu.Engine', rpc_method_handlers)
     server.add_generic_rpc_handlers((generic_handler,))
-    server.add_registered_method_handlers('vxpu.Executor', rpc_method_handlers)
+    server.add_registered_method_handlers('vxpu.Engine', rpc_method_handlers)
 
 
  # This class is part of an EXPERIMENTAL API.
-class Executor:
-    """Executor runs models shipped as vXPU artifacts: a content-addressed
-    manifest (architecture config + weight references), weightless
-    exported graphs, and a binding classifying every graph tensor as
-    bound (weight reference), derived (computed from config), or state
-    (session-owned, zero-initialized).
-
-    The executor never receives weights over this API: it rehydrates
-    them from the manifest's content-addressed references.
+class Engine:
+    """Engine is the client-facing service for vXPU.
+    Clients (the vxpu CLI, Python client, and transformers AutoModel facade)
+    call Engine on the router for session management, chat, generation, and model metadata.
+    It is stable, versioned with care, and carries no engine internals.
     """
 
     @staticmethod
@@ -320,7 +227,7 @@ class Executor:
         return grpc.experimental.unary_unary(
             request,
             target,
-            '/vxpu.Executor/LoadModel',
+            '/vxpu.Engine/LoadModel',
             vxpu__pb2.LoadModelRequest.SerializeToString,
             vxpu__pb2.LoadModelResponse.FromString,
             options,
@@ -347,9 +254,354 @@ class Executor:
         return grpc.experimental.unary_unary(
             request,
             target,
-            '/vxpu.Executor/RegisterModel',
+            '/vxpu.Engine/RegisterModel',
             vxpu__pb2.RegisterModelRequest.SerializeToString,
             vxpu__pb2.RegisterModelResponse.FromString,
+            options,
+            channel_credentials,
+            insecure,
+            call_credentials,
+            compression,
+            wait_for_ready,
+            timeout,
+            metadata,
+            _registered_method=True)
+
+    @staticmethod
+    def NewSession(request,
+            target,
+            options=(),
+            channel_credentials=None,
+            call_credentials=None,
+            insecure=False,
+            compression=None,
+            wait_for_ready=None,
+            timeout=None,
+            metadata=None):
+        return grpc.experimental.unary_unary(
+            request,
+            target,
+            '/vxpu.Engine/NewSession',
+            vxpu__pb2.NewSessionRequest.SerializeToString,
+            vxpu__pb2.NewSessionResponse.FromString,
+            options,
+            channel_credentials,
+            insecure,
+            call_credentials,
+            compression,
+            wait_for_ready,
+            timeout,
+            metadata,
+            _registered_method=True)
+
+    @staticmethod
+    def Chat(request,
+            target,
+            options=(),
+            channel_credentials=None,
+            call_credentials=None,
+            insecure=False,
+            compression=None,
+            wait_for_ready=None,
+            timeout=None,
+            metadata=None):
+        return grpc.experimental.unary_unary(
+            request,
+            target,
+            '/vxpu.Engine/Chat',
+            vxpu__pb2.ChatRequest.SerializeToString,
+            vxpu__pb2.ChatResponse.FromString,
+            options,
+            channel_credentials,
+            insecure,
+            call_credentials,
+            compression,
+            wait_for_ready,
+            timeout,
+            metadata,
+            _registered_method=True)
+
+    @staticmethod
+    def Generate(request,
+            target,
+            options=(),
+            channel_credentials=None,
+            call_credentials=None,
+            insecure=False,
+            compression=None,
+            wait_for_ready=None,
+            timeout=None,
+            metadata=None):
+        return grpc.experimental.unary_stream(
+            request,
+            target,
+            '/vxpu.Engine/Generate',
+            vxpu__pb2.GenerateRequest.SerializeToString,
+            vxpu__pb2.GenerateResponse.FromString,
+            options,
+            channel_credentials,
+            insecure,
+            call_credentials,
+            compression,
+            wait_for_ready,
+            timeout,
+            metadata,
+            _registered_method=True)
+
+    @staticmethod
+    def GetModelStats(request,
+            target,
+            options=(),
+            channel_credentials=None,
+            call_credentials=None,
+            insecure=False,
+            compression=None,
+            wait_for_ready=None,
+            timeout=None,
+            metadata=None):
+        return grpc.experimental.unary_unary(
+            request,
+            target,
+            '/vxpu.Engine/GetModelStats',
+            vxpu__pb2.GetModelStatsRequest.SerializeToString,
+            vxpu__pb2.GetModelStatsResponse.FromString,
+            options,
+            channel_credentials,
+            insecure,
+            call_credentials,
+            compression,
+            wait_for_ready,
+            timeout,
+            metadata,
+            _registered_method=True)
+
+    @staticmethod
+    def ExplainModel(request,
+            target,
+            options=(),
+            channel_credentials=None,
+            call_credentials=None,
+            insecure=False,
+            compression=None,
+            wait_for_ready=None,
+            timeout=None,
+            metadata=None):
+        return grpc.experimental.unary_unary(
+            request,
+            target,
+            '/vxpu.Engine/ExplainModel',
+            vxpu__pb2.ExplainModelRequest.SerializeToString,
+            vxpu__pb2.ExplainModelResponse.FromString,
+            options,
+            channel_credentials,
+            insecure,
+            call_credentials,
+            compression,
+            wait_for_ready,
+            timeout,
+            metadata,
+            _registered_method=True)
+
+
+class ExecutorStub:
+    """Executor is the internal router-to-executor service.
+    The router (and later the planner/coordinator) calls Executor on executor pods
+    for model loading, execution, telemetry, node serving, and plan inspection.
+    It can change freely with the router and executors, which ship together.
+    """
+
+    def __init__(self, channel):
+        """Constructor.
+
+        Args:
+            channel: A grpc.Channel.
+        """
+        self.LoadModel = channel.unary_unary(
+                '/vxpu.Executor/LoadModel',
+                request_serializer=vxpu__pb2.LoadModelRequest.SerializeToString,
+                response_deserializer=vxpu__pb2.LoadModelResponse.FromString,
+                _registered_method=True)
+        self.NewSession = channel.unary_unary(
+                '/vxpu.Executor/NewSession',
+                request_serializer=vxpu__pb2.NewSessionRequest.SerializeToString,
+                response_deserializer=vxpu__pb2.NewSessionResponse.FromString,
+                _registered_method=True)
+        self.ExecuteChat = channel.unary_unary(
+                '/vxpu.Executor/ExecuteChat',
+                request_serializer=vxpu__pb2.ExecuteChatRequest.SerializeToString,
+                response_deserializer=vxpu__pb2.ExecuteChatResponse.FromString,
+                _registered_method=True)
+        self.Execute = channel.unary_stream(
+                '/vxpu.Executor/Execute',
+                request_serializer=vxpu__pb2.ExecuteRequest.SerializeToString,
+                response_deserializer=vxpu__pb2.ExecuteResponse.FromString,
+                _registered_method=True)
+        self.Describe = channel.unary_unary(
+                '/vxpu.Executor/Describe',
+                request_serializer=vxpu__pb2.DescribeRequest.SerializeToString,
+                response_deserializer=vxpu__pb2.DescribeResponse.FromString,
+                _registered_method=True)
+        self.DescribeNodes = channel.unary_unary(
+                '/vxpu.Executor/DescribeNodes',
+                request_serializer=vxpu__pb2.DescribeNodesRequest.SerializeToString,
+                response_deserializer=vxpu__pb2.DescribeNodesResponse.FromString,
+                _registered_method=True)
+        self.ServeNodes = channel.unary_unary(
+                '/vxpu.Executor/ServeNodes',
+                request_serializer=vxpu__pb2.ServeNodesRequest.SerializeToString,
+                response_deserializer=vxpu__pb2.ServeNodesResponse.FromString,
+                _registered_method=True)
+        self.ServeRange = channel.unary_unary(
+                '/vxpu.Executor/ServeRange',
+                request_serializer=vxpu__pb2.ServeRangeRequest.SerializeToString,
+                response_deserializer=vxpu__pb2.ServeRangeResponse.FromString,
+                _registered_method=True)
+
+
+class ExecutorServicer:
+    """Executor is the internal router-to-executor service.
+    The router (and later the planner/coordinator) calls Executor on executor pods
+    for model loading, execution, telemetry, node serving, and plan inspection.
+    It can change freely with the router and executors, which ship together.
+    """
+
+    def LoadModel(self, request, context):
+        """LoadModel ships the artifact. Idempotent: the artifact's content
+        digest identifies the model, and a matching digest reuses the
+        already-loaded engine.
+        """
+        context.set_code(grpc.StatusCode.UNIMPLEMENTED)
+        context.set_details('Method not implemented!')
+        raise NotImplementedError('Method not implemented!')
+
+    def NewSession(self, request, context):
+        """NewSession allocates fresh per-session state (KV cache).
+        """
+        context.set_code(grpc.StatusCode.UNIMPLEMENTED)
+        context.set_details('Method not implemented!')
+        raise NotImplementedError('Method not implemented!')
+
+    def ExecuteChat(self, request, context):
+        """ExecuteChat runs one conversation turn in a session, returning execution
+        telemetry when requested.
+        """
+        context.set_code(grpc.StatusCode.UNIMPLEMENTED)
+        context.set_details('Method not implemented!')
+        raise NotImplementedError('Method not implemented!')
+
+    def Execute(self, request, context):
+        """Execute runs the token generation loop on the executor, optionally
+        returning execution telemetry on the final message.
+        """
+        context.set_code(grpc.StatusCode.UNIMPLEMENTED)
+        context.set_details('Method not implemented!')
+        raise NotImplementedError('Method not implemented!')
+
+    def Describe(self, request, context):
+        """Describe reports what the executor runs on: its probe of the machine,
+        for the coordinator's machine database (#394). Answers with or without a model loaded.
+        """
+        context.set_code(grpc.StatusCode.UNIMPLEMENTED)
+        context.set_details('Method not implemented!')
+        raise NotImplementedError('Method not implemented!')
+
+    def DescribeNodes(self, request, context):
+        """DescribeNodes describes an artifact's decode step as a dataflow graph:
+        its nodes in call order, and for a host node what it reads and how many bytes that is (#394).
+        """
+        context.set_code(grpc.StatusCode.UNIMPLEMENTED)
+        context.set_details('Method not implemented!')
+        raise NotImplementedError('Method not implemented!')
+
+    def ServeNodes(self, request, context):
+        """ServeNodes serves some of an artifact's decode-step nodes on a port of this machine.
+        """
+        context.set_code(grpc.StatusCode.UNIMPLEMENTED)
+        context.set_details('Method not implemented!')
+        raise NotImplementedError('Method not implemented!')
+
+    def ServeRange(self, request, context):
+        """ServeRange serves the loaded engine's range of whole layers on a port of this machine (#387).
+        """
+        context.set_code(grpc.StatusCode.UNIMPLEMENTED)
+        context.set_details('Method not implemented!')
+        raise NotImplementedError('Method not implemented!')
+
+
+def add_ExecutorServicer_to_server(servicer, server):
+    rpc_method_handlers = {
+            'LoadModel': grpc.unary_unary_rpc_method_handler(
+                    servicer.LoadModel,
+                    request_deserializer=vxpu__pb2.LoadModelRequest.FromString,
+                    response_serializer=vxpu__pb2.LoadModelResponse.SerializeToString,
+            ),
+            'NewSession': grpc.unary_unary_rpc_method_handler(
+                    servicer.NewSession,
+                    request_deserializer=vxpu__pb2.NewSessionRequest.FromString,
+                    response_serializer=vxpu__pb2.NewSessionResponse.SerializeToString,
+            ),
+            'ExecuteChat': grpc.unary_unary_rpc_method_handler(
+                    servicer.ExecuteChat,
+                    request_deserializer=vxpu__pb2.ExecuteChatRequest.FromString,
+                    response_serializer=vxpu__pb2.ExecuteChatResponse.SerializeToString,
+            ),
+            'Execute': grpc.unary_stream_rpc_method_handler(
+                    servicer.Execute,
+                    request_deserializer=vxpu__pb2.ExecuteRequest.FromString,
+                    response_serializer=vxpu__pb2.ExecuteResponse.SerializeToString,
+            ),
+            'Describe': grpc.unary_unary_rpc_method_handler(
+                    servicer.Describe,
+                    request_deserializer=vxpu__pb2.DescribeRequest.FromString,
+                    response_serializer=vxpu__pb2.DescribeResponse.SerializeToString,
+            ),
+            'DescribeNodes': grpc.unary_unary_rpc_method_handler(
+                    servicer.DescribeNodes,
+                    request_deserializer=vxpu__pb2.DescribeNodesRequest.FromString,
+                    response_serializer=vxpu__pb2.DescribeNodesResponse.SerializeToString,
+            ),
+            'ServeNodes': grpc.unary_unary_rpc_method_handler(
+                    servicer.ServeNodes,
+                    request_deserializer=vxpu__pb2.ServeNodesRequest.FromString,
+                    response_serializer=vxpu__pb2.ServeNodesResponse.SerializeToString,
+            ),
+            'ServeRange': grpc.unary_unary_rpc_method_handler(
+                    servicer.ServeRange,
+                    request_deserializer=vxpu__pb2.ServeRangeRequest.FromString,
+                    response_serializer=vxpu__pb2.ServeRangeResponse.SerializeToString,
+            ),
+    }
+    generic_handler = grpc.method_handlers_generic_handler(
+            'vxpu.Executor', rpc_method_handlers)
+    server.add_generic_rpc_handlers((generic_handler,))
+    server.add_registered_method_handlers('vxpu.Executor', rpc_method_handlers)
+
+
+ # This class is part of an EXPERIMENTAL API.
+class Executor:
+    """Executor is the internal router-to-executor service.
+    The router (and later the planner/coordinator) calls Executor on executor pods
+    for model loading, execution, telemetry, node serving, and plan inspection.
+    It can change freely with the router and executors, which ship together.
+    """
+
+    @staticmethod
+    def LoadModel(request,
+            target,
+            options=(),
+            channel_credentials=None,
+            call_credentials=None,
+            insecure=False,
+            compression=None,
+            wait_for_ready=None,
+            timeout=None,
+            metadata=None):
+        return grpc.experimental.unary_unary(
+            request,
+            target,
+            '/vxpu.Executor/LoadModel',
+            vxpu__pb2.LoadModelRequest.SerializeToString,
+            vxpu__pb2.LoadModelResponse.FromString,
             options,
             channel_credentials,
             insecure,
@@ -388,7 +640,7 @@ class Executor:
             _registered_method=True)
 
     @staticmethod
-    def Chat(request,
+    def ExecuteChat(request,
             target,
             options=(),
             channel_credentials=None,
@@ -401,9 +653,9 @@ class Executor:
         return grpc.experimental.unary_unary(
             request,
             target,
-            '/vxpu.Executor/Chat',
-            vxpu__pb2.ChatRequest.SerializeToString,
-            vxpu__pb2.ChatResponse.FromString,
+            '/vxpu.Executor/ExecuteChat',
+            vxpu__pb2.ExecuteChatRequest.SerializeToString,
+            vxpu__pb2.ExecuteChatResponse.FromString,
             options,
             channel_credentials,
             insecure,
@@ -415,7 +667,7 @@ class Executor:
             _registered_method=True)
 
     @staticmethod
-    def Generate(request,
+    def Execute(request,
             target,
             options=(),
             channel_credentials=None,
@@ -428,36 +680,9 @@ class Executor:
         return grpc.experimental.unary_stream(
             request,
             target,
-            '/vxpu.Executor/Generate',
-            vxpu__pb2.GenerateRequest.SerializeToString,
-            vxpu__pb2.GenerateResponse.FromString,
-            options,
-            channel_credentials,
-            insecure,
-            call_credentials,
-            compression,
-            wait_for_ready,
-            timeout,
-            metadata,
-            _registered_method=True)
-
-    @staticmethod
-    def GetModelStats(request,
-            target,
-            options=(),
-            channel_credentials=None,
-            call_credentials=None,
-            insecure=False,
-            compression=None,
-            wait_for_ready=None,
-            timeout=None,
-            metadata=None):
-        return grpc.experimental.unary_unary(
-            request,
-            target,
-            '/vxpu.Executor/GetModelStats',
-            vxpu__pb2.GetModelStatsRequest.SerializeToString,
-            vxpu__pb2.GetModelStatsResponse.FromString,
+            '/vxpu.Executor/Execute',
+            vxpu__pb2.ExecuteRequest.SerializeToString,
+            vxpu__pb2.ExecuteResponse.FromString,
             options,
             channel_credentials,
             insecure,
@@ -485,33 +710,6 @@ class Executor:
             '/vxpu.Executor/Describe',
             vxpu__pb2.DescribeRequest.SerializeToString,
             vxpu__pb2.DescribeResponse.FromString,
-            options,
-            channel_credentials,
-            insecure,
-            call_credentials,
-            compression,
-            wait_for_ready,
-            timeout,
-            metadata,
-            _registered_method=True)
-
-    @staticmethod
-    def ExplainModel(request,
-            target,
-            options=(),
-            channel_credentials=None,
-            call_credentials=None,
-            insecure=False,
-            compression=None,
-            wait_for_ready=None,
-            timeout=None,
-            metadata=None):
-        return grpc.experimental.unary_unary(
-            request,
-            target,
-            '/vxpu.Executor/ExplainModel',
-            vxpu__pb2.ExplainModelRequest.SerializeToString,
-            vxpu__pb2.ExplainModelResponse.FromString,
             options,
             channel_credentials,
             insecure,

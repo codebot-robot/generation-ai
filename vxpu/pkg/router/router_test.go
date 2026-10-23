@@ -98,25 +98,6 @@ func TestWrappedSessionIDParsing(t *testing.T) {
 	}
 }
 
-func TestBackendChatRequest_ForwardsAllFields(t *testing.T) {
-	req := &pb.ChatRequest{
-		SessionId:    "abcdef123456:s7",
-		Text:         "<bos><|turn>user\nhi<turn|>",
-		MaxNewTokens: 42,
-		RawPrompt:    true,
-	}
-	got := backendChatRequest(req, "s7")
-	if got.SessionId != "s7" {
-		t.Errorf("expected backend session id s7, got %q", got.SessionId)
-	}
-	if got.Text != req.Text || got.MaxNewTokens != 42 || !got.RawPrompt {
-		t.Errorf("request fields not forwarded: %+v", got)
-	}
-	if req.SessionId != "abcdef123456:s7" {
-		t.Error("client request must not be mutated")
-	}
-}
-
 func TestGetPeerKey(t *testing.T) {
 	// Test without peer info
 	ctx := t.Context()
@@ -212,7 +193,7 @@ func TestGetOrStartPod_RecreatesMismatchedPod(t *testing.T) {
 	stale := &corev1.Pod{
 		ObjectMeta: metav1.ObjectMeta{
 			Name: podName, Namespace: "ns",
-			Annotations: placementAnnotations(PlanPlacement("nvidia-l4", 16_000_000_000)),
+			Annotations: placementAnnotations(PlanPlacement("nvidia-l4", 16_000_000_000), "img"),
 		},
 		Status: corev1.PodStatus{Phase: corev1.PodRunning, PodIP: "10.0.0.1"},
 	}
@@ -238,7 +219,7 @@ func TestGetOrStartPod_RecreatesMismatchedPod(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if !placementMatches(pod, want) || pod.Spec.NodeSelector != nil {
+	if !placementMatches(pod, want, "img") || pod.Spec.NodeSelector != nil {
 		t.Errorf("recreated pod should carry the CPU placement, got annotations %v selector %v",
 			pod.Annotations, pod.Spec.NodeSelector)
 	}
@@ -250,8 +231,60 @@ func TestGetOrStartPod_RecreatesMismatchedPod(t *testing.T) {
 	}
 	// Legacy pods without annotations are kept.
 	legacy := &corev1.Pod{ObjectMeta: metav1.ObjectMeta{Name: "x"}}
-	if !placementMatches(legacy, want) {
+	if !placementMatches(legacy, want, "img") {
 		t.Error("pods without placement annotations must be kept")
+	}
+}
+
+func TestGetOrStartPod_RecreatesMismatchedImage(t *testing.T) {
+	modelKey := "test-model"
+	podName := "vxpu-executor-" + modelKey
+	want := PlanPlacement("nvidia-l4", 16_000_000_000)
+
+	stale := &corev1.Pod{
+		ObjectMeta: metav1.ObjectMeta{
+			Name: podName, Namespace: "ns",
+			Annotations: placementAnnotations(want, "gcr.io/gke-labs/vxpu-executor:v0.1.0"),
+		},
+		Spec: corev1.PodSpec{
+			Containers: []corev1.Container{{Name: "executor", Image: "gcr.io/gke-labs/vxpu-executor:v0.1.0"}},
+		},
+		Status: corev1.PodStatus{Phase: corev1.PodRunning, PodIP: "10.0.0.1"},
+	}
+	clientset := fake.NewSimpleClientset(stale)
+	clientset.PrependReactor("create", "pods", func(action k8stesting.Action) (bool, runtime.Object, error) {
+		pod := action.(k8stesting.CreateAction).GetObject().(*corev1.Pod)
+		pod.Status = corev1.PodStatus{Phase: corev1.PodRunning, PodIP: "10.0.0.2"}
+		return false, nil, nil
+	})
+	newImage := "gcr.io/gke-labs/vxpu-executor:v0.2.0"
+	s := NewServer(clientset, "ns", newImage, "nvidia-l4")
+
+	ip, err := s.getOrStartPod(t.Context(), modelKey, &want)
+	if err != nil {
+		t.Fatalf("getOrStartPod: %v", err)
+	}
+	if ip != "10.0.0.2" {
+		t.Errorf("expected recreated pod IP 10.0.0.2, got %q", ip)
+	}
+	pod, err := clientset.CoreV1().Pods("ns").Get(t.Context(), podName, metav1.GetOptions{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if pod.Annotations[annotationImage] != newImage {
+		t.Errorf("expected recreated pod annotation %q, got %q", newImage, pod.Annotations[annotationImage])
+	}
+	if len(pod.Spec.Containers) == 0 || pod.Spec.Containers[0].Image != newImage {
+		t.Errorf("expected recreated pod container image %q, got %v", newImage, pod.Spec.Containers)
+	}
+}
+
+func TestGetOrStartPod_FailsWithoutExecutorImage(t *testing.T) {
+	s := NewServer(fake.NewSimpleClientset(), "ns", "", "nvidia-l4")
+	want := PlanPlacement("nvidia-l4", 16_000_000_000)
+	_, err := s.getOrStartPod(t.Context(), "model", &want)
+	if err == nil || !strings.Contains(err.Error(), "no executor image configured") {
+		t.Errorf("expected error about missing executor image, got %v", err)
 	}
 }
 
@@ -264,17 +297,20 @@ type fakeExecutor struct {
 	gotTelemetry bool
 }
 
-func (f *fakeExecutor) Generate(req *pb.GenerateRequest, stream grpc.ServerStreamingServer[pb.GenerateResponse]) error {
-	f.gotSession = req.SessionId
-	f.gotIDs = req.InputIds
-	f.gotTopK = req.TopK
+func (f *fakeExecutor) Execute(req *pb.ExecuteRequest, stream grpc.ServerStreamingServer[pb.ExecuteResponse]) error {
+	reqInner := req.GetRequest()
+	if reqInner != nil {
+		f.gotSession = reqInner.SessionId
+		f.gotIDs = reqInner.InputIds
+		f.gotTopK = reqInner.TopK
+	}
 	f.gotTelemetry = req.GetTelemetry()
 	for _, id := range []int32{7, 8, 9} {
-		if err := stream.Send(&pb.GenerateResponse{TokenIds: []int32{id}}); err != nil {
+		if err := stream.Send(&pb.ExecuteResponse{Response: &pb.GenerateResponse{TokenIds: []int32{id}}}); err != nil {
 			return err
 		}
 	}
-	final := &pb.GenerateResponse{Done: true, FinishReason: "eos", Generated: 3}
+	final := &pb.ExecuteResponse{Response: &pb.GenerateResponse{Done: true, FinishReason: "eos", Generated: 3}}
 	if req.GetTelemetry() {
 		final.TelemetryJson = `{"format": "vxpu-telemetry/1"}`
 	}
@@ -304,13 +340,13 @@ func TestGenerate_ProxiesStreamToExecutor(t *testing.T) {
 	router := NewServer(fake.NewSimpleClientset(pod), "default", "img", "")
 	router.executorPort = lis.Addr().(*net.TCPAddr).Port
 
-	// Router on its own loopback port.
+	// Public listener serves only Engine.
 	rlis, err := net.Listen("tcp", "127.0.0.1:0")
 	if err != nil {
 		t.Fatal(err)
 	}
 	routerSrv := grpc.NewServer()
-	pb.RegisterExecutorServer(routerSrv, router)
+	pb.RegisterEngineServer(routerSrv, router)
 	go func() { _ = routerSrv.Serve(rlis) }()
 	defer routerSrv.Stop()
 
@@ -319,10 +355,10 @@ func TestGenerate_ProxiesStreamToExecutor(t *testing.T) {
 		t.Fatal(err)
 	}
 	defer conn.Close()
-	topK, maxNew, telemetry := int32(5), int32(3), true
-	stream, err := pb.NewExecutorClient(conn).Generate(ctx, &pb.GenerateRequest{
+
+	topK, maxNew := int32(5), int32(3)
+	stream, err := pb.NewEngineClient(conn).Generate(ctx, &pb.GenerateRequest{
 		SessionId: modelKey + ":s3", InputIds: []int32{1, 2, 3}, MaxNewTokens: &maxNew, TopK: &topK,
-		Telemetry: &telemetry,
 	})
 	if err != nil {
 		t.Fatal(err)
@@ -348,8 +384,90 @@ func TestGenerate_ProxiesStreamToExecutor(t *testing.T) {
 	if done == nil || done.FinishReason != "eos" || done.Generated != 3 {
 		t.Errorf("final message not forwarded: %+v", done)
 	}
-	// execution telemetry rides on the stream: the request's flag reaches
-	// the executor and the final message's JSON reaches the client
+	// Client Generate API carries no telemetry
+	if executor.gotTelemetry {
+		t.Errorf("executor should not see a telemetry request from client Generate")
+	}
+	if executor.gotSession != "s3" {
+		t.Errorf("executor should see the backend session id, got %q", executor.gotSession)
+	}
+	if len(executor.gotIDs) != 3 || executor.gotTopK == nil || *executor.gotTopK != 5 {
+		t.Errorf("request fields not forwarded: ids=%v topK=%v", executor.gotIDs, executor.gotTopK)
+	}
+}
+
+func TestExecute_ProxiesStreamWithTelemetry(t *testing.T) {
+	ctx := t.Context()
+
+	// Fake executor on a loopback port.
+	lis, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	executor := &fakeExecutor{}
+	executorSrv := grpc.NewServer()
+	pb.RegisterExecutorServer(executorSrv, executor)
+	go func() { _ = executorSrv.Serve(lis) }()
+	defer executorSrv.Stop()
+
+	// A running executor pod whose IP is the loopback.
+	modelKey := "abc123"
+	pod := &corev1.Pod{
+		ObjectMeta: metav1.ObjectMeta{Name: "vxpu-executor-" + modelKey, Namespace: "default"},
+		Status:     corev1.PodStatus{Phase: corev1.PodRunning, PodIP: "127.0.0.1"},
+	}
+	router := NewServer(fake.NewSimpleClientset(pod), "default", "img", "")
+	router.executorPort = lis.Addr().(*net.TCPAddr).Port
+
+	// Admin listener serves Executor.
+	adminLis, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	adminSrv := grpc.NewServer()
+	pb.RegisterExecutorServer(adminSrv, router)
+	go func() { _ = adminSrv.Serve(adminLis) }()
+	defer adminSrv.Stop()
+
+	adminConn, err := grpc.NewClient(adminLis.Addr().String(), grpc.WithTransportCredentials(insecure.NewCredentials()))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer adminConn.Close()
+	topK, maxNew, telemetry := int32(5), int32(3), true
+	stream, err := pb.NewExecutorClient(adminConn).Execute(ctx, &pb.ExecuteRequest{
+		Request: &pb.GenerateRequest{
+			SessionId: modelKey + ":s3", InputIds: []int32{1, 2, 3}, MaxNewTokens: &maxNew, TopK: &topK,
+		},
+		Telemetry: &telemetry,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	var got []int32
+	var done *pb.ExecuteResponse
+	for {
+		resp, err := stream.Recv()
+		if err == io.EOF {
+			break
+		}
+		if err != nil {
+			t.Fatalf("recv: %v", err)
+		}
+		if resp.GetResponse() != nil {
+			got = append(got, resp.GetResponse().TokenIds...)
+			if resp.GetResponse().Done {
+				done = resp
+			}
+		}
+	}
+	if len(got) != 3 || got[0] != 7 || got[2] != 9 {
+		t.Errorf("expected streamed ids [7 8 9], got %v", got)
+	}
+	if done == nil || done.GetResponse().GetFinishReason() != "eos" || done.GetResponse().GetGenerated() != 3 {
+		t.Errorf("final message not forwarded: %+v", done)
+	}
+	// Execution telemetry rides on the Execute stream
 	if !executor.gotTelemetry {
 		t.Errorf("executor should see the telemetry request")
 	}
@@ -361,6 +479,69 @@ func TestGenerate_ProxiesStreamToExecutor(t *testing.T) {
 	}
 	if len(executor.gotIDs) != 3 || executor.gotTopK == nil || *executor.gotTopK != 5 {
 		t.Errorf("request fields not forwarded: ids=%v topK=%v", executor.gotIDs, executor.gotTopK)
+	}
+}
+
+// TestPublicListenerServesNoExecutorMethods verifies that the router's public
+// listener serves exclusively the Engine service and rejects all Executor calls.
+func TestPublicListenerServesNoExecutorMethods(t *testing.T) {
+	ctx := t.Context()
+
+	router := NewServer(fake.NewSimpleClientset(), "default", "img", "")
+	rlis, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	routerSrv := grpc.NewServer()
+	pb.RegisterEngineServer(routerSrv, router)
+	go func() { _ = routerSrv.Serve(rlis) }()
+	defer routerSrv.Stop()
+
+	conn, err := grpc.NewClient(rlis.Addr().String(), grpc.WithTransportCredentials(insecure.NewCredentials()))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer conn.Close()
+
+	client := pb.NewExecutorClient(conn)
+
+	// Execute
+	stream, err := client.Execute(ctx, &pb.ExecuteRequest{Request: &pb.GenerateRequest{SessionId: "m:s"}})
+	if err == nil {
+		_, err = stream.Recv()
+	}
+	if status.Code(err) != codes.Unimplemented {
+		t.Errorf("Execute on public listener should return Unimplemented, got %v", err)
+	}
+
+	// ExecuteChat
+	_, err = client.ExecuteChat(ctx, &pb.ExecuteChatRequest{Request: &pb.ChatRequest{SessionId: "m:s"}})
+	if status.Code(err) != codes.Unimplemented {
+		t.Errorf("ExecuteChat on public listener should return Unimplemented, got %v", err)
+	}
+
+	// Describe
+	_, err = client.Describe(ctx, &pb.DescribeRequest{})
+	if status.Code(err) != codes.Unimplemented {
+		t.Errorf("Describe on public listener should return Unimplemented, got %v", err)
+	}
+
+	// DescribeNodes
+	_, err = client.DescribeNodes(ctx, &pb.DescribeNodesRequest{})
+	if status.Code(err) != codes.Unimplemented {
+		t.Errorf("DescribeNodes on public listener should return Unimplemented, got %v", err)
+	}
+
+	// ServeNodes
+	_, err = client.ServeNodes(ctx, &pb.ServeNodesRequest{})
+	if status.Code(err) != codes.Unimplemented {
+		t.Errorf("ServeNodes on public listener should return Unimplemented, got %v", err)
+	}
+
+	// ServeRange
+	_, err = client.ServeRange(ctx, &pb.ServeRangeRequest{})
+	if status.Code(err) != codes.Unimplemented {
+		t.Errorf("ServeRange on public listener should return Unimplemented, got %v", err)
 	}
 }
 

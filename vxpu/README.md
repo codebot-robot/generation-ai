@@ -558,7 +558,7 @@ this table, not an invisible rewrite.
 ## Layout
 
 ```
-proto/        Executor gRPC API (LoadModel / NewSession / Chat)
+proto/        Engine (client) and Executor (internal) gRPC APIs
 python/vxpu/  export (thin client), client (thin client, no torch),
               modeling (transformers-shaped from_pretrained/generate),
               vectors (test vectors: record with any producer, compare),
@@ -568,7 +568,7 @@ cmd/vxpu/     Go CLI: no Python/torch — ships artifacts, creates the
               (`vxpu up` brings up just the router for other clients)
 cmd/vxpu-router/  in-cluster router: keeps weights in modelstore (or
               caches them itself), places and creates executor pods,
-              proxies the Executor API
+              proxies the Engine API to executors
 images/       executor and router container images
 examples/     notebooks (Gemma 4 on vXPU)
 third_party/  forked dependencies as submodules (transformers)

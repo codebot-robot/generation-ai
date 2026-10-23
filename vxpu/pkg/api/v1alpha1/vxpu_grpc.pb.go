@@ -33,14 +33,407 @@ import (
 const _ = grpc.SupportPackageIsVersion9
 
 const (
+	Engine_LoadModel_FullMethodName     = "/vxpu.Engine/LoadModel"
+	Engine_RegisterModel_FullMethodName = "/vxpu.Engine/RegisterModel"
+	Engine_NewSession_FullMethodName    = "/vxpu.Engine/NewSession"
+	Engine_Chat_FullMethodName          = "/vxpu.Engine/Chat"
+	Engine_Generate_FullMethodName      = "/vxpu.Engine/Generate"
+	Engine_GetModelStats_FullMethodName = "/vxpu.Engine/GetModelStats"
+	Engine_ExplainModel_FullMethodName  = "/vxpu.Engine/ExplainModel"
+)
+
+// EngineClient is the client API for Engine service.
+//
+// For semantics around ctx use and closing/ending streaming RPCs, please refer to https://pkg.go.dev/google.golang.org/grpc/?tab=doc#ClientConn.NewStream.
+//
+// Engine is the client-facing service for vXPU. Clients (the vxpu CLI,
+// Python client, and transformers AutoModel facade) call Engine on the
+// router for session management, chat, generation, and model metadata.
+// It is stable, versioned with care, and carries no engine internals.
+type EngineClient interface {
+	// LoadModel ships the artifact. Idempotent: the artifact's content
+	// digest identifies the model, and a matching digest reuses the
+	// already-loaded engine.
+	LoadModel(ctx context.Context, in *LoadModelRequest, opts ...grpc.CallOption) (*LoadModelResponse, error)
+	// RegisterModel makes a model servable by name: the router imports
+	// the weights into modelstore and compiles the model for its executor
+	// image (a compile job exporting the artifact into modelstore), unless
+	// that was done before. Blocks until the model is registered;
+	// idempotent.
+	RegisterModel(ctx context.Context, in *RegisterModelRequest, opts ...grpc.CallOption) (*RegisterModelResponse, error)
+	// NewSession allocates fresh per-session state (KV cache). With a
+	// model name, the router loads that registered model if needed; while
+	// it loads, NewSession fails with FAILED_PRECONDITION and the caller
+	// retries.
+	NewSession(ctx context.Context, in *NewSessionRequest, opts ...grpc.CallOption) (*NewSessionResponse, error)
+	// Chat runs one conversation turn in a session. Multi-turn reuses
+	// the session's cache: only new suffix tokens are prefilled.
+	Chat(ctx context.Context, in *ChatRequest, opts ...grpc.CallOption) (*ChatResponse, error)
+	// Generate is transformers' generate() over the wire: the client
+	// owns the tokenizer and sends the full prompt as token ids; the
+	// router forwards the call to an executor, which runs the same torch
+	// loop (prefill, decode, HF-style sampling) in the session and
+	// streams back the new ids. The session's cache is reused for
+	// whatever prefix matches.
+	Generate(ctx context.Context, in *GenerateRequest, opts ...grpc.CallOption) (grpc.ServerStreamingClient[GenerateResponse], error)
+	// GetModelStats summarises what the engine recorded about a model
+	// served by name: every request's statistics, and the execution
+	// telemetry of the requests it sampled (kept in modelstore, so they
+	// outlive the router).
+	GetModelStats(ctx context.Context, in *GetModelStatsRequest, opts ...grpc.CallOption) (*GetModelStatsResponse, error)
+	// ExplainModel returns the plan the coordinator chose for a model's
+	// last load by name, and why (#394).
+	ExplainModel(ctx context.Context, in *ExplainModelRequest, opts ...grpc.CallOption) (*ExplainModelResponse, error)
+}
+
+type engineClient struct {
+	cc grpc.ClientConnInterface
+}
+
+func NewEngineClient(cc grpc.ClientConnInterface) EngineClient {
+	return &engineClient{cc}
+}
+
+func (c *engineClient) LoadModel(ctx context.Context, in *LoadModelRequest, opts ...grpc.CallOption) (*LoadModelResponse, error) {
+	cOpts := append([]grpc.CallOption{grpc.StaticMethod()}, opts...)
+	out := new(LoadModelResponse)
+	err := c.cc.Invoke(ctx, Engine_LoadModel_FullMethodName, in, out, cOpts...)
+	if err != nil {
+		return nil, err
+	}
+	return out, nil
+}
+
+func (c *engineClient) RegisterModel(ctx context.Context, in *RegisterModelRequest, opts ...grpc.CallOption) (*RegisterModelResponse, error) {
+	cOpts := append([]grpc.CallOption{grpc.StaticMethod()}, opts...)
+	out := new(RegisterModelResponse)
+	err := c.cc.Invoke(ctx, Engine_RegisterModel_FullMethodName, in, out, cOpts...)
+	if err != nil {
+		return nil, err
+	}
+	return out, nil
+}
+
+func (c *engineClient) NewSession(ctx context.Context, in *NewSessionRequest, opts ...grpc.CallOption) (*NewSessionResponse, error) {
+	cOpts := append([]grpc.CallOption{grpc.StaticMethod()}, opts...)
+	out := new(NewSessionResponse)
+	err := c.cc.Invoke(ctx, Engine_NewSession_FullMethodName, in, out, cOpts...)
+	if err != nil {
+		return nil, err
+	}
+	return out, nil
+}
+
+func (c *engineClient) Chat(ctx context.Context, in *ChatRequest, opts ...grpc.CallOption) (*ChatResponse, error) {
+	cOpts := append([]grpc.CallOption{grpc.StaticMethod()}, opts...)
+	out := new(ChatResponse)
+	err := c.cc.Invoke(ctx, Engine_Chat_FullMethodName, in, out, cOpts...)
+	if err != nil {
+		return nil, err
+	}
+	return out, nil
+}
+
+func (c *engineClient) Generate(ctx context.Context, in *GenerateRequest, opts ...grpc.CallOption) (grpc.ServerStreamingClient[GenerateResponse], error) {
+	cOpts := append([]grpc.CallOption{grpc.StaticMethod()}, opts...)
+	stream, err := c.cc.NewStream(ctx, &Engine_ServiceDesc.Streams[0], Engine_Generate_FullMethodName, cOpts...)
+	if err != nil {
+		return nil, err
+	}
+	x := &grpc.GenericClientStream[GenerateRequest, GenerateResponse]{ClientStream: stream}
+	if err := x.ClientStream.SendMsg(in); err != nil {
+		return nil, err
+	}
+	if err := x.ClientStream.CloseSend(); err != nil {
+		return nil, err
+	}
+	return x, nil
+}
+
+// This type alias is provided for backwards compatibility with existing code that references the prior non-generic stream type by name.
+type Engine_GenerateClient = grpc.ServerStreamingClient[GenerateResponse]
+
+func (c *engineClient) GetModelStats(ctx context.Context, in *GetModelStatsRequest, opts ...grpc.CallOption) (*GetModelStatsResponse, error) {
+	cOpts := append([]grpc.CallOption{grpc.StaticMethod()}, opts...)
+	out := new(GetModelStatsResponse)
+	err := c.cc.Invoke(ctx, Engine_GetModelStats_FullMethodName, in, out, cOpts...)
+	if err != nil {
+		return nil, err
+	}
+	return out, nil
+}
+
+func (c *engineClient) ExplainModel(ctx context.Context, in *ExplainModelRequest, opts ...grpc.CallOption) (*ExplainModelResponse, error) {
+	cOpts := append([]grpc.CallOption{grpc.StaticMethod()}, opts...)
+	out := new(ExplainModelResponse)
+	err := c.cc.Invoke(ctx, Engine_ExplainModel_FullMethodName, in, out, cOpts...)
+	if err != nil {
+		return nil, err
+	}
+	return out, nil
+}
+
+// EngineServer is the server API for Engine service.
+// All implementations must embed UnimplementedEngineServer
+// for forward compatibility.
+//
+// Engine is the client-facing service for vXPU. Clients (the vxpu CLI,
+// Python client, and transformers AutoModel facade) call Engine on the
+// router for session management, chat, generation, and model metadata.
+// It is stable, versioned with care, and carries no engine internals.
+type EngineServer interface {
+	// LoadModel ships the artifact. Idempotent: the artifact's content
+	// digest identifies the model, and a matching digest reuses the
+	// already-loaded engine.
+	LoadModel(context.Context, *LoadModelRequest) (*LoadModelResponse, error)
+	// RegisterModel makes a model servable by name: the router imports
+	// the weights into modelstore and compiles the model for its executor
+	// image (a compile job exporting the artifact into modelstore), unless
+	// that was done before. Blocks until the model is registered;
+	// idempotent.
+	RegisterModel(context.Context, *RegisterModelRequest) (*RegisterModelResponse, error)
+	// NewSession allocates fresh per-session state (KV cache). With a
+	// model name, the router loads that registered model if needed; while
+	// it loads, NewSession fails with FAILED_PRECONDITION and the caller
+	// retries.
+	NewSession(context.Context, *NewSessionRequest) (*NewSessionResponse, error)
+	// Chat runs one conversation turn in a session. Multi-turn reuses
+	// the session's cache: only new suffix tokens are prefilled.
+	Chat(context.Context, *ChatRequest) (*ChatResponse, error)
+	// Generate is transformers' generate() over the wire: the client
+	// owns the tokenizer and sends the full prompt as token ids; the
+	// router forwards the call to an executor, which runs the same torch
+	// loop (prefill, decode, HF-style sampling) in the session and
+	// streams back the new ids. The session's cache is reused for
+	// whatever prefix matches.
+	Generate(*GenerateRequest, grpc.ServerStreamingServer[GenerateResponse]) error
+	// GetModelStats summarises what the engine recorded about a model
+	// served by name: every request's statistics, and the execution
+	// telemetry of the requests it sampled (kept in modelstore, so they
+	// outlive the router).
+	GetModelStats(context.Context, *GetModelStatsRequest) (*GetModelStatsResponse, error)
+	// ExplainModel returns the plan the coordinator chose for a model's
+	// last load by name, and why (#394).
+	ExplainModel(context.Context, *ExplainModelRequest) (*ExplainModelResponse, error)
+	mustEmbedUnimplementedEngineServer()
+}
+
+// UnimplementedEngineServer must be embedded to have
+// forward compatible implementations.
+//
+// NOTE: this should be embedded by value instead of pointer to avoid a nil
+// pointer dereference when methods are called.
+type UnimplementedEngineServer struct{}
+
+func (UnimplementedEngineServer) LoadModel(context.Context, *LoadModelRequest) (*LoadModelResponse, error) {
+	return nil, status.Error(codes.Unimplemented, "method LoadModel not implemented")
+}
+func (UnimplementedEngineServer) RegisterModel(context.Context, *RegisterModelRequest) (*RegisterModelResponse, error) {
+	return nil, status.Error(codes.Unimplemented, "method RegisterModel not implemented")
+}
+func (UnimplementedEngineServer) NewSession(context.Context, *NewSessionRequest) (*NewSessionResponse, error) {
+	return nil, status.Error(codes.Unimplemented, "method NewSession not implemented")
+}
+func (UnimplementedEngineServer) Chat(context.Context, *ChatRequest) (*ChatResponse, error) {
+	return nil, status.Error(codes.Unimplemented, "method Chat not implemented")
+}
+func (UnimplementedEngineServer) Generate(*GenerateRequest, grpc.ServerStreamingServer[GenerateResponse]) error {
+	return status.Error(codes.Unimplemented, "method Generate not implemented")
+}
+func (UnimplementedEngineServer) GetModelStats(context.Context, *GetModelStatsRequest) (*GetModelStatsResponse, error) {
+	return nil, status.Error(codes.Unimplemented, "method GetModelStats not implemented")
+}
+func (UnimplementedEngineServer) ExplainModel(context.Context, *ExplainModelRequest) (*ExplainModelResponse, error) {
+	return nil, status.Error(codes.Unimplemented, "method ExplainModel not implemented")
+}
+func (UnimplementedEngineServer) mustEmbedUnimplementedEngineServer() {}
+func (UnimplementedEngineServer) testEmbeddedByValue()                {}
+
+// UnsafeEngineServer may be embedded to opt out of forward compatibility for this service.
+// Use of this interface is not recommended, as added methods to EngineServer will
+// result in compilation errors.
+type UnsafeEngineServer interface {
+	mustEmbedUnimplementedEngineServer()
+}
+
+func RegisterEngineServer(s grpc.ServiceRegistrar, srv EngineServer) {
+	// If the following call panics, it indicates UnimplementedEngineServer was
+	// embedded by pointer and is nil.  This will cause panics if an
+	// unimplemented method is ever invoked, so we test this at initialization
+	// time to prevent it from happening at runtime later due to I/O.
+	if t, ok := srv.(interface{ testEmbeddedByValue() }); ok {
+		t.testEmbeddedByValue()
+	}
+	s.RegisterService(&Engine_ServiceDesc, srv)
+}
+
+func _Engine_LoadModel_Handler(srv interface{}, ctx context.Context, dec func(interface{}) error, interceptor grpc.UnaryServerInterceptor) (interface{}, error) {
+	in := new(LoadModelRequest)
+	if err := dec(in); err != nil {
+		return nil, err
+	}
+	if interceptor == nil {
+		return srv.(EngineServer).LoadModel(ctx, in)
+	}
+	info := &grpc.UnaryServerInfo{
+		Server:     srv,
+		FullMethod: Engine_LoadModel_FullMethodName,
+	}
+	handler := func(ctx context.Context, req interface{}) (interface{}, error) {
+		return srv.(EngineServer).LoadModel(ctx, req.(*LoadModelRequest))
+	}
+	return interceptor(ctx, in, info, handler)
+}
+
+func _Engine_RegisterModel_Handler(srv interface{}, ctx context.Context, dec func(interface{}) error, interceptor grpc.UnaryServerInterceptor) (interface{}, error) {
+	in := new(RegisterModelRequest)
+	if err := dec(in); err != nil {
+		return nil, err
+	}
+	if interceptor == nil {
+		return srv.(EngineServer).RegisterModel(ctx, in)
+	}
+	info := &grpc.UnaryServerInfo{
+		Server:     srv,
+		FullMethod: Engine_RegisterModel_FullMethodName,
+	}
+	handler := func(ctx context.Context, req interface{}) (interface{}, error) {
+		return srv.(EngineServer).RegisterModel(ctx, req.(*RegisterModelRequest))
+	}
+	return interceptor(ctx, in, info, handler)
+}
+
+func _Engine_NewSession_Handler(srv interface{}, ctx context.Context, dec func(interface{}) error, interceptor grpc.UnaryServerInterceptor) (interface{}, error) {
+	in := new(NewSessionRequest)
+	if err := dec(in); err != nil {
+		return nil, err
+	}
+	if interceptor == nil {
+		return srv.(EngineServer).NewSession(ctx, in)
+	}
+	info := &grpc.UnaryServerInfo{
+		Server:     srv,
+		FullMethod: Engine_NewSession_FullMethodName,
+	}
+	handler := func(ctx context.Context, req interface{}) (interface{}, error) {
+		return srv.(EngineServer).NewSession(ctx, req.(*NewSessionRequest))
+	}
+	return interceptor(ctx, in, info, handler)
+}
+
+func _Engine_Chat_Handler(srv interface{}, ctx context.Context, dec func(interface{}) error, interceptor grpc.UnaryServerInterceptor) (interface{}, error) {
+	in := new(ChatRequest)
+	if err := dec(in); err != nil {
+		return nil, err
+	}
+	if interceptor == nil {
+		return srv.(EngineServer).Chat(ctx, in)
+	}
+	info := &grpc.UnaryServerInfo{
+		Server:     srv,
+		FullMethod: Engine_Chat_FullMethodName,
+	}
+	handler := func(ctx context.Context, req interface{}) (interface{}, error) {
+		return srv.(EngineServer).Chat(ctx, req.(*ChatRequest))
+	}
+	return interceptor(ctx, in, info, handler)
+}
+
+func _Engine_Generate_Handler(srv interface{}, stream grpc.ServerStream) error {
+	m := new(GenerateRequest)
+	if err := stream.RecvMsg(m); err != nil {
+		return err
+	}
+	return srv.(EngineServer).Generate(m, &grpc.GenericServerStream[GenerateRequest, GenerateResponse]{ServerStream: stream})
+}
+
+// This type alias is provided for backwards compatibility with existing code that references the prior non-generic stream type by name.
+type Engine_GenerateServer = grpc.ServerStreamingServer[GenerateResponse]
+
+func _Engine_GetModelStats_Handler(srv interface{}, ctx context.Context, dec func(interface{}) error, interceptor grpc.UnaryServerInterceptor) (interface{}, error) {
+	in := new(GetModelStatsRequest)
+	if err := dec(in); err != nil {
+		return nil, err
+	}
+	if interceptor == nil {
+		return srv.(EngineServer).GetModelStats(ctx, in)
+	}
+	info := &grpc.UnaryServerInfo{
+		Server:     srv,
+		FullMethod: Engine_GetModelStats_FullMethodName,
+	}
+	handler := func(ctx context.Context, req interface{}) (interface{}, error) {
+		return srv.(EngineServer).GetModelStats(ctx, req.(*GetModelStatsRequest))
+	}
+	return interceptor(ctx, in, info, handler)
+}
+
+func _Engine_ExplainModel_Handler(srv interface{}, ctx context.Context, dec func(interface{}) error, interceptor grpc.UnaryServerInterceptor) (interface{}, error) {
+	in := new(ExplainModelRequest)
+	if err := dec(in); err != nil {
+		return nil, err
+	}
+	if interceptor == nil {
+		return srv.(EngineServer).ExplainModel(ctx, in)
+	}
+	info := &grpc.UnaryServerInfo{
+		Server:     srv,
+		FullMethod: Engine_ExplainModel_FullMethodName,
+	}
+	handler := func(ctx context.Context, req interface{}) (interface{}, error) {
+		return srv.(EngineServer).ExplainModel(ctx, req.(*ExplainModelRequest))
+	}
+	return interceptor(ctx, in, info, handler)
+}
+
+// Engine_ServiceDesc is the grpc.ServiceDesc for Engine service.
+// It's only intended for direct use with grpc.RegisterService,
+// and not to be introspected or modified (even as a copy)
+var Engine_ServiceDesc = grpc.ServiceDesc{
+	ServiceName: "vxpu.Engine",
+	HandlerType: (*EngineServer)(nil),
+	Methods: []grpc.MethodDesc{
+		{
+			MethodName: "LoadModel",
+			Handler:    _Engine_LoadModel_Handler,
+		},
+		{
+			MethodName: "RegisterModel",
+			Handler:    _Engine_RegisterModel_Handler,
+		},
+		{
+			MethodName: "NewSession",
+			Handler:    _Engine_NewSession_Handler,
+		},
+		{
+			MethodName: "Chat",
+			Handler:    _Engine_Chat_Handler,
+		},
+		{
+			MethodName: "GetModelStats",
+			Handler:    _Engine_GetModelStats_Handler,
+		},
+		{
+			MethodName: "ExplainModel",
+			Handler:    _Engine_ExplainModel_Handler,
+		},
+	},
+	Streams: []grpc.StreamDesc{
+		{
+			StreamName:    "Generate",
+			Handler:       _Engine_Generate_Handler,
+			ServerStreams: true,
+		},
+	},
+	Metadata: "proto/vxpu.proto",
+}
+
+const (
 	Executor_LoadModel_FullMethodName     = "/vxpu.Executor/LoadModel"
-	Executor_RegisterModel_FullMethodName = "/vxpu.Executor/RegisterModel"
 	Executor_NewSession_FullMethodName    = "/vxpu.Executor/NewSession"
-	Executor_Chat_FullMethodName          = "/vxpu.Executor/Chat"
-	Executor_Generate_FullMethodName      = "/vxpu.Executor/Generate"
-	Executor_GetModelStats_FullMethodName = "/vxpu.Executor/GetModelStats"
+	Executor_ExecuteChat_FullMethodName   = "/vxpu.Executor/ExecuteChat"
+	Executor_Execute_FullMethodName       = "/vxpu.Executor/Execute"
 	Executor_Describe_FullMethodName      = "/vxpu.Executor/Describe"
-	Executor_ExplainModel_FullMethodName  = "/vxpu.Executor/ExplainModel"
 	Executor_DescribeNodes_FullMethodName = "/vxpu.Executor/DescribeNodes"
 	Executor_ServeNodes_FullMethodName    = "/vxpu.Executor/ServeNodes"
 	Executor_ServeRange_FullMethodName    = "/vxpu.Executor/ServeRange"
@@ -50,64 +443,52 @@ const (
 //
 // For semantics around ctx use and closing/ending streaming RPCs, please refer to https://pkg.go.dev/google.golang.org/grpc/?tab=doc#ClientConn.NewStream.
 //
-// Executor runs models shipped as vXPU artifacts: a content-addressed
-// manifest (architecture config + weight references), weightless
-// exported graphs, and a binding classifying every graph tensor as
-// bound (weight reference), derived (computed from config), or state
-// (session-owned, zero-initialized).
+// Executor is the internal router-to-executor service. The router (and
+// later the planner or coordinator) calls Executor on executor pods for
+// model loading, execution, telemetry, node serving, and plan inspection.
+// It can change freely with the router and executors, which ship together.
 //
-// The executor never receives weights over this API: it rehydrates
-// them from the manifest's content-addressed references.
+// Executor runs models shipped as vXPU artifacts: a content-addressed
+// manifest (architecture config + weight references), weightless exported
+// graphs, and a binding classifying every graph tensor as bound (weight
+// reference), derived (computed from config), or state (session-owned,
+// zero-initialized).
+//
+// The executor never receives weights over this API: it rehydrates them
+// from the manifest's content-addressed references.
 type ExecutorClient interface {
 	// LoadModel ships the artifact. Idempotent: the artifact's content
 	// digest identifies the model, and a matching digest reuses the
 	// already-loaded engine.
 	LoadModel(ctx context.Context, in *LoadModelRequest, opts ...grpc.CallOption) (*LoadModelResponse, error)
-	// RegisterModel makes a model servable by name (router only): the
-	// router imports the weights into modelstore and compiles the model
-	// for its executor image (a compile job exporting the artifact into
-	// modelstore), unless that was done before. Blocks until the model is
-	// registered; idempotent.
-	RegisterModel(ctx context.Context, in *RegisterModelRequest, opts ...grpc.CallOption) (*RegisterModelResponse, error)
-	// NewSession allocates fresh per-session state (KV cache). With a
-	// model name (router only), the router loads that registered model
-	// if needed; while it loads, NewSession fails with FAILED_PRECONDITION
-	// and the caller retries.
+	// NewSession allocates fresh per-session state (KV cache).
 	NewSession(ctx context.Context, in *NewSessionRequest, opts ...grpc.CallOption) (*NewSessionResponse, error)
-	// Chat runs one conversation turn in a session. Multi-turn reuses
-	// the session's cache: only new suffix tokens are prefilled.
-	Chat(ctx context.Context, in *ChatRequest, opts ...grpc.CallOption) (*ChatResponse, error)
-	// Generate is transformers' generate() over the wire: the client
-	// owns the tokenizer and sends the full prompt as token ids; the
-	// executor runs the same torch loop (prefill, decode, HF-style
-	// sampling) in the session and streams back the new ids. The
-	// session's cache is reused for whatever prefix matches.
-	Generate(ctx context.Context, in *GenerateRequest, opts ...grpc.CallOption) (grpc.ServerStreamingClient[GenerateResponse], error)
-	// GetModelStats (router only) summarises what the engine recorded
-	// about a model served by name: every request's statistics, and the
-	// execution telemetry of the requests it sampled (kept in modelstore,
-	// so they outlive the router).
-	GetModelStats(ctx context.Context, in *GetModelStatsRequest, opts ...grpc.CallOption) (*GetModelStatsResponse, error)
-	// Describe reports what the executor runs on (executor only): its probe
-	// of the machine, for the coordinator's machine database (#394).
-	// Answers with or without a model loaded.
+	// ExecuteChat runs one conversation turn in a session, returning
+	// execution telemetry when requested. Multi-turn reuses the session's
+	// cache: only new suffix tokens are prefilled.
+	ExecuteChat(ctx context.Context, in *ExecuteChatRequest, opts ...grpc.CallOption) (*ExecuteChatResponse, error)
+	// Execute runs transformers' generate() loop on the executor,
+	// optionally returning execution telemetry on the final message. The
+	// executor runs the torch loop (prefill, decode, HF-style sampling) in
+	// the session and streams back the new ids. The session's cache is
+	// reused for whatever prefix matches.
+	Execute(ctx context.Context, in *ExecuteRequest, opts ...grpc.CallOption) (grpc.ServerStreamingClient[ExecuteResponse], error)
+	// Describe reports what the executor runs on: its probe of the machine,
+	// for the coordinator's machine database (#394). Answers with or
+	// without a model loaded.
 	Describe(ctx context.Context, in *DescribeRequest, opts ...grpc.CallOption) (*DescribeResponse, error)
-	// ExplainModel (router only) returns the plan the coordinator chose for
-	// a model's last load by name, and why (#394).
-	ExplainModel(ctx context.Context, in *ExplainModelRequest, opts ...grpc.CallOption) (*ExplainModelResponse, error)
-	// DescribeNodes (executor only) describes an artifact's decode step as
-	// a dataflow graph: its nodes in call order, and for a host node what
-	// it reads and how many bytes that is (#394). The coordinator places
-	// nodes from it.
+	// DescribeNodes describes an artifact's decode step as a dataflow graph:
+	// its nodes in call order, and for a host node what it reads and how
+	// many bytes that is (#394). The coordinator places nodes from it.
 	DescribeNodes(ctx context.Context, in *DescribeNodesRequest, opts ...grpc.CallOption) (*DescribeNodesResponse, error)
-	// ServeNodes (executor only) serves some of an artifact's decode-step
-	// nodes on a port of this machine: a native node server (nodeserver.py)
-	// that answers their tcp:// mailboxes. Answers once they are loaded.
+	// ServeNodes serves some of an artifact's decode-step nodes on a port
+	// of this machine: a native node server (nodeserver.py) that answers
+	// their tcp:// mailboxes. Answers once they are loaded.
 	ServeNodes(ctx context.Context, in *ServeNodesRequest, opts ...grpc.CallOption) (*ServeNodesResponse, error)
-	// ServeRange (executor only) serves the loaded engine's range of whole
-	// layers on a port of this machine, for the engine that runs the layers
-	// before it (rangeserver.py, #387). LoadModel sets the range, through the
-	// plan's VXPU_LAYER_RANGE. ServeRange returns FAILED_PRECONDITION while the
+	// ServeRange serves the loaded engine's range of whole layers on a
+	// port of this machine, for the engine that runs the layers before it
+	// (rangeserver.py, #387). LoadModel sets the range, through the plan's
+	// VXPU_LAYER_RANGE. ServeRange returns FAILED_PRECONDITION while the
 	// engine is still loading.
 	ServeRange(ctx context.Context, in *ServeRangeRequest, opts ...grpc.CallOption) (*ServeRangeResponse, error)
 }
@@ -130,16 +511,6 @@ func (c *executorClient) LoadModel(ctx context.Context, in *LoadModelRequest, op
 	return out, nil
 }
 
-func (c *executorClient) RegisterModel(ctx context.Context, in *RegisterModelRequest, opts ...grpc.CallOption) (*RegisterModelResponse, error) {
-	cOpts := append([]grpc.CallOption{grpc.StaticMethod()}, opts...)
-	out := new(RegisterModelResponse)
-	err := c.cc.Invoke(ctx, Executor_RegisterModel_FullMethodName, in, out, cOpts...)
-	if err != nil {
-		return nil, err
-	}
-	return out, nil
-}
-
 func (c *executorClient) NewSession(ctx context.Context, in *NewSessionRequest, opts ...grpc.CallOption) (*NewSessionResponse, error) {
 	cOpts := append([]grpc.CallOption{grpc.StaticMethod()}, opts...)
 	out := new(NewSessionResponse)
@@ -150,23 +521,23 @@ func (c *executorClient) NewSession(ctx context.Context, in *NewSessionRequest, 
 	return out, nil
 }
 
-func (c *executorClient) Chat(ctx context.Context, in *ChatRequest, opts ...grpc.CallOption) (*ChatResponse, error) {
+func (c *executorClient) ExecuteChat(ctx context.Context, in *ExecuteChatRequest, opts ...grpc.CallOption) (*ExecuteChatResponse, error) {
 	cOpts := append([]grpc.CallOption{grpc.StaticMethod()}, opts...)
-	out := new(ChatResponse)
-	err := c.cc.Invoke(ctx, Executor_Chat_FullMethodName, in, out, cOpts...)
+	out := new(ExecuteChatResponse)
+	err := c.cc.Invoke(ctx, Executor_ExecuteChat_FullMethodName, in, out, cOpts...)
 	if err != nil {
 		return nil, err
 	}
 	return out, nil
 }
 
-func (c *executorClient) Generate(ctx context.Context, in *GenerateRequest, opts ...grpc.CallOption) (grpc.ServerStreamingClient[GenerateResponse], error) {
+func (c *executorClient) Execute(ctx context.Context, in *ExecuteRequest, opts ...grpc.CallOption) (grpc.ServerStreamingClient[ExecuteResponse], error) {
 	cOpts := append([]grpc.CallOption{grpc.StaticMethod()}, opts...)
-	stream, err := c.cc.NewStream(ctx, &Executor_ServiceDesc.Streams[0], Executor_Generate_FullMethodName, cOpts...)
+	stream, err := c.cc.NewStream(ctx, &Executor_ServiceDesc.Streams[0], Executor_Execute_FullMethodName, cOpts...)
 	if err != nil {
 		return nil, err
 	}
-	x := &grpc.GenericClientStream[GenerateRequest, GenerateResponse]{ClientStream: stream}
+	x := &grpc.GenericClientStream[ExecuteRequest, ExecuteResponse]{ClientStream: stream}
 	if err := x.ClientStream.SendMsg(in); err != nil {
 		return nil, err
 	}
@@ -177,32 +548,12 @@ func (c *executorClient) Generate(ctx context.Context, in *GenerateRequest, opts
 }
 
 // This type alias is provided for backwards compatibility with existing code that references the prior non-generic stream type by name.
-type Executor_GenerateClient = grpc.ServerStreamingClient[GenerateResponse]
-
-func (c *executorClient) GetModelStats(ctx context.Context, in *GetModelStatsRequest, opts ...grpc.CallOption) (*GetModelStatsResponse, error) {
-	cOpts := append([]grpc.CallOption{grpc.StaticMethod()}, opts...)
-	out := new(GetModelStatsResponse)
-	err := c.cc.Invoke(ctx, Executor_GetModelStats_FullMethodName, in, out, cOpts...)
-	if err != nil {
-		return nil, err
-	}
-	return out, nil
-}
+type Executor_ExecuteClient = grpc.ServerStreamingClient[ExecuteResponse]
 
 func (c *executorClient) Describe(ctx context.Context, in *DescribeRequest, opts ...grpc.CallOption) (*DescribeResponse, error) {
 	cOpts := append([]grpc.CallOption{grpc.StaticMethod()}, opts...)
 	out := new(DescribeResponse)
 	err := c.cc.Invoke(ctx, Executor_Describe_FullMethodName, in, out, cOpts...)
-	if err != nil {
-		return nil, err
-	}
-	return out, nil
-}
-
-func (c *executorClient) ExplainModel(ctx context.Context, in *ExplainModelRequest, opts ...grpc.CallOption) (*ExplainModelResponse, error) {
-	cOpts := append([]grpc.CallOption{grpc.StaticMethod()}, opts...)
-	out := new(ExplainModelResponse)
-	err := c.cc.Invoke(ctx, Executor_ExplainModel_FullMethodName, in, out, cOpts...)
 	if err != nil {
 		return nil, err
 	}
@@ -243,64 +594,52 @@ func (c *executorClient) ServeRange(ctx context.Context, in *ServeRangeRequest, 
 // All implementations must embed UnimplementedExecutorServer
 // for forward compatibility.
 //
-// Executor runs models shipped as vXPU artifacts: a content-addressed
-// manifest (architecture config + weight references), weightless
-// exported graphs, and a binding classifying every graph tensor as
-// bound (weight reference), derived (computed from config), or state
-// (session-owned, zero-initialized).
+// Executor is the internal router-to-executor service. The router (and
+// later the planner or coordinator) calls Executor on executor pods for
+// model loading, execution, telemetry, node serving, and plan inspection.
+// It can change freely with the router and executors, which ship together.
 //
-// The executor never receives weights over this API: it rehydrates
-// them from the manifest's content-addressed references.
+// Executor runs models shipped as vXPU artifacts: a content-addressed
+// manifest (architecture config + weight references), weightless exported
+// graphs, and a binding classifying every graph tensor as bound (weight
+// reference), derived (computed from config), or state (session-owned,
+// zero-initialized).
+//
+// The executor never receives weights over this API: it rehydrates them
+// from the manifest's content-addressed references.
 type ExecutorServer interface {
 	// LoadModel ships the artifact. Idempotent: the artifact's content
 	// digest identifies the model, and a matching digest reuses the
 	// already-loaded engine.
 	LoadModel(context.Context, *LoadModelRequest) (*LoadModelResponse, error)
-	// RegisterModel makes a model servable by name (router only): the
-	// router imports the weights into modelstore and compiles the model
-	// for its executor image (a compile job exporting the artifact into
-	// modelstore), unless that was done before. Blocks until the model is
-	// registered; idempotent.
-	RegisterModel(context.Context, *RegisterModelRequest) (*RegisterModelResponse, error)
-	// NewSession allocates fresh per-session state (KV cache). With a
-	// model name (router only), the router loads that registered model
-	// if needed; while it loads, NewSession fails with FAILED_PRECONDITION
-	// and the caller retries.
+	// NewSession allocates fresh per-session state (KV cache).
 	NewSession(context.Context, *NewSessionRequest) (*NewSessionResponse, error)
-	// Chat runs one conversation turn in a session. Multi-turn reuses
-	// the session's cache: only new suffix tokens are prefilled.
-	Chat(context.Context, *ChatRequest) (*ChatResponse, error)
-	// Generate is transformers' generate() over the wire: the client
-	// owns the tokenizer and sends the full prompt as token ids; the
-	// executor runs the same torch loop (prefill, decode, HF-style
-	// sampling) in the session and streams back the new ids. The
-	// session's cache is reused for whatever prefix matches.
-	Generate(*GenerateRequest, grpc.ServerStreamingServer[GenerateResponse]) error
-	// GetModelStats (router only) summarises what the engine recorded
-	// about a model served by name: every request's statistics, and the
-	// execution telemetry of the requests it sampled (kept in modelstore,
-	// so they outlive the router).
-	GetModelStats(context.Context, *GetModelStatsRequest) (*GetModelStatsResponse, error)
-	// Describe reports what the executor runs on (executor only): its probe
-	// of the machine, for the coordinator's machine database (#394).
-	// Answers with or without a model loaded.
+	// ExecuteChat runs one conversation turn in a session, returning
+	// execution telemetry when requested. Multi-turn reuses the session's
+	// cache: only new suffix tokens are prefilled.
+	ExecuteChat(context.Context, *ExecuteChatRequest) (*ExecuteChatResponse, error)
+	// Execute runs transformers' generate() loop on the executor,
+	// optionally returning execution telemetry on the final message. The
+	// executor runs the torch loop (prefill, decode, HF-style sampling) in
+	// the session and streams back the new ids. The session's cache is
+	// reused for whatever prefix matches.
+	Execute(*ExecuteRequest, grpc.ServerStreamingServer[ExecuteResponse]) error
+	// Describe reports what the executor runs on: its probe of the machine,
+	// for the coordinator's machine database (#394). Answers with or
+	// without a model loaded.
 	Describe(context.Context, *DescribeRequest) (*DescribeResponse, error)
-	// ExplainModel (router only) returns the plan the coordinator chose for
-	// a model's last load by name, and why (#394).
-	ExplainModel(context.Context, *ExplainModelRequest) (*ExplainModelResponse, error)
-	// DescribeNodes (executor only) describes an artifact's decode step as
-	// a dataflow graph: its nodes in call order, and for a host node what
-	// it reads and how many bytes that is (#394). The coordinator places
-	// nodes from it.
+	// DescribeNodes describes an artifact's decode step as a dataflow graph:
+	// its nodes in call order, and for a host node what it reads and how
+	// many bytes that is (#394). The coordinator places nodes from it.
 	DescribeNodes(context.Context, *DescribeNodesRequest) (*DescribeNodesResponse, error)
-	// ServeNodes (executor only) serves some of an artifact's decode-step
-	// nodes on a port of this machine: a native node server (nodeserver.py)
-	// that answers their tcp:// mailboxes. Answers once they are loaded.
+	// ServeNodes serves some of an artifact's decode-step nodes on a port
+	// of this machine: a native node server (nodeserver.py) that answers
+	// their tcp:// mailboxes. Answers once they are loaded.
 	ServeNodes(context.Context, *ServeNodesRequest) (*ServeNodesResponse, error)
-	// ServeRange (executor only) serves the loaded engine's range of whole
-	// layers on a port of this machine, for the engine that runs the layers
-	// before it (rangeserver.py, #387). LoadModel sets the range, through the
-	// plan's VXPU_LAYER_RANGE. ServeRange returns FAILED_PRECONDITION while the
+	// ServeRange serves the loaded engine's range of whole layers on a
+	// port of this machine, for the engine that runs the layers before it
+	// (rangeserver.py, #387). LoadModel sets the range, through the plan's
+	// VXPU_LAYER_RANGE. ServeRange returns FAILED_PRECONDITION while the
 	// engine is still loading.
 	ServeRange(context.Context, *ServeRangeRequest) (*ServeRangeResponse, error)
 	mustEmbedUnimplementedExecutorServer()
@@ -316,26 +655,17 @@ type UnimplementedExecutorServer struct{}
 func (UnimplementedExecutorServer) LoadModel(context.Context, *LoadModelRequest) (*LoadModelResponse, error) {
 	return nil, status.Error(codes.Unimplemented, "method LoadModel not implemented")
 }
-func (UnimplementedExecutorServer) RegisterModel(context.Context, *RegisterModelRequest) (*RegisterModelResponse, error) {
-	return nil, status.Error(codes.Unimplemented, "method RegisterModel not implemented")
-}
 func (UnimplementedExecutorServer) NewSession(context.Context, *NewSessionRequest) (*NewSessionResponse, error) {
 	return nil, status.Error(codes.Unimplemented, "method NewSession not implemented")
 }
-func (UnimplementedExecutorServer) Chat(context.Context, *ChatRequest) (*ChatResponse, error) {
-	return nil, status.Error(codes.Unimplemented, "method Chat not implemented")
+func (UnimplementedExecutorServer) ExecuteChat(context.Context, *ExecuteChatRequest) (*ExecuteChatResponse, error) {
+	return nil, status.Error(codes.Unimplemented, "method ExecuteChat not implemented")
 }
-func (UnimplementedExecutorServer) Generate(*GenerateRequest, grpc.ServerStreamingServer[GenerateResponse]) error {
-	return status.Error(codes.Unimplemented, "method Generate not implemented")
-}
-func (UnimplementedExecutorServer) GetModelStats(context.Context, *GetModelStatsRequest) (*GetModelStatsResponse, error) {
-	return nil, status.Error(codes.Unimplemented, "method GetModelStats not implemented")
+func (UnimplementedExecutorServer) Execute(*ExecuteRequest, grpc.ServerStreamingServer[ExecuteResponse]) error {
+	return status.Error(codes.Unimplemented, "method Execute not implemented")
 }
 func (UnimplementedExecutorServer) Describe(context.Context, *DescribeRequest) (*DescribeResponse, error) {
 	return nil, status.Error(codes.Unimplemented, "method Describe not implemented")
-}
-func (UnimplementedExecutorServer) ExplainModel(context.Context, *ExplainModelRequest) (*ExplainModelResponse, error) {
-	return nil, status.Error(codes.Unimplemented, "method ExplainModel not implemented")
 }
 func (UnimplementedExecutorServer) DescribeNodes(context.Context, *DescribeNodesRequest) (*DescribeNodesResponse, error) {
 	return nil, status.Error(codes.Unimplemented, "method DescribeNodes not implemented")
@@ -385,24 +715,6 @@ func _Executor_LoadModel_Handler(srv interface{}, ctx context.Context, dec func(
 	return interceptor(ctx, in, info, handler)
 }
 
-func _Executor_RegisterModel_Handler(srv interface{}, ctx context.Context, dec func(interface{}) error, interceptor grpc.UnaryServerInterceptor) (interface{}, error) {
-	in := new(RegisterModelRequest)
-	if err := dec(in); err != nil {
-		return nil, err
-	}
-	if interceptor == nil {
-		return srv.(ExecutorServer).RegisterModel(ctx, in)
-	}
-	info := &grpc.UnaryServerInfo{
-		Server:     srv,
-		FullMethod: Executor_RegisterModel_FullMethodName,
-	}
-	handler := func(ctx context.Context, req interface{}) (interface{}, error) {
-		return srv.(ExecutorServer).RegisterModel(ctx, req.(*RegisterModelRequest))
-	}
-	return interceptor(ctx, in, info, handler)
-}
-
 func _Executor_NewSession_Handler(srv interface{}, ctx context.Context, dec func(interface{}) error, interceptor grpc.UnaryServerInterceptor) (interface{}, error) {
 	in := new(NewSessionRequest)
 	if err := dec(in); err != nil {
@@ -421,52 +733,34 @@ func _Executor_NewSession_Handler(srv interface{}, ctx context.Context, dec func
 	return interceptor(ctx, in, info, handler)
 }
 
-func _Executor_Chat_Handler(srv interface{}, ctx context.Context, dec func(interface{}) error, interceptor grpc.UnaryServerInterceptor) (interface{}, error) {
-	in := new(ChatRequest)
+func _Executor_ExecuteChat_Handler(srv interface{}, ctx context.Context, dec func(interface{}) error, interceptor grpc.UnaryServerInterceptor) (interface{}, error) {
+	in := new(ExecuteChatRequest)
 	if err := dec(in); err != nil {
 		return nil, err
 	}
 	if interceptor == nil {
-		return srv.(ExecutorServer).Chat(ctx, in)
+		return srv.(ExecutorServer).ExecuteChat(ctx, in)
 	}
 	info := &grpc.UnaryServerInfo{
 		Server:     srv,
-		FullMethod: Executor_Chat_FullMethodName,
+		FullMethod: Executor_ExecuteChat_FullMethodName,
 	}
 	handler := func(ctx context.Context, req interface{}) (interface{}, error) {
-		return srv.(ExecutorServer).Chat(ctx, req.(*ChatRequest))
+		return srv.(ExecutorServer).ExecuteChat(ctx, req.(*ExecuteChatRequest))
 	}
 	return interceptor(ctx, in, info, handler)
 }
 
-func _Executor_Generate_Handler(srv interface{}, stream grpc.ServerStream) error {
-	m := new(GenerateRequest)
+func _Executor_Execute_Handler(srv interface{}, stream grpc.ServerStream) error {
+	m := new(ExecuteRequest)
 	if err := stream.RecvMsg(m); err != nil {
 		return err
 	}
-	return srv.(ExecutorServer).Generate(m, &grpc.GenericServerStream[GenerateRequest, GenerateResponse]{ServerStream: stream})
+	return srv.(ExecutorServer).Execute(m, &grpc.GenericServerStream[ExecuteRequest, ExecuteResponse]{ServerStream: stream})
 }
 
 // This type alias is provided for backwards compatibility with existing code that references the prior non-generic stream type by name.
-type Executor_GenerateServer = grpc.ServerStreamingServer[GenerateResponse]
-
-func _Executor_GetModelStats_Handler(srv interface{}, ctx context.Context, dec func(interface{}) error, interceptor grpc.UnaryServerInterceptor) (interface{}, error) {
-	in := new(GetModelStatsRequest)
-	if err := dec(in); err != nil {
-		return nil, err
-	}
-	if interceptor == nil {
-		return srv.(ExecutorServer).GetModelStats(ctx, in)
-	}
-	info := &grpc.UnaryServerInfo{
-		Server:     srv,
-		FullMethod: Executor_GetModelStats_FullMethodName,
-	}
-	handler := func(ctx context.Context, req interface{}) (interface{}, error) {
-		return srv.(ExecutorServer).GetModelStats(ctx, req.(*GetModelStatsRequest))
-	}
-	return interceptor(ctx, in, info, handler)
-}
+type Executor_ExecuteServer = grpc.ServerStreamingServer[ExecuteResponse]
 
 func _Executor_Describe_Handler(srv interface{}, ctx context.Context, dec func(interface{}) error, interceptor grpc.UnaryServerInterceptor) (interface{}, error) {
 	in := new(DescribeRequest)
@@ -482,24 +776,6 @@ func _Executor_Describe_Handler(srv interface{}, ctx context.Context, dec func(i
 	}
 	handler := func(ctx context.Context, req interface{}) (interface{}, error) {
 		return srv.(ExecutorServer).Describe(ctx, req.(*DescribeRequest))
-	}
-	return interceptor(ctx, in, info, handler)
-}
-
-func _Executor_ExplainModel_Handler(srv interface{}, ctx context.Context, dec func(interface{}) error, interceptor grpc.UnaryServerInterceptor) (interface{}, error) {
-	in := new(ExplainModelRequest)
-	if err := dec(in); err != nil {
-		return nil, err
-	}
-	if interceptor == nil {
-		return srv.(ExecutorServer).ExplainModel(ctx, in)
-	}
-	info := &grpc.UnaryServerInfo{
-		Server:     srv,
-		FullMethod: Executor_ExplainModel_FullMethodName,
-	}
-	handler := func(ctx context.Context, req interface{}) (interface{}, error) {
-		return srv.(ExecutorServer).ExplainModel(ctx, req.(*ExplainModelRequest))
 	}
 	return interceptor(ctx, in, info, handler)
 }
@@ -570,28 +846,16 @@ var Executor_ServiceDesc = grpc.ServiceDesc{
 			Handler:    _Executor_LoadModel_Handler,
 		},
 		{
-			MethodName: "RegisterModel",
-			Handler:    _Executor_RegisterModel_Handler,
-		},
-		{
 			MethodName: "NewSession",
 			Handler:    _Executor_NewSession_Handler,
 		},
 		{
-			MethodName: "Chat",
-			Handler:    _Executor_Chat_Handler,
-		},
-		{
-			MethodName: "GetModelStats",
-			Handler:    _Executor_GetModelStats_Handler,
+			MethodName: "ExecuteChat",
+			Handler:    _Executor_ExecuteChat_Handler,
 		},
 		{
 			MethodName: "Describe",
 			Handler:    _Executor_Describe_Handler,
-		},
-		{
-			MethodName: "ExplainModel",
-			Handler:    _Executor_ExplainModel_Handler,
 		},
 		{
 			MethodName: "DescribeNodes",
@@ -608,8 +872,8 @@ var Executor_ServiceDesc = grpc.ServiceDesc{
 	},
 	Streams: []grpc.StreamDesc{
 		{
-			StreamName:    "Generate",
-			Handler:       _Executor_Generate_Handler,
+			StreamName:    "Execute",
+			Handler:       _Executor_Execute_Handler,
 			ServerStreams: true,
 		},
 	},

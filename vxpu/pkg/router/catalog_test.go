@@ -219,8 +219,10 @@ func (e *loadingExecutor) LoadModel(_ context.Context, req *pb.LoadModelRequest)
 const testTelemetry = `{"format":"vxpu-telemetry/1","by_kind_ms_per_step":{"dense":20,"experts":18},` +
 	`"host_ops":{"decode":{"moe_experts":{"impl_ms":15}}},"experts":{"decode":{"0":{"1":5,"2":1},"1":{"3":6}}}}`
 
-func (e *loadingExecutor) Chat(_ context.Context, req *pb.ChatRequest) (*pb.ChatResponse, error) {
-	resp := &pb.ChatResponse{Text: "yes", SessionTokens: 12, NewPromptTokens: 2, Generated: 10, PrefillMs: 5, MsPerToken: 40}
+func (e *loadingExecutor) ExecuteChat(_ context.Context, req *pb.ExecuteChatRequest) (*pb.ExecuteChatResponse, error) {
+	resp := &pb.ExecuteChatResponse{
+		Response: &pb.ChatResponse{Text: "yes", SessionTokens: 12, NewPromptTokens: 2, Generated: 10, PrefillMs: 5, MsPerToken: 40},
+	}
 	if req.GetTelemetry() {
 		resp.TelemetryJson = testTelemetry
 	}

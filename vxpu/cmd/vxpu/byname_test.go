@@ -28,7 +28,7 @@ import (
 
 // scriptedRouter answers NewSession with errs in turn, then a session.
 type scriptedRouter struct {
-	pb.ExecutorClient
+	pb.EngineClient
 	errs  []error
 	calls int
 }

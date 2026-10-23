@@ -103,7 +103,7 @@ class Session:
     def generate_ids(self, input_ids, max_new_tokens=None, do_sample=None,
                      temperature=None, top_k=None, top_p=None,
                      repetition_penalty=None, eos_token_id=(), seed=None,
-                     timeout=None, telemetry=False):
+                     timeout=None):
         """transformers' generate() over the wire, streamed.
 
         ``input_ids`` is the complete prompt as a list of ints (the
@@ -111,10 +111,40 @@ class Session:
         time; after the stream ends, ``self.last`` holds the final
         statistics (finish_reason, prefilled_tokens, timings).
         Parameters left as None follow the model's generation_config,
-        exactly as model.generate(input_ids) would. ``telemetry=True``
-        asks the executor for its execution telemetry, which arrives as
-        ``self.last.telemetry`` (a dict, format vxpu-telemetry/1).
+        exactly as model.generate(input_ids) would.
         """
+        for token_id in self._stream_ids(
+                input_ids, max_new_tokens=max_new_tokens, do_sample=do_sample,
+                temperature=temperature, top_k=top_k, top_p=top_p,
+                repetition_penalty=repetition_penalty, eos_token_id=eos_token_id,
+                seed=seed, timeout=timeout, telemetry=False, admin=False):
+            yield token_id
+
+    def execute_ids(self, input_ids, max_new_tokens=None, do_sample=None,
+                    temperature=None, top_k=None, top_p=None,
+                    repetition_penalty=None, eos_token_id=(), seed=None,
+                    timeout=None, telemetry=False):
+        """Internal call to Executor.Execute on the router's admin port or executor.
+
+        For internal tuning and test vectors (vectors record --telemetry).
+        ``telemetry=True`` asks the executor for its execution telemetry,
+        which arrives as ``self.last.telemetry`` (a dict, format vxpu-telemetry/1).
+        """
+        if self.client.internal_stub is None:
+            raise RuntimeError(
+                "no router admin address configured; pass internal_address to "
+                "Client (or set VXPU_ROUTER_ADMIN / pass --router-admin to vectors record)")
+        for token_id in self._stream_ids(
+                input_ids, max_new_tokens=max_new_tokens, do_sample=do_sample,
+                temperature=temperature, top_k=top_k, top_p=top_p,
+                repetition_penalty=repetition_penalty, eos_token_id=eos_token_id,
+                seed=seed, timeout=timeout, telemetry=telemetry, admin=True):
+            yield token_id
+
+    def _stream_ids(self, input_ids, max_new_tokens=None, do_sample=None,
+                    temperature=None, top_k=None, top_p=None,
+                    repetition_penalty=None, eos_token_id=(), seed=None,
+                    timeout=None, telemetry=False, admin=False):
         request = vxpu_pb2.GenerateRequest(
             session_id=self.session_id,
             input_ids=[int(i) for i in input_ids],
@@ -130,16 +160,22 @@ class Session:
                             ("seed", seed)):
             if value is not None:
                 setattr(request, name, value)
-        if telemetry:
-            request.telemetry = True
         self.last = None
+        to = timeout or self.client.timeout
         try:
-            for response in self.client.stub.Generate(
-                    request, timeout=timeout or self.client.timeout):
-                if response.done:
-                    self.last = GenerateStats(response)
+            if admin:
+                exec_req = vxpu_pb2.ExecuteRequest(request=request)
+                if telemetry:
+                    exec_req.telemetry = True
+                stream = self.client.internal_stub.Execute(exec_req, timeout=to)
+            else:
+                stream = self.client.stub.Generate(request, timeout=to)
+            for msg in stream:
+                resp = msg.response if admin else msg
+                if resp.done:
+                    self.last = GenerateStats(resp, telemetry_json=msg.telemetry_json if admin else "")
                 else:
-                    for token_id in response.token_ids:
+                    for token_id in resp.token_ids:
                         yield int(token_id)
         except grpc.RpcError as e:
             if e.code() == grpc.StatusCode.FAILED_PRECONDITION:
@@ -148,8 +184,9 @@ class Session:
                     "eviction or restart); call client.load_artifact(...) "
                     f"again for a fresh session: {e.details()}") from e
             if e.code() == grpc.StatusCode.UNIMPLEMENTED:
+                name = "Execute" if admin else "Generate"
                 raise RuntimeError(
-                    "the router or executor does not implement Generate; "
+                    f"the router or executor does not implement {name}; "
                     "rebuild both images from this version of vxpu") from e
             if e.code() == grpc.StatusCode.INVALID_ARGUMENT:
                 # Bad sampling parameters or an over-long prompt: the
@@ -159,17 +196,17 @@ class Session:
 
 
 class GenerateStats:
-    """Statistics of one Generate call, from the final stream message."""
+    """Statistics of one Generate or Execute call, from the final stream message."""
 
-    def __init__(self, response):
+    def __init__(self, response, telemetry_json=""):
         self.finish_reason = response.finish_reason
         self.prompt_tokens = response.prompt_tokens
         self.prefilled_tokens = response.prefilled_tokens
         self.generated = response.generated
         self.prefill_ms = response.prefill_ms
         self.ms_per_token = response.ms_per_token
-        # the executor's execution telemetry, when the request asked for it
-        self.telemetry = json.loads(response.telemetry_json) if response.telemetry_json else None
+        # the executor's execution telemetry, when an internal call asked for it
+        self.telemetry = json.loads(telemetry_json) if telemetry_json else None
 
     def __repr__(self):
         return (f"GenerateStats(finish_reason={self.finish_reason!r}, "
@@ -197,10 +234,12 @@ def check_shippable(manifest):
             "export from a Hub repo id to ship it, or run it in-process")
 
 class Client:
-    def __init__(self, address="localhost:50051", timeout=1800):
+    def __init__(self, address="localhost:50051", timeout=1800,
+                 internal_address=None):
         self.address = address
+        self.internal_address = internal_address or os.environ.get("VXPU_ROUTER_ADMIN")
         self.timeout = timeout
-        self.channel = grpc.insecure_channel(address, options=[
+        channel_options = [
             ("grpc.max_send_message_length", MAX_MESSAGE_BYTES),
             ("grpc.max_receive_message_length", MAX_MESSAGE_BYTES),
             # Keep port-forward tunnels alive through long LoadModel
@@ -208,8 +247,21 @@ class Client:
             ("grpc.keepalive_time_ms", 60000),
             ("grpc.keepalive_timeout_ms", 20000),
             ("grpc.keepalive_permit_without_calls", 1),
-        ])
-        self.stub = vxpu_pb2_grpc.ExecutorStub(self.channel)
+        ]
+        self.channel = grpc.insecure_channel(address, options=channel_options)
+        self.stub = vxpu_pb2_grpc.EngineStub(self.channel)
+        if self.internal_address:
+            self.internal_channel = grpc.insecure_channel(
+                self.internal_address, options=channel_options)
+            self.internal_stub = vxpu_pb2_grpc.ExecutorStub(self.internal_channel)
+        else:
+            self.internal_channel = None
+            self.internal_stub = None
+
+    def close(self):
+        self.channel.close()
+        if self.internal_channel is not None:
+            self.internal_channel.close()
 
     def load_artifact(self, artifact_dir, poll_interval=15, progress=print):
         """Ship an artifact and wait until the model is ready.
