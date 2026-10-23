@@ -371,8 +371,11 @@ def strip_asserts(module):
 
 
 def load_program(graph_path, tensors, device):
-    """Load a .pt2, place real tensors into it, retarget to device."""
-    exported = torch.export.load(graph_path)
+    """Load an exported program or reuse an existing one. Place real tensors into it, and retarget them to the device."""
+    if isinstance(graph_path, torch.export.ExportedProgram):
+        exported = graph_path
+    else:
+        exported = torch.export.load(graph_path)
 
     def place(fqn, tensor):
         # The checkpoint's dtype may differ from the graph's parameter

@@ -305,7 +305,6 @@ def record_vxpu_engine(model, revision, prompts, settings, artifact, device="cpu
     """Candidate: the executor's engine in this process (no cluster).
     telemetry=True keeps each prompt's execution telemetry with it; keep,
     a list, receives the engine (for checks of its state afterwards)."""
-    import torch
     from .engine import Engine, SamplingParams
     tok = _tokenizer(model, revision, prompts)
     engine = Engine(artifact, device=device, compile_decode=compile_decode)
@@ -1016,6 +1015,7 @@ def _check_lowering(model, prompts, settings, artifact, workdir):
         print(table(runs["compiled"], runs[label], rows))
         ok = ok and same
     return ok
+
 
 def _check_host_reads(workdir):
     """The n-gram tables' reads (#364): the CPU kernels' gather_rows gives
@@ -2053,6 +2053,28 @@ def _check_dedup_constants(workdir):
     assert_no_duplicate_constants(p2)
 
 
+def _check_copy_worker_failure(artifact):
+    """Confirm that a copy worker failure in _fetch_bound raises promptly instead of hanging."""
+    from .engine import Engine
+    call_count = 0
+
+    def fail_hook(*args):
+        nonlocal call_count
+        call_count += 1
+        if call_count >= 5:
+            raise RuntimeError("simulated copy worker failure")
+
+    try:
+        Engine(artifact, device="cpu", _copy_worker_hook=fail_hook)
+        print("copy worker failure check: Engine did not raise on worker failure")
+        return False
+    except RuntimeError as e:
+        if "simulated copy worker failure" not in str(e):
+            print(f"copy worker failure check: unexpected error {e}")
+            return False
+        return True
+
+
 def selftest(workdir, settings):
     """The CI tier: tiny models through export, the in-process engine,
     and a transformers reference, token-exact. No cluster."""
@@ -2105,6 +2127,13 @@ def selftest(workdir, settings):
         print(table(ref, got, rows))
         if not ok:
             failed.append(name)
+        notes = got.get("producer", {}).get("plan", {}).get("notes", [])
+        load_notes = [n for n in notes if n.startswith("load: ")]
+        if not load_notes or "probe " not in load_notes[0] or "graph " not in load_notes[0]:
+            print(f"load timings check: missing or incomplete load breakdown in plan notes: {notes}")
+            failed.append(name + " (load timings)")
+        if name == "tiny-fp8-moe" and not _check_copy_worker_failure(artifact):
+            failed.append(name + " (copy failure)")
         if name == "tiny-fp8-moe" and not _check_local_blobs(model, prompts, settings, artifact, got, workdir):
             failed.append(name + " (local weight tier)")
         if not _check_dataflow(model, prompts, settings, artifact, got):
