@@ -136,6 +136,11 @@ func init() {
 			catalog.Aliases[alias] = m.Name
 		}
 	}
+	for alias, name := range catalog.Aliases { // Lookup checks aliases first, so one would hide a machine of that name
+		if _, ok := catalog.Machines[alias]; ok {
+			panic(fmt.Sprintf("machines: %s's alias %q is another machine's name", name, alias))
+		}
+	}
 }
 
 // Names lists the catalog's machines, sorted.

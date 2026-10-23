@@ -108,6 +108,12 @@ def main():
     parser.add_argument("--width", type=int, default=1600)
     parser.add_argument("--height", type=int, default=900)
     args = parser.parse_args()
+    # the server runs from vxpu/, so resolve the paths the caller gave against the caller's directory
+    args.artifact = os.path.abspath(args.artifact)
+    if args.records:
+        args.records = os.path.abspath(args.records)
+    if args.vxpu and os.sep in args.vxpu.split()[0]:  # a path, not a command found on PATH
+        args.vxpu = " ".join([os.path.abspath(args.vxpu.split()[0])] + args.vxpu.split()[1:])
     if args.width % 2 or args.height % 2:
         parser.error("--width and --height must be even (the mp4 encoder needs it)")
     os.makedirs(args.out, exist_ok=True)

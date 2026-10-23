@@ -1681,6 +1681,7 @@ def _check_range_server(model, prompts, settings, artifact, plain, device="cpu")
         plain = _with_env(base, record_vxpu_engine, model, "main", prompts, settings, artifact, **kw)
     # the other range as the coordinator starts it: an executor loads the model with its range
     # (LoadModel, VXPU_LAYER_RANGE) and serves it (ServeRange); the head is wired by its plan
+    import grpc
     from . import vxpu_pb2
     from .server import ExecutorServicer
 
@@ -1705,12 +1706,20 @@ def _check_range_server(model, prompts, settings, artifact, plain, device="cpu")
                                                  binding_json=files["binding.json"].decode(),
                                                  prefill_graph=files["prefill.pt2"], decode_graph=files["decode.pt2"],
                                                  plan=plan), ctx)
+    if ctx.code is not None:  # LoadModel refused the plan or failed, so nothing will start serving
+        print(f"range server check: LoadModel failed: {ctx.code} {ctx.details}")
+        return False
     port = 0
     for _ in range(600):
         ctx = Context()
         resp = executor.ServeRange(vxpu_pb2.ServeRangeRequest(), ctx)
         if resp.port:
             port = resp.port
+            break
+        # ServeRange answers FAILED_PRECONDITION while the engine is still
+        # loading, which means "ask again". Any other error means the load
+        # failed, so stop waiting and report it below.
+        if ctx.code is not None and ctx.code != grpc.StatusCode.FAILED_PRECONDITION:
             break
         time.sleep(1)
     if not port:

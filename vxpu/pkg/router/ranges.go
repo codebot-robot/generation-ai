@@ -202,6 +202,8 @@ func (s *Server) loadRange(ctx context.Context, addr string, plan map[string]str
 		case err == nil && resp.Port > 0:
 			return net.JoinHostPort(host, strconv.Itoa(int(resp.Port))), nil
 		case err != nil && status.Code(err) != codes.FailedPrecondition:
+			// ServeRange answers FailedPrecondition while the range is still
+			// loading, so the loop keeps polling on that. Any other error is final.
 			return "", fmt.Errorf("ServeRange: %w", err)
 		case time.Now().After(deadline):
 			return "", fmt.Errorf("ServeRange: still loading after an hour")
