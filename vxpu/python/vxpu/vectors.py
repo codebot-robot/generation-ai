@@ -350,14 +350,24 @@ def record_vxpu_engine(model, revision, prompts, settings, artifact, device="cpu
 
 
 
-def record_vxpu_router(model, revision, prompts, settings, artifact, router=None, telemetry=False):
+def record_vxpu_router(model, revision, prompts, settings, artifact,
+                       router=None, router_admin=None, telemetry=False):
     """Candidate: an executor reached through a router (tokens only;
     the wire carries no logits). telemetry=True keeps each prompt's
-    execution telemetry, which rides back on the Generate stream."""
+    execution telemetry, through an internal Execute call on the router's admin port."""
     from .modeling import VxpuModelForCausalLM
     tok = _tokenizer(model, revision, prompts)
+    admin_forward = None
+    if telemetry and not router_admin and not os.environ.get("VXPU_ROUTER_ADMIN"):
+        from .client import DEFAULT_ROUTER_TARGET, PortForward
+        admin_forward = PortForward(DEFAULT_ROUTER_TARGET, remote_port=50052)
+        try:
+            router_admin = admin_forward.start()
+        except RuntimeError:
+            admin_forward = None
     lm = VxpuModelForCausalLM.from_pretrained(
-        model, router=router, artifact_dir=artifact, revision=revision,
+        model, router=router, router_admin=router_admin,
+        artifact_dir=artifact, revision=revision,
         progress=lambda *a: None)
     lm.collect_telemetry = telemetry
     out = []
@@ -380,6 +390,8 @@ def record_vxpu_router(model, revision, prompts, settings, artifact, router=None
             _progress(prompt, new, getattr(stats, "ms_per_token", None))
     finally:
         lm.close()
+        if admin_forward is not None:
+            admin_forward.stop()
     producer = {"kind": "vxpu-router", **_versions("remote"),
                 "router": lm.client.address}
     return _document(model, revision, lm.config, producer, settings, out)
@@ -667,7 +679,9 @@ def cmd_record(args):
                           enforce_eager=args.enforce_eager)
     else:
         doc = record_vxpu_router(args.model, args.revision, args.prompts, settings,
-                                 args.artifact, router=args.router, telemetry=args.telemetry)
+                                 args.artifact, router=args.router,
+                                 router_admin=args.router_admin,
+                                 telemetry=args.telemetry)
     with open(args.out, "w") as f:
         json.dump(doc, f, indent=1)
     print(f"{args.out}: {len(doc['prompts'])} prompts by {doc['producer']['kind']}")
@@ -1191,6 +1205,60 @@ def _check_chat_telemetry(artifact):
         print("chat telemetry check: telemetry changed the reply, or was recorded unasked")
         return False
     print(f"chat telemetry: {tel['decode_steps']} decode steps recorded, reply unchanged")
+    return True
+
+
+def _check_admin_telemetry():
+    """Verify that Client with internal_address routes execute_ids to the
+    Executor service on the admin port and receives execution telemetry,
+    while generate_ids routes to Engine without telemetry."""
+    from concurrent import futures
+    import grpc
+    from . import client, vxpu_pb2, vxpu_pb2_grpc
+
+    class FakeEngine(vxpu_pb2_grpc.EngineServicer):
+        def Generate(self, request, context):
+            yield vxpu_pb2.GenerateResponse(token_ids=[10])
+            yield vxpu_pb2.GenerateResponse(done=True, finish_reason="eos", generated=1)
+
+    class FakeExecutor(vxpu_pb2_grpc.ExecutorServicer):
+        def Execute(self, request, context):
+            has_tel = request.HasField("telemetry") and request.telemetry
+            tel_json = json.dumps({"format": "vxpu-telemetry/1", "ok": True}) if has_tel else ""
+            yield vxpu_pb2.ExecuteResponse(
+                response=vxpu_pb2.GenerateResponse(token_ids=[20]))
+            yield vxpu_pb2.ExecuteResponse(
+                response=vxpu_pb2.GenerateResponse(done=True, finish_reason="eos", generated=1),
+                telemetry_json=tel_json)
+
+    eng_srv = grpc.server(futures.ThreadPoolExecutor(max_workers=1))
+    vxpu_pb2_grpc.add_EngineServicer_to_server(FakeEngine(), eng_srv)
+    eng_port = eng_srv.add_insecure_port("127.0.0.1:0")
+    eng_srv.start()
+
+    exec_srv = grpc.server(futures.ThreadPoolExecutor(max_workers=1))
+    vxpu_pb2_grpc.add_ExecutorServicer_to_server(FakeExecutor(), exec_srv)
+    exec_port = exec_srv.add_insecure_port("127.0.0.1:0")
+    exec_srv.start()
+
+    try:
+        c = client.Client(f"127.0.0.1:{eng_port}", internal_address=f"127.0.0.1:{exec_port}")
+        sess = client.Session(c, "m:s1")
+        # generate_ids hits Engine, no telemetry
+        g_tokens = list(sess.generate_ids([1, 2]))
+        if g_tokens != [10] or sess.last.telemetry is not None:
+            print("admin telemetry check: generate_ids unexpected reply")
+            return False
+        # execute_ids hits Executor admin listener, with telemetry
+        e_tokens = list(sess.execute_ids([1, 2], telemetry=True))
+        if e_tokens != [20] or sess.last.telemetry.get("format") != "vxpu-telemetry/1":
+            print("admin telemetry check: execute_ids missing telemetry")
+            return False
+        c.close()
+    finally:
+        eng_srv.stop(None)
+        exec_srv.stop(None)
+    print("admin telemetry: execute_ids reaches the admin listener, returns telemetry, reply unchanged")
     return True
 
 
@@ -2061,6 +2129,8 @@ def selftest(workdir, settings):
     _check_compile_plan()
     _check_plan_given()
     _check_compile_names()
+    if not _check_admin_telemetry():
+        raise SystemExit("admin telemetry check failed")
     os.makedirs(workdir, exist_ok=True)
     _check_host_reads(workdir)
     _check_local_blobs_copy(workdir)
@@ -2164,6 +2234,8 @@ def main(argv=None):
                      help="text prompts through the chat template, or fixed ids (auto: ids if no tokenizer)")
     rec.add_argument("--artifact", help="vxpu artifact directory (vxpu-* producers)")
     rec.add_argument("--router", help="router host:port (vxpu-router; default: port-forward)")
+    rec.add_argument("--router-admin",
+                     help="router admin host:port (for --producer vxpu-router --telemetry; default: port-forward to port 50052)")
     rec.add_argument("--device", default="cpu", help="transformers / vxpu-engine producers (vllm places itself)")
     rec.add_argument("--dtype", default="auto", help="transformers / vllm model dtype (auto: the config's)")
     rec.add_argument("--compile", action="store_true", help="vxpu-engine: torch.compile the decode graph")

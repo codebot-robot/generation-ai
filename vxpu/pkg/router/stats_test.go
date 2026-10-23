@@ -54,8 +54,8 @@ func TestStats_RecordsNamedModelRequests(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Chat: %v", err)
 	}
-	if reply.TelemetryJson != "" {
-		t.Error("the engine's telemetry must not reach a client that did not ask for it")
+	if reply.Text != "yes" {
+		t.Errorf("expected reply 'yes', got %q", reply.Text)
 	}
 
 	stats, err := s.GetModelStats(ctx, &pb.GetModelStatsRequest{Model: "org/M", Records: true})

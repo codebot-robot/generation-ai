@@ -318,48 +318,55 @@ class ExecutorServicer(vxpu_pb2_grpc.ExecutorServicer):
         print(f"[vxpu] new session {session_id}", flush=True)
         return vxpu_pb2.NewSessionResponse(session_id=session_id)
 
-    def Chat(self, request, context):
+    def ExecuteChat(self, request, context):
         with self.lock:
             if self.engine is None:
                 context.set_code(grpc.StatusCode.FAILED_PRECONDITION)
                 context.set_details("call LoadModel first")
-                return vxpu_pb2.ChatResponse()
+                return vxpu_pb2.ExecuteChatResponse()
             self._touch()
             engine = self.engine
 
-        if request.max_new_tokens <= 0:
+        if not request.HasField("request"):
+            context.set_code(grpc.StatusCode.INVALID_ARGUMENT)
+            context.set_details("missing request in ExecuteChatRequest")
+            return vxpu_pb2.ExecuteChatResponse()
+        req = request.request
+
+        if req.max_new_tokens <= 0:
             max_new_tokens = 96
-        elif request.max_new_tokens > 4096:
+        elif req.max_new_tokens > 4096:
             max_new_tokens = 4096
         else:
-            max_new_tokens = request.max_new_tokens
+            max_new_tokens = req.max_new_tokens
 
         try:
             reply = engine.chat(
-                request.session_id, request.text,
+                req.session_id, req.text,
                 max_new_tokens=max_new_tokens,
-                raw_prompt=request.raw_prompt,
-                telemetry=request.telemetry)
-            return vxpu_pb2.ChatResponse(
+                raw_prompt=req.raw_prompt,
+                telemetry=request.HasField("telemetry") and request.telemetry)
+            chat_resp = vxpu_pb2.ChatResponse(
                 text=reply["text"],
                 session_tokens=reply["session_tokens"],
                 new_prompt_tokens=reply["new_prompt_tokens"],
                 generated=reply["generated"],
                 prefill_ms=float(reply["prefill_ms"]),
-                ms_per_token=float(reply["ms_per_token"]),
+                ms_per_token=float(reply["ms_per_token"]))
+            return vxpu_pb2.ExecuteChatResponse(
+                response=chat_resp,
                 telemetry_json=json.dumps(reply["telemetry"]) if "telemetry" in reply else "")
         except ValueError as e:
             context.set_code(grpc.StatusCode.INVALID_ARGUMENT)
             context.set_details(str(e))
-            return vxpu_pb2.ChatResponse()
+            return vxpu_pb2.ExecuteChatResponse()
         except Exception as e:  # noqa: BLE001
-            print(f"[vxpu] Chat error: {e}", file=sys.stderr, flush=True)
+            print(f"[vxpu] ExecuteChat error: {e}", file=sys.stderr, flush=True)
             context.set_code(grpc.StatusCode.INTERNAL)
             context.set_details(str(e))
-            return vxpu_pb2.ChatResponse()
+            return vxpu_pb2.ExecuteChatResponse()
 
-
-    def Generate(self, request, context):
+    def Execute(self, request, context):
         with self.lock:
             if self.engine is None:
                 context.abort(grpc.StatusCode.FAILED_PRECONDITION,
@@ -367,48 +374,56 @@ class ExecutorServicer(vxpu_pb2_grpc.ExecutorServicer):
             self._touch()
             engine = self.engine
 
-        if request.HasField("max_new_tokens"):
-            max_new_tokens = max(0, request.max_new_tokens)
+        if not request.HasField("request"):
+            context.abort(grpc.StatusCode.INVALID_ARGUMENT,
+                          "missing request in ExecuteRequest")
+        req = request.request
+
+        if req.HasField("max_new_tokens"):
+            max_new_tokens = max(0, req.max_new_tokens)
         else:
             max_new_tokens = 20  # transformers' max_length default
         max_new_tokens = min(max_new_tokens, 4096)
         params = SamplingParams(
-            do_sample=(request.do_sample
-                       if request.HasField("do_sample") else None),
-            temperature=(request.temperature
-                         if request.HasField("temperature") else None),
-            top_k=request.top_k if request.HasField("top_k") else None,
-            top_p=request.top_p if request.HasField("top_p") else None,
-            repetition_penalty=(request.repetition_penalty
-                                if request.HasField("repetition_penalty")
+            do_sample=(req.do_sample
+                       if req.HasField("do_sample") else None),
+            temperature=(req.temperature
+                         if req.HasField("temperature") else None),
+            top_k=req.top_k if req.HasField("top_k") else None,
+            top_p=req.top_p if req.HasField("top_p") else None,
+            repetition_penalty=(req.repetition_penalty
+                                if req.HasField("repetition_penalty")
                                 else None),
-            seed=request.seed if request.HasField("seed") else None)
+            seed=req.seed if req.HasField("seed") else None)
         try:
             for chunk in engine.generate(
-                    request.session_id, list(request.input_ids),
-                    max_new_tokens, params, list(request.eos_token_id),
+                    req.session_id, list(req.input_ids),
+                    max_new_tokens, params, list(req.eos_token_id),
                     telemetry=request.HasField("telemetry") and request.telemetry):
                 if not context.is_active():
                     return
                 self._touch()  # a long stream is not idle
                 if chunk["done"]:
-                    yield vxpu_pb2.GenerateResponse(
+                    gen_resp = vxpu_pb2.GenerateResponse(
                         done=True,
                         finish_reason=chunk["finish_reason"],
                         prompt_tokens=chunk["prompt_tokens"],
                         prefilled_tokens=chunk["prefilled_tokens"],
                         generated=chunk["generated"],
                         prefill_ms=float(chunk["prefill_ms"]),
-                        ms_per_token=float(chunk["ms_per_token"]),
+                        ms_per_token=float(chunk["ms_per_token"]))
+                    yield vxpu_pb2.ExecuteResponse(
+                        response=gen_resp,
                         telemetry_json=(json.dumps(chunk["telemetry"])
                                         if chunk.get("telemetry") else ""))
                 else:
-                    yield vxpu_pb2.GenerateResponse(
+                    gen_resp = vxpu_pb2.GenerateResponse(
                         token_ids=chunk["token_ids"])
+                    yield vxpu_pb2.ExecuteResponse(response=gen_resp)
         except ValueError as e:
             context.abort(grpc.StatusCode.INVALID_ARGUMENT, str(e))
         except Exception as e:  # noqa: BLE001
-            print(f"[vxpu] Generate error: {e}", file=sys.stderr, flush=True)
+            print(f"[vxpu] Execute error: {e}", file=sys.stderr, flush=True)
             context.abort(grpc.StatusCode.INTERNAL, str(e))
 
 

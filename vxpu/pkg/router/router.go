@@ -49,6 +49,7 @@ import (
 )
 
 type Server struct {
+	pb.UnimplementedEngineServer
 	pb.UnimplementedExecutorServer
 	clientset   kubernetes.Interface
 	namespace   string
@@ -100,6 +101,7 @@ var errNoExecutor = stderrors.New("no executor for this model; call LoadModel")
 const (
 	annotationWeightBytes = "vxpu.gke-labs.dev/weight-bytes"
 	annotationAccelerator = "vxpu.gke-labs.dev/accelerator"
+	annotationImage       = "vxpu.gke-labs.dev/image"
 )
 
 func NewServer(clientset kubernetes.Interface, namespace, imageName, accelerator string) *Server {
@@ -230,24 +232,37 @@ func getPeerKey(ctx context.Context) string {
 }
 
 // placementAnnotations records what a pod was sized for, so a later
-// LoadModel can tell whether an existing pod fits the model.
-func placementAnnotations(p Placement) map[string]string {
-	return map[string]string{
+// LoadModel can tell whether an existing pod fits the model and runs the expected image.
+func placementAnnotations(p Placement, image string) map[string]string {
+	m := map[string]string{
 		annotationWeightBytes: strconv.FormatInt(p.WeightBytes, 10),
 		annotationAccelerator: p.Accelerator,
 	}
+	if image != "" {
+		m[annotationImage] = image
+	}
+	return m
 }
 
 // placementMatches reports whether an existing pod was created for
-// this placement. Pods without annotations (created before they were
+// this placement and image. Pods without annotations (created before they were
 // recorded) are kept.
-func placementMatches(pod *corev1.Pod, p Placement) bool {
+func placementMatches(pod *corev1.Pod, p Placement, image string) bool {
 	weight, ok := pod.Annotations[annotationWeightBytes]
 	if !ok {
 		return true
 	}
-	return weight == strconv.FormatInt(p.WeightBytes, 10) &&
-		pod.Annotations[annotationAccelerator] == p.Accelerator
+	if weight != strconv.FormatInt(p.WeightBytes, 10) ||
+		pod.Annotations[annotationAccelerator] != p.Accelerator {
+		return false
+	}
+	if image != "" {
+		recordedImage, ok := pod.Annotations[annotationImage]
+		if !ok || recordedImage != image {
+			return false
+		}
+	}
+	return true
 }
 
 // waitDeleted blocks until the pod is gone (or ctx ends).
@@ -268,13 +283,17 @@ func (s *Server) waitDeleted(ctx context.Context, podName string) error {
 
 // getOrStartPod returns the IP of the executor serving modelID. With a
 // placement (LoadModel) it creates the pod if absent and recreates it
-// if the existing pod was sized for a different placement; without one
+// if the existing pod was sized for a different placement or image; without one
 // (NewSession/Chat) it only finds an existing pod and otherwise returns
 // errNoExecutor.
 func (s *Server) getOrStartPod(ctx context.Context, modelID string, want *Placement) (string, error) {
 	log := klog.FromContext(ctx)
 	if modelID == "" {
 		return "", fmt.Errorf("modelID cannot be empty")
+	}
+
+	if s.imageName == "" {
+		return "", fmt.Errorf("no executor image configured on router")
 	}
 
 	podName := "vxpu-executor-" + modelID
@@ -285,8 +304,8 @@ func (s *Server) getOrStartPod(ctx context.Context, modelID string, want *Placem
 		log.Info("Found existing pod", "pod", podName, "phase", pod.Status.Phase)
 		recreate := ""
 		switch {
-		case want != nil && !placementMatches(pod, *want):
-			recreate = "existing pod was sized for a different placement"
+		case want != nil && !placementMatches(pod, *want, s.imageName):
+			recreate = "existing pod was sized for a different placement or image"
 		case pod.Status.Phase == corev1.PodFailed || pod.Status.Phase == corev1.PodUnknown:
 			recreate = "existing pod is in bad state"
 		case pod.Status.Phase == corev1.PodRunning && pod.Status.PodIP != "":
@@ -372,7 +391,7 @@ func (s *Server) getOrStartPod(ctx context.Context, modelID string, want *Placem
 					"app":      "vxpu-executor",
 					"model-id": modelID,
 				},
-				Annotations: placementAnnotations(placement),
+				Annotations: placementAnnotations(placement, s.imageName),
 			},
 			Spec: corev1.PodSpec{
 				NodeSelector: nodeSelector,
@@ -657,6 +676,44 @@ func (s *Server) NewSession(ctx context.Context, req *pb.NewSessionRequest) (*pb
 	}, nil
 }
 
+// proxyChat forwards a ChatRequest to the executor via ExecuteChat, sampling telemetry
+// for stats if configured.
+func (s *Server) proxyChat(ctx context.Context, modelKey, backendSessionID string, chatReq *pb.ChatRequest, telemetry *bool) (*pb.ExecuteChatResponse, error) {
+	client, conn, err := s.executorClient(ctx, modelKey)
+	if err != nil {
+		return nil, err
+	}
+	defer closeConn(ctx, conn)
+
+	backend := &pb.ExecuteChatRequest{
+		Request:   proto.Clone(chatReq).(*pb.ChatRequest),
+		Telemetry: telemetry,
+	}
+	backend.Request.SessionId = backendSessionID
+	ref, executor, recorded := s.statsTarget(modelKey)
+	asked := backend.GetTelemetry()
+	if recorded && !asked && s.stats.sampleTelemetry() {
+		on := true
+		backend.Telemetry = &on
+	}
+	resp, err := client.ExecuteChat(ctx, backend)
+	if err != nil || !recorded {
+		return resp, err
+	}
+	r := newRecord(ref, executor, "chat")
+	innerResp := resp.GetResponse()
+	if innerResp != nil {
+		r.PromptTokens, r.PrefilledTokens = innerResp.SessionTokens-innerResp.Generated, innerResp.NewPromptTokens
+		r.Generated, r.PrefillMs, r.MsPerToken = innerResp.Generated, innerResp.PrefillMs, innerResp.MsPerToken
+	}
+	if resp.TelemetryJson != "" {
+		r.Telemetry = json.RawMessage(resp.TelemetryJson)
+	}
+	s.stats.record(ctx, r)
+	return resp, nil
+}
+
+// Chat runs one conversation turn in a session (Engine service).
 func (s *Server) Chat(ctx context.Context, req *pb.ChatRequest) (*pb.ChatResponse, error) {
 	log := klog.FromContext(ctx)
 	log.Info("Chat request received", "session_id", req.SessionId)
@@ -665,62 +722,58 @@ func (s *Server) Chat(ctx context.Context, req *pb.ChatRequest) (*pb.ChatRespons
 	if err != nil {
 		return nil, err
 	}
-	client, conn, err := s.executorClient(ctx, modelKey)
+	resp, err := s.proxyChat(ctx, modelKey, backendSessionID, req, nil)
 	if err != nil {
 		return nil, err
 	}
-	defer closeConn(ctx, conn)
+	return resp.GetResponse(), nil
+}
 
-	backend := backendChatRequest(req, backendSessionID)
-	ref, executor, recorded := s.statsTarget(modelKey)
-	asked := req.GetTelemetry()
-	if recorded && !asked && s.stats.sampleTelemetry() {
-		on := true
-		backend.Telemetry = &on
+// ExecuteChat runs one conversation turn on the router's admin port (Executor service),
+// allowing internal/admin callers to receive telemetry.
+func (s *Server) ExecuteChat(ctx context.Context, req *pb.ExecuteChatRequest) (*pb.ExecuteChatResponse, error) {
+	log := klog.FromContext(ctx)
+	reqInner := req.GetRequest()
+	if reqInner == nil {
+		return nil, status.Error(codes.InvalidArgument, "missing request in ExecuteChatRequest")
 	}
-	// Propagate the backend's status error unchanged.
-	resp, err := client.Chat(ctx, backend)
-	if err != nil || !recorded {
-		return resp, err
+	log.Info("ExecuteChat request received", "session_id", reqInner.SessionId)
+
+	modelKey, backendSessionID, err := splitSessionID(reqInner.SessionId)
+	if err != nil {
+		return nil, err
 	}
-	r := newRecord(ref, executor, "chat")
-	r.PromptTokens, r.PrefilledTokens = resp.SessionTokens-resp.Generated, resp.NewPromptTokens
-	r.Generated, r.PrefillMs, r.MsPerToken = resp.Generated, resp.PrefillMs, resp.MsPerToken
-	if resp.TelemetryJson != "" {
-		r.Telemetry = json.RawMessage(resp.TelemetryJson)
+	resp, err := s.proxyChat(ctx, modelKey, backendSessionID, reqInner, req.Telemetry)
+	if err != nil {
+		return nil, err
 	}
-	s.stats.record(ctx, r)
-	if !asked {
-		resp.TelemetryJson = "" // the engine's own record, unless the client asked for it
+	if !req.GetTelemetry() {
+		resp.TelemetryJson = ""
 	}
 	return resp, nil
 }
 
-// Generate proxies the executor's token stream to the client.
-func (s *Server) Generate(req *pb.GenerateRequest, stream grpc.ServerStreamingServer[pb.GenerateResponse]) error {
-	ctx := stream.Context()
-	log := klog.FromContext(ctx)
-	log.Info("Generate request received", "session_id", req.SessionId, "prompt_tokens", len(req.InputIds))
-
-	modelKey, backendSessionID, err := splitSessionID(req.SessionId)
-	if err != nil {
-		return err
-	}
+// proxyGenerate forwards a GenerateRequest to the executor via Execute, sampling telemetry
+// for stats if configured, and yielding each ExecuteResponse to send.
+func (s *Server) proxyGenerate(ctx context.Context, modelKey, backendSessionID string, genReq *pb.GenerateRequest, telemetry *bool, send func(*pb.ExecuteResponse) error) error {
 	client, conn, err := s.executorClient(ctx, modelKey)
 	if err != nil {
 		return err
 	}
 	defer closeConn(ctx, conn)
 
-	backend := proto.Clone(req).(*pb.GenerateRequest)
-	backend.SessionId = backendSessionID
+	backend := &pb.ExecuteRequest{
+		Request:   proto.Clone(genReq).(*pb.GenerateRequest),
+		Telemetry: telemetry,
+	}
+	backend.Request.SessionId = backendSessionID
 	ref, executor, recorded := s.statsTarget(modelKey)
-	asked := req.GetTelemetry()
+	asked := backend.GetTelemetry()
 	if recorded && !asked && s.stats.sampleTelemetry() {
 		on := true
 		backend.Telemetry = &on
 	}
-	upstream, err := client.Generate(ctx, backend)
+	upstream, err := client.Execute(ctx, backend)
 	if err != nil {
 		return err
 	}
@@ -732,22 +785,59 @@ func (s *Server) Generate(req *pb.GenerateRequest, stream grpc.ServerStreamingSe
 		if err != nil {
 			return err // the executor's status, unchanged
 		}
-		if resp.Done && recorded {
+		innerResp := resp.GetResponse()
+		if innerResp != nil && innerResp.Done && recorded {
 			r := newRecord(ref, executor, "generate")
-			r.PromptTokens, r.PrefilledTokens, r.Generated = resp.PromptTokens, resp.PrefilledTokens, resp.Generated
-			r.PrefillMs, r.MsPerToken, r.FinishReason = resp.PrefillMs, resp.MsPerToken, resp.FinishReason
+			r.PromptTokens, r.PrefilledTokens, r.Generated = innerResp.PromptTokens, innerResp.PrefilledTokens, innerResp.Generated
+			r.PrefillMs, r.MsPerToken, r.FinishReason = innerResp.PrefillMs, innerResp.MsPerToken, innerResp.FinishReason
 			if resp.TelemetryJson != "" {
 				r.Telemetry = json.RawMessage(resp.TelemetryJson)
 			}
 			s.stats.record(ctx, r)
-			if !asked {
-				resp.TelemetryJson = ""
-			}
 		}
-		if err := stream.Send(resp); err != nil {
+		if err := send(resp); err != nil {
 			return err
 		}
 	}
+}
+
+// Generate implements the Engine service: proxies the executor's token stream to the client.
+func (s *Server) Generate(req *pb.GenerateRequest, stream grpc.ServerStreamingServer[pb.GenerateResponse]) error {
+	ctx := stream.Context()
+	log := klog.FromContext(ctx)
+	log.Info("Generate request received", "session_id", req.SessionId, "prompt_tokens", len(req.InputIds))
+
+	modelKey, backendSessionID, err := splitSessionID(req.SessionId)
+	if err != nil {
+		return err
+	}
+	return s.proxyGenerate(ctx, modelKey, backendSessionID, req, nil, func(resp *pb.ExecuteResponse) error {
+		return stream.Send(resp.GetResponse())
+	})
+}
+
+// Execute implements the Executor service on the router for internal or
+// admin callers (e.g. vectors record --producer vxpu-router) needing telemetry.
+func (s *Server) Execute(req *pb.ExecuteRequest, stream grpc.ServerStreamingServer[pb.ExecuteResponse]) error {
+	ctx := stream.Context()
+	log := klog.FromContext(ctx)
+	reqInner := req.GetRequest()
+	if reqInner == nil {
+		return status.Error(codes.InvalidArgument, "missing request in ExecuteRequest")
+	}
+	log.Info("Execute request received", "session_id", reqInner.SessionId, "prompt_tokens", len(reqInner.InputIds))
+
+	modelKey, backendSessionID, err := splitSessionID(reqInner.SessionId)
+	if err != nil {
+		return err
+	}
+	asked := req.GetTelemetry()
+	return s.proxyGenerate(ctx, modelKey, backendSessionID, reqInner, req.Telemetry, func(resp *pb.ExecuteResponse) error {
+		if !asked {
+			resp.TelemetryJson = ""
+		}
+		return stream.Send(resp)
+	})
 }
 
 // closeConn closes an executor connection, logging rather than
@@ -756,15 +846,6 @@ func closeConn(ctx context.Context, conn *grpc.ClientConn) {
 	if err := conn.Close(); err != nil {
 		klog.FromContext(ctx).Error(err, "closing executor connection")
 	}
-}
-
-// backendChatRequest is the client's request addressed to the executor's
-// own session id. Everything else is forwarded untouched, so new
-// ChatRequest fields reach the executor without router changes.
-func backendChatRequest(req *pb.ChatRequest, backendSessionID string) *pb.ChatRequest {
-	backend := proto.Clone(req).(*pb.ChatRequest)
-	backend.SessionId = backendSessionID
-	return backend
 }
 
 // PeerMappingMethods helper for tests to directly query and inject mapping

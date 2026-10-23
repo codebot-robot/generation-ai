@@ -38,7 +38,7 @@ _sym_db = _symbol_database.Default()
 
 
 
-DESCRIPTOR = _descriptor_pool.Default().AddSerializedFile(b'\n\nvxpu.proto\x12\x04vxpu\"\xc9\x01\n\x10LoadModelRequest\x12\x15\n\rmanifest_json\x18\x01 \x01(\t\x12\x14\n\x0c\x62inding_json\x18\x02 \x01(\t\x12\x15\n\rprefill_graph\x18\x03 \x01(\x0c\x12\x14\n\x0c\x64\x65\x63ode_graph\x18\x04 \x01(\x0c\x12.\n\x04plan\x18\x05 \x03(\x0b\x32 .vxpu.LoadModelRequest.PlanEntry\x1a+\n\tPlanEntry\x12\x0b\n\x03key\x18\x01 \x01(\t\x12\r\n\x05value\x18\x02 \x01(\t:\x02\x38\x01\"$\n\x11LoadModelResponse\x12\x0f\n\x07success\x18\x01 \x01(\x08\"\x98\x01\n\x14RegisterModelRequest\x12\r\n\x05model\x18\x01 \x01(\t\x12\x10\n\x08revision\x18\x02 \x01(\t\x12\x32\n\x04plan\x18\x03 \x03(\x0b\x32$.vxpu.RegisterModelRequest.PlanEntry\x1a+\n\tPlanEntry\x12\x0b\n\x03key\x18\x01 \x01(\t\x12\r\n\x05value\x18\x02 \x01(\t:\x02\x38\x01\"\x82\x01\n\x15RegisterModelResponse\x12\r\n\x05model\x18\x01 \x01(\t\x12\x10\n\x08revision\x18\x02 \x01(\t\x12\x0e\n\x06\x63ommit\x18\x03 \x01(\t\x12\x10\n\x08\x61rtifact\x18\x04 \x01(\t\x12\x10\n\x08\x63ompiled\x18\x05 \x01(\x08\x12\x14\n\x0cweight_bytes\x18\x06 \x01(\x03\"4\n\x11NewSessionRequest\x12\r\n\x05model\x18\x01 \x01(\t\x12\x10\n\x08revision\x18\x02 \x01(\t\"(\n\x12NewSessionResponse\x12\x12\n\nsession_id\x18\x01 \x01(\t\"\x81\x01\n\x0b\x43hatRequest\x12\x12\n\nsession_id\x18\x01 \x01(\t\x12\x0c\n\x04text\x18\x02 \x01(\t\x12\x16\n\x0emax_new_tokens\x18\x03 \x01(\x05\x12\x12\n\nraw_prompt\x18\x04 \x01(\x08\x12\x16\n\ttelemetry\x18\x05 \x01(\x08H\x00\x88\x01\x01\x42\x0c\n\n_telemetry\"\xa4\x01\n\x0c\x43hatResponse\x12\x0c\n\x04text\x18\x01 \x01(\t\x12\x16\n\x0esession_tokens\x18\x02 \x01(\x05\x12\x19\n\x11new_prompt_tokens\x18\x03 \x01(\x05\x12\x11\n\tgenerated\x18\x04 \x01(\x05\x12\x12\n\nprefill_ms\x18\x05 \x01(\x02\x12\x14\n\x0cms_per_token\x18\x06 \x01(\x02\x12\x16\n\x0etelemetry_json\x18\x07 \x01(\t\"\x84\x03\n\x0fGenerateRequest\x12\x12\n\nsession_id\x18\x01 \x01(\t\x12\x11\n\tinput_ids\x18\x02 \x03(\x05\x12\x1b\n\x0emax_new_tokens\x18\x03 \x01(\x05H\x00\x88\x01\x01\x12\x16\n\tdo_sample\x18\x04 \x01(\x08H\x01\x88\x01\x01\x12\x18\n\x0btemperature\x18\x05 \x01(\x02H\x02\x88\x01\x01\x12\x12\n\x05top_k\x18\x06 \x01(\x05H\x03\x88\x01\x01\x12\x12\n\x05top_p\x18\x07 \x01(\x02H\x04\x88\x01\x01\x12\x1f\n\x12repetition_penalty\x18\x08 \x01(\x02H\x05\x88\x01\x01\x12\x14\n\x0c\x65os_token_id\x18\t \x03(\x05\x12\x11\n\x04seed\x18\n \x01(\x04H\x06\x88\x01\x01\x12\x16\n\ttelemetry\x18\x0b \x01(\x08H\x07\x88\x01\x01\x42\x11\n\x0f_max_new_tokensB\x0c\n\n_do_sampleB\x0e\n\x0c_temperatureB\x08\n\x06_top_kB\x08\n\x06_top_pB\x15\n\x13_repetition_penaltyB\x07\n\x05_seedB\x0c\n\n_telemetry\"\xd0\x01\n\x10GenerateResponse\x12\x11\n\ttoken_ids\x18\x01 \x03(\x05\x12\x0c\n\x04\x64one\x18\x02 \x01(\x08\x12\x15\n\rfinish_reason\x18\x03 \x01(\t\x12\x15\n\rprompt_tokens\x18\x04 \x01(\x05\x12\x18\n\x10prefilled_tokens\x18\x05 \x01(\x05\x12\x11\n\tgenerated\x18\x06 \x01(\x05\x12\x12\n\nprefill_ms\x18\x07 \x01(\x02\x12\x14\n\x0cms_per_token\x18\x08 \x01(\x02\x12\x16\n\x0etelemetry_json\x18\t \x01(\t\"6\n\x14GetModelStatsRequest\x12\r\n\x05model\x18\x01 \x01(\t\x12\x0f\n\x07records\x18\x02 \x01(\x08\"D\n\x15GetModelStatsResponse\x12\x14\n\x0csummary_json\x18\x01 \x01(\t\x12\x15\n\rrecords_jsonl\x18\x02 \x01(\t\"\x11\n\x0f\x44\x65scribeRequest\")\n\x10\x44\x65scribeResponse\x12\x15\n\rhardware_json\x18\x01 \x01(\t\"$\n\x13\x45xplainModelRequest\x12\r\n\x05model\x18\x01 \x01(\t\")\n\x14\x45xplainModelResponse\x12\x11\n\tplan_json\x18\x01 \x01(\t\"p\n\x14\x44\x65scribeNodesRequest\x12\x15\n\rmanifest_json\x18\x01 \x01(\t\x12\x14\n\x0c\x62inding_json\x18\x02 \x01(\t\x12\x14\n\x0c\x64\x65\x63ode_graph\x18\x03 \x01(\x0c\x12\x15\n\rprefill_graph\x18\x04 \x01(\x0c\">\n\x15\x44\x65scribeNodesResponse\x12\x12\n\nnodes_json\x18\x01 \x01(\t\x12\x11\n\tcuts_json\x18\x02 \x01(\t\"e\n\x11ServeNodesRequest\x12\x15\n\rmanifest_json\x18\x01 \x01(\t\x12\x14\n\x0c\x62inding_json\x18\x02 \x01(\t\x12\x14\n\x0c\x64\x65\x63ode_graph\x18\x03 \x01(\x0c\x12\r\n\x05nodes\x18\x04 \x03(\t\"\"\n\x12ServeNodesResponse\x12\x0c\n\x04port\x18\x01 \x01(\x05\"\x13\n\x11ServeRangeRequest\"7\n\x12ServeRangeResponse\x12\x0c\n\x04port\x18\x01 \x01(\x05\x12\x13\n\x0blayer_range\x18\x02 \x01(\t2\xed\x05\n\x08\x45xecutor\x12>\n\tLoadModel\x12\x16.vxpu.LoadModelRequest\x1a\x17.vxpu.LoadModelResponse\"\x00\x12J\n\rRegisterModel\x12\x1a.vxpu.RegisterModelRequest\x1a\x1b.vxpu.RegisterModelResponse\"\x00\x12\x41\n\nNewSession\x12\x17.vxpu.NewSessionRequest\x1a\x18.vxpu.NewSessionResponse\"\x00\x12/\n\x04\x43hat\x12\x11.vxpu.ChatRequest\x1a\x12.vxpu.ChatResponse\"\x00\x12=\n\x08Generate\x12\x15.vxpu.GenerateRequest\x1a\x16.vxpu.GenerateResponse\"\x00\x30\x01\x12J\n\rGetModelStats\x12\x1a.vxpu.GetModelStatsRequest\x1a\x1b.vxpu.GetModelStatsResponse\"\x00\x12;\n\x08\x44\x65scribe\x12\x15.vxpu.DescribeRequest\x1a\x16.vxpu.DescribeResponse\"\x00\x12G\n\x0c\x45xplainModel\x12\x19.vxpu.ExplainModelRequest\x1a\x1a.vxpu.ExplainModelResponse\"\x00\x12J\n\rDescribeNodes\x12\x1a.vxpu.DescribeNodesRequest\x1a\x1b.vxpu.DescribeNodesResponse\"\x00\x12\x41\n\nServeNodes\x12\x17.vxpu.ServeNodesRequest\x1a\x18.vxpu.ServeNodesResponse\"\x00\x12\x41\n\nServeRange\x12\x17.vxpu.ServeRangeRequest\x1a\x18.vxpu.ServeRangeResponse\"\x00\x42\x42Z@github.com/gke-labs/generation-ai/vxpu/pkg/api/v1alpha1;v1alpha1b\x06proto3')
+DESCRIPTOR = _descriptor_pool.Default().AddSerializedFile(b'\n\nvxpu.proto\x12\x04vxpu\"\xc9\x01\n\x10LoadModelRequest\x12\x15\n\rmanifest_json\x18\x01 \x01(\t\x12\x14\n\x0c\x62inding_json\x18\x02 \x01(\t\x12\x15\n\rprefill_graph\x18\x03 \x01(\x0c\x12\x14\n\x0c\x64\x65\x63ode_graph\x18\x04 \x01(\x0c\x12.\n\x04plan\x18\x05 \x03(\x0b\x32 .vxpu.LoadModelRequest.PlanEntry\x1a+\n\tPlanEntry\x12\x0b\n\x03key\x18\x01 \x01(\t\x12\r\n\x05value\x18\x02 \x01(\t:\x02\x38\x01\"$\n\x11LoadModelResponse\x12\x0f\n\x07success\x18\x01 \x01(\x08\"\x98\x01\n\x14RegisterModelRequest\x12\r\n\x05model\x18\x01 \x01(\t\x12\x10\n\x08revision\x18\x02 \x01(\t\x12\x32\n\x04plan\x18\x03 \x03(\x0b\x32$.vxpu.RegisterModelRequest.PlanEntry\x1a+\n\tPlanEntry\x12\x0b\n\x03key\x18\x01 \x01(\t\x12\r\n\x05value\x18\x02 \x01(\t:\x02\x38\x01\"\x82\x01\n\x15RegisterModelResponse\x12\r\n\x05model\x18\x01 \x01(\t\x12\x10\n\x08revision\x18\x02 \x01(\t\x12\x0e\n\x06\x63ommit\x18\x03 \x01(\t\x12\x10\n\x08\x61rtifact\x18\x04 \x01(\t\x12\x10\n\x08\x63ompiled\x18\x05 \x01(\x08\x12\x14\n\x0cweight_bytes\x18\x06 \x01(\x03\"4\n\x11NewSessionRequest\x12\r\n\x05model\x18\x01 \x01(\t\x12\x10\n\x08revision\x18\x02 \x01(\t\"(\n\x12NewSessionResponse\x12\x12\n\nsession_id\x18\x01 \x01(\t\"[\n\x0b\x43hatRequest\x12\x12\n\nsession_id\x18\x01 \x01(\t\x12\x0c\n\x04text\x18\x02 \x01(\t\x12\x16\n\x0emax_new_tokens\x18\x03 \x01(\x05\x12\x12\n\nraw_prompt\x18\x04 \x01(\x08\"\x8c\x01\n\x0c\x43hatResponse\x12\x0c\n\x04text\x18\x01 \x01(\t\x12\x16\n\x0esession_tokens\x18\x02 \x01(\x05\x12\x19\n\x11new_prompt_tokens\x18\x03 \x01(\x05\x12\x11\n\tgenerated\x18\x04 \x01(\x05\x12\x12\n\nprefill_ms\x18\x05 \x01(\x02\x12\x14\n\x0cms_per_token\x18\x06 \x01(\x02\"^\n\x12\x45xecuteChatRequest\x12\"\n\x07request\x18\x01 \x01(\x0b\x32\x11.vxpu.ChatRequest\x12\x16\n\ttelemetry\x18\x02 \x01(\x08H\x00\x88\x01\x01\x42\x0c\n\n_telemetry\"S\n\x13\x45xecuteChatResponse\x12$\n\x08response\x18\x01 \x01(\x0b\x32\x12.vxpu.ChatResponse\x12\x16\n\x0etelemetry_json\x18\x02 \x01(\t\"\xde\x02\n\x0fGenerateRequest\x12\x12\n\nsession_id\x18\x01 \x01(\t\x12\x11\n\tinput_ids\x18\x02 \x03(\x05\x12\x1b\n\x0emax_new_tokens\x18\x03 \x01(\x05H\x00\x88\x01\x01\x12\x16\n\tdo_sample\x18\x04 \x01(\x08H\x01\x88\x01\x01\x12\x18\n\x0btemperature\x18\x05 \x01(\x02H\x02\x88\x01\x01\x12\x12\n\x05top_k\x18\x06 \x01(\x05H\x03\x88\x01\x01\x12\x12\n\x05top_p\x18\x07 \x01(\x02H\x04\x88\x01\x01\x12\x1f\n\x12repetition_penalty\x18\x08 \x01(\x02H\x05\x88\x01\x01\x12\x14\n\x0c\x65os_token_id\x18\t \x03(\x05\x12\x11\n\x04seed\x18\n \x01(\x04H\x06\x88\x01\x01\x42\x11\n\x0f_max_new_tokensB\x0c\n\n_do_sampleB\x0e\n\x0c_temperatureB\x08\n\x06_top_kB\x08\n\x06_top_pB\x15\n\x13_repetition_penaltyB\x07\n\x05_seed\"\xb8\x01\n\x10GenerateResponse\x12\x11\n\ttoken_ids\x18\x01 \x03(\x05\x12\x0c\n\x04\x64one\x18\x02 \x01(\x08\x12\x15\n\rfinish_reason\x18\x03 \x01(\t\x12\x15\n\rprompt_tokens\x18\x04 \x01(\x05\x12\x18\n\x10prefilled_tokens\x18\x05 \x01(\x05\x12\x11\n\tgenerated\x18\x06 \x01(\x05\x12\x12\n\nprefill_ms\x18\x07 \x01(\x02\x12\x14\n\x0cms_per_token\x18\x08 \x01(\x02\"^\n\x0e\x45xecuteRequest\x12&\n\x07request\x18\x01 \x01(\x0b\x32\x15.vxpu.GenerateRequest\x12\x16\n\ttelemetry\x18\x02 \x01(\x08H\x00\x88\x01\x01\x42\x0c\n\n_telemetry\"S\n\x0f\x45xecuteResponse\x12(\n\x08response\x18\x01 \x01(\x0b\x32\x16.vxpu.GenerateResponse\x12\x16\n\x0etelemetry_json\x18\x02 \x01(\t\"6\n\x14GetModelStatsRequest\x12\r\n\x05model\x18\x01 \x01(\t\x12\x0f\n\x07records\x18\x02 \x01(\x08\"D\n\x15GetModelStatsResponse\x12\x14\n\x0csummary_json\x18\x01 \x01(\t\x12\x15\n\rrecords_jsonl\x18\x02 \x01(\t\"\x11\n\x0f\x44\x65scribeRequest\")\n\x10\x44\x65scribeResponse\x12\x15\n\rhardware_json\x18\x01 \x01(\t\"$\n\x13\x45xplainModelRequest\x12\r\n\x05model\x18\x01 \x01(\t\")\n\x14\x45xplainModelResponse\x12\x11\n\tplan_json\x18\x01 \x01(\t\"p\n\x14\x44\x65scribeNodesRequest\x12\x15\n\rmanifest_json\x18\x01 \x01(\t\x12\x14\n\x0c\x62inding_json\x18\x02 \x01(\t\x12\x14\n\x0c\x64\x65\x63ode_graph\x18\x03 \x01(\x0c\x12\x15\n\rprefill_graph\x18\x04 \x01(\x0c\">\n\x15\x44\x65scribeNodesResponse\x12\x12\n\nnodes_json\x18\x01 \x01(\t\x12\x11\n\tcuts_json\x18\x02 \x01(\t\"e\n\x11ServeNodesRequest\x12\x15\n\rmanifest_json\x18\x01 \x01(\t\x12\x14\n\x0c\x62inding_json\x18\x02 \x01(\t\x12\x14\n\x0c\x64\x65\x63ode_graph\x18\x03 \x01(\x0c\x12\r\n\x05nodes\x18\x04 \x03(\t\"\"\n\x12ServeNodesResponse\x12\x0c\n\x04port\x18\x01 \x01(\x05\"\x13\n\x11ServeRangeRequest\"7\n\x12ServeRangeResponse\x12\x0c\n\x04port\x18\x01 \x01(\x05\x12\x13\n\x0blayer_range\x18\x02 \x01(\t2\xdc\x03\n\x06\x45ngine\x12>\n\tLoadModel\x12\x16.vxpu.LoadModelRequest\x1a\x17.vxpu.LoadModelResponse\"\x00\x12J\n\rRegisterModel\x12\x1a.vxpu.RegisterModelRequest\x1a\x1b.vxpu.RegisterModelResponse\"\x00\x12\x41\n\nNewSession\x12\x17.vxpu.NewSessionRequest\x1a\x18.vxpu.NewSessionResponse\"\x00\x12/\n\x04\x43hat\x12\x11.vxpu.ChatRequest\x1a\x12.vxpu.ChatResponse\"\x00\x12=\n\x08Generate\x12\x15.vxpu.GenerateRequest\x1a\x16.vxpu.GenerateResponse\"\x00\x30\x01\x12J\n\rGetModelStats\x12\x1a.vxpu.GetModelStatsRequest\x1a\x1b.vxpu.GetModelStatsResponse\"\x00\x12G\n\x0c\x45xplainModel\x12\x19.vxpu.ExplainModelRequest\x1a\x1a.vxpu.ExplainModelResponse\"\x00\x32\x9e\x04\n\x08\x45xecutor\x12>\n\tLoadModel\x12\x16.vxpu.LoadModelRequest\x1a\x17.vxpu.LoadModelResponse\"\x00\x12\x41\n\nNewSession\x12\x17.vxpu.NewSessionRequest\x1a\x18.vxpu.NewSessionResponse\"\x00\x12\x44\n\x0b\x45xecuteChat\x12\x18.vxpu.ExecuteChatRequest\x1a\x19.vxpu.ExecuteChatResponse\"\x00\x12:\n\x07\x45xecute\x12\x14.vxpu.ExecuteRequest\x1a\x15.vxpu.ExecuteResponse\"\x00\x30\x01\x12;\n\x08\x44\x65scribe\x12\x15.vxpu.DescribeRequest\x1a\x16.vxpu.DescribeResponse\"\x00\x12J\n\rDescribeNodes\x12\x1a.vxpu.DescribeNodesRequest\x1a\x1b.vxpu.DescribeNodesResponse\"\x00\x12\x41\n\nServeNodes\x12\x17.vxpu.ServeNodesRequest\x1a\x18.vxpu.ServeNodesResponse\"\x00\x12\x41\n\nServeRange\x12\x17.vxpu.ServeRangeRequest\x1a\x18.vxpu.ServeRangeResponse\"\x00\x42\x42Z@github.com/gke-labs/generation-ai/vxpu/pkg/api/v1alpha1;v1alpha1b\x06proto3')
 
 _globals = globals()
 _builder.BuildMessageAndEnumDescriptors(DESCRIPTOR, _globals)
@@ -66,38 +66,48 @@ if not _descriptor._USE_C_DESCRIPTORS:
   _globals['_NEWSESSIONREQUEST']._serialized_end=602
   _globals['_NEWSESSIONRESPONSE']._serialized_start=604
   _globals['_NEWSESSIONRESPONSE']._serialized_end=644
-  _globals['_CHATREQUEST']._serialized_start=647
-  _globals['_CHATREQUEST']._serialized_end=776
-  _globals['_CHATRESPONSE']._serialized_start=779
-  _globals['_CHATRESPONSE']._serialized_end=943
-  _globals['_GENERATEREQUEST']._serialized_start=946
-  _globals['_GENERATEREQUEST']._serialized_end=1334
-  _globals['_GENERATERESPONSE']._serialized_start=1337
-  _globals['_GENERATERESPONSE']._serialized_end=1545
-  _globals['_GETMODELSTATSREQUEST']._serialized_start=1547
-  _globals['_GETMODELSTATSREQUEST']._serialized_end=1601
-  _globals['_GETMODELSTATSRESPONSE']._serialized_start=1603
-  _globals['_GETMODELSTATSRESPONSE']._serialized_end=1671
-  _globals['_DESCRIBEREQUEST']._serialized_start=1673
-  _globals['_DESCRIBEREQUEST']._serialized_end=1690
-  _globals['_DESCRIBERESPONSE']._serialized_start=1692
-  _globals['_DESCRIBERESPONSE']._serialized_end=1733
-  _globals['_EXPLAINMODELREQUEST']._serialized_start=1735
-  _globals['_EXPLAINMODELREQUEST']._serialized_end=1771
-  _globals['_EXPLAINMODELRESPONSE']._serialized_start=1773
-  _globals['_EXPLAINMODELRESPONSE']._serialized_end=1814
-  _globals['_DESCRIBENODESREQUEST']._serialized_start=1816
-  _globals['_DESCRIBENODESREQUEST']._serialized_end=1928
-  _globals['_DESCRIBENODESRESPONSE']._serialized_start=1930
-  _globals['_DESCRIBENODESRESPONSE']._serialized_end=1992
-  _globals['_SERVENODESREQUEST']._serialized_start=1994
-  _globals['_SERVENODESREQUEST']._serialized_end=2095
-  _globals['_SERVENODESRESPONSE']._serialized_start=2097
-  _globals['_SERVENODESRESPONSE']._serialized_end=2131
-  _globals['_SERVERANGEREQUEST']._serialized_start=2133
-  _globals['_SERVERANGEREQUEST']._serialized_end=2152
-  _globals['_SERVERANGERESPONSE']._serialized_start=2154
-  _globals['_SERVERANGERESPONSE']._serialized_end=2209
-  _globals['_EXECUTOR']._serialized_start=2212
-  _globals['_EXECUTOR']._serialized_end=2961
+  _globals['_CHATREQUEST']._serialized_start=646
+  _globals['_CHATREQUEST']._serialized_end=737
+  _globals['_CHATRESPONSE']._serialized_start=740
+  _globals['_CHATRESPONSE']._serialized_end=880
+  _globals['_EXECUTECHATREQUEST']._serialized_start=882
+  _globals['_EXECUTECHATREQUEST']._serialized_end=976
+  _globals['_EXECUTECHATRESPONSE']._serialized_start=978
+  _globals['_EXECUTECHATRESPONSE']._serialized_end=1061
+  _globals['_GENERATEREQUEST']._serialized_start=1064
+  _globals['_GENERATEREQUEST']._serialized_end=1414
+  _globals['_GENERATERESPONSE']._serialized_start=1417
+  _globals['_GENERATERESPONSE']._serialized_end=1601
+  _globals['_EXECUTEREQUEST']._serialized_start=1603
+  _globals['_EXECUTEREQUEST']._serialized_end=1697
+  _globals['_EXECUTERESPONSE']._serialized_start=1699
+  _globals['_EXECUTERESPONSE']._serialized_end=1782
+  _globals['_GETMODELSTATSREQUEST']._serialized_start=1784
+  _globals['_GETMODELSTATSREQUEST']._serialized_end=1838
+  _globals['_GETMODELSTATSRESPONSE']._serialized_start=1840
+  _globals['_GETMODELSTATSRESPONSE']._serialized_end=1908
+  _globals['_DESCRIBEREQUEST']._serialized_start=1910
+  _globals['_DESCRIBEREQUEST']._serialized_end=1927
+  _globals['_DESCRIBERESPONSE']._serialized_start=1929
+  _globals['_DESCRIBERESPONSE']._serialized_end=1970
+  _globals['_EXPLAINMODELREQUEST']._serialized_start=1972
+  _globals['_EXPLAINMODELREQUEST']._serialized_end=2008
+  _globals['_EXPLAINMODELRESPONSE']._serialized_start=2010
+  _globals['_EXPLAINMODELRESPONSE']._serialized_end=2051
+  _globals['_DESCRIBENODESREQUEST']._serialized_start=2053
+  _globals['_DESCRIBENODESREQUEST']._serialized_end=2165
+  _globals['_DESCRIBENODESRESPONSE']._serialized_start=2167
+  _globals['_DESCRIBENODESRESPONSE']._serialized_end=2229
+  _globals['_SERVENODESREQUEST']._serialized_start=2231
+  _globals['_SERVENODESREQUEST']._serialized_end=2332
+  _globals['_SERVENODESRESPONSE']._serialized_start=2334
+  _globals['_SERVENODESRESPONSE']._serialized_end=2368
+  _globals['_SERVERANGEREQUEST']._serialized_start=2370
+  _globals['_SERVERANGEREQUEST']._serialized_end=2389
+  _globals['_SERVERANGERESPONSE']._serialized_start=2391
+  _globals['_SERVERANGERESPONSE']._serialized_end=2446
+  _globals['_ENGINE']._serialized_start=2449
+  _globals['_ENGINE']._serialized_end=2925
+  _globals['_EXECUTOR']._serialized_start=2928
+  _globals['_EXECUTOR']._serialized_end=3470
 # @@protoc_insertion_point(module_scope)
