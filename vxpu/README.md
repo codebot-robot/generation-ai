@@ -145,7 +145,7 @@ engine builds one at load, from the hardware and the configuration:
 
 The engine logs the plan at load, and `Engine.explain()` returns it.
 `python -m vxpu.plan --artifact DIR --device cuda --compile` explains the
-plan for an artifact without loading weights. `vectors record` and
+plan for an artifact without loading weights. `vectors_test record` and
 `dev/vm/attribute_decode.py` store the plan with their results, so a
 measurement says which plan produced it.
 
@@ -441,7 +441,7 @@ run one transformers. Each patch is written to be upstreamable.
 
 ## Verifying a model: test vectors
 
-`vxpu.vectors` records what a model says and compares two recordings.
+`vxpu.vectors_test` records what a model says and compares two recordings.
 Eager transformers writes the reference; the vXPU engine (in-process,
 or through a router) and vLLM write candidates. Where the candidate's
 greedy tokens leave the reference's, the reference's own logits at
@@ -453,19 +453,19 @@ interchange point between engines.
 
 ```sh
 # reference, from the same transformers the exporter uses
-python -m vxpu.vectors record --producer transformers --model Qwen/Qwen3-8B-FP8 -o ref.json
+python -m vxpu.vectors_test record --producer transformers --model Qwen/Qwen3-8B-FP8 -o ref.json
 # candidate: the exported artifact on this machine's CPU ...
 python -m vxpu.export Qwen/Qwen3-8B-FP8 -o qwen8b/
-python -m vxpu.vectors record --producer vxpu-engine --model Qwen/Qwen3-8B-FP8 --artifact qwen8b/ -o got.json
+python -m vxpu.vectors_test record --producer vxpu-engine --model Qwen/Qwen3-8B-FP8 --artifact qwen8b/ -o got.json
 # ... or through the router in the cluster (tokens only; no logits on the wire)
-python -m vxpu.vectors record --producer vxpu-router --model Qwen/Qwen3-8B-FP8 --artifact qwen8b/ -o got.json
-# ... or vLLM; in a vLLM image with no vxpu installed, copy vectors.py in and
-# run it as a file: python vectors.py record --producer vllm ...
-python -m vxpu.vectors record --producer vllm --model Qwen/Qwen3-8B-FP8 -o vllm.json
-python -m vxpu.vectors compare ref.json got.json
+python -m vxpu.vectors_test record --producer vxpu-router --model Qwen/Qwen3-8B-FP8 --artifact qwen8b/ -o got.json
+# ... or vLLM; in a vLLM image with no vxpu installed, copy vectors_test.py in and
+# run it as a file: python vectors_test.py record --producer vllm ...
+python -m vxpu.vectors_test record --producer vllm --model Qwen/Qwen3-8B-FP8 -o vllm.json
+python -m vxpu.vectors_test compare ref.json got.json
 ```
 
-Two tiers. The CI tier, `python -m vxpu.vectors selftest`, runs in the
+Two tiers. The CI tier, `python -m vxpu.vectors_test selftest`, runs in the
 e2e presubmit on three tiny models built in-process or fetched from the
 Hub: a random fp8 Qwen3-MoE (`vxpu.fixtures.tiny_fp8_moe`: block
 scales, per-expert tensors, an unquantized lm_head), the tiny random
@@ -505,7 +505,7 @@ logits* of each generated position (`logprobs_mode="raw_logits"`, the
 pre-softmax values before any processor), so a vLLM recording compares
 with the others at the logit level. vLLM places the model itself, and
 the recording is labelled with the card it used. The producer needs
-only the `vllm` package: copy `vectors.py` into a vLLM image and run
+only the `vllm` package: copy `vectors_test.py` into a vLLM image and run
 it as a file.
 
 Qwen3-8B-FP8 through vLLM 0.31 on two cards, against eager transformers
@@ -561,7 +561,7 @@ this table, not an invisible rewrite.
 proto/        Engine (client) and Executor (internal) gRPC APIs
 python/vxpu/  export (thin client), client (thin client, no torch),
               modeling (transformers-shaped from_pretrained/generate),
-              vectors (test vectors: record with any producer, compare),
+              vectors_test (test vectors: record with any producer, compare),
               server (executor): manifest, export, rehydrate, engine
 cmd/vxpu/     Go CLI: no Python/torch — ships artifacts, creates the
               router pod on demand, port-forwards, chats

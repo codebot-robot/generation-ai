@@ -815,7 +815,7 @@ func (s *Server) Generate(req *pb.GenerateRequest, stream grpc.ServerStreamingSe
 }
 
 // Execute implements the Executor service on the router for internal or
-// admin callers (e.g. vectors record --producer vxpu-router) needing telemetry.
+// admin callers (e.g. vectors_test record --producer vxpu-router) needing telemetry.
 func (s *Server) Execute(req *pb.ExecuteRequest, stream grpc.ServerStreamingServer[pb.ExecuteResponse]) error {
 	ctx := stream.Context()
 	log := klog.FromContext(ctx)

@@ -35,7 +35,7 @@ how often each expert was chosen) and reports, per layer and overall:
 and, with --artifact, the expert size and the storage bandwidth the misses
 would need at a target decode rate.
 
-Counts come from any file carrying telemetry: `vectors record --telemetry`
+Counts come from any file carrying telemetry: `vectors_test record --telemetry`
 output (each prompt's "telemetry"), attribute_decode.py output, a raw
 telemetry dict, or the engine's request records (JSON lines, from `vxpu
 stats --records`). Small samples overstate skew: an expert that was not seen

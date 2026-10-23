@@ -126,7 +126,7 @@ class Session:
                     timeout=None, telemetry=vxpu_pb2.TELEMETRY_NONE):
         """Internal call to Executor.Execute on the router's admin port or executor.
 
-        For internal tuning and test vectors (vectors record --telemetry).
+        For internal tuning and test vectors (vectors_test record --telemetry).
         With ``telemetry=vxpu_pb2.TELEMETRY_SUMMARY``, the executor records execution
         telemetry, which arrives as ``self.last.telemetry`` (a dict, format
         vxpu-telemetry/1). ``telemetry=vxpu_pb2.TELEMETRY_TRACE`` also records each decode
@@ -135,7 +135,7 @@ class Session:
         if self.client.internal_stub is None:
             raise RuntimeError(
                 "no router admin address configured; pass internal_address to "
-                "Client (or set VXPU_ROUTER_ADMIN / pass --router-admin to vectors record)")
+                "Client (or set VXPU_ROUTER_ADMIN / pass --router-admin to vectors_test record)")
         for token_id in self._stream_ids(
                 input_ids, max_new_tokens=max_new_tokens, do_sample=do_sample,
                 temperature=temperature, top_k=top_k, top_p=top_p,

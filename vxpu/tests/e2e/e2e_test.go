@@ -57,10 +57,10 @@ func TestE2E(t *testing.T) {
 
 	// The equivalence harness's CI tier: tiny models exported from a
 	// local directory and from the Hub, run on the in-process engine,
-	// token-exact against eager transformers (vxpu/python/vxpu/vectors.py).
+	// token-exact against eager transformers (vxpu/python/vxpu/vectors_test.py).
 	h.t.Log("Running the test-vectors selftest in the executor image")
 	h.RunCommand("docker", "run", "--rm", "--entrypoint", "python", "vxpu-executor:e2e",
-		"-m", "vxpu.vectors", "selftest", "--workdir", "/tmp/vectors")
+		"-m", "vxpu.vectors_test", "selftest", "--workdir", "/tmp/vectors")
 
 	// Build the vxpu Go CLI binary
 	h.t.Logf("Building vxpu CLI binary to %s", vxpuBin)
