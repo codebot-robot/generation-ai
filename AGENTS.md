@@ -25,6 +25,7 @@ The rules that matter most here:
 - **Write full sentences, one idea each.** Don't chain clauses with colons, semicolons and parenthetical asides.
 - **Define a term before you use it,** and use the project's existing words. Don't coin shorthand.
 - **Say what the code does and why,** not how it got that way.
+- **Check all the prose in your change** before you send it. Start from the diff, and check every file that holds prose: docs (such as `design.md` and `README.md`), code comments, docstrings, proto and script comments, error and log messages, flag help, the commit message and the PR description.
 
 For example, rewrite this:
 
