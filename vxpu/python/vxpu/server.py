@@ -43,6 +43,12 @@ from .plan import Plan, probe_hardware
 
 MAX_MESSAGE_BYTES = 128 * 1024 * 1024
 
+_TELEMETRY = {
+    vxpu_pb2.TELEMETRY_NONE: None,
+    vxpu_pb2.TELEMETRY_SUMMARY: "summary",
+    vxpu_pb2.TELEMETRY_TRACE: "trace",
+}
+
 
 class ExecutorServicer(vxpu_pb2_grpc.ExecutorServicer):
     def __init__(self, device="cpu", compile_decode=False,
@@ -346,7 +352,7 @@ class ExecutorServicer(vxpu_pb2_grpc.ExecutorServicer):
                 req.session_id, req.text,
                 max_new_tokens=max_new_tokens,
                 raw_prompt=req.raw_prompt,
-                telemetry=request.HasField("telemetry") and request.telemetry)
+                telemetry=_TELEMETRY[request.telemetry])
             chat_resp = vxpu_pb2.ChatResponse(
                 text=reply["text"],
                 session_tokens=reply["session_tokens"],
@@ -400,7 +406,7 @@ class ExecutorServicer(vxpu_pb2_grpc.ExecutorServicer):
             for chunk in engine.generate(
                     req.session_id, list(req.input_ids),
                     max_new_tokens, params, list(req.eos_token_id),
-                    telemetry=request.HasField("telemetry") and request.telemetry):
+                    telemetry=_TELEMETRY[request.telemetry]):
                 if not context.is_active():
                     return
                 self._touch()  # a long stream is not idle

@@ -38,6 +38,12 @@ MAX_MESSAGE_BYTES = 128 * 1024 * 1024
 ARTIFACT_FILES = ("manifest.json", "binding.json", "prefill.pt2",
                   "decode.pt2")
 
+_TELEMETRY = {
+    None: vxpu_pb2.TELEMETRY_NONE,
+    "summary": vxpu_pb2.TELEMETRY_SUMMARY,
+    "trace": vxpu_pb2.TELEMETRY_TRACE,
+}
+
 
 class Reply:
     """One turn's result: the text plus the executor's own timings."""
@@ -117,18 +123,20 @@ class Session:
                 input_ids, max_new_tokens=max_new_tokens, do_sample=do_sample,
                 temperature=temperature, top_k=top_k, top_p=top_p,
                 repetition_penalty=repetition_penalty, eos_token_id=eos_token_id,
-                seed=seed, timeout=timeout, telemetry=False, admin=False):
+                seed=seed, timeout=timeout, telemetry=None, admin=False):
             yield token_id
 
     def execute_ids(self, input_ids, max_new_tokens=None, do_sample=None,
                     temperature=None, top_k=None, top_p=None,
                     repetition_penalty=None, eos_token_id=(), seed=None,
-                    timeout=None, telemetry=False):
+                    timeout=None, telemetry=None):
         """Internal call to Executor.Execute on the router's admin port or executor.
 
         For internal tuning and test vectors (vectors record --telemetry).
-        ``telemetry=True`` asks the executor for its execution telemetry,
-        which arrives as ``self.last.telemetry`` (a dict, format vxpu-telemetry/1).
+        With ``telemetry="summary"``, the executor records execution
+        telemetry, which arrives as ``self.last.telemetry`` (a dict, format
+        vxpu-telemetry/1). ``telemetry="trace"`` also records each decode
+        step's expert selections, in order.
         """
         if self.client.internal_stub is None:
             raise RuntimeError(
@@ -144,7 +152,7 @@ class Session:
     def _stream_ids(self, input_ids, max_new_tokens=None, do_sample=None,
                     temperature=None, top_k=None, top_p=None,
                     repetition_penalty=None, eos_token_id=(), seed=None,
-                    timeout=None, telemetry=False, admin=False):
+                    timeout=None, telemetry=None, admin=False):
         request = vxpu_pb2.GenerateRequest(
             session_id=self.session_id,
             input_ids=[int(i) for i in input_ids],
@@ -165,8 +173,8 @@ class Session:
         try:
             if admin:
                 exec_req = vxpu_pb2.ExecuteRequest(request=request)
-                if telemetry:
-                    exec_req.telemetry = True
+                if telemetry is not None:
+                    exec_req.telemetry = _TELEMETRY[telemetry]
                 stream = self.client.internal_stub.Execute(exec_req, timeout=to)
             else:
                 stream = self.client.stub.Generate(request, timeout=to)

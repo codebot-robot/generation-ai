@@ -84,9 +84,9 @@ class VxpuModelForCausalLM:
         self.device = torch.device("cpu")
         self.dtype = torch.bfloat16
         self.last = None  # statistics of the latest generate()
-        # ask the executor for its execution telemetry on each generate()
+        # execution telemetry mode on each generate(): None, "summary", or "trace"
         # (it arrives as self.last.telemetry)
-        self.collect_telemetry = False
+        self.collect_telemetry = None
 
     @classmethod
     def from_pretrained(cls, repo_id, *, router=None, router_admin=None,
@@ -259,7 +259,7 @@ class VxpuModelForCausalLM:
                 prompt, max_new_tokens=max_new_tokens, do_sample=do_sample,
                 temperature=temperature, top_k=top_k, top_p=top_p,
                 repetition_penalty=repetition_penalty,
-                eos_token_id=extra_eos, seed=seed, telemetry=True)
+                eos_token_id=extra_eos, seed=seed, telemetry=self.collect_telemetry)
         else:
             stream = self.session.generate_ids(
                 prompt, max_new_tokens=max_new_tokens, do_sample=do_sample,

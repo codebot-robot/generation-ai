@@ -294,7 +294,7 @@ type fakeExecutor struct {
 	gotSession   string
 	gotIDs       []int32
 	gotTopK      *int32
-	gotTelemetry bool
+	gotTelemetry pb.Telemetry
 }
 
 func (f *fakeExecutor) Execute(req *pb.ExecuteRequest, stream grpc.ServerStreamingServer[pb.ExecuteResponse]) error {
@@ -311,7 +311,7 @@ func (f *fakeExecutor) Execute(req *pb.ExecuteRequest, stream grpc.ServerStreami
 		}
 	}
 	final := &pb.ExecuteResponse{Response: &pb.GenerateResponse{Done: true, FinishReason: "eos", Generated: 3}}
-	if req.GetTelemetry() {
+	if req.GetTelemetry() != pb.Telemetry_TELEMETRY_NONE {
 		final.TelemetryJson = `{"format": "vxpu-telemetry/1"}`
 	}
 	return stream.Send(final)
@@ -385,7 +385,7 @@ func TestGenerate_ProxiesStreamToExecutor(t *testing.T) {
 		t.Errorf("final message not forwarded: %+v", done)
 	}
 	// Client Generate API carries no telemetry
-	if executor.gotTelemetry {
+	if executor.gotTelemetry != pb.Telemetry_TELEMETRY_NONE {
 		t.Errorf("executor should not see a telemetry request from client Generate")
 	}
 	if executor.gotSession != "s3" {
@@ -434,12 +434,12 @@ func TestExecute_ProxiesStreamWithTelemetry(t *testing.T) {
 		t.Fatal(err)
 	}
 	defer adminConn.Close()
-	topK, maxNew, telemetry := int32(5), int32(3), true
+	topK, maxNew := int32(5), int32(3)
 	stream, err := pb.NewExecutorClient(adminConn).Execute(ctx, &pb.ExecuteRequest{
 		Request: &pb.GenerateRequest{
 			SessionId: modelKey + ":s3", InputIds: []int32{1, 2, 3}, MaxNewTokens: &maxNew, TopK: &topK,
 		},
-		Telemetry: &telemetry,
+		Telemetry: pb.Telemetry_TELEMETRY_SUMMARY,
 	})
 	if err != nil {
 		t.Fatal(err)
@@ -468,7 +468,7 @@ func TestExecute_ProxiesStreamWithTelemetry(t *testing.T) {
 		t.Errorf("final message not forwarded: %+v", done)
 	}
 	// Execution telemetry rides on the Execute stream
-	if !executor.gotTelemetry {
+	if executor.gotTelemetry != pb.Telemetry_TELEMETRY_SUMMARY {
 		t.Errorf("executor should see the telemetry request")
 	}
 	if done == nil || done.TelemetryJson == "" {

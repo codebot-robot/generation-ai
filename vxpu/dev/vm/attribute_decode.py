@@ -101,7 +101,7 @@ def main():
     # events between segments, read back in batches, so the measurement
     # adds no synchronization of its own
     sid = eng.new_session()
-    done = [ev for ev in eng.generate(sid, ids, args.steps, SamplingParams(do_sample=False), telemetry=True)
+    done = [ev for ev in eng.generate(sid, ids, args.steps, SamplingParams(do_sample=False), telemetry="summary")
             if ev.get("done")][0]
     tel = done["telemetry"]
     res["telemetry"] = tel

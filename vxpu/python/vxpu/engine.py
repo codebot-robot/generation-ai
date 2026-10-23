@@ -949,10 +949,12 @@ class Engine:
             }
         return session_id
 
-    def chat(self, session_id, text, max_new_tokens=96, raw_prompt=False, telemetry=False):
+    def chat(self, session_id, text, max_new_tokens=96, raw_prompt=False, telemetry=None):
         """One templated (or raw) text turn; greedy, like the CLI expects.
-        ``telemetry=True`` adds the turn's execution telemetry to the
-        reply (as generate does), under ``"telemetry"``."""
+        With ``telemetry="summary"``, the reply carries the turn's execution
+        telemetry under ``"telemetry"``. ``telemetry="trace"`` also records
+        each decode step's expert selections, in order. Without either,
+        nothing is recorded."""
         with self._lock:
             return self._chat_locked(session_id, text, max_new_tokens,
                                      raw_prompt, telemetry)
@@ -979,7 +981,7 @@ class Engine:
             messages, add_generation_prompt=True,
             return_tensors="pt", return_dict=True)["input_ids"][0].tolist()
 
-    def _chat_locked(self, session_id, text, max_new_tokens, raw_prompt, telemetry=False):
+    def _chat_locked(self, session_id, text, max_new_tokens, raw_prompt, telemetry=None):
         session = self._session(session_id)
         ids = self._prompt_ids(session, text, raw_prompt)
         token_ids, stats = [], None
@@ -1013,7 +1015,7 @@ class Engine:
         }
 
     def generate(self, session_id, input_ids, max_new_tokens, params,
-                 extra_eos_ids=(), logits_sink=None, telemetry=False):
+                 extra_eos_ids=(), logits_sink=None, telemetry=None):
         """transformers' generate() loop, streamed.
 
         Yields dicts {"token_ids": [...], "done": bool, ...}; the last
@@ -1022,9 +1024,10 @@ class Engine:
         serially anyway). ``logits_sink(position, logits)``, if given,
         sees the next-token logits (a 1-D tensor) before each pick,
         position 0 being the first generated token; used to record
-        test vectors. ``telemetry=True`` records this call's execution
-        (telemetry.py) and returns it on the final event as
-        ``"telemetry"``; nothing is recorded otherwise.
+        test vectors. With ``telemetry="summary"``, the final event carries
+        the call's execution telemetry under ``"telemetry"``.
+        ``telemetry="trace"`` also records each decode step's expert
+        selections, in order. Without either, nothing is recorded.
         """
         with self._lock:
             session = self._session(session_id)
@@ -1038,13 +1041,16 @@ class Engine:
         return self.sessions[session_id]
 
     def _generate_locked(self, session, ids, max_new_tokens, params,
-                         extra_eos_ids=(), logits_sink=None, telemetry=False):
+                         extra_eos_ids=(), logits_sink=None, telemetry=None):
+        if telemetry not in (None, "summary", "trace"):
+            raise ValueError(f"telemetry accepts only None, 'summary' or 'trace', got {telemetry!r}")
         if self.expert_mover is not None:  # generate and chat: the hot experts follow this request's selections too
             self.expert_mover.begin_request()
         recorder = None
-        if telemetry:
+        if telemetry is not None:
             recorder = Recorder(self.device, getattr(self, "_segment_info", None)
-                                if self._decode_split is not None else None)
+                                if self._decode_split is not None else None,
+                                trace=(telemetry == "trace"))
             self.external.telemetry = recorder
             if self._decode_split is not None:
                 self._decode_split.set_recorder(recorder)

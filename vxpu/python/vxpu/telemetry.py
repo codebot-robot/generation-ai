@@ -53,16 +53,18 @@ DRAIN_EVERY = 8  # decode steps of CUDA events held before reading them back
 class Recorder:
     """Telemetry for one generate call."""
 
-    def __init__(self, device, segments=None):
+    def __init__(self, device, segments=None, trace=False):
         self.cuda = str(device).startswith("cuda")
         self.device = device
         self.segments = segments or []  # [{name, kind, layers, nodes}] in call order
+        self.trace = trace
         self.phase = "prefill"
         self.seg_ms = collections.Counter()
         self.seg_steps = 0
         self.host = collections.defaultdict(collections.Counter)
         self.experts = {"prefill": collections.defaultdict(collections.Counter),
                         "decode": collections.defaultdict(collections.Counter)}
+        self.expert_trace = collections.defaultdict(list)
         self.step_ms = []
         self.prefill_ms = None
         self.prefill_tokens = None  # prompt tokens this call prefilled (the cached prefix excluded)
@@ -128,6 +130,8 @@ class Recorder:
         counts = self.experts[self.phase][layer]
         for e in indices:
             counts[e] += 1
+        if self.trace and self.phase == "decode":
+            self.expert_trace[layer].append([int(e) for e in indices])
 
     # ---- result
 
@@ -160,6 +164,8 @@ class Recorder:
         out["host_ops"] = host  # decode: per step; prefill: totals
         out["experts"] = {phase: {str(layer): dict(sorted(c.items())) for layer, c in sorted(layers.items())}
                           for phase, layers in self.experts.items() if layers}
+        if self.trace:
+            out["expert_trace"] = {str(layer): steps for layer, steps in sorted(self.expert_trace.items())}
         if plan_record is not None:
             out["plan"] = plan_record
         return out
