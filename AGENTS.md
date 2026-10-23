@@ -16,6 +16,24 @@ This file provides context and instructions for LLM coding agents working on the
 - **Testability**: Ensure that implementations are well-tested, including end-to-end tests where appropriate.
 - **Modern Go**: Use `any` instead of `interface{}` in Go code.
 
+## Writing
+
+Code comments, docstrings, commit messages, PR descriptions and docs should read clearly to someone new to the code. Follow Google's [Technical Writing One](https://developers.google.com/tech-writing/one) and, for details, the [Google developer documentation style guide](https://developers.google.com/style). For doc comments, see [Go doc comments](https://go.dev/doc/comment) and the docstring section of the [Google Python Style Guide](https://google.github.io/styleguide/pyguide.html#38-comments-and-docstrings).
+
+The rules that matter most here:
+- **Use active voice.** Say who does what: "the router claims the executor before it asks it to serve", not "the executor is claimed before it is asked to serve".
+- **Write full sentences, one idea each.** Don't chain clauses with colons, semicolons and parenthetical asides.
+- **Define a term before you use it,** and use the project's existing words. Don't coin shorthand.
+- **Say what the code does and why,** not how it got that way.
+
+For example, rewrite this:
+
+> The inputs of this engine's range that are numbers, not tensors (a prefill's length one segment hands another): from the network they come as tensors, and are turned back.
+
+as this:
+
+> The names of this range's inputs that are plain numbers rather than tensors, such as a prefill's length. The wire format carries only tensors, so the range server turns these back into numbers when they arrive.
+
 ## Development Workflow
 
 - Adhere to the project's coding style and structure.
