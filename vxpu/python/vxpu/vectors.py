@@ -301,7 +301,7 @@ def record_deepseek_eager(model, revision, prompts, settings):
 
 
 def record_vxpu_engine(model, revision, prompts, settings, artifact, device="cpu",
-                       compile_decode=False, telemetry=None, keep=None, prepare=None):
+                       compile_decode=False, telemetry=None, keep=None, prepare=None, external_dir=None):
     """Candidate: the executor's engine in this process (no cluster).
     With ``telemetry="summary"``, each prompt carries its execution
     telemetry. With ``telemetry="trace"``, it also records ordered
@@ -310,7 +310,8 @@ def record_vxpu_engine(model, revision, prompts, settings, artifact, device="cpu
     import torch
     from .engine import Engine, SamplingParams
     tok = _tokenizer(model, revision, prompts)
-    engine = Engine(artifact, device=device, compile_decode=compile_decode)
+    engine = Engine(artifact, device=device, compile_decode=compile_decode,
+                    external_dir=external_dir)
     if prepare is not None:  # a check's change to the loaded engine, before it generates
         prepare(engine)
     if keep is not None:
@@ -342,7 +343,8 @@ def record_vxpu_engine(model, revision, prompts, settings, artifact, device="cpu
     with open(os.path.join(artifact, "binding.json")) as f:
         binding = json.load(f)
     from .plan import record as plan_record
-    producer = {"kind": "vxpu-engine", **_versions(device),
+    producer = {"kind": "vxpu-engine" if not external_dir else "vxpu-engine (external_dir)",
+                **_versions(device),
                 "compile": compile_decode,
                 "binding": {k: len(binding.get(k, [])) for k in
                             ("bound", "derived", "state", "stacked", "aliases")},
@@ -1108,7 +1110,7 @@ def _check_host_reads(workdir):
     else:
         raise SystemExit(f"gather_rows accepted indices on {device}")
     path = os.path.join(workdir, "advise-random.bin")
-    mapped, _ = file_backed(path, 1 << 16)
+    mapped, *_ = file_backed(path, 1 << 16)
     if getattr(mmap, "MADV_RANDOM", None) is not None and not advise_random(mapped):
         raise SystemExit("advise_random: madvise(MADV_RANDOM) was refused on a memory-mapped tensor")
     print("host reads: gather_rows matches index_select and refuses bad or device indices; MADV_RANDOM taken")
@@ -2186,6 +2188,77 @@ def _check_copy_worker_failure(artifact):
         return True
 
 
+def _check_external_dir(model, prompts, settings, artifact, ref, workdir):
+    """Check that the engine can keep its external tensors (expert banks
+    and n-gram tables) in files under external_dir. The first load
+    fetches them and leaves no .partial files behind. A second load with
+    a deleted bank and an unlocked stray partial file cleans up the stray,
+    refetches only that bank, and still matches the eager reference
+    token for token."""
+    import shutil
+    ext_dir = os.path.join(workdir, "tiny-deepseek-v41-external")
+    shutil.rmtree(ext_dir, ignore_errors=True)
+    from .engine import Engine
+    first_engine = Engine(artifact, external_dir=ext_dir)
+    if first_engine.external_bytes_fetched <= 0:
+        print(f"external_dir check: first load fetched {first_engine.external_bytes_fetched} bytes; expected > 0")
+        return False
+
+    ext_files, partial_files = [], []
+    for root, _, filenames in os.walk(ext_dir):
+        for f in filenames:
+            rel = os.path.relpath(os.path.join(root, f), ext_dir)
+            if ".partial" in f:
+                partial_files.append(rel)
+            else:
+                ext_files.append(os.path.join(root, f))
+    if not ext_files:
+        print(f"external_dir check: no completed bank files in {ext_dir}")
+        return False
+    if partial_files:
+        print(f"external_dir check: left behind partial files: {partial_files}")
+        return False
+
+    # Simulate an interrupted load: delete one completed bank, and plant an
+    # unlocked partial file next to it. The next load must clean up the stray,
+    # refetch that bank, leave no partial files behind, and match the reference.
+    victim = ext_files[0]
+    victim_size = os.path.getsize(victim)
+    os.remove(victim)
+    stray = victim + ".partial.stray"
+    with open(stray, "wb"):
+        pass
+
+    kept = []
+    got_mmap = record_vxpu_engine(model, "main", prompts, settings, artifact, external_dir=ext_dir, keep=kept)
+    if not kept:
+        print("external_dir check: record_vxpu_engine did not keep engine")
+        return False
+    reloaded = kept[0]
+    if reloaded.external_bytes_fetched != victim_size:
+        print(f"external_dir check: reload refetched {reloaded.external_bytes_fetched} bytes; expected {victim_size}")
+        return False
+    if os.path.exists(stray):
+        print(f"external_dir check: stray file was not removed: {stray}")
+        return False
+    if not os.path.exists(victim):
+        print(f"external_dir check: victim bank file was not restored: {victim}")
+        return False
+
+    remaining_partials = [os.path.join(root, f) for root, _, filenames in os.walk(ext_dir)
+                          for f in filenames if ".partial" in f]
+    if remaining_partials:
+        print(f"external_dir check: left behind partial files after reload: {remaining_partials}")
+        return False
+
+    rows_mmap, ok_mmap = compare(ref, got_mmap, strict_tokens=True)
+    print(table(ref, got_mmap, rows_mmap))
+    if not ok_mmap:
+        return False
+    print("  external_dir ok: crash-safe reload refetched only missing bank and matched reference")
+    return True
+
+
 def selftest(workdir, settings):
     """The CI tier: tiny models through export, the in-process engine,
     and a transformers reference, token-exact. No cluster."""
@@ -2278,6 +2351,8 @@ def selftest(workdir, settings):
             failed.append(name + " (chat telemetry)")
         if name == "tiny-deepseek-v41" and not _check_gpu_experts(model, prompts, settings, artifact, workdir):
             failed.append(name + " (gpu experts)")
+        if name == "tiny-deepseek-v41" and not _check_external_dir(model, prompts, settings, artifact, ref, workdir):
+            failed.append(name + " (external_dir)")
         if name == "tiny-deepseek-v41" and not _check_telemetry(model, prompts, settings, artifact, got, workdir):
             failed.append(name + " (telemetry)")
         if name == "tiny-deepseek-v41" and not _check_lowering(model, prompts, settings, artifact, workdir):
