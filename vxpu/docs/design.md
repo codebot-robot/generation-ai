@@ -229,18 +229,72 @@ VMs attach that disk:
   (`VXPU_BLOB_DIR`).
 - **Making one:** once per checkpoint, a disk factory, which is a
   short-lived VM, copies the files from the bucket onto a fresh disk. We
-  then make a snapshot of that disk. Snapshots are global, so any zone can
-  make disks from one.
+  then make a snapshot of that disk. A GCE snapshot is a global resource:
+  a zone in any region can make disks from it. Its data, though, is
+  stored in one location, by default a multi-region such as `us`.
 - **Using one:** the coordinator makes a disk from the snapshot in the
   executor's zone and attaches it read-only. Many VMs can attach the same
   Hyperdisk ML disk at once. The machine's agent (`vxpu-agent`, the start
   of #384) mounts the disk and checks it against the index.
 
 For now, `vxpu disk build`, `attach` and `detach` run their GCE operations
-through the gcloud CLI; #443 replaces it with the Compute API. The planner
-will choose between a disk in the executor's zone and streaming from the
-bucket by time to ready and by cost, using disk throughput measured per
-machine type.
+through the gcloud CLI; #443 replaces it with the Compute API.
+
+**What a disk saves.** We measured both ways of getting weights onto a new
+VM on Oct 23 2026. The VM was a g2-standard-48 in us-central1-b, and it
+loaded layers 20 to 39 of DeepSeek-V4.1-Flash (154 GB) into a cold
+engine. Time to first token here means the time until the engine is
+loaded, not counting the VM's boot or the prompt's prefill:
+
+| step | copy from the bucket | weights disk |
+|---|---|---|
+| put the checkpoint on the VM | 338 s: 511 GB to local SSD at 1.5 GB/s | 6 s: attach 5.7 s, mount 0.3 s |
+| load the engine | 221 s | 230 s |
+| time to first token (sum) | about 9 minutes | about 4 minutes |
+
+Making the disk from the snapshot took 476 s, once for the zone. Raw
+reads on this VM reach 2.94 GB/s from local SSD and 2.52 GB/s from the
+disk. The disk stops at 2,400 MiB/s although it is provisioned for
+13,080 MB/s, so the limit is probably the VM's (inferred). The engine
+reads at 1.35 to 1.5 GB/s from either source, so today the engine, not
+the storage, limits how fast a model loads.
+
+**Disks are caches.** The bucket holds the canonical copy of every
+checkpoint, and we don't copy it per region or per zone. It should be one
+multi-region bucket. Today it is a regional bucket in us-central1
+(`modelstore/README.md`), which is enough while everything runs there.
+Snapshots and disks are caches of the bucket:
+- A snapshot costs its stored bytes. It saves rerunning the factory,
+  which copies the whole checkpoint from the bucket.
+- A disk serves one zone. It costs its capacity and provisioned
+  throughput by the minute, and every VM that attaches it shares them.
+
+The planner decides when each cache is worth its cost (#349). It makes a
+disk in a zone when the VMs it expects there, each ready about 5 minutes
+sooner, are worth the disk's cost. It can make the disk ahead of demand,
+so that a scale-up doesn't wait 476 s for it. It deletes a disk that sits
+idle, because the snapshot can make it again in about 8 minutes. A VM
+without a disk copies its checkpoint from the bucket, which suits a VM
+that starts once.
+
+**Open questions:**
+- **Where the bucket and snapshots are stored.** A VM that copies from
+  a bucket in another region, or a disk made far from its snapshot's
+  storage location, probably runs more slowly and pays for inter-region
+  transfer; we haven't measured either. When we run outside us-central1,
+  the bucket moves to a multi-region, and we would keep a copy of the
+  snapshot near each geography. On
+  GCP, that is a snapshot or image with its own `--storage-location`.
+  AWS works the same way at a different scope. An EBS snapshot belongs
+  to one region, so we would copy it to each region we use. On both
+  clouds, disks belong to one zone.
+- **Volumes that fill as they're read.** On AWS, a volume made from a
+  snapshot loads each block from S3 the first time it is read, unless
+  Fast Snapshot Restore is on. A new volume is not at full speed
+  straight away.
+- **Mapping straight from the disk.** The engine copies n-gram tables to
+  local SSD before it memory-maps them. With a weights disk, it could map
+  them from the disk instead (#452).
 
 **Direction.** Hierarchical placement: RAM as a cache over SSD when the
 expert banks don't fit (#348, #259), and weight blocks shared across
