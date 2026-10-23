@@ -47,7 +47,7 @@ from concurrent.futures import ThreadPoolExecutor
 
 import torch
 
-from . import lower, ops, segments  # noqa: F401  (registers vxpu::* before a graph that calls them is loaded)
+from . import lower, ops, segments, vxpu_pb2  # noqa: F401  (registers vxpu::* before a graph that calls them is loaded)
 from .plan import Plan
 from .plan import record as plan_record
 from .telemetry import Recorder, segment_info
@@ -952,12 +952,13 @@ class Engine:
             }
         return session_id
 
-    def chat(self, session_id, text, max_new_tokens=96, raw_prompt=False, telemetry=None):
+    def chat(self, session_id, text, max_new_tokens=96, raw_prompt=False,
+             telemetry=vxpu_pb2.TELEMETRY_NONE):
         """One templated (or raw) text turn; greedy, like the CLI expects.
-        With ``telemetry="summary"``, the reply carries the turn's execution
-        telemetry under ``"telemetry"``. ``telemetry="trace"`` also records
-        each decode step's expert selections, in order. Without either,
-        nothing is recorded."""
+        With ``telemetry=vxpu_pb2.TELEMETRY_SUMMARY``, the reply carries the turn's
+        execution telemetry under ``"telemetry"``. ``telemetry=vxpu_pb2.TELEMETRY_TRACE``
+        also records each decode step's expert selections, in order. Without
+        either, nothing is recorded."""
         with self._lock:
             return self._chat_locked(session_id, text, max_new_tokens,
                                      raw_prompt, telemetry)
@@ -984,7 +985,8 @@ class Engine:
             messages, add_generation_prompt=True,
             return_tensors="pt", return_dict=True)["input_ids"][0].tolist()
 
-    def _chat_locked(self, session_id, text, max_new_tokens, raw_prompt, telemetry=None):
+    def _chat_locked(self, session_id, text, max_new_tokens, raw_prompt,
+                     telemetry=vxpu_pb2.TELEMETRY_NONE):
         session = self._session(session_id)
         ids = self._prompt_ids(session, text, raw_prompt)
         token_ids, stats = [], None
@@ -1018,7 +1020,8 @@ class Engine:
         }
 
     def generate(self, session_id, input_ids, max_new_tokens, params,
-                 extra_eos_ids=(), logits_sink=None, telemetry=None):
+                 extra_eos_ids=(), logits_sink=None,
+                 telemetry=vxpu_pb2.TELEMETRY_NONE):
         """transformers' generate() loop, streamed.
 
         Yields dicts {"token_ids": [...], "done": bool, ...}; the last
@@ -1027,9 +1030,9 @@ class Engine:
         serially anyway). ``logits_sink(position, logits)``, if given,
         sees the next-token logits (a 1-D tensor) before each pick,
         position 0 being the first generated token; used to record
-        test vectors. With ``telemetry="summary"``, the final event carries
-        the call's execution telemetry under ``"telemetry"``.
-        ``telemetry="trace"`` also records each decode step's expert
+        test vectors. With ``telemetry=vxpu_pb2.TELEMETRY_SUMMARY``, the final
+        event carries the call's execution telemetry under ``"telemetry"``.
+        ``telemetry=vxpu_pb2.TELEMETRY_TRACE`` also records each decode step's expert
         selections, in order. Without either, nothing is recorded.
         """
         with self._lock:
@@ -1044,16 +1047,17 @@ class Engine:
         return self.sessions[session_id]
 
     def _generate_locked(self, session, ids, max_new_tokens, params,
-                         extra_eos_ids=(), logits_sink=None, telemetry=None):
-        if telemetry not in (None, "summary", "trace"):
-            raise ValueError(f"telemetry accepts only None, 'summary' or 'trace', got {telemetry!r}")
+                         extra_eos_ids=(), logits_sink=None,
+                         telemetry=vxpu_pb2.TELEMETRY_NONE):
+        if isinstance(telemetry, bool) or telemetry not in vxpu_pb2.Telemetry.values():
+            raise ValueError(f"telemetry accepts only Telemetry enum values, got {telemetry!r}")
         if self.expert_mover is not None:  # generate and chat: the hot experts follow this request's selections too
             self.expert_mover.begin_request()
         recorder = None
-        if telemetry is not None:
+        if telemetry != vxpu_pb2.TELEMETRY_NONE:
             recorder = Recorder(self.device, getattr(self, "_segment_info", None)
                                 if self._decode_split is not None else None,
-                                trace=(telemetry == "trace"))
+                                trace=(telemetry == vxpu_pb2.TELEMETRY_TRACE))
             self.external.telemetry = recorder
             if self._decode_split is not None:
                 self._decode_split.set_recorder(recorder)

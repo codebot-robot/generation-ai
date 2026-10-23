@@ -43,7 +43,7 @@ import os
 import re
 import time
 
-from vxpu import segments
+from vxpu import segments, vxpu_pb2
 from vxpu.engine import Engine, SamplingParams
 
 LAYER = re.compile(r"layers\.\d+")
@@ -101,7 +101,7 @@ def main():
     # events between segments, read back in batches, so the measurement
     # adds no synchronization of its own
     sid = eng.new_session()
-    done = [ev for ev in eng.generate(sid, ids, args.steps, SamplingParams(do_sample=False), telemetry="summary")
+    done = [ev for ev in eng.generate(sid, ids, args.steps, SamplingParams(do_sample=False), telemetry=vxpu_pb2.TELEMETRY_SUMMARY)
             if ev.get("done")][0]
     tel = done["telemetry"]
     res["telemetry"] = tel
