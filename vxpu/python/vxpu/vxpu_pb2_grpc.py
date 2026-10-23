@@ -106,6 +106,11 @@ class ExecutorStub:
                 request_serializer=vxpu__pb2.ServeNodesRequest.SerializeToString,
                 response_deserializer=vxpu__pb2.ServeNodesResponse.FromString,
                 _registered_method=True)
+        self.ServeRange = channel.unary_unary(
+                '/vxpu.Executor/ServeRange',
+                request_serializer=vxpu__pb2.ServeRangeRequest.SerializeToString,
+                response_deserializer=vxpu__pb2.ServeRangeResponse.FromString,
+                _registered_method=True)
 
 
 class ExecutorServicer:
@@ -214,6 +219,16 @@ class ExecutorServicer:
         context.set_details('Method not implemented!')
         raise NotImplementedError('Method not implemented!')
 
+    def ServeRange(self, request, context):
+        """ServeRange (executor only) serves the range of whole layers the loaded
+        engine runs (a LoadModel whose plan sets VXPU_LAYER_RANGE) to the
+        engine running the layers before it, on a port of this machine
+        (rangeserver.py, #387). FAILED_PRECONDITION while the engine loads.
+        """
+        context.set_code(grpc.StatusCode.UNIMPLEMENTED)
+        context.set_details('Method not implemented!')
+        raise NotImplementedError('Method not implemented!')
+
 
 def add_ExecutorServicer_to_server(servicer, server):
     rpc_method_handlers = {
@@ -266,6 +281,11 @@ def add_ExecutorServicer_to_server(servicer, server):
                     servicer.ServeNodes,
                     request_deserializer=vxpu__pb2.ServeNodesRequest.FromString,
                     response_serializer=vxpu__pb2.ServeNodesResponse.SerializeToString,
+            ),
+            'ServeRange': grpc.unary_unary_rpc_method_handler(
+                    servicer.ServeRange,
+                    request_deserializer=vxpu__pb2.ServeRangeRequest.FromString,
+                    response_serializer=vxpu__pb2.ServeRangeResponse.SerializeToString,
             ),
     }
     generic_handler = grpc.method_handlers_generic_handler(
@@ -546,6 +566,33 @@ class Executor:
             '/vxpu.Executor/ServeNodes',
             vxpu__pb2.ServeNodesRequest.SerializeToString,
             vxpu__pb2.ServeNodesResponse.FromString,
+            options,
+            channel_credentials,
+            insecure,
+            call_credentials,
+            compression,
+            wait_for_ready,
+            timeout,
+            metadata,
+            _registered_method=True)
+
+    @staticmethod
+    def ServeRange(request,
+            target,
+            options=(),
+            channel_credentials=None,
+            call_credentials=None,
+            insecure=False,
+            compression=None,
+            wait_for_ready=None,
+            timeout=None,
+            metadata=None):
+        return grpc.experimental.unary_unary(
+            request,
+            target,
+            '/vxpu.Executor/ServeRange',
+            vxpu__pb2.ServeRangeRequest.SerializeToString,
+            vxpu__pb2.ServeRangeResponse.FromString,
             options,
             channel_credentials,
             insecure,

@@ -94,9 +94,35 @@ from the measurements, not from a rule written for it. The same holds
 beyond the three shapes: a search over every layer's two placements
 (`planner.Search`: random layouts and changes to the best, kept as in
 simulated annealing) finds the same layouts, and occasionally better
-ones the shapes miss. `vxpu explain --serve` shows it running. Layer ranges need
-a node server that runs whole layers, dense half and KV cache included
-(#387), before the executors can run them.
+ones the shapes miss. `vxpu explain --serve` shows it running.
+
+vXPU can split one LLM across machines by layer (#387). Each machine runs
+a range of whole layers. An engine started with
+`VXPU_LAYER_RANGE=START:END` loads and runs only layers START to END-1:
+their slice of the decode and prefill graphs (`dataflow.Graph.slice`),
+their experts and n-gram tables, and each session's state for those layers.
+
+The engine that runs the first range is the head. For each step, the head
+runs its own layers, then sends the step's inputs and its layers' outputs
+to the engine that runs the next range. `VXPU_REMOTE_RANGES` tells the head
+where the other ranges are. Each of the other executors serves its range
+on a port (`ServeRange`, `rangeserver.py`). Its server receives each step
+as one message in the node wire format, tagged with the head's session id.
+Once the range has captured its step graph, the server runs decode steps
+in C++, with no Python.
+
+The router chooses ranges when the cost model ranks them cheapest. It asks
+the engine's executor where the step can be cut (`DescribeNodes`), loads
+each range on its executor, and tells the head where the ranges are.
+Ranges produce output bit-identical to one engine's, on the CPU and on the
+GPU with the step graph.
+
+On two g2-standard-48s, with layers 0-19 on one and 20-39 on the other,
+DeepSeek-V4.1-Flash decodes at 78 ms/token (measured over 10 prompts),
+against the 66 ms the cost model predicted. The network round trip takes
+1.5 ms of that, less than the 2.2 ms predicted. Most of the gap comes from
+the last range, which also runs the logits head; the cost model doesn't
+charge that to it yet (#424).
 
 Not every layer boundary can start a range (`cuts.py`): a cut must not
 separate state a layer writes every step from the layers that read it.

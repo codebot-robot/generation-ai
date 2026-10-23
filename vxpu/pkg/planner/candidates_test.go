@@ -79,7 +79,7 @@ func TestCandidates_L4AndTwoC3d(t *testing.T) {
 // (a hop for each of the second machine's layers).
 func TestCandidates_TwoG2Standard48(t *testing.T) {
 	cands := ranked(t, fleetOf(t, "g2-standard-48", "g2-standard-48"), nil)
-	if cands[0].Kind != "layer-ranges" || len(cands[0].Placements) != 2 || cands[0].Runnable {
+	if cands[0].Kind != "layer-ranges" || len(cands[0].Placements) != 2 || !cands[0].Runnable {
 		t.Fatalf("best: %+v", cands[0])
 	}
 	if cands[1].Kind != "experts-spread" || cands[1].Prediction.MsPerToken <= cands[0].Prediction.MsPerToken {
@@ -149,5 +149,35 @@ func TestCandidates_OnlyAtLegalCuts(t *testing.T) {
 	}
 	if !more {
 		t.Error("no layout of more than 2 ranges fits, though 0-13, 14-19, 20-39 does")
+	}
+}
+
+// CandidatesFor starts every layout on the executor being loaded: it runs
+// the step (experts-spread) or the first range (layer-ranges), each range
+// with its own switches.
+func TestCandidatesFor_StartOnTheEngine(t *testing.T) {
+	a := deepseekFull()
+	a.Cuts = []int{1, 2, 8, 14, 20}
+	fleet := fleetOf(t, "g2-standard-48", "c3d-standard-60", "g2-standard-48")
+	cands := CandidatesFor(a, fleet[0], fleet[1:], skewedCounts(), map[string]string{"VXPU_DATAFLOW": "1"})
+	for i, c := range cands {
+		t.Logf("%d. %-15s %7.1f ms  %s %s", i+1, c.Kind, c.Prediction.MsPerToken, c.Summary, c.Infeasible)
+		if len(c.Placements) > 0 && c.Placements[0].Node != fleet[0].Name {
+			t.Errorf("%s starts on %s, want the engine", c.Summary, c.Placements[0].Node)
+		}
+	}
+	best := cands[0]
+	if best.Kind != "layer-ranges" || best.Placements[1].Machine != "g2-standard-48" || best.Placements[1].Layers[0] != 20 {
+		t.Fatalf("best: %+v", best)
+	}
+	for _, p := range best.Placements {
+		if p.Switches["VXPU_STEP_GRAPH"] != "1" || p.Switches["VXPU_GPU_EXPERTS"] == "" {
+			t.Errorf("%s's switches %v: want the step graph and its GPU experts", p.Node, p.Switches)
+		}
+	}
+	for _, c := range cands {
+		if c.Kind == "experts-spread" && c.Plan.Switches["VXPU_DATAFLOW"] != "1" {
+			t.Errorf("experts-spread lacks the registered plan's switches: %v", c.Plan.Switches)
+		}
 	}
 }

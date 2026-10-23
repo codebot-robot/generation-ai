@@ -521,6 +521,14 @@ class Engine:
                 self._decode_run = torch.compile(self._decode, mode=mode)
         if self.plan["dataflow"]:
             self._run_as_dataflow(scratch)
+        if self.plan["remote_ranges"]:  # other executors run the layers after this engine's range (#387)
+            from .rangeserver import RemoteRange
+            ranges = []
+            for item in self.plan["remote_ranges"].split(","):
+                span, address = item.split("=", 1)
+                ranges.append(RemoteRange(address, self.device))
+                print(f"[vxpu] layers {span} on {address}", flush=True)
+            self.attach_ranges(ranges)
         print("[vxpu] " + self.plan.summary(self.plan_ops()).replace("\n", "\n[vxpu] "), flush=True)
 
     def _run_as_dataflow(self, scratch):
