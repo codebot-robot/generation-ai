@@ -207,6 +207,7 @@ Weights are content-addressed by sha256 at every tier:
 | tier | what | code |
 |---|---|---|
 | bucket | modelstore's blobs (`gs://…/_blobs/<sha256>`) | modelstore |
+| weights disk | a checkpoint's blobs on a GCE disk, attached read-only | `pkg/weightdisk`, `pkg/agent` |
 | executor's disk | the local weight tier, filled from the bucket | `localblobs.py` |
 | RAM, or memory-mapped from local SSD | expert banks and n-gram tables, outside the graphs | `engine.py` (`external_dir`) |
 | GPU | dense weights; hot experts (§4) | `engine.py`, `experts_gpu.py` |
@@ -214,6 +215,32 @@ Weights are content-addressed by sha256 at every tier:
 The tables a token reads a few rows of (the n-gram tables, ~200 GB on
 DeepSeek-V4.1-Flash) stay on SSD and are read row by row, concurrently,
 with no readahead.
+
+**Weights disks (#407).** Today each executor VM copies its checkpoint
+from the bucket before it can load a model. The copy is slow for two
+reasons. Downloading uses the VM's CPU for TLS and checksums. And many
+machines write to local SSD slower than they can download: a
+g2-standard-24 copies at 0.83 GB/s, the speed of its local SSD. A weights
+disk removes the copy. The checkpoint goes onto a disk once, and executor
+VMs attach that disk:
+- **Layout:** the disk uses the same layout as the executor's local
+  weight tier, one file per checkpoint file (`blobs/<sha256>`), plus an
+  index (`weights.json`). The executor reads the files in place
+  (`VXPU_BLOB_DIR`).
+- **Making one:** once per checkpoint, a disk factory, which is a
+  short-lived VM, copies the files from the bucket onto a fresh disk. We
+  then make a snapshot of that disk. Snapshots are global, so any zone can
+  make disks from one.
+- **Using one:** the coordinator makes a disk from the snapshot in the
+  executor's zone and attaches it read-only. Many VMs can attach the same
+  Hyperdisk ML disk at once. The machine's agent (`vxpu-agent`, the start
+  of #384) mounts the disk and checks it against the index.
+
+For now, `vxpu disk build`, `attach` and `detach` run their GCE operations
+through the gcloud CLI; #443 replaces it with the Compute API. The planner
+will choose between a disk in the executor's zone and streaming from the
+bucket by time to ready and by cost, using disk throughput measured per
+machine type.
 
 **Direction.** Hierarchical placement: RAM as a cache over SSD when the
 expert banks don't fit (#348, #259), and weight blocks shared across

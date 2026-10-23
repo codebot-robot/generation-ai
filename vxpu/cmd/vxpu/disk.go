@@ -25,18 +25,24 @@ import (
 	"github.com/gke-labs/generation-ai/vxpu/pkg/weightdisk"
 )
 
-// cmdDisk makes weights disks (#407):
+// cmdDisk makes and attaches weights disks (#407):
 //
 //	vxpu disk build --project P --zone Z --image NAME --bucket gs://B --manifest ARTIFACT/manifest.json
+//	vxpu disk attach --project P --zone Z --vm VM --image NAME --disk DISK --agent HOST:PORT [--verify]
+//	vxpu disk detach --project P --zone Z --vm VM --disk DISK --agent HOST:PORT
 func cmdDisk(ctx context.Context, args []string) error {
 	if len(args) == 0 {
-		return fmt.Errorf("usage: vxpu disk build [flags]")
+		return fmt.Errorf("usage: vxpu disk build|attach|detach [flags]")
 	}
 	switch args[0] {
 	case "build":
 		return cmdDiskBuild(ctx, args[1:])
+	case "attach":
+		return cmdDiskAttach(ctx, args[1:])
+	case "detach":
+		return cmdDiskDetach(ctx, args[1:])
 	}
-	return fmt.Errorf("unknown disk command %q (build)", args[0])
+	return fmt.Errorf("unknown disk command %q (build, attach, detach)", args[0])
 }
 
 func cmdDiskBuild(ctx context.Context, args []string) error {
