@@ -35,11 +35,15 @@ follow-up turn prefills only the tokens beyond the cached prefix.
 """
 
 import collections
+import concurrent.futures
+import contextlib
 import hashlib
 import json
 import os
+import queue
 import threading
 import time
+from concurrent.futures import ThreadPoolExecutor
 
 import torch
 
@@ -85,6 +89,30 @@ def external_files_dir(external_dir, manifest):
         manifest["source"], sort_keys=True).encode()).hexdigest()[:16])
 
 
+def fetch_engram_tensors(manifest, specs_by_layer, cas_dir, mmap_root, layers=None, stop_event=None):
+    """Fetch the raw engram table tensors for layers, and return them as
+    {layer: (weight, scale)} with the bytes fetched. Stop early, before
+    the next tensor, if stop_event is set."""
+    out, fetched = {}, 0
+    for key, spec in specs_by_layer.items():
+        if stop_event is not None and stop_event.is_set():
+            return None, fetched
+        layer = int(key)
+        if layers is not None and layer not in layers:
+            continue
+        weight, n = fetch_tensor(manifest["tensors"][spec["weight"]], manifest["files"], cas_dir, mmap_dir=mmap_root)
+        fetched += n
+        if stop_event is not None and stop_event.is_set():
+            return None, fetched
+        scale, n = fetch_tensor(manifest["tensors"][spec["scale"]], manifest["files"], cas_dir, mmap_dir=mmap_root)
+        fetched += n
+        if mmap_root:
+            advise_random(weight)
+            advise_random(scale)
+        out[layer] = (weight, scale)
+    return out, fetched
+
+
 def load_engram_tables(manifest, specs_by_layer, cas_dir, mmap_root, layers=None):
     """The n-gram tables of an artifact's layers (binding external.engram;
     `layers` limits them), each as the model's own embedding module on the
@@ -92,21 +120,36 @@ def load_engram_tables(manifest, specs_by_layer, cas_dir, mmap_root, layers=None
     mmap_root when set, read row by row at random (no readahead, #364).
     The engine and a node server (nodeserver.py) load them the same way."""
     from . import deepseek_v41 as ds
-    tables, fetched = {}, 0
-    for key, spec in specs_by_layer.items():
-        layer = int(key)
-        if layers is not None and layer not in layers:
-            continue
-        weight, n = fetch_tensor(manifest["tensors"][spec["weight"]], manifest["files"], cas_dir, mmap_dir=mmap_root)
-        fetched += n
-        scale, n = fetch_tensor(manifest["tensors"][spec["scale"]], manifest["files"], cas_dir, mmap_dir=mmap_root)
-        fetched += n
-        if mmap_root:
-            advise_random(weight)
-            advise_random(scale)
+    tensors_by_layer, fetched = fetch_engram_tensors(manifest, specs_by_layer, cas_dir, mmap_root, layers=layers)
+    tables = {}
+    for layer, (weight, scale) in tensors_by_layer.items():
+        spec = specs_by_layer[str(layer)]
         tables[layer] = ds.host_engram(layer, spec["num_embeddings"], spec["dim"], weight, scale)
         ops.ENGRAM_DIM[layer] = spec["dim"]
     return tables, fetched
+
+
+def fetch_expert_banks(manifest, specs_by_layer, cas_dir, mmap_root, in_ram, layers=None, stop_event=None):
+    """Fetch the raw expert bank tensors for layers, and return them as
+    {layer: {name: tensor}} with the bytes fetched. Stop early, before the
+    next bank, if stop_event is set."""
+    out, fetched = {}, 0
+    for layer, specs in specs_by_layer.items():
+        if stop_event is not None and stop_event.is_set():
+            return None, fetched
+        if layers is not None and int(layer) not in layers:
+            continue
+        banks = {}
+        for name, spec in specs.items():
+            if stop_event is not None and stop_event.is_set():
+                return None, fetched
+            tensor, downloaded = fetch_stacked(
+                spec, manifest["tensors"], manifest["files"], cas_dir,
+                mmap_path=os.path.join(mmap_root, f"experts.{layer}.{name}") if (mmap_root and not in_ram) else None)
+            banks[name] = tensor
+            fetched += downloaded
+        out[int(layer)] = banks
+    return out, fetched
 
 
 def load_expert_layers(manifest, specs_by_layer, args, cas_dir, mmap_root, in_ram, layers=None):
@@ -116,18 +159,10 @@ def load_expert_layers(manifest, specs_by_layer, args, cas_dir, mmap_root, in_ra
     files under mmap_root unless in_ram. The engine and the expert
     server (nodeserver.py) load them the same way."""
     from . import deepseek_v41 as ds
-    out, fetched = {}, 0
-    for layer, specs in specs_by_layer.items():
-        if layers is not None and int(layer) not in layers:
-            continue
-        banks = {}
-        for name, spec in specs.items():
-            tensor, downloaded = fetch_stacked(
-                spec, manifest["tensors"], manifest["files"], cas_dir,
-                mmap_path=os.path.join(mmap_root, f"experts.{layer}.{name}") if (mmap_root and not in_ram) else None)
-            banks[name] = tensor
-            fetched += downloaded
-        out[int(layer)] = ds.host_experts(int(layer), args, banks)
+    banks_by_layer, fetched = fetch_expert_banks(manifest, specs_by_layer, cas_dir, mmap_root, in_ram, layers)
+    out = {}
+    for layer, banks in banks_by_layer.items():
+        out[layer] = ds.host_experts(layer, args, banks)
     return out, fetched
 
 
@@ -138,9 +173,13 @@ def _has_tokenizer_files(repo):
         return True
     return any(os.path.exists(os.path.join(repo, f)) for f in TOKENIZER_FILES)
 
+
 class Engine:
+    _copy_worker_hook = None
+
     def __init__(self, artifact_dir, device="cpu", compile_decode=False,
-                 cas_dir=None, external_dir=None, plan_given=None):
+                 cas_dir=None, external_dir=None, plan_given=None,
+                 _copy_worker_hook=None):
         from transformers import AutoTokenizer
         from transformers.models.auto.configuration_auto import (
             CONFIG_MAPPING)
@@ -148,6 +187,7 @@ class Engine:
         self.artifact_dir = artifact_dir
         self.device = device
         self.compile_decode = compile_decode
+        self._copy_worker_hook = _copy_worker_hook or self._copy_worker_hook
         # The physical plan: every choice about how this engine runs the
         # artifact, made here once and reported by explain() (plan.py).
         self.plan = Plan(device, compile_decode=compile_decode, external_dir=external_dir, given=plan_given)
@@ -207,48 +247,28 @@ class Engine:
 
         # Shared, read-only: fetched/computed exactly once. Shapes for
         # derived/state tensors come from the decode program itself.
+        t_probe_start = time.time()
         probe = torch.export.load(
             os.path.join(artifact_dir, "decode.pt2"))
         probe_meta = {**probe.state_dict, **probe.constants}
+        t_probe = time.time() - t_probe_start
 
-        # Weights move to the device once, here: both programs then
+        # Weights move to the device once: both programs then
         # alias the same storage (device pass no-ops on tensors already
         # in place), so a session costs cache memory, not a weight copy.
         self.shared = {}
         self.bytes_fetched = 0
-        # Bound tensors are fetched concurrently (a bounded window, so
-        # the memory in flight stays near the window, not the model);
-        # each lands on the device as it completes.
-        from concurrent.futures import ThreadPoolExecutor
-        bound = list(self.binding["bound"].items())
-        with ThreadPoolExecutor(max_workers=16) as pool:
-            pending = {}
-            for i, (fqn, ref) in enumerate(bound):
-                pending[i] = pool.submit(fetch_tensor, ref, self.manifest["files"], cas_dir)
-                if len(pending) >= 32:
-                    j = min(pending)
-                    tensor, downloaded = pending.pop(j).result()
-                    self.shared[bound[j][0]] = tensor.to(device)
-                    self.bytes_fetched += downloaded
-            for j in sorted(pending):
-                tensor, downloaded = pending.pop(j).result()
-                self.shared[bound[j][0]] = tensor.to(device)
-                self.bytes_fetched += downloaded
-        # Stacked parameters (mixture-of-experts banks) are assembled
-        # from the checkpoint's per-expert tensors.
-        for fqn, spec in self.binding.get("stacked", {}).items():
-            tensor, downloaded = fetch_stacked(
-                spec, self.manifest["tensors"], self.manifest["files"], cas_dir)
-            self.shared[fqn] = tensor.to(device)
-            self.bytes_fetched += downloaded
+        self._timing_bound = 0.0
+        self._timing_banks = 0.0
+        self._timing_stacked = 0.0
+        self._timing_graph = 0.0
+
         # What the graphs call out for (ops.py), owned here: it is freed
         # with the engine and seen by the ops only while this engine runs
         # a graph (external_scope).
         self.external = ops.External()
         self.expert_mover = None  # experts_gpu.Mover, when hot experts move with the traffic
         self.external.plan = self.plan  # the ops dispatch by this engine's plan
-        if self.binding.get("external"):
-            self._bind_external(self.binding["external"], cas_dir)
         for fqn in self.binding["derived"]:
             self.shared[fqn] = derived_tensor(
                 fqn, probe_meta[fqn], self.config).to(device)
@@ -276,13 +296,241 @@ class Engine:
         self._resident_owner = None
         self._ranges = []  # the ranges of layers after this engine's, on other engines (attach_ranges)
         self._current = None  # the session being generated for
-        self._build()
+
+        scratch = {
+            fqn: torch.zeros(shape, dtype=dtype, device=self.device)
+            for fqn, (shape, dtype) in self.state_specs.items()}
+
+        # Fetch the dense weights first, both bound and stacked tensors.
+        # Real weights land on the device before graph building starts.
+        self._fetch_bound(cas_dir)
+        if self.binding.get("stacked"):
+            self._fetch_stacked(cas_dir)
+
+        # Build the graphs while another thread fetches external tensors.
+        # The graphs do not hold external banks as attributes, so _build
+        # runs concurrently with fetching expert banks and n-gram tables.
+        if self.binding.get("external"):
+            from . import deepseek_v41 as ds
+            args = ds.model_args(self.manifest["source"]["repo"], self.max_cache_len)
+            mm = external_files_dir(self.external_dir, self.manifest)
+            self.external.remote_nodes = self._connect_remote_nodes()
+            self._remote_layers = {i for kind, i in self.external.remote_nodes if kind == "experts"}
+            remote_tables = {i for kind, i in self.external.remote_nodes if kind == "engram"}
+            specs = self.binding["external"].get("experts", {})
+            if self.plan["layer_range"]:
+                self._remote_layers |= {int(layer) for layer in specs if not self._in_range(int(layer))}
+                remote_tables |= {int(k) for k in self.binding["external"].get("engram", {}) if not self._in_range(int(k))}
+            local = {int(layer) for layer in specs} - self._remote_layers
+            local_tables = {int(k) for k in self.binding["external"].get("engram", {})} - remote_tables
+
+            stop_event = threading.Event()
+            pool = ThreadPoolExecutor(max_workers=2)
+            f_build = pool.submit(self._build, probe, scratch)
+            f_external = pool.submit(
+                self._fetch_external_tensors, self.binding["external"], cas_dir, mm, local, local_tables, stop_event)
+            done, not_done = concurrent.futures.wait(
+                [f_build, f_external], return_when=concurrent.futures.FIRST_EXCEPTION)
+            for f in done:
+                if f.exception() is not None:
+                    stop_event.set()
+                    pool.shutdown(wait=True)
+                    raise f.exception()
+            if not_done:
+                done2, _ = concurrent.futures.wait(not_done)
+                for f in done2:
+                    if f.exception() is not None:
+                        stop_event.set()
+                        pool.shutdown(wait=True)
+                        raise f.exception()
+            pool.shutdown(wait=True)
+            fetched_experts, fetched_engram = f_external.result()
+            self._assemble_external(self.binding["external"], args, mm, local, remote_tables, fetched_experts, fetched_engram)
+        else:
+            self._build(probe, scratch)
         if self.plan["blob_dir"]:
             # the weights are loaded: the blob files' cached pages would only
             # crowd out the memory-mapped tables read every token
             from . import localblobs
             released = localblobs.release(self.manifest["files"], self.plan["blob_dir"])
             print(f"[vxpu] released the page cache of {released} local blob files", flush=True)
+
+        parts = [f"probe {t_probe:.1f}s"]
+        if self._timing_bound > 0 or self.binding.get("bound"):
+            parts.append(f"bound {self._timing_bound:.1f}s")
+        if self._timing_stacked > 0 or self.binding.get("stacked"):
+            parts.append(f"stacked {self._timing_stacked:.1f}s")
+        if self.binding.get("external"):
+            parts.append(
+                f"concurrent phases: external {self._timing_banks:.1f}s, "
+                f"graph {self._timing_graph:.1f}s")
+        else:
+            parts.append(f"graph {self._timing_graph:.1f}s")
+
+        self.load_breakdown = ", ".join(parts)
+        self.plan.note(f"load: {self.load_breakdown}")
+
+        print("[vxpu] " + self.plan.summary(self.plan_ops()).replace("\n", "\n[vxpu] "), flush=True)
+
+    def _fetch_bound(self, cas_dir):
+        """Fetch bound tensors concurrently. Copy them to the device on a
+        worker thread, using a dedicated CUDA stream when running on CUDA."""
+        bound = list(self.binding.get("bound", {}).items())
+        if not bound:
+            self._timing_bound = 0.0
+            return
+        t_start = time.time()
+        q = queue.Queue(maxsize=32)
+        device = self.device
+        stream = torch.cuda.Stream(device=device) if str(device).startswith("cuda") else None
+        copy_error = []
+
+        def device_copy_worker():
+            ctx = torch.cuda.stream(stream) if stream else contextlib.nullcontext()
+            with ctx:
+                while True:
+                    item = q.get()
+                    if item is None:
+                        q.task_done()
+                        break
+                    if not copy_error:
+                        try:
+                            if self._copy_worker_hook:
+                                self._copy_worker_hook(item)
+                            fqn, tensor, downloaded = item
+                            if stream:
+                                tensor = tensor.pin_memory()
+                                self.shared[fqn] = tensor.to(device, non_blocking=True)
+                            else:
+                                self.shared[fqn] = tensor.to(device)
+                            with self._lock:
+                                self.bytes_fetched += downloaded
+                        except Exception as e:  # noqa: BLE001
+                            copy_error.append(e)
+                    q.task_done()
+            if stream and not copy_error:
+                try:
+                    stream.synchronize()
+                except Exception as e:  # noqa: BLE001
+                    copy_error.append(e)
+
+        copy_thread = threading.Thread(target=device_copy_worker, daemon=True)
+        copy_thread.start()
+
+        def put_item(item):
+            while True:
+                if copy_error:
+                    raise copy_error[0]
+                try:
+                    q.put(item, timeout=0.1)
+                    return
+                except queue.Full:
+                    pass
+
+        try:
+            with ThreadPoolExecutor(max_workers=16) as pool:
+                pending = {}
+                for i, (fqn, ref) in enumerate(bound):
+                    if copy_error:
+                        raise copy_error[0]
+                    pending[i] = pool.submit(fetch_tensor, ref, self.manifest["files"], cas_dir)
+                    if len(pending) >= 32:
+                        j = min(pending)
+                        tensor, downloaded = pending.pop(j).result()
+                        put_item((bound[j][0], tensor, downloaded))
+                for j in sorted(pending):
+                    if copy_error:
+                        raise copy_error[0]
+                    tensor, downloaded = pending.pop(j).result()
+                    put_item((bound[j][0], tensor, downloaded))
+        finally:
+            q.put(None)
+            copy_thread.join()
+        if copy_error:
+            raise copy_error[0]
+        self._timing_bound = time.time() - t_start
+
+    def _fetch_stacked(self, cas_dir):
+        """Fetch stacked parameters assembled from checkpoint per-expert tensors."""
+        stacked = self.binding.get("stacked", {})
+        if not stacked:
+            self._timing_stacked = 0.0
+            return
+        t_start = time.time()
+        for fqn, spec in stacked.items():
+            tensor, downloaded = fetch_stacked(
+                spec, self.manifest["tensors"], self.manifest["files"], cas_dir)
+            self.shared[fqn] = tensor.to(self.device)
+            with self._lock:
+                self.bytes_fetched += downloaded
+        self._timing_stacked = time.time() - t_start
+
+    def _fetch_external_tensors(self, external, cas_dir, mm, local_experts, local_tables, stop_event=None):
+        """Fetch expert banks and n-gram table tensors into host memory without
+        constructing modules. Stop early if stop_event is set."""
+        t_start = time.time()
+        specs = external.get("experts", {})
+        banks_in_ram = self.plan["experts_placement"] == "ram"
+        fetched_experts, downloaded = fetch_expert_banks(
+            self.manifest, specs, cas_dir, mm, in_ram=banks_in_ram,
+            layers=local_experts, stop_event=stop_event)
+        with self._lock:
+            self.bytes_fetched += downloaded
+        if stop_event is not None and stop_event.is_set():
+            return None, None
+
+        fetched_engram = {}
+        for key, spec in external.get("engram", {}).items():
+            layer = int(key)
+            if local_tables is not None and layer not in local_tables:
+                continue
+            if stop_event is not None and stop_event.is_set():
+                return None, None
+            weight, downloaded = fetch_tensor(self.manifest["tensors"][spec["weight"]], self.manifest["files"], cas_dir, mmap_dir=mm)
+            with self._lock:
+                self.bytes_fetched += downloaded
+            if stop_event is not None and stop_event.is_set():
+                return None, None
+            scale, downloaded = fetch_tensor(self.manifest["tensors"][spec["scale"]], self.manifest["files"], cas_dir, mmap_dir=mm)
+            with self._lock:
+                self.bytes_fetched += downloaded
+            if mm:  # memory-mapped, read row by row at random: no readahead (#364)
+                advise_random(weight)
+                advise_random(scale)
+            fetched_engram[layer] = (weight, scale)
+        self._timing_banks = time.time() - t_start
+        return fetched_experts, fetched_engram
+
+    def _assemble_external(self, external, args, mm, local_experts, remote_tables, fetched_experts, fetched_engram):
+        """Assemble host-side external modules from fetched tensors.
+
+        The host_experts and host_engram functions construct modules under
+        deepseek_v41.bf16_default(), which sets PyTorch's default dtype to
+        bfloat16 process-wide. Run this method only after _build finishes on
+        the other thread. That prevents tensors created during graph construction
+        or lowering from silently turning into bfloat16.
+        """
+        from . import deepseek_v41 as ds
+        from . import ops
+        specs = external.get("experts", {})
+        if fetched_experts:
+            for layer, banks in fetched_experts.items():
+                self.external.experts[layer] = ds.host_experts(layer, args, banks)
+        for layer in sorted({int(layer) for layer in specs} & self._remote_layers):
+            self.external.experts[layer] = ds.host_experts(layer, args, {})
+        if self.plan["gpu_experts"] and self.external.experts:
+            self._place_hot_experts(self.plan["gpu_experts"])
+        if self.plan["expert_mailboxes"] and self.external.experts:
+            self._attach_mailboxes()
+        if fetched_engram:
+            engram = external.get("engram", {})
+            for layer, (weight, scale) in fetched_engram.items():
+                spec = engram[str(layer)]
+                self.external.engram[int(layer)] = ds.host_engram(
+                    int(layer), spec["num_embeddings"], spec["dim"], weight, scale)
+                ops.ENGRAM_DIM[int(layer)] = spec["dim"]
+        for key in remote_tables:
+            ops.ENGRAM_DIM[key] = external.get("engram", {})[str(key)]["dim"]
 
     def _bind_external(self, external, cas_dir):
         """Tensors the graphs call out for (ops.py): the expert banks and
@@ -291,17 +539,8 @@ class Engine:
         whatever device they run, reach them through the ops. A device
         copy of 272 GB of experts is exactly what this avoids."""
         from . import deepseek_v41 as ds
-        from . import ops
         args = ds.model_args(self.manifest["source"]["repo"], self.max_cache_len)
         mm = external_files_dir(self.external_dir, self.manifest)
-        # The expert banks: memory-mapped files like the tables, or held
-        # in RAM outright (the plan's experts_placement; VXPU_EXPERTS_IN_RAM=1)
-        # when the node has the 272 GB, so residency is guaranteed rather
-        # than left to the page cache; the kernels are memory-bound and
-        # want the bytes resident.
-        # Nodes a node server serves (remote_nodes): their residents are not
-        # loaded here (an experts layer's module keeps the meta banks it is
-        # built with), and their host ops send their inputs to the server.
         self.external.remote_nodes = self._connect_remote_nodes()
         self._remote_layers = {i for kind, i in self.external.remote_nodes if kind == "experts"}
         remote_tables = {i for kind, i in self.external.remote_nodes if kind == "engram"}
@@ -310,23 +549,9 @@ class Engine:
             self._remote_layers |= {int(layer) for layer in specs if not self._in_range(int(layer))}
             remote_tables |= {int(k) for k in external.get("engram", {}) if not self._in_range(int(k))}
         local = {int(layer) for layer in specs} - self._remote_layers
-        experts, downloaded = load_expert_layers(self.manifest, specs, args, cas_dir, mm,
-                                                 in_ram=self.plan["experts_placement"] == "ram", layers=local)
-        self.external.experts.update(experts)
-        for layer in sorted({int(layer) for layer in specs} & self._remote_layers):
-            self.external.experts[layer] = ds.host_experts(layer, args, {})
-        self.bytes_fetched += downloaded
-        if self.plan["gpu_experts"] and self.external.experts:
-            self._place_hot_experts(self.plan["gpu_experts"])
-        if self.plan["expert_mailboxes"] and self.external.experts:
-            self._attach_mailboxes()
-        engram = external.get("engram", {})
-        tables, downloaded = load_engram_tables(self.manifest, engram, cas_dir, mm,
-                                                layers={int(k) for k in engram} - remote_tables)
-        self.external.engram.update(tables)
-        self.bytes_fetched += downloaded
-        for key in remote_tables:
-            ops.ENGRAM_DIM[key] = engram[str(key)]["dim"]  # a remote table's rows' width, for shapes
+        local_tables = {int(k) for k in external.get("engram", {})} - remote_tables
+        fetched_experts, fetched_engram = self._fetch_external_tensors(external, cas_dir, mm, local, local_tables)
+        self._assemble_external(external, args, mm, local, remote_tables, fetched_experts, fetched_engram)
 
     def _in_range(self, layer):
         """Whether this engine runs `layer` (all of them without a layer range)."""
@@ -460,12 +685,10 @@ class Engine:
             ids.add(int(self.tokenizer.eos_token_id))
         return ids
 
-    def _build(self):
-        """Build and compile the two graphs once. Scratch state is bound
-        now and overwritten per session at chat time."""
-        scratch = {
-            fqn: torch.zeros(shape, dtype=dtype, device=self.device)
-            for fqn, (shape, dtype) in self.state_specs.items()}
+    def _build(self, probe, scratch):
+        """Build and compile the prefill and decode graphs once with real weights in place.
+        Bind scratch state now and overwrite it per session at chat time."""
+        t_start = time.time()
         tensors = {**self.shared, **scratch}
         # Aliases must be placed too (an unplaced constant stays on the
         # meta device); _bind below re-points them at the canonical
@@ -477,7 +700,7 @@ class Engine:
             os.path.join(self.artifact_dir, "prefill.pt2"),
             tensors, self.device).module()
         self._decode = load_program(
-            os.path.join(self.artifact_dir, "decode.pt2"),
+            probe,
             tensors, self.device).module()
         shared = share_state(self._prefill, self._decode,
                              self.binding["state"])
@@ -529,7 +752,7 @@ class Engine:
                 ranges.append(RemoteRange(address, self.device))
                 print(f"[vxpu] layers {span} on {address}", flush=True)
             self.attach_ranges(ranges)
-        print("[vxpu] " + self.plan.summary(self.plan_ops()).replace("\n", "\n[vxpu] "), flush=True)
+        self._timing_graph = time.time() - t_start
 
     def _run_as_dataflow(self, scratch):
         """Run decode through the dataflow runner (dataflow.py): over the
