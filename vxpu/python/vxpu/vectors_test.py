@@ -888,8 +888,35 @@ def _check_telemetry(model, prompts, settings, artifact, plain, workdir):
                 expected_counts = {int(k): v for k, v in decode_counts.get(l, {}).items()}
                 if dict(trace_counts) != expected_counts:
                     problems.append(f"{b['name']}: layer {l} trace counts do not match decode expert counts")
-    _, text = expert_stats.report([path])
+    import math
+    from . import expert_sim
+    stats_out, text = expert_stats.report([path], artifact=artifact)
     print(text)
+    per_expert, experts = expert_sim.resolve_expert_size(artifact, None)
+    sim_out, sim_text = expert_sim.report_trace(
+        [path], per_expert=per_expert, experts=experts, train=0.0
+    )
+    print(sim_text)
+
+    # Check that the oracle row matches expert_stats across layer expert fractions (#447).
+    docs = expert_stats.load([path])
+    layer_steps, _ = expert_sim.traces(docs)
+    for f_str, expected_rate in stats_out["hit_rate_overall"].items():
+        k = math.ceil(float(f_str) * experts)
+        hits, misses, total = expert_sim.simulate_trace_policy(layer_steps, k, train_steps=0, policy="oracle")
+        actual_rate = round(hits / total, 4) if total else 0.0
+        if actual_rate != expected_rate:
+            problems.append(f"expert_sim: oracle hit rate for {f_str} is {actual_rate}, expected {expected_rate}")
+
+    # Check that LRU at 100% capacity misses only each expert's first selection (#447).
+    distinct = len({(int(l), e) for l, steps in layer_steps.items() for step in steps for e in step})
+    hits, lru_misses, _ = expert_sim.simulate_trace_policy(layer_steps, experts, train_steps=0, policy="lru")
+    if lru_misses != distinct:
+        problems.append(
+            f"expert_sim: LRU at 100% capacity has {lru_misses} misses, expected {distinct} "
+            f"(one per distinct expert)"
+        )
+
     for p in problems:
         print("telemetry check:", p)
     return not problems

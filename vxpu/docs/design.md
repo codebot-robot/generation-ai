@@ -361,7 +361,11 @@ default; every Nth with `--telemetry-every`). That
 includes which experts each layer selected, and each segment's and host
 op's time. Records are batched into modelstore (`vxpu-stats/<model>`, one
 tag per day). `vxpu stats` summarizes them, and `expert_stats` and
-`expert_sim` read them.
+`expert_sim` read them. The `expert_sim requests` subcommand replays
+recorded traffic against placement policies: static, adaptive, prefill,
+and the oracle bound. The `expert_sim steps` subcommand replays ordered
+selection traces per decode step through cache policies, storage tiers,
+and prefetch predictors (#348, #447).
 
 The planner predicts each plan's decode time (`pkg/planner/cost.go`,
 #349): decode is memory-bound, so each part costs its bytes over the
