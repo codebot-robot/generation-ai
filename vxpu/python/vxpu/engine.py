@@ -578,6 +578,22 @@ class Engine:
         graph = getattr(run, "runner", run).graph
         return list(graph.inputs)
 
+    def range_numbers(self, phase):
+        """The names of this range's inputs that are plain numbers rather than
+        tensors, such as a prefill's length. The wire format carries only
+        tensors, so the range server turns these back into numbers when they
+        arrive."""
+        run = self._decode_run if phase == "decode" else self._prefill_run
+        runner = getattr(run, "runner", run)
+        numbers = set()
+        for node in runner.graph.nodes:
+            sub = getattr(runner.split, node.name)
+            phs = [n for n in getattr(sub, "_orig_mod", sub).graph.nodes if n.op == "placeholder"]
+            for r, ph in zip(node.args, phs):
+                if getattr(r, "kind", None) == "input" and not isinstance(ph.meta.get("val"), torch.Tensor):
+                    numbers.add(r.name)
+        return numbers
+
     def run_range(self, session_id, phase, values):
         """Run this engine's range of layers for session_id (#387): its
         state bound (a session this engine has not seen starts empty), the

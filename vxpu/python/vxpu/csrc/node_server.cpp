@@ -21,6 +21,11 @@
 //               starts the server; from there, a message is read, run and
 //               answered by the threads here.
 //   NodeClient  the engine's side of a tcp:// mailbox.
+//   RangeServer (#387) a range of whole layers on this machine, for the
+//               engine running the layers before it: a decode step's
+//               message replays the range's captured step graph (and its
+//               step host answers the range's own host nodes), with no
+//               Python; prefill, a session switch and the rest go to Python.
 //   StepHost    (#409) the engine's side of the step graph's mailboxes
 //               (stepgraph.py): a thread that waits for each host node's
 //               flag from the GPU, runs the node (its native package here,
@@ -53,6 +58,8 @@
 #include <netinet/tcp.h>
 #include <sys/socket.h>
 #include <unistd.h>
+
+#include <dlfcn.h>
 
 #include <atomic>
 #include <chrono>
@@ -465,11 +472,14 @@ class StepHost {
     boxes_.push_back(std::move(box));
   }
 
+  // prefix: tensors sent before the inputs, set from Python between steps
+  // (a range's session, #387)
   void add_remote(const std::vector<at::Tensor>& inputs, const at::Tensor& outbox,
-                  std::shared_ptr<NodeClient> client, int64_t node) {
+                  std::shared_ptr<NodeClient> client, int64_t node, const std::vector<at::Tensor>& prefix) {
     auto box = make_box(inputs, outbox);
     box->client = std::move(client);
     box->node = node;
+    box->prefix = prefix;
     boxes_.push_back(std::move(box));
   }
 
@@ -525,6 +535,7 @@ class StepHost {
     std::vector<at::Tensor> residents;
     std::shared_ptr<NodeClient> client;
     int64_t node = 0;
+    std::vector<at::Tensor> prefix;
   };
 
   std::unique_ptr<Box> make_box(const std::vector<at::Tensor>& inputs, const at::Tensor& outbox) {
@@ -557,7 +568,13 @@ class StepHost {
           t[5 * i] = now_ns();
           std::vector<at::Tensor> out;
           if (box.client) {
-            out = box.client->call(box.node, box.inputs);
+            if (box.prefix.empty()) {
+              out = box.client->call(box.node, box.inputs);
+            } else {
+              std::vector<at::Tensor> message(box.prefix);
+              message.insert(message.end(), box.inputs.begin(), box.inputs.end());
+              out = box.client->call(box.node, message);
+            }
             auto [read_ns, run_ns] = box.client->server_times();
             t[5 * i + 3] = read_ns;
             t[5 * i + 4] = run_ns;
@@ -598,6 +615,252 @@ class StepHost {
   std::string error_;
 };
 
+
+namespace {
+
+// The CUDA driver's calls a range server makes, found at run time: the
+// kernels are built without CUDA, as the step graph's own driver calls
+// are made from Python (stepgraph.py). A runtime handle (a cudaGraphExec_t,
+// a cudaStream_t) is the driver's.
+struct Driver {
+  int (*graph_launch)(void*, void*) = nullptr;
+  int (*memcpy_async)(uint64_t, uint64_t, size_t, void*) = nullptr;
+  int (*stream_sync)(void*) = nullptr;
+  int (*primary_ctx_retain)(void**, int) = nullptr;
+  int (*ctx_set_current)(void*) = nullptr;
+
+  static Driver& get() {
+    static Driver d = [] {
+      Driver d;
+      void* lib = ::dlopen("libcuda.so.1", RTLD_NOW | RTLD_GLOBAL);
+      TORCH_CHECK(lib != nullptr, "range server: no CUDA driver (libcuda.so.1)");
+      auto sym = [lib](const char* name) {
+        void* p = ::dlsym(lib, name);
+        TORCH_CHECK(p != nullptr, "range server: the CUDA driver lacks ", name);
+        return p;
+      };
+      d.graph_launch = reinterpret_cast<int (*)(void*, void*)>(sym("cuGraphLaunch"));
+      d.memcpy_async = reinterpret_cast<int (*)(uint64_t, uint64_t, size_t, void*)>(sym("cuMemcpyAsync"));
+      d.stream_sync = reinterpret_cast<int (*)(void*)>(sym("cuStreamSynchronize"));
+      d.primary_ctx_retain = reinterpret_cast<int (*)(void**, int)>(sym("cuDevicePrimaryCtxRetain"));
+      d.ctx_set_current = reinterpret_cast<int (*)(void*)>(sym("cuCtxSetCurrent"));
+      return d;
+    }();
+    return d;
+  }
+
+  static void check(int status, const char* what) {
+    TORCH_CHECK(status == 0, "range server: ", what, " failed (CUresult ", status, ")");
+  }
+};
+
+}  // namespace
+
+// RangeServer runs a range of whole layers for the engine before it, over
+// one tcp:// mailbox in the node wire format. Every message starts with its
+// session (the engine's id, as bytes). Node 0 is a decode step: with the
+// range's step graph captured (set_decode) and the session the one bound,
+// the inputs are copied into the graph's input buffers, the range's step
+// host is told to go, the graphs replay, and the outputs go back, all here.
+// Anything else (prefill, a decode step for another session, the steps
+// before the capture, a reset, a description) is handed to Python's
+// fallback(node, tensors) -> tensors, with the GIL.
+class RangeServer {
+ public:
+  RangeServer(int64_t port, pybind11::function fallback) : fallback_(std::move(fallback)) {
+    fd_ = ::socket(AF_INET, SOCK_STREAM, 0);
+    TORCH_CHECK(fd_ >= 0, "range server: socket");
+    int one = 1;
+    ::setsockopt(fd_, SOL_SOCKET, SO_REUSEADDR, &one, sizeof(one));
+    sockaddr_in addr{};
+    addr.sin_family = AF_INET;
+    addr.sin_addr.s_addr = htonl(INADDR_ANY);
+    addr.sin_port = htons(static_cast<uint16_t>(port));
+    TORCH_CHECK(::bind(fd_, reinterpret_cast<sockaddr*>(&addr), sizeof(addr)) == 0,
+                "range server: bind to port ", port, ": ", std::strerror(errno));
+    TORCH_CHECK(::listen(fd_, 16) == 0, "range server: listen");
+    socklen_t len = sizeof(addr);
+    ::getsockname(fd_, reinterpret_cast<sockaddr*>(&addr), &len);
+    port_ = ntohs(addr.sin_port);
+    accept_ = std::thread([this] { accept_loop(); });
+  }
+
+  ~RangeServer() { stop(); }
+
+  int64_t port() const { return port_; }
+  int64_t messages() const { return messages_.load(); }
+  int64_t native_steps() const { return native_.load(); }
+
+  // The captured decode step: its input buffers (on the GPU, in the order
+  // a decode message carries them after the session), its outputs (the
+  // graph's own buffers), the graphs to replay (cudaGraphExec_t, the
+  // engine's GPU first) with each one's stream and device, the step host
+  // and its flags. host: the StepHost object, kept alive here. Called
+  // from the fallback after a decode step, which already holds the step
+  // lock (taking it here deadlocked the first GPU run).
+  void set_decode(const std::vector<at::Tensor>& inputs, const std::vector<at::Tensor>& outputs,
+                  const std::vector<int64_t>& execs, const std::vector<int64_t>& streams,
+                  const std::vector<int64_t>& devices, pybind11::object host, at::Tensor flags) {
+    decode_inputs_ = inputs;
+    decode_outputs_ = outputs;
+    execs_ = execs;
+    streams_ = streams;
+    devices_ = devices;
+    ctxs_.clear();  // each GPU's primary context, retained once (the driver counts retains)
+    for (int64_t d : devices_) {
+      void* c = nullptr;
+      Driver::check(Driver::get().primary_ctx_retain(&c, static_cast<int>(d)), "cuDevicePrimaryCtxRetain");
+      ctxs_.push_back(c);
+    }
+    host_obj_ = std::move(host);
+    host_ = host_obj_.cast<StepHost*>();
+    flags_ = std::move(flags);
+  }
+
+  void stop() {
+    if (stopped_.exchange(true)) return;
+    ::shutdown(fd_, SHUT_RDWR);
+    ::close(fd_);
+    if (accept_.joinable()) accept_.join();
+    connections_.stop();
+  }
+
+ private:
+  void accept_loop() {
+    while (!stopped_) {
+      int conn = ::accept(fd_, nullptr, nullptr);
+      if (conn < 0) {
+        if (stopped_) return;
+        std::this_thread::sleep_for(std::chrono::milliseconds(10));
+        continue;
+      }
+      int one = 1;
+      ::setsockopt(conn, IPPROTO_TCP, TCP_NODELAY, &one, sizeof(one));
+      connections_.start(conn, [this](int c) { serve(c); });
+    }
+  }
+
+  static std::string bytes_of(const at::Tensor& t) {
+    auto c = t.contiguous();
+    return std::string(static_cast<const char*>(c.data_ptr()), static_cast<size_t>(c.numel() * c.element_size()));
+  }
+
+  std::vector<at::Tensor> native_decode(const std::vector<at::Tensor>& inputs) {
+    auto& cu = Driver::get();
+    TORCH_CHECK(inputs.size() == decode_inputs_.size() + 1, "range server: a decode step of ", inputs.size() - 1,
+                " values, the range takes ", decode_inputs_.size());
+    void* ctx = ctxs_[0];
+    Driver::check(cu.ctx_set_current(ctx), "cuCtxSetCurrent");
+    void* stream = reinterpret_cast<void*>(streams_[0]);
+    for (size_t i = 0; i < decode_inputs_.size(); ++i) {
+      auto src = inputs[i + 1].contiguous();
+      auto& dst = decode_inputs_[i];
+      TORCH_CHECK(src.numel() == dst.numel() && src.scalar_type() == dst.scalar_type(),
+                  "range server: decode value ", i, " does not fit its buffer");
+      Driver::check(cu.memcpy_async(reinterpret_cast<uint64_t>(dst.data_ptr()), reinterpret_cast<uint64_t>(src.data_ptr()),
+                                    static_cast<size_t>(src.numel() * src.element_size()), stream), "cuMemcpyAsync");
+    }
+    host_->go();
+    for (size_t g = 0; g < execs_.size(); ++g) {  // the engine's GPU's graph first: the others wait on its flags
+      Driver::check(cu.ctx_set_current(ctxs_[g]), "cuCtxSetCurrent");
+      Driver::check(cu.graph_launch(reinterpret_cast<void*>(execs_[g]), reinterpret_cast<void*>(streams_[g])), "cuGraphLaunch");
+    }
+    for (size_t g = 0; g < execs_.size(); ++g) {  // each GPU's stream under its own context: stream 0
+      Driver::check(cu.ctx_set_current(ctxs_[g]), "cuCtxSetCurrent");  // (the default) names the current one's
+      Driver::check(cu.stream_sync(reinterpret_cast<void*>(streams_[g])), "cuStreamSynchronize");
+    }
+    Driver::check(cu.ctx_set_current(ctx), "cuCtxSetCurrent");
+    std::string error = host_->take_error();
+    if (!error.empty()) {
+      flags_.zero_();  // released every flag; the next step starts clean
+      throw std::runtime_error("range step host: " + error);
+    }
+    std::vector<at::Tensor> out;
+    for (const auto& t : decode_outputs_) {
+      auto host = at::empty(t.sizes(), t.options().device(at::kCPU));
+      Driver::check(cu.memcpy_async(reinterpret_cast<uint64_t>(host.data_ptr()), reinterpret_cast<uint64_t>(t.data_ptr()),
+                                    static_cast<size_t>(t.numel() * t.element_size()), stream), "cuMemcpyAsync");
+      out.push_back(host);
+    }
+    Driver::check(cu.stream_sync(stream), "cuStreamSynchronize");
+    native_++;
+    return out;
+  }
+
+  void serve(int conn) {
+    try {
+      for (;;) {
+        char magic[4];
+        read_exact(conn, magic, 4);
+        const int64_t t0 = now_ns();
+        if (std::memcmp(magic, "VXN1", 4) != 0) throw std::runtime_error("not a node message");
+        uint32_t node = read_value<uint32_t>(conn);
+        uint32_t count = read_value<uint32_t>(conn);
+        if (count > kMaxTensors) throw std::runtime_error("too many tensors");
+        std::vector<at::Tensor> inputs;
+        for (uint32_t i = 0; i < count; ++i) inputs.push_back(read_tensor(conn));
+        const int64_t t1 = now_ns();
+        std::vector<at::Tensor> outputs;
+        std::string error;
+        {
+          std::lock_guard<std::mutex> lock(mu_);  // one step at a time: the range's state is one session's
+          try {
+            std::string session = inputs.empty() ? std::string() : bytes_of(inputs[0]);
+            if (node == 0 && host_ != nullptr && session == bound_) {
+              outputs = native_decode(inputs);
+            } else {
+              pybind11::gil_scoped_acquire gil;
+              // Python binds the session's state before the step runs: if the
+              // step then fails, the resident state is no longer bound_'s, and
+              // that session's next decode must not replay natively on it
+              if (node <= 1) bound_.clear();
+              outputs = fallback_(node, inputs).cast<std::vector<at::Tensor>>();
+              if (node <= 1) bound_ = session;  // Python bound it for the step
+            }
+          } catch (const std::exception& e) {
+            error = e.what();
+          }
+        }
+        const int64_t t2 = now_ns();
+        Out reply;
+        reply.bytes("VXR2", 4);
+        if (!error.empty()) {
+          reply.value<uint32_t>(1);
+          reply.value<uint32_t>(static_cast<uint32_t>(error.size()));
+          reply.bytes(error.data(), error.size());
+          reply.send(conn);
+          continue;
+        }
+        reply.value<uint32_t>(0);
+        reply.value<uint32_t>(static_cast<uint32_t>(outputs.size()));
+        for (const auto& t : outputs) reply.tensor(t);
+        reply.value<int64_t>(t1 - t0);
+        reply.value<int64_t>(t2 - t1);
+        reply.send(conn);
+        messages_++;
+      }
+    } catch (const std::exception&) {
+      // the peer went away, or sent something that is not a message
+    }
+  }
+
+  pybind11::function fallback_;
+  std::mutex mu_;
+  std::string bound_;
+  std::vector<at::Tensor> decode_inputs_, decode_outputs_;
+  std::vector<int64_t> execs_, streams_, devices_;
+  std::vector<void*> ctxs_;
+  pybind11::object host_obj_;
+  StepHost* host_ = nullptr;
+  at::Tensor flags_;
+  int fd_ = -1;
+  int64_t port_ = 0;
+  std::thread accept_;
+  Connections connections_;
+  std::atomic<bool> stopped_{false};
+  std::atomic<int64_t> messages_{0}, native_{0};
+};
+
 void register_node_server(pybind11::module& m) {
   pybind11::class_<NodeClient, std::shared_ptr<NodeClient>>(m, "NodeClient")
       .def(pybind11::init<const std::string&, int64_t>())
@@ -612,11 +875,19 @@ void register_node_server(pybind11::module& m) {
   pybind11::class_<StepHost>(m, "StepHost")
       .def(pybind11::init<at::Tensor>())
       .def("add_local", &StepHost::add_local, pybind11::call_guard<pybind11::gil_scoped_release>())
-      .def("add_remote", &StepHost::add_remote)
+      .def("add_remote", &StepHost::add_remote, pybind11::arg("inputs"), pybind11::arg("outbox"), pybind11::arg("client"),
+           pybind11::arg("node"), pybind11::arg("prefix") = std::vector<at::Tensor>{})
       .def("start", &StepHost::start)
       .def("go", &StepHost::go)
       .def("take_error", &StepHost::take_error)
       .def("times", &StepHost::times)
       .def("running", &StepHost::running)
       .def("stop", &StepHost::stop, pybind11::call_guard<pybind11::gil_scoped_release>());
+  pybind11::class_<RangeServer>(m, "RangeServer")
+      .def(pybind11::init<int64_t, pybind11::function>())
+      .def("port", &RangeServer::port)
+      .def("messages", &RangeServer::messages)
+      .def("native_steps", &RangeServer::native_steps)
+      .def("set_decode", &RangeServer::set_decode)
+      .def("stop", &RangeServer::stop, pybind11::call_guard<pybind11::gil_scoped_release>());
 }

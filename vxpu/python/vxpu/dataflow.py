@@ -218,6 +218,7 @@ class Runner(torch.nn.Module):
         self.device = torch.device(device) if device is not None else None
         self.recorder = None
         self.inboxes = {}  # {(producer, index, device): tensor}, each allocated the first time it is written
+        self.returned = {}  # the nodes that fed the last step's output, and what they made
         self._index = {name: i for i, (name, _) in enumerate(segments.segments_of(split))}
         self.place(self.placement)
 
@@ -306,6 +307,7 @@ class Runner(torch.nn.Module):
             raise RuntimeError(f"dataflow: {len(self.graph.nodes) - fired} nodes never had all their inputs")
         if recorder is not None:
             recorder.end_step()
+        self.returned = returned  # what fed the step's output: shapes for a node with no inbox (a slice's last)
         result = self._resolve(self.graph.output, returned, inputs)
         if self.graph.output_names is not None:  # a slice: its outputs by name, for the next
             return dict(zip(self.graph.output_names, result))
