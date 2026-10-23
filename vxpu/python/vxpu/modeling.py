@@ -40,6 +40,7 @@ import warnings
 
 import torch
 
+from . import vxpu_pb2
 from .client import ARTIFACT_FILES, Client, PortForward
 
 DEFAULT_ROUTER_TARGET = "pod/vxpu-router"
@@ -84,9 +85,10 @@ class VxpuModelForCausalLM:
         self.device = torch.device("cpu")
         self.dtype = torch.bfloat16
         self.last = None  # statistics of the latest generate()
-        # execution telemetry mode on each generate(): None, "summary", or "trace"
+        # execution telemetry mode on each generate(): vxpu_pb2.TELEMETRY_NONE,
+        # vxpu_pb2.TELEMETRY_SUMMARY, or vxpu_pb2.TELEMETRY_TRACE
         # (it arrives as self.last.telemetry)
-        self.collect_telemetry = None
+        self.collect_telemetry = vxpu_pb2.TELEMETRY_NONE
 
     @classmethod
     def from_pretrained(cls, repo_id, *, router=None, router_admin=None,
@@ -254,7 +256,7 @@ class VxpuModelForCausalLM:
         if streamer is not None:
             streamer.put(ids)
         new_ids = []
-        if self.collect_telemetry:
+        if self.collect_telemetry not in (None, vxpu_pb2.TELEMETRY_NONE):
             stream = self.session.execute_ids(
                 prompt, max_new_tokens=max_new_tokens, do_sample=do_sample,
                 temperature=temperature, top_k=top_k, top_p=top_p,
