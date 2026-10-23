@@ -1,0 +1,39 @@
+# Copyright 2026 Google LLC
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
+name: c3d-standard-60
+description: GCP C3D compute instance with AMD EPYC Genoa processors (60 vCPUs)
+cpu:
+  cache_sizes:
+    l1d: 983.04e3
+    l1i: 983.04e3
+    l2: 31457280  # 30 MiB
+    l3: 134217728  # 128 MiB
+  cores: 30
+  memory_bandwidth_bytes_per_sec: 153.6e9
+  model: AMD EPYC 9B14
+  simd: avx512
+  threads: 60
+ram_bytes: 257698037760  # 240 GiB
+gpu_count: 0
+network:
+  bandwidth_bytes_per_sec: 5e9
+price:
+  on_demand_usd_per_hour: 2.7239
+  spot_usd_per_hour: 0.6594
+measured:
+  cpu_dense_bytes_per_sec: 6.65e9
+  cpu_expert_kernel_bytes_per_sec: 121e9
+  gcs_blob_fetch_bytes_per_sec: 1.4e9
+  gcs_checkpoint_copy_pd_ssd_bytes_per_sec: 630e6

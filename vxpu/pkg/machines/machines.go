@@ -12,19 +12,25 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-// Package machines is the coordinator's machine database (#394): the
-// machines vXPU knows (catalog.json: CPUs, GPUs, memory and bandwidths,
-// local storage, network, prices, and what we measured on them), what an
-// executor reports about the machine it runs on (Probe), and how the two
-// match. The planner reasons over it (#349).
+// Package machines is the coordinator's machine database (#394). It has
+// three parts:
+//   - the catalog of machine types vXPU knows, one YAML file per type in
+//     catalog/. Each file lists the machine's CPUs, GPUs, memory and
+//     bandwidths, local storage, network, prices, and what we measured on it;
+//   - Probe, what an executor reports about the machine it runs on;
+//   - Match, which finds the catalog machine a probe describes.
+//
+// The planner uses it to price layouts (#349).
 package machines
 
 import (
-	_ "embed"
-	"encoding/json"
+	"embed"
 	"fmt"
+	"path"
 	"sort"
 	"strings"
+
+	"sigs.k8s.io/yaml"
 )
 
 // ComputeByDtype is peak throughput by precision, in FLOPS.
@@ -80,6 +86,7 @@ type Price struct {
 // Machine is one machine type.
 type Machine struct {
 	Name        string         `json:"name"`
+	Aliases     []string       `json:"aliases,omitempty"` // other names Lookup accepts
 	CPU         CPU            `json:"cpu"`
 	RAMBytes    int64          `json:"ram_bytes"`
 	GPU         *GPU           `json:"gpu,omitempty"` // per device
@@ -91,17 +98,43 @@ type Machine struct {
 	Description string         `json:"description,omitempty"`
 }
 
-//go:embed catalog.json
-var catalogJSON []byte
+// The catalog keeps one YAML file per machine type, named for the type, so
+// a person can read and review each machine on its own. Sizes are in bytes
+// and rates in bytes per second. The files write round numbers in
+// exponent form, such as 24e9, when that is exact.
+//
+//go:embed catalog/*.yaml
+var catalogFiles embed.FS
 
-var catalog struct {
-	Aliases  map[string]string   `json:"aliases"`
-	Machines map[string]*Machine `json:"machines"`
-}
+var catalog = struct {
+	Aliases  map[string]string
+	Machines map[string]*Machine
+}{map[string]string{}, map[string]*Machine{}}
 
 func init() {
-	if err := json.Unmarshal(catalogJSON, &catalog); err != nil {
-		panic(fmt.Sprintf("machines: catalog.json: %v", err))
+	files, err := catalogFiles.ReadDir("catalog")
+	if err != nil {
+		panic(fmt.Sprintf("machines: catalog: %v", err))
+	}
+	for _, f := range files {
+		data, err := catalogFiles.ReadFile(path.Join("catalog", f.Name()))
+		if err != nil {
+			panic(fmt.Sprintf("machines: catalog/%s: %v", f.Name(), err))
+		}
+		m := &Machine{}
+		if err := yaml.UnmarshalStrict(data, m); err != nil {
+			panic(fmt.Sprintf("machines: catalog/%s: %v", f.Name(), err))
+		}
+		if want := strings.TrimSuffix(f.Name(), ".yaml"); m.Name != want {
+			panic(fmt.Sprintf("machines: catalog/%s names machine %q, want %q", f.Name(), m.Name, want))
+		}
+		catalog.Machines[m.Name] = m
+		for _, alias := range m.Aliases {
+			if other, ok := catalog.Aliases[alias]; ok {
+				panic(fmt.Sprintf("machines: alias %q is both %s's and %s's", alias, other, m.Name))
+			}
+			catalog.Aliases[alias] = m.Name
+		}
 	}
 }
 

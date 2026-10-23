@@ -1,0 +1,54 @@
+# Copyright 2026 Google LLC
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
+name: a3-highgpu-8g
+description: GCP A3 accelerator instance with 8x NVIDIA H100 80GB SXM5 GPUs
+aliases: [a3-highgpu]
+cpu:
+  cache_sizes:
+    l1d: 5111808  # 4992 KiB
+    l1i: 3407872  # 3328 KiB
+    l2: 218103808  # 208 MiB
+    l3: 220200960  # 210 MiB
+  cores: 104
+  memory_bandwidth_bytes_per_sec: 614.4e9
+  model: Intel Xeon Platinum 8480C
+  simd: avx512
+  threads: 208
+ram_bytes: 2010044694528  # 1872 GiB
+gpu_count: 8
+gpu:
+  memory_bandwidth_bytes_per_sec: 3.35e12
+  memory_bytes: 85899345920  # 80 GiB
+  name: NVIDIA H100 80GB HBM3
+  pcie_bandwidth_bytes_per_sec: 63e9
+  pcie_gen: 5
+  pcie_lanes: 16
+  peak_compute_flops:
+    bf16: 989e12
+    fp32: 67e12
+    fp8: 1979e12
+  sm_count: 132
+storage:
+  capacity_bytes: 6e12
+  devices: 16
+  read_bandwidth_bytes_per_sec: 10.56e9
+  read_iops: 2.72e6
+  write_bandwidth_bytes_per_sec: 5.6e9
+  write_iops: 1.44e6
+network:
+  bandwidth_bytes_per_sec: 125e9
+price:
+  on_demand_usd_per_hour: 88.49
+  spot_usd_per_hour: 50.32
