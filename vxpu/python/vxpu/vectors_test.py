@@ -1143,6 +1143,65 @@ def _check_host_reads(workdir):
     mapped, *_ = file_backed(path, 1 << 16)
     if getattr(mmap, "MADV_RANDOM", None) is not None and not advise_random(mapped):
         raise SystemExit("advise_random: madvise(MADV_RANDOM) was refused on a memory-mapped tensor")
+
+    # The n-gram tables read straight from checkpoint files (#452): gather_rows_file
+    # and gather_table_rows with io_uring and with pread fallback against gather_rows
+    tbl_path = os.path.join(workdir, "gather-rows-file.bin")
+    offset = 128
+    row_bytes = table.shape[1] * table.element_size()
+    rows = table.shape[0]
+    with open(tbl_path, "wb") as f:
+        f.write(b"\0" * offset)
+        f.write(table.numpy().tobytes())
+
+    fd = os.open(tbl_path, os.O_RDONLY)
+    try:
+        g = torch.Generator().manual_seed(42)
+        rand_idx = torch.randint(0, rows, (4, 6), generator=g)
+        want_rows = k.gather_rows(table, rand_idx)
+
+        # use_uring=False: pread fallback
+        got_pread = k.gather_rows_file(fd, offset, row_bytes, rows, rand_idx, use_uring=False)
+        if got_pread.numpy().tobytes() != want_rows.numpy().tobytes():
+            raise SystemExit("gather_rows_file (pread): rows differ from gather_rows")
+
+        # use_uring=True: io_uring when available, pread fallback otherwise
+        got_uring = k.gather_rows_file(fd, offset, row_bytes, rows, rand_idx, use_uring=True)
+        if got_uring.numpy().tobytes() != want_rows.numpy().tobytes():
+            raise SystemExit("gather_rows_file (use_uring=True): rows differ from gather_rows")
+
+        # gather_table_rows: reads weights and scales in one submit
+        w_got, s_got = k.gather_table_rows(fd, offset, row_bytes, offset, row_bytes, rows, rand_idx, use_uring=False)
+        if w_got.numpy().tobytes() != want_rows.numpy().tobytes() or s_got.numpy().tobytes() != want_rows.numpy().tobytes():
+            raise SystemExit("gather_table_rows (pread): rows differ from gather_rows")
+
+        w_got_u, s_got_u = k.gather_table_rows(fd, offset, row_bytes, offset, row_bytes, rows, rand_idx, use_uring=True)
+        if w_got_u.numpy().tobytes() != want_rows.numpy().tobytes() or s_got_u.numpy().tobytes() != want_rows.numpy().tobytes():
+            raise SystemExit("gather_table_rows (use_uring=True): rows differ from gather_rows")
+
+        if k.io_uring_ready():
+            print("host reads: gather_rows_file and gather_table_rows io_uring match gather_rows")
+        else:
+            print("host reads: gather_rows_file and gather_table_rows io_uring unavailable, fallback to pread verified")
+
+        for bad in (torch.tensor([64]), torch.tensor([-1])):
+            try:
+                k.gather_rows_file(fd, offset, row_bytes, rows, bad)
+            except RuntimeError as e:
+                if "outside" not in str(e):
+                    raise
+            else:
+                raise SystemExit(f"gather_rows_file accepted index {bad.item()} for a {rows}-row table")
+        try:
+            k.gather_rows_file(fd, offset, row_bytes, rows, rand_idx.to(device))
+        except RuntimeError as e:
+            if "indices on the CPU" not in str(e):
+                raise
+        else:
+            raise SystemExit(f"gather_rows_file accepted indices on {device}")
+    finally:
+        os.close(fd)
+
     print("host reads: gather_rows matches index_select and refuses bad or device indices; MADV_RANDOM taken")
 
 
@@ -2289,6 +2348,76 @@ def _check_external_dir(model, prompts, settings, artifact, ref, workdir):
     return True
 
 
+def _check_engram_file(model, prompts, settings, artifact, ref, workdir):
+    """The n-gram tables read straight from checkpoint files (#452): with
+    local checkpoint files (file://), tokens match the eager reference, and
+    no table files are written under external_dir. Under the step graph,
+    tables are copied and the plan notes why (#470)."""
+    import hashlib
+    import shutil
+    from .engine import Engine, FileTable
+
+    with open(os.path.join(artifact, "manifest.json")) as f:
+        manifest = json.load(f)
+    tensors = manifest["tensors"]
+    with open(os.path.join(artifact, "binding.json")) as f:
+        binding = json.load(f)
+
+    # The expected hashes for engram table tensors if they were written to external_dir
+    engram_specs = binding.get("external", {}).get("engram", {})
+    table_shas = set()
+    for spec in engram_specs.values():
+        for k in ("weight", "scale"):
+            r = tensors[spec[k]]
+            key = hashlib.sha256(f"{r['file_sha256']}:{r['offset']}:{r['length']}".encode()).hexdigest()
+            table_shas.add(key)
+
+    ext_dir = os.path.join(workdir, "deepseek-engram-ext")
+    shutil.rmtree(ext_dir, ignore_errors=True)
+
+    got = record_vxpu_engine(model, "main", prompts, settings, artifact, external_dir=ext_dir)
+
+    rows, ok = compare(ref, got, strict_tokens=True)
+    if not ok:
+        print("engram checkpoint reads: tokens changed when reading from checkpoint files")
+        return False
+
+    ext_files = []
+    if os.path.exists(ext_dir):
+        for root, _, filenames in os.walk(ext_dir):
+            for f in filenames:
+                ext_files.append(f)
+    leaked_tables = set(ext_files) & table_shas
+    if leaked_tables:
+        print(f"engram checkpoint reads: table files written to external_dir: {leaked_tables}")
+        return False
+
+    notes = got.get("producer", {}).get("plan", {}).get("notes", [])
+    engram_notes = [n for n in notes if "n-gram tables: rows read straight from checkpoint files" in n]
+    if not engram_notes:
+        print(f"engram checkpoint reads: missing plan note about checkpoint reads in {notes}")
+        return False
+
+    # Also test step_graph=True: tables are copied and the plan notes why (#470)
+    step_ext = os.path.join(workdir, "deepseek-step-ext")
+    shutil.rmtree(step_ext, ignore_errors=True)
+    step_engine = Engine(artifact, external_dir=step_ext)
+    step_engine.plan.choices["step_graph"].value = True
+    _, step_engram = step_engine._fetch_external_tensors(
+        step_engine.binding["external"], None, step_ext, None, None)
+    step_notes = step_engine.plan.notes
+    if not any("step graph native packages require resident tensors" in n for n in step_notes):
+        print(f"engram checkpoint reads: missing step_graph plan note in {step_notes}")
+        return False
+    if any(isinstance(v, FileTable) for v in step_engram.values()):
+        print(f"engram checkpoint reads: step_graph used FileTable instead of copying: {step_engram}")
+        return False
+    step_engine.close()
+
+    print(f"  engram checkpoint reads ok: tokens match reference, no table files in external_dir ({engram_notes[0]})")
+    return True
+
+
 def selftest(workdir, settings):
     """The CI tier: tiny models through export, the in-process engine,
     and a transformers reference, token-exact. No cluster."""
@@ -2383,6 +2512,8 @@ def selftest(workdir, settings):
             failed.append(name + " (gpu experts)")
         if name == "tiny-deepseek-v41" and not _check_external_dir(model, prompts, settings, artifact, ref, workdir):
             failed.append(name + " (external_dir)")
+        if name == "tiny-deepseek-v41" and not _check_engram_file(model, prompts, settings, artifact, ref, workdir):
+            failed.append(name + " (engram checkpoint reads)")
         if name == "tiny-deepseek-v41" and not _check_telemetry(model, prompts, settings, artifact, got, workdir):
             failed.append(name + " (telemetry)")
         if name == "tiny-deepseek-v41" and not _check_lowering(model, prompts, settings, artifact, workdir):

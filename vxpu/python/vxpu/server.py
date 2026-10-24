@@ -71,6 +71,8 @@ class ExecutorServicer(vxpu_pb2_grpc.ExecutorServicer):
         if self.range_server is not None:
             self.range_server[1].stop()
             self.range_server = None
+        if self.engine is not None and hasattr(self.engine, "close"):
+            self.engine.close()
         self.engine = None
         self.digest = None
 

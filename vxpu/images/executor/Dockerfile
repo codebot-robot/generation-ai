@@ -19,7 +19,7 @@ WORKDIR /app
 # torch JIT-compiles some eager CUDA ops via Triton at runtime,
 # which needs a C compiler even without torch.compile.
 RUN apt-get update && apt-get install -y --no-install-recommends \
-    gcc g++ libc6-dev \
+    gcc g++ libc6-dev liburing-dev \
     && rm -rf /var/lib/apt/lists/*
 
 # torch is pinned to the exporting torch version: serialized
