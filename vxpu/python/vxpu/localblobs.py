@@ -96,17 +96,17 @@ def localize(files, blob_dir, bucket=None, log=lambda msg: print(msg, flush=True
     return out, summary
 
 
-def release(files, blob_dir):
+def release(files, blob_dir, exclude_shas=None):
     """Ask the kernel to drop the page cache of the local blob files once
     the engine has loaded from them: their bytes now live in RAM (the
     expert banks), on the GPU or in the external tables' own files, so
     cached blob pages only push out what the engine reads every token
-    (the memory-mapped n-gram tables). Measured on the hero run's VM
-    (380 GB RAM, the experts in RAM): with the 510 GB of blob pages
-    cached after a fresh copy and load, the n-gram lookups took ~90 ms a
-    decode step instead of ~0.5."""
+    (the memory-mapped or file-backed n-gram tables). Tables read directly
+    from checkpoint files via io_uring are excluded (#452)."""
     released = 0
     for sha in files:
+        if exclude_shas and sha in exclude_shas:
+            continue
         path = os.path.join(blob_dir, sha)
         try:
             fd = os.open(path, os.O_RDONLY)

@@ -49,10 +49,10 @@ fi
 mkdir -p /mnt/ssd/blobs /mnt/ssd/src /mnt/ssd/artifact
 df -h /mnt/ssd | tail -1
 
-# the venv module, a C++ compiler and Python headers (the CPU kernels build on first use)
-if ! dpkg -s python3-venv python3-dev g++ >/dev/null 2>&1; then
+# the venv module, a C++ compiler, Python headers and liburing (the CPU kernels build on first use)
+if ! dpkg -s python3-venv python3-dev g++ liburing-dev >/dev/null 2>&1; then
   $SUDO env DEBIAN_FRONTEND=noninteractive apt-get update -qq >/dev/null
-  $SUDO env DEBIAN_FRONTEND=noninteractive apt-get install -y -qq python3-venv python3-dev g++ >/dev/null
+  $SUDO env DEBIAN_FRONTEND=noninteractive apt-get install -y -qq python3-venv python3-dev g++ liburing-dev >/dev/null
 fi
 echo "packages ok"
 

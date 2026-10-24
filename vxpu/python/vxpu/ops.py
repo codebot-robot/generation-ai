@@ -372,7 +372,7 @@ def engram_rows(indices: torch.Tensor, table: int) -> torch.Tensor:
         return out
     embed = _current("engram", table)
     host = embed.weight.device
-    impl = _plan(host.type).select("vxpu::engram_rows", host.type)
+    impl = _plan(host.type).select("vxpu::engram_rows", host.type, embed=embed)
     rec = _recorder()
     if rec is None:
         return impl.fn(embed, indices.to(host)).to(indices.device)
@@ -382,10 +382,34 @@ def engram_rows(indices: torch.Tensor, table: int) -> torch.Tensor:
     return out
 
 
+@implementation("vxpu::engram_rows", "host-file", ("cpu",), "bit-identical",
+                "kernels on: the rows read straight from the checkpoint file with io_uring (or pread fallback); "
+                "dequantized as the module does",
+                applies=lambda plan, embed=None, **_: plan["kernels"] and kernels.available() and getattr(embed, "file_backed", None) is not None,
+                host=True)
+def _engram_file(embed, indices):
+    k = kernels.load()
+    mask = (indices < embed.vocab_start_idx) | (indices >= embed.vocab_end_idx)
+    local = (indices - embed.vocab_start_idx).masked_fill(mask, 0)
+    fb = embed.file_backed
+    values, scales = k.gather_table_rows(
+        fb.fd, fb.weight_offset, fb.weight_row_bytes,
+        fb.scale_offset, fb.scale_row_bytes, fb.rows, local)
+    if fb.weight_dtype != values.dtype:
+        values = values.view(fb.weight_dtype)
+    if fb.scale_dtype != scales.dtype:
+        scales = scales.view(fb.scale_dtype)
+    values = values.float().unflatten(-1, (-1, embed.block_size)) * scales.float().unsqueeze(-1)
+    values = values.flatten(-2).to(torch.bfloat16)
+    return values.masked_fill(mask.unsqueeze(-1), 0)
+
+
 @implementation("vxpu::engram_rows", "host-parallel", ("cpu",), "bit-identical",
                 "kernels on: the rows gathered by the kernel threads, so a table memory-mapped from SSD reads a "
                 "step's rows concurrently (one page fault per thread, not one after another); dequantized as the "
-                "module does", applies=lambda plan, **_: plan["kernels"] and kernels.load() is not None, host=True)
+                "module does",
+                applies=lambda plan, embed=None, **_: plan["kernels"] and kernels.load() is not None and getattr(embed, "file_backed", None) is None,
+                host=True)
 def _engram_parallel(embed, indices):
     k = kernels.load()
     mask = (indices < embed.vocab_start_idx) | (indices >= embed.vocab_end_idx)
@@ -402,6 +426,8 @@ def _engram_parallel(embed, indices):
 @implementation("vxpu::engram_rows", "host-lookup", ("cpu", "cuda"), "bit-identical",
                 "the module's own lookup, on the table's device (RAM or a memory-mapped file)", reference=True, host=True)
 def _engram_lookup(embed, indices):
+    if getattr(embed, "file_backed", None) is not None:
+        raise RuntimeError("this n-gram table is read from its checkpoint file and needs the CPU kernels")
     return embed.lookup(indices)
 
 

@@ -43,6 +43,14 @@ def set_enabled(on):
     _enabled = bool(on)
 
 
+def _has_liburing():
+    """Whether liburing headers are installed: links -luring and defines VXPU_HAVE_IO_URING."""
+    for inc in ("/usr/include", "/usr/local/include"):
+        if os.path.exists(os.path.join(inc, "liburing.h")):
+            return True
+    return False
+
+
 def load():
     """The extension module, or None if it cannot be built here (or the
     kernels are switched off)."""
@@ -65,13 +73,16 @@ def load():
             if sys.platform != "darwin":  # gcc/clang with an OpenMP runtime; Apple clang has none
                 cflags.append("-fopenmp")
                 ldflags.append("-fopenmp")
+            if _has_liburing():
+                cflags.append("-DVXPU_HAVE_IO_URING=1")
+                ldflags.append("-luring")
             _module = jit_load(name="vxpu_fp4_kernels", sources=SOURCES,
                                extra_cflags=cflags, extra_ldflags=ldflags, verbose=False)
         except Exception as e:  # noqa: BLE001  (no compiler, no headers: the aten path remains)
             _error = f"{type(e).__name__}: {e}"
             print(f"[vxpu] CPU kernels unavailable, using the plain-aten path: {_error.splitlines()[0][:200]}", flush=True)
             return None
-        print(f"[vxpu] CPU kernels loaded (avx512: {_module.has_avx512()}, neon: {_module.has_neon()})", flush=True)
+        print(f"[vxpu] CPU kernels loaded (avx512: {_module.has_avx512()}, neon: {_module.has_neon()}, io_uring: {_module.has_io_uring()})", flush=True)
         return _module
 
 

@@ -52,6 +52,17 @@
 #include <cstring>
 #include <limits>
 #include <vector>
+#include <fcntl.h>
+#include <unistd.h>
+#include <sys/types.h>
+#include <sys/stat.h>
+#include <mutex>
+#include <unordered_map>
+#include <string>
+
+#if defined(VXPU_HAVE_IO_URING)
+#include <liburing.h>
+#endif
 
 #if defined(__aarch64__)
 #include <arm_neon.h>
@@ -769,6 +780,225 @@ torch::Tensor gather_rows(const torch::Tensor& table, const torch::Tensor& indic
   return out.view(shape);
 }
 
+static bool has_io_uring() {
+#if defined(VXPU_HAVE_IO_URING)
+  return true;
+#else
+  return false;
+#endif
+}
+
+#if defined(VXPU_HAVE_IO_URING)
+struct RingState {
+  io_uring ring;
+  bool inited = false;
+  bool failed = false;
+  std::mutex mu;
+
+  bool init() {
+    std::lock_guard<std::mutex> lock(mu);
+    if (inited) return true;
+    if (failed) return false;
+    if (io_uring_queue_init(512, &ring, 0) < 0) {
+      failed = true;
+      return false;
+    }
+    inited = true;
+    return true;
+  }
+
+  void destroy() {
+    if (inited) {
+      io_uring_queue_exit(&ring);
+      inited = false;
+    }
+    failed = true;
+  }
+
+  ~RingState() {
+    if (inited) {
+      io_uring_queue_exit(&ring);
+    }
+  }
+};
+static RingState g_ring;
+#endif
+
+bool io_uring_ready() {
+#if defined(VXPU_HAVE_IO_URING)
+  return g_ring.init();
+#else
+  return false;
+#endif
+}
+
+// Rows of an n-gram table's weights and scales read from a checkpoint file
+// at their byte offsets in a single io_uring submit (and pread across kernel
+// threads as a fallback).
+std::tuple<torch::Tensor, torch::Tensor> gather_table_rows(
+    int fd,
+    int64_t weight_offset,
+    int64_t weight_row_bytes,
+    int64_t scale_offset,
+    int64_t scale_row_bytes,
+    int64_t rows,
+    const torch::Tensor& indices,
+    bool use_uring = true) {
+  TORCH_CHECK(fd >= 0, "gather_table_rows: invalid file descriptor ", fd);
+  TORCH_CHECK(weight_row_bytes > 0, "gather_table_rows: weight_row_bytes must be > 0 (got ", weight_row_bytes, ")");
+  TORCH_CHECK(scale_row_bytes > 0, "gather_table_rows: scale_row_bytes must be > 0 (got ", scale_row_bytes, ")");
+  TORCH_CHECK(weight_offset >= 0, "gather_table_rows: weight_offset must be >= 0 (got ", weight_offset, ")");
+  TORCH_CHECK(scale_offset >= 0, "gather_table_rows: scale_offset must be >= 0 (got ", scale_offset, ")");
+  TORCH_CHECK(rows > 0, "gather_table_rows: rows must be > 0 (got ", rows, ")");
+  TORCH_CHECK(indices.device().is_cpu(), "gather_table_rows: indices on the CPU (got ", indices.device(), ")");
+
+  const auto idx = indices.to(torch::kLong).contiguous().view(-1);
+  const int64_t n = idx.numel();
+  const int64_t* ix = idx.data_ptr<int64_t>();
+  for (int64_t i = 0; i < n; ++i) {
+    TORCH_CHECK(ix[i] >= 0 && ix[i] < rows, "gather_table_rows: index ", ix[i], " outside [0, ", rows, ")");
+  }
+
+  auto out_weights = torch::empty({n, weight_row_bytes}, torch::TensorOptions().dtype(torch::kUInt8).device(torch::kCPU));
+  auto out_scales = torch::empty({n, scale_row_bytes}, torch::TensorOptions().dtype(torch::kUInt8).device(torch::kCPU));
+  char* dst_w = static_cast<char*>(out_weights.data_ptr());
+  char* dst_s = static_cast<char*>(out_scales.data_ptr());
+
+  auto shape = indices.sizes().vec();
+  auto shape_w = shape; shape_w.push_back(weight_row_bytes);
+  auto shape_s = shape; shape_s.push_back(scale_row_bytes);
+
+  if (n == 0) {
+    return {out_weights.view(shape_w), out_scales.view(shape_s)};
+  }
+
+  bool ran_uring = false;
+#if defined(VXPU_HAVE_IO_URING)
+  if (use_uring && g_ring.init()) {
+    std::lock_guard<std::mutex> lock(g_ring.mu);
+    int64_t submitted_pairs = 0;
+    while (submitted_pairs < n) {
+      int64_t batch_pairs = std::min<int64_t>(n - submitted_pairs, 256);
+      int64_t batch_sqes = batch_pairs * 2;
+      unsigned space = io_uring_sq_space_left(&g_ring.ring);
+      TORCH_CHECK(space >= batch_sqes, "gather_table_rows: io_uring submission queue full (space: ", space, ", needed: ", batch_sqes, ")");
+
+      for (int64_t i = 0; i < batch_pairs; ++i) {
+        int64_t item = submitted_pairs + i;
+        io_uring_sqe* sqe_w = io_uring_get_sqe(&g_ring.ring);
+        TORCH_CHECK(sqe_w != nullptr, "gather_table_rows: io_uring_get_sqe returned null");
+        io_uring_prep_read(sqe_w, fd, dst_w + item * weight_row_bytes, weight_row_bytes, weight_offset + ix[item] * weight_row_bytes);
+        sqe_w->user_data = static_cast<uint64_t>(weight_row_bytes);
+
+        io_uring_sqe* sqe_s = io_uring_get_sqe(&g_ring.ring);
+        TORCH_CHECK(sqe_s != nullptr, "gather_table_rows: io_uring_get_sqe returned null");
+        io_uring_prep_read(sqe_s, fd, dst_s + item * scale_row_bytes, scale_row_bytes, scale_offset + ix[item] * scale_row_bytes);
+        sqe_s->user_data = static_cast<uint64_t>(scale_row_bytes);
+      }
+
+      int to_submit = batch_sqes;
+      while (to_submit > 0) {
+        int ret = io_uring_submit(&g_ring.ring);
+        if (ret == -EINTR) {
+          continue;
+        }
+        if (ret < 0) {
+          g_ring.destroy();
+          TORCH_CHECK(false, "gather_table_rows: io_uring_submit failed: ", std::strerror(-ret));
+        }
+        to_submit -= ret;
+      }
+
+      int64_t seen = 0;
+      int err = 0;
+      int64_t short_expected = 0;
+      int64_t short_got = 0;
+      while (seen < batch_sqes) {
+        io_uring_cqe* cqe = nullptr;
+        int wait_ret = io_uring_wait_cqe(&g_ring.ring, &cqe);
+        if (wait_ret == -EINTR) {
+          continue;
+        }
+        if (wait_ret < 0) {
+          g_ring.destroy();
+          TORCH_CHECK(false, "gather_table_rows: io_uring_wait_cqe failed: ", std::strerror(-wait_ret));
+        }
+        if (cqe->res < 0 && err == 0) {
+          err = -cqe->res;
+        } else if (cqe->user_data != 0) {
+          int64_t expected_bytes = static_cast<int64_t>(cqe->user_data);
+          if (cqe->res != expected_bytes && err == 0) {
+            err = -1;
+            short_expected = expected_bytes;
+            short_got = cqe->res;
+          }
+        }
+        seen++;
+        io_uring_cqe_seen(&g_ring.ring, cqe);
+      }
+      if (err > 0) {
+        TORCH_CHECK(false, "gather_table_rows: read error: ", std::strerror(err));
+      } else if (err < 0) {
+        TORCH_CHECK(false, "gather_table_rows: short read: expected ", short_expected, " bytes, got ", short_got);
+      }
+      submitted_pairs += batch_pairs;
+    }
+    ran_uring = true;
+  }
+#endif
+
+  if (!ran_uring) {
+    std::atomic<bool> failed{false};
+    std::atomic<int> fail_errno{0};
+    std::atomic<int64_t> short_expected{0};
+    std::atomic<int64_t> short_got{0};
+    auto record_fail = [&](int e, int64_t exp, int64_t got) {
+      bool expected_failed = false;
+      if (failed.compare_exchange_strong(expected_failed, true)) {
+        fail_errno.store(e);
+        short_expected.store(exp);
+        short_got.store(got);
+      }
+    };
+
+    parallel_range(n, 1, [&](int64_t i0, int64_t i1) {
+      for (int64_t i = i0; i < i1; ++i) {
+        if (failed.load(std::memory_order_relaxed)) return;
+        int64_t w_off = weight_offset + ix[i] * weight_row_bytes;
+        ssize_t got_w = pread(fd, dst_w + i * weight_row_bytes, weight_row_bytes, w_off);
+        if (got_w < 0) {
+          record_fail(errno, 0, 0);
+          return;
+        }
+        if (got_w != weight_row_bytes) {
+          record_fail(0, weight_row_bytes, got_w);
+          return;
+        }
+        int64_t s_off = scale_offset + ix[i] * scale_row_bytes;
+        ssize_t got_s = pread(fd, dst_s + i * scale_row_bytes, scale_row_bytes, s_off);
+        if (got_s < 0) {
+          record_fail(errno, 0, 0);
+          return;
+        }
+        if (got_s != scale_row_bytes) {
+          record_fail(0, scale_row_bytes, got_s);
+          return;
+        }
+      }
+    });
+
+    if (failed.load()) {
+      if (fail_errno.load() != 0) {
+        TORCH_CHECK(false, "gather_table_rows: pread failed on fd ", fd, ": ", std::strerror(fail_errno.load()));
+      } else {
+        TORCH_CHECK(false, "gather_table_rows: short read: expected ", short_expected.load(), " bytes, got ", short_got.load());
+      }
+    }
+  }
+
+  return {out_weights.view(shape_w), out_scales.view(shape_s)};
+}
+
 // The kernels a node's native package calls (#394): torch ops, so the
 // C++ AOTInductor generates for a node calls them through the dispatcher,
 // with no Python between messages. Loading this library registers them.
@@ -827,6 +1057,13 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
   m.def("fp4_moe_decode", &fp4_moe_decode, "one decode layer's routed experts: gate/up, SwiGLU, act_quant, down, sum -> fp32 [n, K]");
   m.def("fp8_linear", &fp8_linear, "x[M,K] bf16 (quantized per 32-block inside, as the fork's act_quant) x fp8 [N,K] with e8m0 32x32 block scales -> bf16 [M,N]");
   m.def("gather_rows", &gather_rows, "rows of a 2-D table by index, copied concurrently (page faults overlap) -> [*indices.shape, cols]");
+  m.def("gather_table_rows", &gather_table_rows,
+        "weights and scales of an n-gram table read directly with io_uring in one submit -> ([*indices.shape, weight_row_bytes], [*indices.shape, scale_row_bytes])",
+        py::arg("fd"), py::arg("weight_offset"), py::arg("weight_row_bytes"),
+        py::arg("scale_offset"), py::arg("scale_row_bytes"), py::arg("rows"), py::arg("indices"),
+        py::arg("use_uring") = true);
+  m.def("io_uring_ready", &io_uring_ready, "whether io_uring is available and its ring is initialized");
+  m.def("has_io_uring", &has_io_uring, "whether io_uring support was compiled in");
   m.def("has_avx512", &has_avx512, "whether the AVX-512 paths are in use");
   m.def("has_neon", &has_neon, "whether the NEON paths are in use");
   register_node_server(m);

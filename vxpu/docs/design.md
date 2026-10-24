@@ -209,12 +209,18 @@ Weights are content-addressed by sha256 at every tier:
 | bucket | modelstore's blobs (`gs://…/_blobs/<sha256>`) | modelstore |
 | weights disk | a checkpoint's blobs on a GCE disk, attached read-only | `pkg/weightdisk`, `pkg/agent` |
 | executor's disk | the local weight tier, filled from the bucket | `localblobs.py` |
-| RAM, or memory-mapped from local SSD | expert banks and n-gram tables, outside the graphs | `engine.py` (`external_dir`) |
+| RAM, memory-mapped from local SSD, or read from checkpoint files | expert banks and n-gram tables, outside the graphs | `engine.py` (`external_dir`) |
 | GPU | dense weights; hot experts (§4) | `engine.py`, `experts_gpu.py` |
 
 The tables a token reads a few rows of (the n-gram tables, ~200 GB on
-DeepSeek-V4.1-Flash) stay on SSD and are read row by row, concurrently,
-with no readahead.
+DeepSeek-V4.1-Flash) stay on disk: when local (on a weights disk or in
+the local weight tier) and the engine runs without the step graph, the
+engine reads their rows straight from the checkpoint files at their byte
+offsets using io_uring, with no copy into `external_dir` and no
+memory-mapping (#452). A pread fallback runs when io_uring is
+unavailable. When the step graph is on, native packages require resident
+tensors, so the tables are copied and memory-mapped (#470). Tables from a
+remote source are copied into `external_dir` and memory-mapped.
 
 **Weights disks (#407).** Today each executor VM copies its checkpoint
 from the bucket before it can load a model. The copy is slow for two
