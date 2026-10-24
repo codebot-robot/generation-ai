@@ -245,14 +245,6 @@ class Engine:
                 "{% endif %}"
             )
 
-        # Shared, read-only: fetched/computed exactly once. Shapes for
-        # derived/state tensors come from the decode program itself.
-        t_probe_start = time.time()
-        probe = torch.export.load(
-            os.path.join(artifact_dir, "decode.pt2"))
-        probe_meta = {**probe.state_dict, **probe.constants}
-        t_probe = time.time() - t_probe_start
-
         # Weights move to the device once: both programs then
         # alias the same storage (device pass no-ops on tensors already
         # in place), so a session costs cache memory, not a weight copy.
@@ -269,19 +261,6 @@ class Engine:
         self.external = ops.External()
         self.expert_mover = None  # experts_gpu.Mover, when hot experts move with the traffic
         self.external.plan = self.plan  # the ops dispatch by this engine's plan
-        for fqn in self.binding["derived"]:
-            self.shared[fqn] = derived_tensor(
-                fqn, probe_meta[fqn], self.config).to(device)
-        # Lifted but unused by the graph (other towers' tables, and the
-        # banks the graph calls out for instead of reading): the graph
-        # never touches them, so an empty tensor of the dtype stands in.
-        # Full-size zeros would be 272 GB for DeepSeek's expert banks.
-        for fqn in self.binding.get("unused", []):
-            meta = probe_meta[fqn]
-            self.shared[fqn] = torch.empty(0, dtype=meta.dtype, device=device)
-        self.state_specs = {
-            fqn: (probe_meta[fqn].shape, probe_meta[fqn].dtype)
-            for fqn in self.binding["state"]}
         # Names the graphs use for a tensor that is also known under a
         # canonical name (a cache tensor lifted both as a wrapper buffer
         # and as a constant); bound to the same tensor as the canonical.
@@ -297,57 +276,93 @@ class Engine:
         self._ranges = []  # the ranges of layers after this engine's, on other engines (attach_ranges)
         self._current = None  # the session being generated for
 
-        scratch = {
-            fqn: torch.zeros(shape, dtype=dtype, device=self.device)
-            for fqn, (shape, dtype) in self.state_specs.items()}
+        # Start fetching dense weights and external tensors first. Fetching
+        # needs only the manifest and the binding, not the graph (#465).
+        # The engine deserializes the decode probe while worker threads read weights.
+        def fetch_dense():
+            self._fetch_bound(cas_dir, stop_event=stop_event)
+            if stop_event is not None and stop_event.is_set():
+                return
+            if self.binding.get("stacked"):
+                self._fetch_stacked(cas_dir, stop_event=stop_event)
 
-        # Fetch the dense weights first, both bound and stacked tensors.
-        # Real weights land on the device before graph building starts.
-        self._fetch_bound(cas_dir)
-        if self.binding.get("stacked"):
-            self._fetch_stacked(cas_dir)
+        has_external = bool(self.binding.get("external"))
+        stop_event = threading.Event()
+        pool = ThreadPoolExecutor(max_workers=2 if has_external else 1)
+        try:
+            f_dense = pool.submit(fetch_dense)
+            f_external = None
+            if has_external:
+                from . import deepseek_v41 as ds
+                args = ds.model_args(self.manifest["source"]["repo"], self.max_cache_len)
+                mm = external_files_dir(self.external_dir, self.manifest)
+                self.external.remote_nodes = self._connect_remote_nodes()
+                self._remote_layers = {i for kind, i in self.external.remote_nodes if kind == "experts"}
+                remote_tables = {i for kind, i in self.external.remote_nodes if kind == "engram"}
+                specs = self.binding["external"].get("experts", {})
+                if self.plan["layer_range"]:
+                    self._remote_layers |= {int(layer) for layer in specs if not self._in_range(int(layer))}
+                    remote_tables |= {int(k) for k in self.binding["external"].get("engram", {}) if not self._in_range(int(k))}
+                local = {int(layer) for layer in specs} - self._remote_layers
+                local_tables = {int(k) for k in self.binding["external"].get("engram", {})} - remote_tables
+                f_external = pool.submit(
+                    self._fetch_external_tensors, self.binding["external"], cas_dir, mm, local, local_tables, stop_event)
 
-        # Build the graphs while another thread fetches external tensors.
-        # The graphs do not hold external banks as attributes, so _build
-        # runs concurrently with fetching expert banks and n-gram tables.
-        if self.binding.get("external"):
-            from . import deepseek_v41 as ds
-            args = ds.model_args(self.manifest["source"]["repo"], self.max_cache_len)
-            mm = external_files_dir(self.external_dir, self.manifest)
-            self.external.remote_nodes = self._connect_remote_nodes()
-            self._remote_layers = {i for kind, i in self.external.remote_nodes if kind == "experts"}
-            remote_tables = {i for kind, i in self.external.remote_nodes if kind == "engram"}
-            specs = self.binding["external"].get("experts", {})
-            if self.plan["layer_range"]:
-                self._remote_layers |= {int(layer) for layer in specs if not self._in_range(int(layer))}
-                remote_tables |= {int(k) for k in self.binding["external"].get("engram", {}) if not self._in_range(int(k))}
-            local = {int(layer) for layer in specs} - self._remote_layers
-            local_tables = {int(k) for k in self.binding["external"].get("engram", {})} - remote_tables
+            # Shapes for derived and state tensors come from the decode program itself.
+            t_probe_start = time.time()
+            probe = torch.export.load(
+                os.path.join(artifact_dir, "decode.pt2"))
+            probe_meta = {**probe.state_dict, **probe.constants}
+            t_probe = time.time() - t_probe_start
 
-            stop_event = threading.Event()
-            pool = ThreadPoolExecutor(max_workers=2)
-            f_build = pool.submit(self._build, probe, scratch)
-            f_external = pool.submit(
-                self._fetch_external_tensors, self.binding["external"], cas_dir, mm, local, local_tables, stop_event)
-            done, not_done = concurrent.futures.wait(
-                [f_build, f_external], return_when=concurrent.futures.FIRST_EXCEPTION)
-            for f in done:
-                if f.exception() is not None:
-                    stop_event.set()
-                    pool.shutdown(wait=True)
-                    raise f.exception()
-            if not_done:
-                done2, _ = concurrent.futures.wait(not_done)
-                for f in done2:
+            # Check for early failure on external tensors, and wait for dense weights.
+            if f_external is not None and f_external.done() and f_external.exception() is not None:
+                raise f_external.exception()
+            f_dense.result()
+
+            for fqn in self.binding["derived"]:
+                self.shared[fqn] = derived_tensor(
+                    fqn, probe_meta[fqn], self.config).to(device)
+            # Lifted but unused by the graph (other towers' tables, and the
+            # banks the graph calls out for instead of reading): the graph
+            # never touches them, so an empty tensor of the dtype stands in.
+            # Full-size zeros would be 272 GB for DeepSeek's expert banks.
+            for fqn in self.binding.get("unused", []):
+                meta = probe_meta[fqn]
+                self.shared[fqn] = torch.empty(0, dtype=meta.dtype, device=device)
+            self.state_specs = {
+                fqn: (probe_meta[fqn].shape, probe_meta[fqn].dtype)
+                for fqn in self.binding["state"]}
+
+            scratch = {
+                fqn: torch.zeros(shape, dtype=dtype, device=self.device)
+                for fqn, (shape, dtype) in self.state_specs.items()}
+
+            # Build the graphs while another thread fetches external tensors.
+            # The graphs do not hold external banks as attributes, so _build
+            # runs concurrently with fetching expert banks and n-gram tables.
+            if has_external:
+                f_build = pool.submit(self._build, probe, scratch)
+                done, not_done = concurrent.futures.wait(
+                    [f_build, f_external], return_when=concurrent.futures.FIRST_EXCEPTION)
+                for f in done:
                     if f.exception() is not None:
-                        stop_event.set()
-                        pool.shutdown(wait=True)
                         raise f.exception()
+                if not_done:
+                    done2, _ = concurrent.futures.wait(not_done)
+                    for f in done2:
+                        if f.exception() is not None:
+                            raise f.exception()
+                fetched_experts, fetched_engram = f_external.result()
+                self._assemble_external(self.binding["external"], args, mm, local, remote_tables, fetched_experts, fetched_engram)
+            else:
+                self._build(probe, scratch)
+        except Exception:
+            stop_event.set()
             pool.shutdown(wait=True)
-            fetched_experts, fetched_engram = f_external.result()
-            self._assemble_external(self.binding["external"], args, mm, local, remote_tables, fetched_experts, fetched_engram)
-        else:
-            self._build(probe, scratch)
+            raise
+        pool.shutdown(wait=True)
+
         if self.plan["blob_dir"]:
             # the weights are loaded: the blob files' cached pages would only
             # crowd out the memory-mapped tables read every token
@@ -355,11 +370,18 @@ class Engine:
             released = localblobs.release(self.manifest["files"], self.plan["blob_dir"])
             print(f"[vxpu] released the page cache of {released} local blob files", flush=True)
 
-        parts = [f"probe {t_probe:.1f}s"]
+        parts = []
+        concurrent_fetch = []
         if self._timing_bound > 0 or self.binding.get("bound"):
-            parts.append(f"bound {self._timing_bound:.1f}s")
+            concurrent_fetch.append(f"bound {self._timing_bound:.1f}s")
         if self._timing_stacked > 0 or self.binding.get("stacked"):
-            parts.append(f"stacked {self._timing_stacked:.1f}s")
+            concurrent_fetch.append(f"stacked {self._timing_stacked:.1f}s")
+        if concurrent_fetch:
+            parts.append(
+                f"concurrent phases: {', '.join(concurrent_fetch)}, probe {t_probe:.1f}s")
+        else:
+            parts.append(f"probe {t_probe:.1f}s")
+
         if self.binding.get("external"):
             parts.append(
                 f"concurrent phases: external {self._timing_banks:.1f}s, "
@@ -372,9 +394,10 @@ class Engine:
 
         print("[vxpu] " + self.plan.summary(self.plan_ops()).replace("\n", "\n[vxpu] "), flush=True)
 
-    def _fetch_bound(self, cas_dir):
+    def _fetch_bound(self, cas_dir, stop_event=None):
         """Fetch bound tensors concurrently. Copy them to the device on a
-        worker thread, using a dedicated CUDA stream when running on CUDA."""
+        worker thread, using a dedicated CUDA stream when running on CUDA.
+        Stop early if stop_event is set."""
         bound = list(self.binding.get("bound", {}).items())
         if not bound:
             self._timing_bound = 0.0
@@ -391,6 +414,9 @@ class Engine:
                 while True:
                     item = q.get()
                     if item is None:
+                        q.task_done()
+                        break
+                    if stop_event is not None and stop_event.is_set():
                         q.task_done()
                         break
                     if not copy_error:
@@ -419,6 +445,8 @@ class Engine:
 
         def put_item(item):
             while True:
+                if stop_event is not None and stop_event.is_set():
+                    return
                 if copy_error:
                     raise copy_error[0]
                 try:
@@ -431,35 +459,50 @@ class Engine:
             with ThreadPoolExecutor(max_workers=16) as pool:
                 pending = {}
                 for i, (fqn, ref) in enumerate(bound):
+                    if stop_event is not None and stop_event.is_set():
+                        break
                     if copy_error:
                         raise copy_error[0]
                     pending[i] = pool.submit(fetch_tensor, ref, self.manifest["files"], cas_dir)
                     if len(pending) >= 32:
                         j = min(pending)
                         tensor, downloaded = pending.pop(j).result()
+                        if stop_event is not None and stop_event.is_set():
+                            break
                         put_item((bound[j][0], tensor, downloaded))
                 for j in sorted(pending):
+                    if stop_event is not None and stop_event.is_set():
+                        break
                     if copy_error:
                         raise copy_error[0]
                     tensor, downloaded = pending.pop(j).result()
+                    if stop_event is not None and stop_event.is_set():
+                        break
                     put_item((bound[j][0], tensor, downloaded))
         finally:
             q.put(None)
             copy_thread.join()
+        if stop_event is not None and stop_event.is_set():
+            return
         if copy_error:
             raise copy_error[0]
         self._timing_bound = time.time() - t_start
 
-    def _fetch_stacked(self, cas_dir):
-        """Fetch stacked parameters assembled from checkpoint per-expert tensors."""
+    def _fetch_stacked(self, cas_dir, stop_event=None):
+        """Fetch stacked parameters assembled from checkpoint per-expert tensors.
+        Stop early if stop_event is set."""
         stacked = self.binding.get("stacked", {})
         if not stacked:
             self._timing_stacked = 0.0
             return
         t_start = time.time()
         for fqn, spec in stacked.items():
+            if stop_event is not None and stop_event.is_set():
+                return
             tensor, downloaded = fetch_stacked(
                 spec, self.manifest["tensors"], self.manifest["files"], cas_dir)
+            if stop_event is not None and stop_event.is_set():
+                return
             self.shared[fqn] = tensor.to(self.device)
             with self._lock:
                 self.bytes_fetched += downloaded
