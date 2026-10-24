@@ -22,12 +22,12 @@ reference's logits at that position say whether the flip was a tie or
 a divergence, and the top-k logits of every position up to there must
 agree within a tolerance.
 
-    python -m vxpu.vectors record --producer transformers --model REPO -o ref.json
-    python -m vxpu.vectors record --producer vxpu-engine --model REPO --artifact DIR -o got.json
-    python -m vxpu.vectors record --producer vxpu-router --model REPO --artifact DIR [--router host:port] -o got.json
-    python -m vxpu.vectors record --producer vllm --model REPO -o vllm.json  # or: python vectors.py ...
-    python -m vxpu.vectors compare ref.json got.json
-    python -m vxpu.vectors selftest  # the CI tier: tiny models, in-process
+    python -m vxpu.vectors_test record --producer transformers --model REPO -o ref.json
+    python -m vxpu.vectors_test record --producer vxpu-engine --model REPO --artifact DIR -o got.json
+    python -m vxpu.vectors_test record --producer vxpu-router --model REPO --artifact DIR [--router host:port] -o got.json
+    python -m vxpu.vectors_test record --producer vllm --model REPO -o vllm.json  # or: python vectors_test.py ...
+    python -m vxpu.vectors_test compare ref.json got.json
+    python -m vxpu.vectors_test selftest  # the CI tier: tiny models, in-process
 
 Format (vxpu-vectors/1):
 
@@ -425,7 +425,7 @@ def record_vllm(model, revision, prompts, settings, dtype="auto",
 
     Runs with the ``vllm`` package only (plus transformers for the
     tokenizer): copy this file into a vLLM image and run it directly,
-    ``python vectors.py record --producer vllm ...``.
+    ``python vectors_test.py record --producer vllm ...``.
     """
     import torch
     import vllm

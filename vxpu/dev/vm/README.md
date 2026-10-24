@@ -31,7 +31,7 @@ vxpu/dev/vm/fetch.sh /path/to/artifact
 vxpu/dev/vm/sync.sh
 
 # 5. run things
-gcloud compute ssh vxpu-dev --zone ZONE --command '. /mnt/ssd/env.sh && cd /mnt/ssd && python -m vxpu.vectors record ...'
+gcloud compute ssh vxpu-dev --zone ZONE --command '. /mnt/ssd/env.sh && cd /mnt/ssd && python -m vxpu.vectors_test record ...'
 
 # 6. delete it when done (Spot or not, an idle GPU VM costs money)
 vxpu/dev/vm/delete.sh
