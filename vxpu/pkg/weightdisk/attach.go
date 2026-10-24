@@ -48,17 +48,12 @@ func Attach(ctx context.Context, gcloud Gcloud, o AttachOptions) error {
 	if o.FromImage {
 		source = "--image"
 	}
-	existing, err := gcloud(ctx, append([]string{"compute", "disks", "describe", o.Disk, "--format", "value(sourceSnapshot,sourceImage)"}, where...)...)
-	if err == nil {
-		// A disk of that name exists. Attach it only if it was made from this image.
-		made := false
-		for _, src := range strings.Fields(string(existing)) {
-			made = made || strings.HasSuffix(src, "/snapshots/"+o.Image) || strings.HasSuffix(src, "/images/"+o.Image)
-		}
-		if !made {
-			return fmt.Errorf("disk %s exists, made from %q, not %s", o.Disk, strings.TrimSpace(string(existing)), o.Image)
-		}
-	} else {
+	existing, err := gcloud(ctx, "compute", "disks", "list", fmt.Sprintf("--filter=name=(%s)", o.Disk),
+		"--zones", o.Zone, "--project", o.Project, "--format", "value(sourceSnapshot,sourceImage)")
+	if err != nil {
+		return err
+	}
+	if strings.TrimSpace(string(existing)) == "" {
 		args := []string{"compute", "disks", "create", o.Disk, source, o.Image,
 			"--type", o.DiskType, "--labels", "vxpu-weights=1", "--quiet"}
 		if o.FromImage {
@@ -75,6 +70,15 @@ func Attach(ctx context.Context, gcloud Gcloud, o AttachOptions) error {
 			return err
 		}
 		log.Info("Made a weights disk", "disk", o.Disk, "image", o.Image, "type", o.DiskType, "seconds", time.Since(t).Seconds())
+	} else {
+		// A disk of that name exists. Attach it only if it was made from this image.
+		made := false
+		for _, src := range strings.Fields(string(existing)) {
+			made = made || strings.HasSuffix(src, "/snapshots/"+o.Image) || strings.HasSuffix(src, "/images/"+o.Image)
+		}
+		if !made {
+			return fmt.Errorf("disk %s exists, made from %q, not %s", o.Disk, strings.TrimSpace(string(existing)), o.Image)
+		}
 	}
 	out, err := gcloud(ctx, append([]string{"compute", "instances", "describe", o.VM, "--format", "value(disks[].source)"}, where...)...)
 	if err != nil {
