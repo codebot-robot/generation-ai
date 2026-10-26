@@ -258,11 +258,15 @@ def host_experts(layer_id, args, banks):
     return moe
 
 
-def host_engram(layer_id, num_embeddings, dim, weight, scale):
+def host_engram(layer_id, num_embeddings, dim, weight=None, scale=None):
     """The fork's n-gram table module for `layer_id` over host tensors."""
     ds = _fork()
     with torch.device("meta"), bf16_default():
         embed = ds.ParallelEngramEmbedding(num_embeddings, dim)
+    if weight is None:
+        weight = torch.empty((0, dim), dtype=torch.uint8, device="cpu")
+    if scale is None:
+        scale = torch.empty((0, dim // embed.block_size), dtype=torch.uint8, device="cpu")
     embed.weight = torch.nn.Parameter(weight, requires_grad=False)
     embed.scale = torch.nn.Parameter(scale, requires_grad=False)
     embed.table_id = layer_id

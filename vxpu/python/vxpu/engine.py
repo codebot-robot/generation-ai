@@ -43,16 +43,35 @@ import os
 import queue
 import threading
 import time
+import weakref
 from concurrent.futures import ThreadPoolExecutor
 
 import torch
 
-from . import lower, ops, segments, vxpu_pb2  # noqa: F401  (registers vxpu::* before a graph that calls them is loaded)
+from typing import NamedTuple
+
+from . import kernels, lower, ops, segments, vxpu_pb2  # noqa: F401  (registers vxpu::* before a graph that calls them is loaded)
 from .plan import Plan
 from .plan import record as plan_record
 from .telemetry import Recorder, segment_info
-from .rehydrate import (advise_random, derived_tensor, fetch_stacked, fetch_tensor,
+from .rehydrate import (DTYPES, advise_random, derived_tensor, fetch_stacked, fetch_tensor,
                         load_program, share_state, strip_asserts)
+
+
+class FileTable:
+    """An n-gram table read straight from checkpoint files via io_uring (#452)."""
+
+    def __init__(self, fd, sha, weight_offset, weight_row_bytes,
+                 scale_offset, scale_row_bytes, rows, weight_dtype, scale_dtype):
+        self.fd = fd
+        self.sha = sha
+        self.weight_offset = weight_offset
+        self.weight_row_bytes = weight_row_bytes
+        self.scale_offset = scale_offset
+        self.scale_row_bytes = scale_row_bytes
+        self.rows = rows
+        self.weight_dtype = weight_dtype
+        self.scale_dtype = scale_dtype
 
 
 def configure_inductor(plan):
@@ -365,9 +384,12 @@ class Engine:
 
         if self.plan["blob_dir"]:
             # the weights are loaded: the blob files' cached pages would only
-            # crowd out the memory-mapped tables read every token
+            # crowd out what the engine reads every token (tables read every
+            # token keep their pages)
             from . import localblobs
-            released = localblobs.release(self.manifest["files"], self.plan["blob_dir"])
+            keep_shas = {t.file_backed.sha for t in getattr(self.external, "engram", {}).values()
+                         if getattr(t, "file_backed", None) is not None} if hasattr(self, "external") else set()
+            released = localblobs.release(self.manifest["files"], self.plan["blob_dir"], exclude_shas=keep_shas)
             print(f"[vxpu] released the page cache of {released} local blob files", flush=True)
 
         parts = []
@@ -523,6 +545,10 @@ class Engine:
         if stop_event is not None and stop_event.is_set():
             return None, None
 
+        use_file_tables = not self.plan["step_graph"] and kernels.available()
+        if self.plan["step_graph"] and external.get("engram"):
+            self.plan.note("n-gram tables copied: step graph native packages require resident tensors (#470)")
+
         fetched_engram = {}
         for key, spec in external.get("engram", {}).items():
             layer = int(key)
@@ -530,13 +556,42 @@ class Engine:
                 continue
             if stop_event is not None and stop_event.is_set():
                 return None, None
-            weight, downloaded = fetch_tensor(self.manifest["tensors"][spec["weight"]], self.manifest["files"], cas_dir, mmap_dir=mm)
+            w_ref = self.manifest["tensors"][spec["weight"]]
+            s_ref = self.manifest["tensors"][spec["scale"]]
+            w_url = self.manifest["files"][w_ref["file_sha256"]]["source"]
+            s_url = self.manifest["files"][s_ref["file_sha256"]]["source"]
+            if (use_file_tables
+                    and w_url.startswith("file://") and s_url.startswith("file://")
+                    and w_ref["file_sha256"] == s_ref["file_sha256"]):
+                path = w_url[len("file://"):]
+                fd = os.open(path, os.O_RDONLY)
+                if hasattr(os, "posix_fadvise") and hasattr(os, "POSIX_FADV_RANDOM"):
+                    try:
+                        os.posix_fadvise(fd, 0, 0, os.POSIX_FADV_RANDOM)
+                    except OSError:
+                        pass
+                rows = w_ref["shape"][0]
+                file_table = FileTable(
+                    fd=fd,
+                    sha=w_ref["file_sha256"],
+                    weight_offset=w_ref["offset"],
+                    scale_offset=s_ref["offset"],
+                    weight_row_bytes=w_ref["length"] // rows,
+                    scale_row_bytes=s_ref["length"] // rows,
+                    rows=rows,
+                    weight_dtype=DTYPES[w_ref["dtype"]],
+                    scale_dtype=DTYPES[s_ref["dtype"]],
+                )
+                weakref.finalize(file_table, os.close, fd)
+                fetched_engram[layer] = file_table
+                continue
+            weight, downloaded = fetch_tensor(w_ref, self.manifest["files"], cas_dir, mmap_dir=mm)
             with self._lock:
                 self.bytes_fetched += downloaded
                 self.external_bytes_fetched += downloaded
             if stop_event is not None and stop_event.is_set():
                 return None, None
-            scale, downloaded = fetch_tensor(self.manifest["tensors"][spec["scale"]], self.manifest["files"], cas_dir, mmap_dir=mm)
+            scale, downloaded = fetch_tensor(s_ref, self.manifest["files"], cas_dir, mmap_dir=mm)
             with self._lock:
                 self.bytes_fetched += downloaded
                 self.external_bytes_fetched += downloaded
@@ -570,11 +625,25 @@ class Engine:
             self._attach_mailboxes()
         if fetched_engram:
             engram = external.get("engram", {})
-            for layer, (weight, scale) in fetched_engram.items():
+            has_file_tables = False
+            for layer, item in fetched_engram.items():
                 spec = engram[str(layer)]
-                self.external.engram[int(layer)] = ds.host_engram(
-                    int(layer), spec["num_embeddings"], spec["dim"], weight, scale)
+                if isinstance(item, FileTable):
+                    has_file_tables = True
+                    embed = ds.host_engram(int(layer), spec["num_embeddings"], spec["dim"])
+                    embed.file_backed = item
+                    self.external.engram[int(layer)] = embed
+                else:
+                    weight, scale = item
+                    self.external.engram[int(layer)] = ds.host_engram(
+                        int(layer), spec["num_embeddings"], spec["dim"], weight, scale)
                 ops.ENGRAM_DIM[int(layer)] = spec["dim"]
+            if has_file_tables:
+                k = kernels.load()
+                if k is not None and k.io_uring_ready():
+                    self.plan.note("n-gram tables: rows read straight from checkpoint files with io_uring")
+                else:
+                    self.plan.note("n-gram tables: rows read straight from checkpoint files with pread (io_uring unavailable)")
         for key in remote_tables:
             ops.ENGRAM_DIM[key] = external.get("engram", {})[str(key)]["dim"]
 
