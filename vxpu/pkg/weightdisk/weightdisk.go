@@ -180,6 +180,15 @@ func Build(ctx context.Context, gcloud Gcloud, o BuildOptions) (*BuildResult, er
 	for _, sha := range shas {
 		fmt.Fprintf(&list, "%s %d\n", sha, o.Files[sha])
 	}
+	indexData, err := json.MarshalIndent(&Index{
+		Format: Format,
+		Source: o.Bucket,
+		Files:  o.Files,
+	}, "", "  ")
+	if err != nil {
+		return nil, err
+	}
+	indexData = append(indexData, '\n')
 	work, err := os.MkdirTemp("", "vxpu-weights-")
 	if err != nil {
 		return nil, err
@@ -189,11 +198,14 @@ func Build(ctx context.Context, gcloud Gcloud, o BuildOptions) (*BuildResult, er
 			log.Error(err, "removing the factory's files", "dir", work)
 		}
 	}()
-	script, files := filepath.Join(work, "factory.sh"), filepath.Join(work, "files.txt")
+	script, files, index := filepath.Join(work, "factory.sh"), filepath.Join(work, "files.txt"), filepath.Join(work, IndexFile)
 	if err := os.WriteFile(script, []byte(factoryScript), 0o644); err != nil {
 		return nil, err
 	}
 	if err := os.WriteFile(files, []byte(list.String()), 0o644); err != nil {
+		return nil, err
+	}
+	if err := os.WriteFile(index, indexData, 0o644); err != nil {
 		return nil, err
 	}
 	// ext4's own space, and some slack
@@ -213,7 +225,7 @@ func Build(ctx context.Context, gcloud Gcloud, o BuildOptions) (*BuildResult, er
 		"--image-family", "debian-12", "--image-project", "debian-cloud", "--boot-disk-size", "20GB",
 		"--create-disk", create, "--scopes", "cloud-platform", "--labels", "vxpu-role=weights-factory",
 		"--metadata", "enable-guest-attributes=TRUE,vxpu-bucket=" + o.Bucket,
-		"--metadata-from-file", "startup-script=" + script + ",vxpu-files=" + files, "--quiet"}, where...)...); err != nil {
+		"--metadata-from-file", "startup-script=" + script + ",vxpu-files=" + files + ",vxpu-index=" + index, "--quiet"}, where...)...); err != nil {
 		return nil, err
 	}
 	deleteFactory := func() error {

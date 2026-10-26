@@ -17,8 +17,9 @@
 # #407). It formats the disk attached as vxpu-weights, then copies the
 # checkpoint's files onto it from the weight bucket, as blobs/<sha256>. The
 # VM's metadata names the bucket (vxpu-bucket) and lists the files
-# (vxpu-files, one "sha256 size" per line). After the copy, the script
-# writes the index, unmounts the disk and powers the VM off.
+# (vxpu-files, one "sha256 size" per line), and holds the index
+# (vxpu-index). After the copy, the script writes the index, unmounts
+# the disk and powers the VM off.
 #
 # The script reports progress in guest attributes under vxpu/: status is one
 # of starting, copying, done or "failed: <reason>", and copy_seconds is how
@@ -39,7 +40,6 @@ mkfs.ext4 -q -F -m 0 -L vxpu-weights "$dev" || fail "mkfs"
 mkdir -p /mnt/weights && mount "$dev" /mnt/weights || fail "mount"
 mkdir -p /mnt/weights/blobs
 
-export BUCKET
 BUCKET=$(meta vxpu-bucket) || fail "no vxpu-bucket metadata"
 meta vxpu-files > /tmp/files || fail "no vxpu-files metadata"
 
@@ -49,18 +49,7 @@ awk -v b="$BUCKET" '{ print b "/_blobs/" $1 }' /tmp/files |
   gcloud storage cp -I /mnt/weights/blobs/ > /tmp/cp.log 2>&1 || fail "gcloud storage cp: $(tail -c 300 /tmp/cp.log)"
 seconds=$(( $(date +%s) - start ))
 
-# check that every file has its expected size, then write the index the agent checks against
-python3 - <<'PY' || fail "a file is missing or the wrong size"
-import json, os
-files = {}
-for line in open("/tmp/files"):
-    sha, size = line.split()
-    if os.path.getsize(f"/mnt/weights/blobs/{sha}") != int(size):
-        raise SystemExit(f"{sha}: not {size} bytes")
-    files[sha] = int(size)
-with open("/mnt/weights/weights.json", "w") as f:
-    json.dump({"format": "vxpu-weights-disk/1", "source": os.environ["BUCKET"], "files": files}, f, indent=1)
-PY
+meta vxpu-index > /mnt/weights/weights.json || fail "no vxpu-index metadata"
 
 sync
 umount /mnt/weights || fail "umount"
