@@ -2218,6 +2218,26 @@ def _check_copy_worker_failure(artifact):
         return True
 
 
+def _check_probe_failure(artifact):
+    """Confirm that a probe load failure cancels dense weight fetching and raises promptly."""
+    from unittest.mock import patch
+    from .engine import Engine
+
+    def fail_load(*args, **kwargs):
+        raise RuntimeError("simulated probe failure")
+
+    with patch("torch.export.load", side_effect=fail_load):
+        try:
+            Engine(artifact, device="cpu")
+            print("probe failure check: Engine did not raise on probe failure")
+            return False
+        except RuntimeError as e:
+            if "simulated probe failure" not in str(e):
+                print(f"probe failure check: unexpected error {e}")
+                return False
+            return True
+
+
 def _check_external_dir(model, prompts, settings, artifact, ref, workdir):
     """Check that the engine can keep its external tensors (expert banks
     and n-gram tables) in files under external_dir. The first load
@@ -2348,8 +2368,16 @@ def selftest(workdir, settings):
         if not load_notes or "probe " not in load_notes[0] or "graph " not in load_notes[0]:
             print(f"load timings check: missing or incomplete load breakdown in plan notes: {notes}")
             failed.append(name + " (load timings)")
+        if load_notes and "bound " in load_notes[0] and load_notes[0].index("bound ") > load_notes[0].index("probe "):
+            print(f"load timings check: bound fetch should start before probe in plan notes: {notes}")
+            failed.append(name + " (load timings: fetch after probe)")
+        if load_notes and "bound " in load_notes[0] and "concurrent phases: bound " not in load_notes[0]:
+            print(f"load timings check: expected bound fetch and probe under concurrent phases in plan notes: {notes}")
+            failed.append(name + " (load timings: bound not concurrent)")
         if name == "tiny-fp8-moe" and not _check_copy_worker_failure(artifact):
             failed.append(name + " (copy failure)")
+        if name == "tiny-fp8-moe" and not _check_probe_failure(artifact):
+            failed.append(name + " (probe failure)")
         if name == "tiny-fp8-moe" and not _check_local_blobs(model, prompts, settings, artifact, got, workdir):
             failed.append(name + " (local weight tier)")
         if not _check_dataflow(model, prompts, settings, artifact, got):
