@@ -21,10 +21,16 @@ import (
 )
 
 func TestAttach(t *testing.T) {
-	g := &fakeGcloud{fail: map[string]bool{"compute disks describe": true}}
+	g := &fakeGcloud{}
 	if err := Attach(t.Context(), g.run, AttachOptions{Project: "p", Zone: "z", VM: "vm", Image: "ds-flash",
 		Disk: "ds-flash-z", DiskType: "hyperdisk-ml", ThroughputMBps: 2400}); err != nil {
 		t.Fatal(err)
+	}
+	list := g.find("compute disks list")
+	for _, want := range []string{"--filter=name=(ds-flash-z)", "--zones z", "--project p", "--format value(sourceSnapshot,sourceImage)"} {
+		if !strings.Contains(list, want) {
+			t.Errorf("disk list %q lacks %q", list, want)
+		}
 	}
 	create := g.find("compute disks create ds-flash-z")
 	for _, want := range []string{"--source-snapshot ds-flash", "--type hyperdisk-ml", "--access-mode READ_ONLY_MANY", "--provisioned-throughput 2400"} {
@@ -36,12 +42,21 @@ func TestAttach(t *testing.T) {
 		!strings.Contains(attach, "--device-name vxpu-weights") {
 		t.Errorf("attach %q", attach)
 	}
+	// Attach creates the disk only when list shows it does not exist. It returns any error from list directly.
+	g = &fakeGcloud{fail: map[string]bool{"compute disks list": true}}
+	if err := Attach(t.Context(), g.run, AttachOptions{Project: "p", Zone: "z", VM: "vm", Image: "ds-flash", Disk: "ds-flash-z"}); err == nil ||
+		!strings.Contains(err.Error(), "compute disks list failed") {
+		t.Errorf("err %v, want list error", err)
+	}
+	if g.find("compute disks create") != "" {
+		t.Error("created the disk when list failed")
+	}
 	// Attach reuses an existing disk made from the image, and refuses one made from another snapshot.
-	describe := func(source, attachedTo string) Gcloud {
+	existingDisks := func(source, attachedTo string) Gcloud {
 		return func(ctx context.Context, args ...string) ([]byte, error) {
 			call := strings.Join(args, " ")
 			switch {
-			case strings.HasPrefix(call, "compute disks describe"):
+			case strings.HasPrefix(call, "compute disks list"):
 				return []byte(source + "\n"), nil
 			case strings.HasPrefix(call, "compute instances describe") && attachedTo != "":
 				return []byte("https://www.googleapis.com/compute/v1/projects/p/zones/z/disks/boot;" +
@@ -52,34 +67,34 @@ func TestAttach(t *testing.T) {
 	}
 	opts := AttachOptions{Project: "p", Zone: "z", VM: "vm2", Image: "ds-flash", Disk: "ds-flash-z", DiskType: "hyperdisk-ml"}
 	g = &fakeGcloud{}
-	if err := Attach(t.Context(), describe("https://www.googleapis.com/compute/v1/projects/p/global/snapshots/ds-flash", ""), opts); err != nil {
+	if err := Attach(t.Context(), existingDisks("https://www.googleapis.com/compute/v1/projects/p/global/snapshots/ds-flash", ""), opts); err != nil {
 		t.Fatal(err)
 	}
 	if g.find("compute disks create") != "" || g.find("compute instances attach-disk vm2") == "" {
 		t.Errorf("want the existing disk attached, not made again:\n%s", strings.Join(g.calls, "\n"))
 	}
 	g = &fakeGcloud{}
-	if err := Attach(t.Context(), describe("https://www.googleapis.com/compute/v1/projects/p/global/snapshots/other", ""), opts); err == nil ||
+	if err := Attach(t.Context(), existingDisks("https://www.googleapis.com/compute/v1/projects/p/global/snapshots/other", ""), opts); err == nil ||
 		g.find("compute instances attach-disk") != "" {
 		t.Errorf("err %v: a disk of that name made from another snapshot must not be attached", err)
 	}
 	// A disk that is already attached needs nothing. A disk whose name only starts with ours is a different disk.
 	g = &fakeGcloud{}
-	if err := Attach(t.Context(), describe("https://www.googleapis.com/compute/v1/projects/p/global/snapshots/ds-flash", "ds-flash-z"), opts); err != nil {
+	if err := Attach(t.Context(), existingDisks("https://www.googleapis.com/compute/v1/projects/p/global/snapshots/ds-flash", "ds-flash-z"), opts); err != nil {
 		t.Fatal(err)
 	}
 	if g.find("compute instances attach-disk") != "" {
 		t.Error("attached a disk that was attached already")
 	}
 	g = &fakeGcloud{}
-	if err := Attach(t.Context(), describe("https://www.googleapis.com/compute/v1/projects/p/global/snapshots/ds-flash", "ds-flash-z-old"), opts); err != nil {
+	if err := Attach(t.Context(), existingDisks("https://www.googleapis.com/compute/v1/projects/p/global/snapshots/ds-flash", "ds-flash-z-old"), opts); err != nil {
 		t.Fatal(err)
 	}
 	if g.find("compute instances attach-disk vm2") == "" {
 		t.Error("ds-flash-z-old taken for ds-flash-z")
 	}
 	// From an image, Attach passes --image, not --source-snapshot.
-	g = &fakeGcloud{fail: map[string]bool{"compute disks describe": true}}
+	g = &fakeGcloud{}
 	if err := Attach(t.Context(), g.run, AttachOptions{Project: "p", Zone: "z", VM: "vm", Image: "ds-flash", FromImage: true,
 		Disk: "ds-flash-z", DiskType: "hyperdisk-ml"}); err != nil {
 		t.Fatal(err)
