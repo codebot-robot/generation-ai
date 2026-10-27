@@ -2474,13 +2474,40 @@ def _check_batched_decode(model, artifact, workdir):
     for prompt in prompts:
         sid = single.new_session()
         alone.append([t for ev in single.generate(sid, prompt, 16, greedy) for t in ev["token_ids"]])
-    out = Engine(batched_artifact).generate_rows(prompts, 16, greedy, arrivals=[0, 0, 2, 5])
+    batched = Engine(batched_artifact)
+    out = batched.generate_rows(prompts, 16, greedy, arrivals=[0, 0, 2, 5])
     differ = [i for i, (a, b) in enumerate(zip(alone, out["token_ids"])) if a != b]
     if differ:
         print(f"batched decode check: prompts {differ} differ from decoding the prompt alone")
         return False
     print(f"batched decode: 4 prompts of 9 to 21 tokens, arriving at steps 0 to 5 on 3 rows, match "
           f"each prompt decoded alone (rows active per step: {out['rows_active']})")
+    # the scheduler: concurrent generate calls, more than the rows, each in its own thread
+    import threading
+    import time
+    prompts = prompts + [[(13 * j + 3) % 30000 + 100 for j in range(17)]]
+    sid = single.new_session()
+    alone.append([t for ev in single.generate(sid, prompts[-1], 16, greedy) for t in ev["token_ids"]])
+    got = [None] * len(prompts)
+
+    def run(i):
+        time.sleep(0.01 * i)
+        got[i] = [t for ev in batched.generate(batched.new_session(), prompts[i], 16, greedy) for t in ev["token_ids"]]
+    threads = [threading.Thread(target=run, args=(i,)) for i in range(len(prompts))]
+    for thread in threads:
+        thread.start()
+    for thread in threads:
+        thread.join(timeout=600)
+    differ = [i for i in range(len(prompts)) if got[i] != alone[i]]
+    if differ:
+        print(f"batched decode check: concurrent requests {differ} differ from decoding the prompt alone")
+        return False
+    reply = batched.chat(batched.new_session(), "Hello", max_new_tokens=8)
+    if not reply["text"] and not reply["generated"]:
+        print(f"batched decode check: a chat turn on the batch engine produced nothing: {reply}")
+        return False
+    print(f"batched decode: {len(prompts)} concurrent requests through the scheduler on 3 rows match each "
+          f"prompt decoded alone; a chat turn works too")
     return True
 
 

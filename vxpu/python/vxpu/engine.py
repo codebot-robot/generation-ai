@@ -1128,6 +1128,12 @@ class Engine:
         execution telemetry under ``"telemetry"``. ``telemetry=vxpu_pb2.TELEMETRY_TRACE``
         also records each decode step's expert selections, in order. Without
         either, nothing is recorded."""
+        if self.binding.get("batch", 1) > 1:  # continuous batching: the turn takes a row
+            with self._lock:
+                session = self._session(session_id)
+                ids = self._prompt_ids(session, text, raw_prompt)
+            events = self._scheduled(session, ids, max_new_tokens, SamplingParams(do_sample=False))
+            return self._chat_reply(session, text, raw_prompt, events)
         with self._lock:
             return self._chat_locked(session_id, text, max_new_tokens,
                                      raw_prompt, telemetry)
@@ -1158,9 +1164,13 @@ class Engine:
                      telemetry=vxpu_pb2.TELEMETRY_NONE):
         session = self._session(session_id)
         ids = self._prompt_ids(session, text, raw_prompt)
+        events = self._generate_locked(session, ids, max_new_tokens, SamplingParams(do_sample=False), telemetry=telemetry)
+        return self._chat_reply(session, text, raw_prompt, events)
+
+    def _chat_reply(self, session, text, raw_prompt, events):
+        """A chat turn's reply from its generate events."""
         token_ids, stats = [], None
-        for chunk in self._generate_locked(
-                session, ids, max_new_tokens, SamplingParams(do_sample=False), telemetry=telemetry):
+        for chunk in events:
             if chunk["token_ids"]:
                 token_ids.extend(chunk["token_ids"])
             if chunk["done"]:
@@ -1204,15 +1214,31 @@ class Engine:
         ``telemetry=vxpu_pb2.TELEMETRY_TRACE`` also records each decode step's expert
         selections, in order. Without either, nothing is recorded.
         """
+        if self.binding.get("batch", 1) > 1:  # continuous batching: the request takes a row
+            with self._lock:
+                session = self._session(session_id)
+            yield from self._scheduled(session, list(input_ids), max_new_tokens, params, extra_eos_ids)
+            return
         with self._lock:
             session = self._session(session_id)
             yield from self._generate_locked(
                 session, list(input_ids), max_new_tokens, params,
                 extra_eos_ids, logits_sink, telemetry)
 
+    def _scheduled(self, session, ids, max_new_tokens, params, extra_eos_ids=()):
+        """A batch engine's generate: the request decodes in a row of the batch, alongside the
+        others, and its events stream back as generate's do. Each request prefills its whole
+        prompt (this model's prefill starts at position 0), so no cache carries across turns."""
+        self._check_prompt(ids)
+        generated = []
+        for event in self._scheduler().submit(ids, max_new_tokens, params, extra_eos_ids):
+            generated.extend(event["token_ids"])
+            yield event
+        session["cached_ids"] = list(ids) + [t for t in generated if t not in self.eos_ids]
+
     def generate_rows(self, prompts, max_new_tokens, params, arrivals=None, telemetry=False):
         """Decode several prompts together, each in its own row of the batch: continuous batching,
-        run to completion.
+        run to completion, as the scheduler runs it for concurrent requests.
 
         The artifact must be exported with a batch size (export --batch B). Row 0 is where each
         prompt is prefilled, alone; the engine then moves it to a row of its own, so B - 1 prompts
@@ -1221,32 +1247,22 @@ class Engine:
         a prompt waits while every row is taken. Each prompt generates up to max_new_tokens
         tokens and stops at an end-of-turn id, which frees its row.
 
-        A row with nothing to decode replays its last fed token at that token's position, which
-        rewrites exactly the values its caches already hold, so a step needs no masking.
-
         Returns {"token_ids": a list per prompt, "prefill_ms": each prompt's prefill,
         "step_ms": each decode step's time, "rows_active": how many rows decoded at each step},
         and with telemetry=True also "telemetry": the decode's execution telemetry.
         """
-        batch = self.binding.get("batch", 1)
-        if batch < 2:
+        if self.binding.get("batch", 1) < 2:
             raise ValueError("generate_rows needs an artifact exported with --batch 2 or more")
         arrivals = list(arrivals) if arrivals is not None else [0] * len(prompts)
-        for prompt in prompts:
-            if not self.min_prefill_len <= len(prompt) <= self.max_cache_len - 1:
-                raise ValueError(f"a prompt of {len(prompt)} tokens: the prefill graph takes "
-                                 f"{self.min_prefill_len} to {self.max_cache_len - 1}")
-        samplers = [params.resolve(self.generation_config) for _ in prompts]
-        state = {fqn: torch.zeros(shape, dtype=dtype, device=self.device)
-                 for fqn, (shape, dtype) in self.state_specs.items()}
-        rows = [None] * batch            # the prompt each row decodes (row 0 is the prefill's)
-        fed = [[] for _ in range(batch)]  # each row's tokens in its caches, in order
-        next_ids = [None] * batch         # each row's token to feed at the next step
-        token_ids = [[] for _ in prompts]
-        prefill_ms, step_ms, rows_active = [0.0] * len(prompts), [], []
+        requests = [_Request(prompt, max_new_tokens, params.resolve(self.generation_config), self.eos_ids)
+                    for prompt in prompts]
+        for request in requests:
+            self._check_prompt(request.prompt)
         waiting = sorted(range(len(prompts)), key=lambda i: arrivals[i])
+        step_ms, rows_active = [], []
         recorder = None
         with self._lock:
+            rows = _Rows(self)
             if telemetry:
                 recorder = Recorder(self.device, getattr(self, "_segment_info", None)
                                     if self._decode_split is not None else None)
@@ -1255,72 +1271,43 @@ class Engine:
                     self._decode_split.set_recorder(recorder)
             try:
                 with self.external_scope():
-                    self._bind(state)
-                    self._current = {"id": "rows", "state": state}
+                    rows.bind()
                     step = 0
-                    while waiting or any(r is not None for r in rows[1:]):
-                        # admit arrived prompts into free rows: prefill in row 0, move to its row
-                        for row in range(1, batch):
-                            if rows[row] is None and waiting and arrivals[waiting[0]] <= step:
-                                i = waiting.pop(0)
-                                started = time.perf_counter()
-                                logits = self._prefill_run(
-                                    input_ids=torch.tensor([prompts[i]], dtype=torch.long, device=self.device),
-                                    cache_position=torch.arange(0, len(prompts[i]), device=self.device))
-                                for tensor in self._live_state(state).values():
-                                    tensor[row].copy_(tensor[0])
-                                prefill_ms[i] = (time.perf_counter() - started) * 1e3
-                                rows[row], fed[row] = i, list(prompts[i])
-                                next_ids[row] = samplers[i].pick(logits[0, -1], fed[row])
-                        # each decoding row emits its token; a row that stops frees itself
-                        for row in range(1, batch):
-                            i = rows[row]
-                            if i is None:
-                                continue
-                            token_ids[i].append(next_ids[row])
-                            if (next_ids[row] in self.eos_ids or len(token_ids[i]) >= max_new_tokens
-                                    or len(fed[row]) >= self.max_cache_len):
-                                rows[row] = None
-                        active = [row for row in range(1, batch) if rows[row] is not None]
-                        if not active:
-                            step += 1
-                            if waiting:
-                                continue
-                            break
-                        # one decode step: active rows feed their token, the others replay their last
-                        ids, pos = [], []
-                        for row in range(batch):
-                            if rows[row] is not None:
-                                ids.append(next_ids[row])
-                                pos.append(len(fed[row]))
-                            elif fed[row]:
-                                ids.append(fed[row][-1])
-                                pos.append(len(fed[row]) - 1)
-                            else:
-                                ids.append(0)
-                                pos.append(0)
-                        started = time.perf_counter()
-                        logits = self._decode_run(
-                            input_ids=torch.tensor([[t] for t in ids], device=self.device),
-                            cache_position=torch.tensor(pos, device=self.device))
-                        for row in active:
-                            fed[row].append(next_ids[row])
-                            next_ids[row] = samplers[rows[row]].pick(logits[row, -1], fed[row])
-                        step_ms.append((time.perf_counter() - started) * 1e3)
-                        rows_active.append(len(active))
-                        if recorder is not None:
-                            recorder.step_ms.append(step_ms[-1])
+                    while waiting or rows.active():
+                        row = rows.free_row()
+                        while row is not None and waiting and arrivals[waiting[0]] <= step:
+                            rows.admit(requests[waiting.pop(0)], row)
+                            row = rows.free_row()
+                        rows.emit()
+                        if rows.active():
+                            rows_active.append(len(rows.active()))
+                            step_ms.append(rows.step())
+                            if recorder is not None:
+                                recorder.step_ms.append(step_ms[-1])
                         step += 1
             finally:
                 if recorder is not None:
                     self.external.telemetry = None
                     if self._decode_split is not None:
                         self._decode_split.set_recorder(None)
-        out = {"token_ids": token_ids, "prefill_ms": prefill_ms, "step_ms": step_ms, "rows_active": rows_active}
+        out = {"token_ids": [r.token_ids for r in requests], "prefill_ms": [r.prefill_ms for r in requests],
+               "step_ms": step_ms, "rows_active": rows_active}
         if recorder is not None:
             recorder.phase = "decode"
             out["telemetry"] = recorder.result(plan_record(self.explain()))
         return out
+
+    def _check_prompt(self, prompt):
+        if not self.min_prefill_len <= len(prompt) <= self.max_cache_len - 1:
+            raise ValueError(f"a prompt of {len(prompt)} tokens: the prefill graph takes "
+                             f"{self.min_prefill_len} to {self.max_cache_len - 1}")
+
+    def _scheduler(self):
+        """The scheduler that decodes this batch engine's requests (started on first use)."""
+        with self._lock:
+            if getattr(self, "_rows_scheduler", None) is None:
+                self._rows_scheduler = _Scheduler(self)
+            return self._rows_scheduler
 
     def _live_state(self, state):
         """The state tensors the graphs read and write right now: the resident state when the
@@ -1472,6 +1459,173 @@ class Engine:
         if recorder is not None:
             done["telemetry"] = recorder.result(plan_record(self.explain()))
         yield done
+
+
+class _Request:
+    """One prompt decoding in a row of a batch engine (continuous batching)."""
+
+    def __init__(self, prompt, max_new_tokens, sampler, eos_ids, sink=None):
+        self.prompt, self.max_new_tokens = list(prompt), max_new_tokens
+        self.sampler, self.eos_ids = sampler, eos_ids
+        self.sink = sink  # receives each event: the scheduler's queue, or None in generate_rows
+        self.token_ids, self.finish_reason, self.cancelled = [], None, False
+        self.prefill_ms = 0.0
+        self.first_token_at = self.done_at = None
+
+    def emit(self, token_id):
+        self.token_ids.append(token_id)
+        if self.first_token_at is None:
+            self.first_token_at = time.perf_counter()
+        if self.sink is not None:
+            self.sink({"token_ids": [token_id], "done": False})
+
+    def finish(self, reason):
+        self.finish_reason, self.done_at = reason, time.perf_counter()
+        if self.sink is not None:
+            n = len(self.token_ids)
+            self.sink({"token_ids": [], "done": True, "finish_reason": reason,
+                       "prompt_tokens": len(self.prompt), "prefilled_tokens": len(self.prompt),
+                       "generated": n, "prefill_ms": round(self.prefill_ms),
+                       "ms_per_token": round((self.done_at - self.first_token_at) / max(n - 1, 1) * 1e3, 1)
+                       if self.first_token_at is not None else 0.0})
+
+    def fail(self, error):
+        self.finish_reason = "error"
+        if self.sink is not None:
+            self.sink({"token_ids": [], "done": True, "error": error})
+
+
+class _Rows:
+    """A batch engine's rows (continuous batching). Row 0 is where a prompt is prefilled, alone;
+    every other row decodes one request at its own position. A row with nothing to decode replays
+    its last fed token at that token's position, which rewrites exactly the values its caches
+    already hold, so a step needs no masking. Used with the engine's lock held."""
+
+    def __init__(self, engine):
+        self.engine = engine
+        self.batch = engine.binding.get("batch", 1)
+        self.state = {fqn: torch.zeros(shape, dtype=dtype, device=engine.device)
+                      for fqn, (shape, dtype) in engine.state_specs.items()}
+        self.requests = [None] * self.batch  # the request each row decodes (row 0 holds none)
+        self.fed = [[] for _ in range(self.batch)]  # each row's tokens in its caches, in order
+        self.next_ids = [None] * self.batch  # each row's token, to emit and then feed
+
+    def bind(self):
+        self.engine._bind(self.state)
+        self.engine._current = {"id": "rows", "state": self.state}
+
+    def free_row(self):
+        return next((row for row in range(1, self.batch) if self.requests[row] is None), None)
+
+    def active(self):
+        return [row for row in range(1, self.batch) if self.requests[row] is not None]
+
+    def admit(self, request, row):
+        """Prefill request in row 0, then move its state to `row`."""
+        e = self.engine
+        started = time.perf_counter()
+        logits = e._prefill_run(input_ids=torch.tensor([request.prompt], dtype=torch.long, device=e.device),
+                                cache_position=torch.arange(0, len(request.prompt), device=e.device))
+        for tensor in e._live_state(self.state).values():
+            tensor[row].copy_(tensor[0])
+        request.prefill_ms = (time.perf_counter() - started) * 1e3
+        self.requests[row], self.fed[row] = request, list(request.prompt)
+        self.next_ids[row] = request.sampler.pick(logits[0, -1], self.fed[row])
+
+    def emit(self):
+        """Each decoding row emits its pending token; a request that stops, or whose caller has
+        gone, frees its row."""
+        for row in self.active():
+            request, token_id = self.requests[row], self.next_ids[row]
+            if request.cancelled:
+                self.requests[row] = None
+                continue
+            request.emit(token_id)
+            if token_id in request.eos_ids:
+                request.finish("eos")
+            elif len(request.token_ids) >= request.max_new_tokens or len(self.fed[row]) >= self.engine.max_cache_len:
+                request.finish("length")
+            if request.finish_reason is not None:
+                self.requests[row] = None
+
+    def step(self):
+        """One decode step for every row; returns its time in ms."""
+        e = self.engine
+        ids, pos = [], []
+        for row in range(self.batch):
+            if self.requests[row] is not None:  # feed the token it just emitted
+                ids.append(self.next_ids[row])
+                pos.append(len(self.fed[row]))
+            elif self.fed[row]:  # replay its last token, rewriting the same values
+                ids.append(self.fed[row][-1])
+                pos.append(len(self.fed[row]) - 1)
+            else:  # never used
+                ids.append(0)
+                pos.append(0)
+        started = time.perf_counter()
+        logits = e._decode_run(input_ids=torch.tensor([[t] for t in ids], device=e.device),
+                               cache_position=torch.tensor(pos, device=e.device))
+        for row in self.active():
+            self.fed[row].append(self.next_ids[row])
+            self.next_ids[row] = self.requests[row].sampler.pick(logits[row, -1], self.fed[row])
+        return (time.perf_counter() - started) * 1e3
+
+
+class _Scheduler:
+    """Continuous batching for a batch engine's concurrent requests: a thread steps every decoding
+    row together, and admits waiting requests into free rows between steps."""
+
+    def __init__(self, engine):
+        self.engine = engine
+        self.rows = _Rows(engine)
+        self.waiting = collections.deque()
+        self.ready = threading.Condition()
+        threading.Thread(target=self._loop, name="vxpu-rows", daemon=True).start()
+
+    def submit(self, prompt, max_new_tokens, params, extra_eos_ids=()):
+        """Queue a request; yields its events as they come, as Engine.generate does."""
+        events = queue.Queue()
+        e = self.engine
+        request = _Request(prompt, max_new_tokens, params.resolve(e.generation_config),
+                           e.eos_ids | set(int(i) for i in extra_eos_ids), sink=events.put)
+        with self.ready:
+            self.waiting.append(request)
+            self.ready.notify()
+        try:
+            while True:
+                event = events.get()
+                if "error" in event:
+                    raise event["error"]
+                yield event
+                if event["done"]:
+                    return
+        finally:  # a caller that stops listening frees its row at the next step
+            request.cancelled = True
+
+    def _loop(self):
+        while True:
+            with self.ready:
+                while not self.waiting and not self.rows.active():
+                    self.ready.wait()
+            try:
+                with self.engine._lock, self.engine.external_scope():
+                    self.rows.bind()
+                    row = self.rows.free_row()
+                    while row is not None:
+                        with self.ready:
+                            request = self.waiting.popleft() if self.waiting else None
+                        if request is None:
+                            break
+                        if not request.cancelled:
+                            self.rows.admit(request, row)
+                        row = self.rows.free_row()
+                    self.rows.emit()
+                    if self.rows.active():
+                        self.rows.step()
+            except Exception as error:  # noqa: BLE001  (every decoding request fails with it)
+                for row in self.rows.active():
+                    self.rows.requests[row].fail(error)
+                    self.rows.requests[row] = None
 
 
 class SamplingParams:
