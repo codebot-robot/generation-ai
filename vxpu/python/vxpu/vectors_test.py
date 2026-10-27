@@ -239,8 +239,10 @@ def record_deepseek_eager(model, revision, prompts, settings):
     # blame the engine. A key is missing only if every shard load reported
     # it so; expert banks are assembled from per-expert checkpoint tensors
     # (the module's _load_from_state_dict), so they are checked by count.
+    # The drafter's stages (mtp.*) have banks too, and share the model's
+    # embedding and head.
     import re
-    expert_re = re.compile(r"^layers\.(\d+)\.ffn\.experts\.(\d+)\.(w[123])\.(weight|scale)$")
+    expert_re = re.compile(r"^((?:layers|mtp)\.\d+)\.ffn\.experts\.(\d+)\.(w[123])\.(weight|scale)$")
     missing_all, experts_seen = None, {}
     with ThreadPoolExecutor(max_workers=4) as pool:
         futures = [pool.submit(fetch, ref) for ref in sorted(manifest["files"].values(), key=lambda r: r["name"])]
@@ -250,7 +252,7 @@ def record_deepseek_eager(model, revision, prompts, settings):
             for key in shard:
                 m = expert_re.match(key)
                 if m:
-                    experts_seen.setdefault((int(m.group(1)), m.group(3), m.group(4)), set()).add(int(m.group(2)))
+                    experts_seen.setdefault((m.group(1), m.group(3), m.group(4)), set()).add(int(m.group(2)))
             missing, unexpected = lm.load_state_dict(shard, strict=False)
             missing_all = set(missing) if missing_all is None else missing_all & set(missing)
             unexpected = [u for u in unexpected if not u.startswith(("mtp.", "vision.", "aligner.", "image_"))]
@@ -259,13 +261,15 @@ def record_deepseek_eager(model, revision, prompts, settings):
             del shard
             if fetched:
                 os.remove(path)
-    bank_re = re.compile(r"^layers\.(\d+)\.ffn\.(w[123])(_scale)?$")
-    problems = sorted(k for k in (missing_all or set()) if not bank_re.match(k))
+    bank_re = re.compile(r"^((layers|mtp)\.(\d+))\.ffn\.(w[123])(_scale)?$")
+    shared_re = re.compile(r"^mtp\.\d+\.(embed|head)\.weight$")
+    problems = sorted(k for k in (missing_all or set()) if not bank_re.match(k) and not shared_re.match(k))
     for key in sorted(k for k in (missing_all or set()) if bank_re.match(k)):
-        layer, proj, scale = bank_re.match(key).groups()
-        seen = experts_seen.get((int(layer), proj, "scale" if scale else "weight"), set())
-        if len(seen) != args.n_routed_experts:
-            problems.append(f"{key}: {len(seen)} of {args.n_routed_experts} experts in the checkpoint")
+        layer, kind, index, proj, scale = bank_re.match(key).groups()
+        n_experts = args.get_moe_config(int(index) + (args.n_layers if kind == "mtp" else 0))[0]
+        seen = experts_seen.get((layer, proj, "scale" if scale else "weight"), set())
+        if len(seen) != n_experts:
+            problems.append(f"{key}: {len(seen)} of {n_experts} experts in the checkpoint")
     if problems:
         raise RuntimeError(f"module tensors the checkpoint did not provide: {problems[:5]}")
     eos_ids = {tokenizer.eos_token_id} if tokenizer.eos_token_id is not None else set()
