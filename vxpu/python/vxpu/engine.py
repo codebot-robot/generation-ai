@@ -391,7 +391,7 @@ class Engine:
                          if getattr(t, "file_backed", None) is not None} if hasattr(self, "external") else set()
             released = localblobs.release(self.manifest["files"], self.plan["blob_dir"], exclude_shas=keep_shas)
             print(f"[vxpu] released the page cache of {released} local blob files", flush=True)
-        if str(self.device).startswith("cuda") and (self.plan["segment_runtime"] == "aoti" or self.plan["step_graph"]):
+        if str(self.device).startswith("cuda") and self._resident is not None:
             self._warm_up()
 
         parts = []
@@ -954,7 +954,7 @@ class Engine:
         return numbers
 
     def _warm_up(self):
-        """Run two throwaway decode steps on zeros, then zero the state (#462).
+        """Run throwaway decode steps on zeros, then zero the state (#462).
 
         Compiled segments are built, or loaded from the cache, on their first
         call, and capture their CUDA graph on the second. Doing both here
@@ -962,17 +962,26 @@ class Engine:
         a fresh machine compiled during its first request for minutes, longer
         than the engine before it waits for a reply, so that request failed.
         A head engine warms only its own layers: the ranges after it may not
-        be serving yet."""
+        be serving yet.
+
+        One eager step comes first. The ops make some weight copies on their
+        first call: the head widened to fp32, and fp8 weights as bf16, when a
+        step has more rows than the GPU's GEMV kernels take. Made inside a
+        compiled segment's first call, a copy would land in that CUDA graph's
+        memory pool, which may hold only what the graph allocates each step,
+        and the graph fails. The eager step makes them outside any pool."""
         run = self._decode_run.local if isinstance(self._decode_run, RangeChain) else self._decode_run
         values = self._zero_inputs(getattr(run, "runner", run))
         started = time.time()
         with self._lock, self.external_scope():
+            if not self.plan["layer_range"]:  # eager, a range engine would call the other ranges' experts
+                self._decode(**self._zero_inputs(self._decode))
             for _ in range(2):
                 run(**values)
             torch.cuda.synchronize(self.device)
             for tensor in (self._resident or {}).values():
                 tensor.zero_()
-        msg = f"warm-up: two decode steps in {time.time() - started:.1f}s (segments built or loaded, graphs captured)"
+        msg = f"warm-up: decode steps in {time.time() - started:.1f}s (weight copies made, segments built or loaded, graphs captured)"
         print(f"[vxpu] {msg}", flush=True)
         self.plan.note(msg)
 
