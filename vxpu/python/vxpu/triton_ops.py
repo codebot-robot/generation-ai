@@ -309,17 +309,21 @@ if triton is not None:
 
 
 def rotary(x, cos, sin, traced=False):
-    """Rotate element pairs in x (last dim d) by cos and sin [s, d/2] using
-    a single Triton kernel."""
+    """Rotate element pairs in x (last dim d) by cos and sin using a single
+    Triton kernel: [s, d/2], shared by every row, or [b, s, d/2], per row."""
     assert x.is_cuda and x.shape[-1] % 2 == 0
     if x.ndim not in (3, 4):
         raise ValueError(f"rotary: x must have rank 3 [b, s, d] or 4 [b, s, h, d], got {x.ndim} {tuple(x.shape)}")
     d = x.shape[-1]
     D = d // 2
     S = x.shape[1]
-    if cos.shape != (S, D) or sin.shape != (S, D):
-        raise ValueError(f"rotary: x {tuple(x.shape)} needs cos and sin [{S}, {D}], "
+    shared, per_row = (S, D), (x.shape[0], S, D)
+    if cos.shape not in (shared, per_row) or sin.shape != cos.shape:
+        raise ValueError(f"rotary: x {tuple(x.shape)} needs cos and sin {list(shared)} or {list(per_row)}, "
                          f"got cos {tuple(cos.shape)} and sin {tuple(sin.shape)}")
+    # the kernel picks frequency row (row // H) % S: with per-row frequencies there are b * s of
+    # them, in the same order as x's rows, so the modulo leaves each row its own
+    S = cos.numel() // D
     H = x.shape[2] if x.ndim == 4 else 1
     n_rows = x.numel() // d
     xc = x.contiguous()

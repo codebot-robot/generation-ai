@@ -764,10 +764,13 @@ def _rotary_reference(x, freqs_cis, inverse=False):
     x_c = torch.view_as_complex(x.float().unflatten(-1, (-1, 2)))
     if inverse:
         freqs_cis = freqs_cis.conj()
+    # [s, d/2] frequencies are shared by every row; [b, s, d/2] are per row (decode steps whose
+    # rows sit at different positions)
+    rows = x_c.size(0) if freqs_cis.dim() == 3 else 1
     if x_c.ndim == 3:
-        freqs_cis = freqs_cis.view(1, x_c.size(1), x_c.size(-1))
+        freqs_cis = freqs_cis.view(rows, x_c.size(1), x_c.size(-1))
     else:
-        freqs_cis = freqs_cis.view(1, x_c.size(1), 1, x_c.size(-1))
+        freqs_cis = freqs_cis.view(rows, x_c.size(1), 1, x_c.size(-1))
     return torch.view_as_real(x_c * freqs_cis).flatten(-2).to(x.dtype)
 
 

@@ -2459,26 +2459,28 @@ def _check_engram_file(model, prompts, settings, artifact, ref, workdir):
 
 
 def _check_batched_decode(model, artifact, workdir):
-    """Batched decode, the measurement prototype: three different prompts of
-    one length decoded together by an artifact exported with batch 3 give
-    each prompt the tokens it gets alone."""
+    """Continuous batching: four prompts of different lengths, arriving at different steps, decoded
+    by an artifact exported with batch 4 (three rows decode; row 0 is where each prompt is
+    prefilled) give each prompt exactly the tokens it gets alone. The last prompt waits for a row,
+    and decodes in the row the first prompt to finish frees."""
     from .engine import Engine, SamplingParams
     from .export import export_artifact
-    batched_artifact = os.path.join(workdir, "tiny-deepseek-v41-artifact-b3")
-    export_artifact(model, batched_artifact, max_cache_len=1024, batch=3)
+    batched_artifact = os.path.join(workdir, "tiny-deepseek-v41-artifact-b4")
+    export_artifact(model, batched_artifact, max_cache_len=1024, batch=4)
     greedy = SamplingParams(do_sample=False)
-    prompts = [[(7 * i + 3 * j + 11) % 30000 + 100 for j in range(12)] for i in range(3)]
+    prompts = [[(11 * i + 7 * j + 5) % 30000 + 100 for j in range(n)] for i, n in enumerate((9, 14, 21, 12))]
     single = Engine(artifact)
     alone = []
     for prompt in prompts:
         sid = single.new_session()
         alone.append([t for ev in single.generate(sid, prompt, 16, greedy) for t in ev["token_ids"]])
-    together = Engine(batched_artifact).generate_batch(prompts, 16, greedy)["token_ids"]
-    differ = [i for i, (a, b) in enumerate(zip(alone, together)) if a != b]
+    out = Engine(batched_artifact).generate_rows(prompts, 16, greedy, arrivals=[0, 0, 2, 5])
+    differ = [i for i, (a, b) in enumerate(zip(alone, out["token_ids"])) if a != b]
     if differ:
-        print(f"batched decode check: rows {differ} differ from decoding the prompt alone")
+        print(f"batched decode check: prompts {differ} differ from decoding the prompt alone")
         return False
-    print("batched decode: 3 prompts decoded together match each prompt decoded alone")
+    print(f"batched decode: 4 prompts of 9 to 21 tokens, arriving at steps 0 to 5 on 3 rows, match "
+          f"each prompt decoded alone (rows active per step: {out['rows_active']})")
     return True
 
 

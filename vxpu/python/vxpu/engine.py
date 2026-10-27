@@ -1210,36 +1210,43 @@ class Engine:
                 session, list(input_ids), max_new_tokens, params,
                 extra_eos_ids, logits_sink, telemetry)
 
-    def generate_batch(self, rows, max_new_tokens, params, telemetry=False):
-        """Decode several prompts together, one row of the batch each.
+    def generate_rows(self, prompts, max_new_tokens, params, arrivals=None, telemetry=False):
+        """Decode several prompts together, each in its own row of the batch: continuous batching,
+        run to completion.
 
-        This is the measurement prototype for batched decode. The artifact
-        must be exported with that batch size (export --batch), and every
-        prompt must have the same length, because every row sits at the same
-        position at each step. Each row generates up to max_new_tokens
-        tokens and stops at an end-of-turn id. A row that has stopped keeps
-        decoding with the others, and its later tokens are dropped.
+        The artifact must be exported with a batch size (export --batch B). Row 0 is where each
+        prompt is prefilled, alone; the engine then moves it to a row of its own, so B - 1 prompts
+        can decode at once. Prompts may have any lengths: every row sits at its own position.
+        `arrivals` gives each prompt the decode step at which it joins (default: all at step 0);
+        a prompt waits while every row is taken. Each prompt generates up to max_new_tokens
+        tokens and stops at an end-of-turn id, which frees its row.
 
-        Returns {"token_ids": a list per row, "prefill_ms": the batched
-        prefill's time, "step_ms": each decode step's time}, and with
-        telemetry=True also "telemetry": the decode's execution telemetry
-        (segment and host-op times), as generate records it.
+        A row with nothing to decode replays its last fed token at that token's position, which
+        rewrites exactly the values its caches already hold, so a step needs no masking.
+
+        Returns {"token_ids": a list per prompt, "prefill_ms": each prompt's prefill,
+        "step_ms": each decode step's time, "rows_active": how many rows decoded at each step},
+        and with telemetry=True also "telemetry": the decode's execution telemetry.
         """
         batch = self.binding.get("batch", 1)
-        if len(rows) != batch:
-            raise ValueError(f"{len(rows)} prompts for an artifact exported with batch {batch}")
-        lengths = {len(row) for row in rows}
-        if len(lengths) != 1:
-            raise ValueError(f"prompts of lengths {sorted(lengths)}: batched decode needs one length")
-        total_len = lengths.pop()
-        if total_len < self.min_prefill_len:
-            raise ValueError(f"prompts of {total_len} tokens: the prefill graph needs at least {self.min_prefill_len}")
-        steps = max(0, min(max_new_tokens, self.max_cache_len - total_len))
-        samplers = [params.resolve(self.generation_config) for _ in rows]
-        session_id = self.new_session()
+        if batch < 2:
+            raise ValueError("generate_rows needs an artifact exported with --batch 2 or more")
+        arrivals = list(arrivals) if arrivals is not None else [0] * len(prompts)
+        for prompt in prompts:
+            if not self.min_prefill_len <= len(prompt) <= self.max_cache_len - 1:
+                raise ValueError(f"a prompt of {len(prompt)} tokens: the prefill graph takes "
+                                 f"{self.min_prefill_len} to {self.max_cache_len - 1}")
+        samplers = [params.resolve(self.generation_config) for _ in prompts]
+        state = {fqn: torch.zeros(shape, dtype=dtype, device=self.device)
+                 for fqn, (shape, dtype) in self.state_specs.items()}
+        rows = [None] * batch            # the prompt each row decodes (row 0 is the prefill's)
+        fed = [[] for _ in range(batch)]  # each row's tokens in its caches, in order
+        next_ids = [None] * batch         # each row's token to feed at the next step
+        token_ids = [[] for _ in prompts]
+        prefill_ms, step_ms, rows_active = [0.0] * len(prompts), [], []
+        waiting = sorted(range(len(prompts)), key=lambda i: arrivals[i])
         recorder = None
         with self._lock:
-            session = self._session(session_id)
             if telemetry:
                 recorder = Recorder(self.device, getattr(self, "_segment_info", None)
                                     if self._decode_split is not None else None)
@@ -1248,49 +1255,77 @@ class Engine:
                     self._decode_split.set_recorder(recorder)
             try:
                 with self.external_scope():
-                    self._bind(session["state"])
-                    self._current = session
-                    started = time.perf_counter()
-                    logits = self._prefill_run(
-                        input_ids=torch.tensor(rows, dtype=torch.long, device=self.device),
-                        cache_position=torch.arange(0, total_len, device=self.device))
-                    prefill_ms = (time.perf_counter() - started) * 1e3
-                    if recorder is not None:
-                        recorder.prefill_ms = prefill_ms
-                        recorder.prefill_tokens = total_len * len(rows)
-                        recorder.phase = "decode"
-                    contexts = [list(row) for row in rows]
-                    next_ids = [sampler.pick(logits[i, -1], contexts[i]) for i, sampler in enumerate(samplers)]
-                    token_ids = [[] for _ in rows]
-                    stopped = [False] * len(rows)
-                    step_ms = []
-                    for step in range(steps):
-                        for i, next_id in enumerate(next_ids):
-                            if not stopped[i]:
-                                token_ids[i].append(next_id)
-                                stopped[i] = next_id in self.eos_ids
-                        if all(stopped) or step == steps - 1:
+                    self._bind(state)
+                    self._current = {"id": "rows", "state": state}
+                    step = 0
+                    while waiting or any(r is not None for r in rows[1:]):
+                        # admit arrived prompts into free rows: prefill in row 0, move to its row
+                        for row in range(1, batch):
+                            if rows[row] is None and waiting and arrivals[waiting[0]] <= step:
+                                i = waiting.pop(0)
+                                started = time.perf_counter()
+                                logits = self._prefill_run(
+                                    input_ids=torch.tensor([prompts[i]], dtype=torch.long, device=self.device),
+                                    cache_position=torch.arange(0, len(prompts[i]), device=self.device))
+                                for tensor in self._live_state(state).values():
+                                    tensor[row].copy_(tensor[0])
+                                prefill_ms[i] = (time.perf_counter() - started) * 1e3
+                                rows[row], fed[row] = i, list(prompts[i])
+                                next_ids[row] = samplers[i].pick(logits[0, -1], fed[row])
+                        # each decoding row emits its token; a row that stops frees itself
+                        for row in range(1, batch):
+                            i = rows[row]
+                            if i is None:
+                                continue
+                            token_ids[i].append(next_ids[row])
+                            if (next_ids[row] in self.eos_ids or len(token_ids[i]) >= max_new_tokens
+                                    or len(fed[row]) >= self.max_cache_len):
+                                rows[row] = None
+                        active = [row for row in range(1, batch) if rows[row] is not None]
+                        if not active:
+                            step += 1
+                            if waiting:
+                                continue
                             break
+                        # one decode step: active rows feed their token, the others replay their last
+                        ids, pos = [], []
+                        for row in range(batch):
+                            if rows[row] is not None:
+                                ids.append(next_ids[row])
+                                pos.append(len(fed[row]))
+                            elif fed[row]:
+                                ids.append(fed[row][-1])
+                                pos.append(len(fed[row]) - 1)
+                            else:
+                                ids.append(0)
+                                pos.append(0)
                         started = time.perf_counter()
                         logits = self._decode_run(
-                            input_ids=torch.tensor([[next_id] for next_id in next_ids], device=self.device),
-                            cache_position=torch.tensor([total_len + step], device=self.device))
-                        for i, next_id in enumerate(next_ids):
-                            contexts[i].append(next_id)
-                        next_ids = [sampler.pick(logits[i, -1], contexts[i]) for i, sampler in enumerate(samplers)]
+                            input_ids=torch.tensor([[t] for t in ids], device=self.device),
+                            cache_position=torch.tensor(pos, device=self.device))
+                        for row in active:
+                            fed[row].append(next_ids[row])
+                            next_ids[row] = samplers[rows[row]].pick(logits[row, -1], fed[row])
                         step_ms.append((time.perf_counter() - started) * 1e3)
+                        rows_active.append(len(active))
                         if recorder is not None:
                             recorder.step_ms.append(step_ms[-1])
+                        step += 1
             finally:
-                self.sessions.pop(session_id, None)
                 if recorder is not None:
                     self.external.telemetry = None
                     if self._decode_split is not None:
                         self._decode_split.set_recorder(None)
-        out = {"token_ids": token_ids, "prefill_ms": prefill_ms, "step_ms": step_ms}
+        out = {"token_ids": token_ids, "prefill_ms": prefill_ms, "step_ms": step_ms, "rows_active": rows_active}
         if recorder is not None:
+            recorder.phase = "decode"
             out["telemetry"] = recorder.result(plan_record(self.explain()))
         return out
+
+    def _live_state(self, state):
+        """The state tensors the graphs read and write right now: the resident state when the
+        compiled split keeps one bound (see _bind), else `state` itself."""
+        return self._resident if self._resident is not None else state
 
     def _session(self, session_id):
         if session_id not in self.sessions:

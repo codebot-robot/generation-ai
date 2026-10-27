@@ -78,25 +78,26 @@ def model_args(repo_or_dir, max_cache_len, model_type_args=None, batch=1):
 
 
 class Prefill(torch.nn.Module):
-    """input_ids [B, L], cache_position [L] (always 0..L-1: this model's prefill starts at 0)."""
+    """input_ids [1, L], cache_position [L] (always 0..L-1: this model's prefill starts at 0).
+    One prompt at a time: it fills row 0 of the state, and the engine moves it to its own row."""
 
     def __init__(self, model):
         super().__init__()
         self.model = model
 
     def forward(self, input_ids, cache_position):
-        return self.model(input_ids, 0)[1].unsqueeze(1)  # [B, 1, vocab]: the last position's logits
+        return self.model(input_ids, 0)[1].unsqueeze(1)  # [1, 1, vocab]: the last position's logits
 
 
 class Decode(torch.nn.Module):
-    """input_ids [B, 1], cache_position [1]: every row is at the same position."""
+    """input_ids [B, 1], cache_position [B]: one token per row, each row at its own position."""
 
     def __init__(self, model):
         super().__init__()
         self.model = model
 
     def forward(self, input_ids, cache_position):
-        return self.model(input_ids, cache_position[0])[1].unsqueeze(1)
+        return self.model(input_ids, cache_position)[1].unsqueeze(1)
 
 
 def build(repo_or_dir, tokenizer, max_cache_len, batch=1):
@@ -294,7 +295,7 @@ def _export_graphs(model, seq, batch):
         # keyword arguments, as the engine calls the graphs
         prefill = torch.export.export(
             Prefill(model), (),
-            kwargs={"input_ids": torch.zeros(batch, 8, dtype=torch.long, device="meta"),
+            kwargs={"input_ids": torch.zeros(1, 8, dtype=torch.long, device="meta"),
                     "cache_position": torch.arange(8, device="meta")},
             dynamic_shapes={"input_ids": {1: seq}, "cache_position": {0: seq}},
             strict=False)
@@ -302,7 +303,7 @@ def _export_graphs(model, seq, batch):
         decode = torch.export.export(
             Decode(model), (),
             kwargs={"input_ids": torch.zeros(batch, 1, dtype=torch.long, device="meta"),
-                    "cache_position": torch.zeros(1, dtype=torch.long, device="meta")},
+                    "cache_position": torch.zeros(batch, dtype=torch.long, device="meta")},
             strict=False)
     return prefill, decode
 
