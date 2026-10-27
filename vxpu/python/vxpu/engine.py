@@ -1157,7 +1157,7 @@ class Engine:
         execution telemetry under ``"telemetry"``. ``telemetry=vxpu_pb2.TELEMETRY_TRACE``
         also records each decode step's expert selections, in order. Without
         either, nothing is recorded."""
-        if self.binding.get("batch", 1) > 1:  # continuous batching: the turn takes a row
+        if self._uses_rows():  # continuous batching: the turn takes a row
             with self._lock:
                 session = self._session(session_id)
                 ids = self._prompt_ids(session, text, raw_prompt)
@@ -1243,7 +1243,7 @@ class Engine:
         ``telemetry=vxpu_pb2.TELEMETRY_TRACE`` also records each decode step's expert
         selections, in order. Without either, nothing is recorded.
         """
-        if self.binding.get("batch", 1) > 1:  # continuous batching: the request takes a row
+        if self._uses_rows():  # continuous batching: the request takes a row
             with self._lock:
                 session = self._session(session_id)
             yield from self._scheduled(session, list(input_ids), max_new_tokens, params, extra_eos_ids)
@@ -1253,6 +1253,11 @@ class Engine:
             yield from self._generate_locked(
                 session, list(input_ids), max_new_tokens, params,
                 extra_eos_ids, logits_sink, telemetry)
+
+    def _uses_rows(self):
+        """Whether requests decode in rows (_Rows, through the scheduler): an artifact with several
+        rows, or with decode steps of several tokens (speculative decoding)."""
+        return self.binding.get("batch", 1) > 1 or self.step_tokens > 1
 
     def _scheduled(self, session, ids, max_new_tokens, params, extra_eos_ids=()):
         """A batch engine's generate: the request decodes in a row of the batch, alongside the
@@ -1269,9 +1274,9 @@ class Engine:
         """Decode several prompts together, each in its own row of the batch: continuous batching,
         run to completion, as the scheduler runs it for concurrent requests.
 
-        The artifact must be exported with a batch size (export --batch B). Row 0 is where each
-        prompt is prefilled, alone; the engine then moves it to a row of its own, so B - 1 prompts
-        can decode at once. Prompts may have any lengths: every row sits at its own position.
+        An artifact exported with --batch B decodes B prompts at once. Each prompt is prefilled
+        alone and then decodes in a row of its own. Prompts may have any lengths: every row sits
+        at its own position.
         `arrivals` gives each prompt the decode step at which it joins (default: all at step 0);
         a prompt waits while every row is taken. Each prompt generates up to max_new_tokens
         tokens and stops at an end-of-turn id, which frees its row.
@@ -1280,8 +1285,6 @@ class Engine:
         "step_ms": each decode step's time, "rows_active": how many rows decoded at each step},
         and with telemetry=True also "telemetry": the decode's execution telemetry.
         """
-        if self.binding.get("batch", 1) < 2:
-            raise ValueError("generate_rows needs an artifact exported with --batch 2 or more")
         arrivals = list(arrivals) if arrivals is not None else [0] * len(prompts)
         requests = [_Request(prompt, max_new_tokens, params.resolve(self.generation_config), self.eos_ids)
                     for prompt in prompts]
@@ -1526,10 +1529,10 @@ class _Request:
 
 
 class _Rows:
-    """A batch engine's rows (continuous batching). Row 0 is where a prompt is prefilled, alone;
-    every other row decodes one request at its own position. A row with nothing to decode replays
-    its last fed token at that token's position, which rewrites exactly the values its caches
-    already hold, so a step needs no masking. Used with the engine's lock held.
+    """A batch engine's rows (continuous batching): each row decodes one request at its own
+    position. A prompt is prefilled alone, in row 0 (the prefill graph's one row), and then moved
+    to its own row. A row with nothing to decode feeds its last token again; whatever that writes,
+    the row's next prefill replaces, so a step needs no masking. Used with the engine's lock held.
 
     With more than one token per step (speculative decoding), each row feeds its next token and
     the drafter's tokens after it. The row keeps each draft that equals the token it would have
@@ -1543,7 +1546,7 @@ class _Rows:
         self.batch = engine.binding.get("batch", 1)
         self.state = {fqn: torch.zeros(shape, dtype=dtype, device=engine.device)
                       for fqn, (shape, dtype) in engine.state_specs.items()}
-        self.requests = [None] * self.batch  # the request each row decodes (row 0 holds none)
+        self.requests = [None] * self.batch  # the request each row decodes
         self.fed = [[] for _ in range(self.batch)]  # each row's tokens in its caches, in order
         # each row's tokens to emit; the last is its next token, not yet fed
         self.pending = [[] for _ in range(self.batch)]
@@ -1557,19 +1560,26 @@ class _Rows:
         self.engine._current = {"id": "rows", "state": self.state}
 
     def free_row(self):
-        return next((row for row in range(1, self.batch) if self.requests[row] is None), None)
+        return next((row for row in range(self.batch) if self.requests[row] is None), None)
 
     def active(self):
-        return [row for row in range(1, self.batch) if self.requests[row] is not None]
+        return [row for row in range(self.batch) if self.requests[row] is not None]
 
     def admit(self, request, row):
-        """Prefill request in row 0, then move its state to `row`."""
+        """Prefill request in row 0, then move its state to `row`. A request decoding in row 0
+        keeps its state: it is set aside for the prefill and put back."""
         e = self.engine
         started = time.perf_counter()
+        live = e._live_state(self.state)
+        kept = ({fqn: tensor[0].clone() for fqn, tensor in live.items()}
+                if row != 0 and self.requests[0] is not None else None)
         logits = e._prefill_run(input_ids=torch.tensor([request.prompt], dtype=torch.long, device=e.device),
                                 cache_position=torch.arange(0, len(request.prompt), device=e.device))
-        for tensor in e._live_state(self.state).values():
-            tensor[row].copy_(tensor[0])
+        if row != 0:
+            for fqn, tensor in live.items():
+                tensor[row].copy_(tensor[0])
+                if kept is not None:
+                    tensor[0].copy_(kept[fqn])
         request.prefill_ms = (time.perf_counter() - started) * 1e3
         self.requests[row], self.fed[row] = request, list(request.prompt)
         self.pending[row] = [request.sampler.pick(logits[0, -1], self.fed[row])]

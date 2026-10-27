@@ -2464,13 +2464,12 @@ def _check_engram_file(model, prompts, settings, artifact, ref, workdir):
 
 def _check_batched_decode(model, artifact, workdir):
     """Continuous batching: four prompts of different lengths, arriving at different steps, decoded
-    by an artifact exported with batch 4 (three rows decode; row 0 is where each prompt is
-    prefilled) give each prompt exactly the tokens it gets alone. The last prompt waits for a row,
-    and decodes in the row the first prompt to finish frees."""
+    by an artifact exported with batch 3 give each prompt exactly the tokens it gets alone. The
+    last prompt waits for a row, and decodes in the row the first prompt to finish frees."""
     from .engine import Engine, SamplingParams
     from .export import export_artifact
-    batched_artifact = os.path.join(workdir, "tiny-deepseek-v41-artifact-b4")
-    export_artifact(model, batched_artifact, max_cache_len=1024, batch=4)
+    batched_artifact = os.path.join(workdir, "tiny-deepseek-v41-artifact-b3")
+    export_artifact(model, batched_artifact, max_cache_len=1024, batch=3)
     greedy = SamplingParams(do_sample=False)
     prompts = [[(11 * i + 7 * j + 5) % 30000 + 100 for j in range(n)] for i, n in enumerate((9, 14, 21, 12))]
     single = Engine(artifact)
@@ -2537,7 +2536,7 @@ def _check_speculative_decode(model, artifact, workdir):
         alone.append([t for ev in single.generate(sid, prompt, 16, greedy) for t in ev["token_ids"]])
     for label, options in (("drafter", {"draft": True}), ("prompt lookup", {"step_tokens": 3})):
         spec_artifact = os.path.join(workdir, "tiny-deepseek-v41-artifact-spec-" + label.replace(" ", "-"))
-        export_artifact(model, spec_artifact, max_cache_len=1024, batch=4, **options)
+        export_artifact(model, spec_artifact, max_cache_len=1024, batch=3, **options)
         engine = Engine(spec_artifact)
         out = engine.generate_rows(prompts, 16, greedy, arrivals=[0, 0, 2, 5])
         differ = [i for i, (a, b) in enumerate(zip(alone, out["token_ids"])) if a != b]

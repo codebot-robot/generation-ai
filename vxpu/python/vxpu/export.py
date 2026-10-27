@@ -649,8 +649,6 @@ def export_deepseek_v41(repo_id, out_dir, manifest, max_cache_len, revision, bat
             raise ValueError(f"{repo_id} has no drafter (DSpark stages) to export")
         step_tokens = step_tokens or ds.model_args(repo_id, max_cache_len).dspark_block_size + 1
     step_tokens = step_tokens or 1
-    if step_tokens > 1 and batch < 2:
-        raise ValueError("decode steps of several tokens run on rows (continuous batching): export with --batch 2 or more")
     model, buffers, args = ds.build(repo_id, tokenizer, max_cache_len, batch=batch, step_tokens=step_tokens)
     view = ds.checkpoint_view(model, manifest["tensors"])
     prefill, decode, drafter = ds.export_graphs(model, max_cache_len, MIN_PREFILL_LEN, batch=batch,
