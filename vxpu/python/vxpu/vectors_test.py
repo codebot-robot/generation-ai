@@ -2511,6 +2511,43 @@ def _check_batched_decode(model, artifact, workdir):
     return True
 
 
+def _check_speculative_decode(model, artifact, workdir):
+    """Speculative decoding: decode steps of several tokens per row verify drafts, from the
+    model's own drafter (draft.pt2, the DSpark stages) and from prompt lookup (any model). Four
+    prompts at their own positions, arriving at different steps on three rows, get exactly the
+    tokens each gets alone, one token a step. The model's drafter must have drafts accepted. The
+    random tiny model never repeats itself, so prompt lookup finds nothing to accept there; its
+    rule is checked on its own."""
+    from .engine import Engine, SamplingParams, _LookupDrafter
+    from .export import export_artifact
+    lookup = _LookupDrafter()._lookup
+    if lookup([5, 1, 2, 3, 9, 1, 2], 3) != [3, 9, 1] or lookup([7, 8], 2) is not None:
+        print("speculative decode check: prompt lookup does not draft what followed the last match")
+        return False
+    greedy = SamplingParams(do_sample=False)
+    prompts = [[(11 * i + 7 * j + 5) % 30000 + 100 for j in range(n)] for i, n in enumerate((9, 14, 21, 12))]
+    single = Engine(artifact)
+    alone = []
+    for prompt in prompts:
+        sid = single.new_session()
+        alone.append([t for ev in single.generate(sid, prompt, 16, greedy) for t in ev["token_ids"]])
+    for label, options in (("drafter", {"draft": True}), ("prompt lookup", {"step_tokens": 3})):
+        spec_artifact = os.path.join(workdir, "tiny-deepseek-v41-artifact-spec-" + label.replace(" ", "-"))
+        export_artifact(model, spec_artifact, max_cache_len=1024, batch=4, **options)
+        engine = Engine(spec_artifact)
+        out = engine.generate_rows(prompts, 16, greedy, arrivals=[0, 0, 2, 5])
+        differ = [i for i, (a, b) in enumerate(zip(alone, out["token_ids"])) if a != b]
+        if differ:
+            print(f"speculative decode check ({label}): prompts {differ} differ from decoding the prompt alone")
+            return False
+        if label == "drafter" and not out["accepted"]:
+            print(f"speculative decode check ({label}): no draft accepted of {out['drafted']}")
+            return False
+        print(f"speculative decode ({label}, {engine.step_tokens} tokens a step): 4 prompts on 3 rows match each "
+              f"prompt decoded alone in {len(out['step_ms'])} steps; {out['accepted']} of {out['drafted']} drafts accepted")
+    return True
+
+
 def selftest(workdir, settings):
     """The CI tier: tiny models through export, the in-process engine,
     and a transformers reference, token-exact. No cluster."""
@@ -2588,6 +2625,8 @@ def selftest(workdir, settings):
             failed.append(name + " (expert mailboxes)")
         if name == "tiny-deepseek-v41" and not _check_batched_decode(model, artifact, workdir):
             failed.append(name + " (batched decode)")
+        if name == "tiny-deepseek-v41" and not _check_speculative_decode(model, artifact, workdir):
+            failed.append(name + " (speculative decode)")
         if name == "tiny-deepseek-v41" and not _check_cuts(artifact):
             failed.append(name + " (layer cuts)")
         if name == "tiny-deepseek-v41" and not _check_slices(model, prompts, settings, artifact, got):

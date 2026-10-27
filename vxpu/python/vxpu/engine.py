@@ -285,6 +285,9 @@ class Engine:
         # and as a constant); bound to the same tensor as the canonical.
         self.aliases = self.binding.get("aliases", {})
         self.min_prefill_len = self.binding.get("min_prefill_len", 1)
+        # tokens per row in a decode step: more than one verifies drafts (_Rows)
+        self.step_tokens = self.binding.get("step_tokens", 1)
+        self._draft = self._draft_run = None  # the model's own drafter (draft.pt2), when exported
 
         self.sessions = {}
         self._next_id = 0
@@ -833,6 +836,10 @@ class Engine:
         shared = share_state(self._prefill, self._decode,
                              self.binding["state"])
         assert shared > 0, "prefill/decode share no cache state"
+        if "draft" in self.binding:
+            self._draft = load_program(os.path.join(self.artifact_dir, "draft.pt2"), tensors, self.device).module()
+            share_state(self._prefill, self._draft, self.binding["state"])
+            self._draft_run = self._draft
         self._bind(scratch)  # aliases -> the canonical tensors, both graphs
         self._decode_run = self._decode
         self._prefill_run = self._prefill
@@ -857,6 +864,12 @@ class Engine:
                 total, compiled = self._decode_split.vxpu_segments
                 print(f"[vxpu] decode graph split into {total} segments, {compiled} compiled", flush=True)
                 self._decode_run = self._decode_split
+                if self._draft is not None:
+                    strip_asserts(self._draft)
+                    self._draft_run = segments.compile_segments(
+                        self._draft, self.device, mode,
+                        split_compile=self.plan["split_compile"], direct=self.plan["direct_host_ops"],
+                        runtime=self.plan["segment_runtime"], aoti_cache_dir=self.plan["aoti_cache_dir"])
                 # The compiled segments mutate the caches in place; a CUDA
                 # graph allows that only on tensors whose address never
                 # changes. So the scratch state stays bound for good (the
@@ -978,6 +991,11 @@ class Engine:
                 self._decode(**self._zero_inputs(self._decode))
             for _ in range(2):
                 run(**values)
+            if self._draft is not None:
+                draft_values = self._zero_inputs(self._draft)
+                self._draft(**draft_values)
+                for _ in range(2):
+                    self._draft_run(**draft_values)
             torch.cuda.synchronize(self.device)
             for tensor in (self._resident or {}).values():
                 tensor.zero_()
@@ -988,7 +1006,8 @@ class Engine:
     def _zero_inputs(self, runner):
         """Zeros shaped like each input of a decode step: from the dataflow
         graph's inputs and the placeholders of the segments that take them,
-        or from the decode graph's own placeholders."""
+        or from the placeholders of runner (a graph module: the decode or
+        draft graph) or else of the decode graph."""
         values = {}
         if hasattr(runner, "graph") and hasattr(runner, "split"):
             for node in runner.graph.nodes:
@@ -1000,7 +1019,8 @@ class Engine:
                         values[r.name] = (torch.zeros(meta.shape, dtype=meta.dtype, device=self.device)
                                           if isinstance(meta, torch.Tensor) else 0)
             return values
-        for ph in (n for n in self._decode.graph.nodes if n.op == "placeholder"):
+        module = runner if isinstance(runner, torch.fx.GraphModule) else self._decode
+        for ph in (n for n in module.graph.nodes if n.op == "placeholder"):
             meta = ph.meta.get("val")
             if isinstance(meta, torch.Tensor):
                 values[ph.name] = torch.zeros(meta.shape, dtype=meta.dtype, device=self.device)
@@ -1097,7 +1117,7 @@ class Engine:
         state = {**state, **{alias: state[canonical]
                              for alias, canonical in self.aliases.items()
                              if canonical in state}}
-        for module in (self._prefill, self._decode):
+        for module in (m for m in (self._prefill, self._decode, self._draft) if m is not None):
             for fqn, tensor in state.items():
                 parent, name = (fqn.rsplit(".", 1) if "." in fqn
                                 else ("", fqn))
@@ -1300,7 +1320,8 @@ class Engine:
                     if self._decode_split is not None:
                         self._decode_split.set_recorder(None)
         out = {"token_ids": [r.token_ids for r in requests], "prefill_ms": [r.prefill_ms for r in requests],
-               "step_ms": step_ms, "rows_active": rows_active}
+               "step_ms": step_ms, "rows_active": rows_active,
+               "drafted": rows.drafted, "accepted": rows.accepted}
         if recorder is not None:
             recorder.phase = "decode"
             out["telemetry"] = recorder.result(plan_record(self.explain()))
@@ -1508,7 +1529,14 @@ class _Rows:
     """A batch engine's rows (continuous batching). Row 0 is where a prompt is prefilled, alone;
     every other row decodes one request at its own position. A row with nothing to decode replays
     its last fed token at that token's position, which rewrites exactly the values its caches
-    already hold, so a step needs no masking. Used with the engine's lock held."""
+    already hold, so a step needs no masking. Used with the engine's lock held.
+
+    With more than one token per step (speculative decoding), each row feeds its next token and
+    the drafter's tokens after it. The row keeps each draft that equals the token it would have
+    picked there, up to the first that does not, and then the token it picked in that place. Its
+    sampler picks every token, so the output is what one token per step would produce. A rejected
+    draft leaves values in the caches past the row's position; the next step overwrites them (the
+    exporter gives the window rings the slack for that)."""
 
     def __init__(self, engine):
         self.engine = engine
@@ -1517,7 +1545,12 @@ class _Rows:
                       for fqn, (shape, dtype) in engine.state_specs.items()}
         self.requests = [None] * self.batch  # the request each row decodes (row 0 holds none)
         self.fed = [[] for _ in range(self.batch)]  # each row's tokens in its caches, in order
-        self.next_ids = [None] * self.batch  # each row's token, to emit and then feed
+        # each row's tokens to emit; the last is its next token, not yet fed
+        self.pending = [[] for _ in range(self.batch)]
+        self.drafter = None
+        if engine.step_tokens > 1:
+            self.drafter = _ModelDrafter(engine) if engine._draft_run is not None else _LookupDrafter()
+        self.drafted = self.accepted = 0
 
     def bind(self):
         self.engine._bind(self.state)
@@ -1539,31 +1572,35 @@ class _Rows:
             tensor[row].copy_(tensor[0])
         request.prefill_ms = (time.perf_counter() - started) * 1e3
         self.requests[row], self.fed[row] = request, list(request.prompt)
-        self.next_ids[row] = request.sampler.pick(logits[0, -1], self.fed[row])
+        self.pending[row] = [request.sampler.pick(logits[0, -1], self.fed[row])]
 
     def emit(self):
-        """Each decoding row emits its pending token; a request that stops, or whose caller has
+        """Each decoding row emits its pending tokens; a request that stops, or whose caller has
         gone, frees its row."""
         for row in self.active():
-            request, token_id = self.requests[row], self.next_ids[row]
+            request = self.requests[row]
             if request.cancelled:
                 self.requests[row] = None
                 continue
-            request.emit(token_id)
-            if token_id in request.eos_ids:
-                request.finish("eos")
-            elif len(request.token_ids) >= request.max_new_tokens or len(self.fed[row]) >= self.engine.max_cache_len:
-                request.finish("length")
-            if request.finish_reason is not None:
-                self.requests[row] = None
+            for token_id in self.pending[row]:
+                request.emit(token_id)
+                if token_id in request.eos_ids:
+                    request.finish("eos")
+                elif (len(request.token_ids) >= request.max_new_tokens
+                      or len(self.fed[row]) + self.engine.step_tokens > self.engine.max_cache_len):
+                    request.finish("length")
+                if request.finish_reason is not None:
+                    self.requests[row] = None
+                    break
+            self.pending[row] = self.pending[row][-1:]
 
     def step(self):
         """One decode step for every row; returns its time in ms."""
         e = self.engine
         ids, pos = [], []
         for row in range(self.batch):
-            if self.requests[row] is not None:  # feed the token it just emitted
-                ids.append(self.next_ids[row])
+            if self.requests[row] is not None:  # feed its next token
+                ids.append(self.pending[row][-1])
                 pos.append(len(self.fed[row]))
             elif self.fed[row]:  # replay its last token, rewriting the same values
                 ids.append(self.fed[row][-1])
@@ -1572,12 +1609,62 @@ class _Rows:
                 ids.append(0)
                 pos.append(0)
         started = time.perf_counter()
-        logits = e._decode_run(input_ids=torch.tensor([[t] for t in ids], device=e.device),
-                               cache_position=torch.tensor(pos, device=e.device))
+        position = torch.tensor(pos, device=e.device)
+        tokens = [[t] for t in ids]
+        if self.drafter is not None:
+            drafts = self.drafter.propose(self, ids, position, e.step_tokens - 1)
+            tokens = [[t] + d for t, d in zip(ids, drafts)]
+        logits = e._decode_run(input_ids=torch.tensor(tokens, device=e.device), cache_position=position)
         for row in self.active():
-            self.fed[row].append(self.next_ids[row])
-            self.next_ids[row] = self.requests[row].sampler.pick(logits[row, -1], self.fed[row])
+            request, fed, kept = self.requests[row], self.fed[row], []
+            for j, token_id in enumerate(tokens[row]):
+                fed.append(token_id)
+                picked = request.sampler.pick(logits[row, j], fed)
+                kept.append(picked)
+                if j + 1 == len(tokens[row]) or tokens[row][j + 1] != picked:
+                    break
+            self.drafted += len(tokens[row]) - 1
+            self.accepted += len(kept) - 1
+            self.pending[row] = kept
         return (time.perf_counter() - started) * 1e3
+
+
+class _ModelDrafter:
+    """Drafts from the model's own drafter (draft.pt2): each row's next token, at its position,
+    in; the drafter's block of tokens after it out."""
+
+    def __init__(self, engine):
+        self.engine = engine
+
+    def propose(self, rows, ids, position, count):
+        e = rows.engine
+        drafts = e._draft_run(input_ids=torch.tensor([[t] for t in ids], device=e.device), cache_position=position)
+        return [d[:count] for d in drafts.tolist()]
+
+
+class _LookupDrafter:
+    """Prompt lookup, for any model: a row's drafts are the tokens that followed the last earlier
+    occurrence of its latest tokens (the longest match of up to `ngram` tokens) in its own prompt
+    and output. Without a match, it repeats the next token, which costs nothing extra to verify."""
+
+    def __init__(self, ngram=3):
+        self.ngram = ngram
+
+    def propose(self, rows, ids, position, count):
+        out = []
+        for row, next_id in enumerate(ids):
+            context = rows.fed[row] + [next_id] if rows.requests[row] is not None else []
+            out.append(self._lookup(context, count) or [next_id] * count)
+        return out
+
+    def _lookup(self, context, count):
+        for n in range(min(self.ngram, len(context) - 1), 0, -1):
+            tail = context[-n:]
+            for start in range(len(context) - n - 1, -1, -1):
+                if context[start:start + n] == tail:
+                    follow = context[start + n:start + n + count]
+                    return follow + [follow[-1]] * (count - len(follow))
+        return None
 
 
 class _Scheduler:
