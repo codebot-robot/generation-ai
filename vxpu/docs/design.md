@@ -477,19 +477,18 @@ computes.
   experts each layer selected. The site is Go, served by the coordinator
   (#331).
 
-**Batched decode.** The engine decodes one sequence per step. Decode is
-bound by memory bandwidth, so stepping several sequences together reads
-each dense weight once for all of them. The prototype covers the case
-that needs no model changes: sequences at the same position.
-- `export --batch B` exports the graphs with B rows. Every state tensor
-  gains the leading dimension, and every row shares one `cache_position`.
-- `Engine.generate_batch` decodes B prompts of one length together, and
-  samples each row with its own sampler.
+**Batched decode.** Decode is bound by memory bandwidth, so stepping
+several sequences together reads each dense weight once for all of them.
+`export --batch B` exports the graphs with B rows. Every state tensor
+gains the leading dimension, and the decode graph takes one position per
+row (`cache_position [B]`), so each row decodes its own sequence at its
+own position. The forked model writes its caches (the window ring, the
+compressor, the indexer, the n-gram hash) per row.
 
 We measured it on DeepSeek-V4.1-Flash on one g4-standard-96 (2 RTX PRO
 6000) on Oct 26 and 27, with hot experts on the GPUs (7,712 experts, 145
 GB, placed from other prompts' telemetry), 32 distinct prompts of 37
-tokens, and 64 new tokens:
+tokens, and 64 new tokens, every row at the same position:
 
 | batch | ms per step | tokens/s | dense (ms) | experts (ms) |
 |---|---|---|---|---|
@@ -503,15 +502,98 @@ tokens, and 64 new tokens:
 barely grow with the batch. The experts the CPU computes, the ones not
 held on a GPU, are the next limit: 111 of the 130 ms at batch 32.
 
-Making it a product needs more than the prototype:
-- **Positions per row:** sequences at different positions in one step.
-  The forked model writes its caches (the compressor, the indexer, the
-  window ring, the n-gram hash) at one shared position.
-- **Sessions as rows:** each session owns a row of one resident state,
-  instead of `_bind` copying whole sessions in and out.
-- **A scheduler:** a loop that steps every active session together, and
-  runs prefills between steps.
-- **Ranges:** a range server message that carries several sessions.
+**Continuous batching.** Requests come and go, and each takes a row
+(`_Rows`):
+- A prompt is prefilled alone, in row 0 (the prefill graph has one row),
+  and then copied to a free row. A request decoding in row 0 has its
+  state set aside for the prefill and put back.
+- A scheduler thread steps every active row together, and admits waiting
+  requests between steps (`_Scheduler`). `Engine.generate` and `chat` go
+  through it for an artifact with rows; `generate_rows` runs a list of
+  prompts to completion, for benchmarks.
+- A row with nothing to decode feeds its last token again. Its next
+  prefill replaces whatever that writes, so a step needs no mask.
+
+The kernels' row limit matters here. Inputs of up to `DECODE_MAX_ROWS`
+token rows take the decode kernels, which read each expert's weights
+once for all its tokens; larger ones dequantize every expert they touch.
+At 32 rows, a 45-token prefill took 7.5 s and dominated continuous
+batching end to end (8 rows: 7.9 tokens/s). At 1024 it takes 0.37 s.
+
+Measured on Oct 27 on the same VM, with the limit at 1024, 37 to 47-token
+chat prompts arriving at once, and 64 new tokens:
+
+| rows | requests | prefill per prompt (s) | ms per step | decode tokens/s | end to end tokens/s |
+|---|---|---|---|---|---|
+| 1 | 1 | 0.4 | 35.6 | 28.4 | 24.3 |
+| 9 | 8 | 0.37 | 84.0 | 96.1 | 61.3 |
+| 33 | 32 | 0.37 | 177.9 | 183.8 | 89.4 |
+
+With the limit at 32, the 8-request run spent 59.5 s in prefill. At 32
+requests, the prefills (11.8 s, one after another) are the larger part
+of the wall time. Every row computes in every step, so one request on a
+9-row artifact pays for nine (95.5 ms a step). About half the processes
+on that VM ran the decode step three times slower (300 ms at 8 rows),
+steady within a process and whatever the code; we have not found why.
+
+**Speculative decoding.** A decode step can take S tokens per row
+(`export --step-tokens S`): the row's next token and S - 1 drafts. The
+row keeps each draft that equals the token its own sampler picks at that
+position, up to the first that does not, and then the token it picked
+there. Every token is the sampler's pick given the tokens before it, so
+the drafter changes the speed and not the output, for any sampler.
+- A rejected draft leaves values in the caches past the row's position.
+  Caches indexed by position or by group are rewritten when the next
+  step feeds those positions. The window rings and the compressor's
+  partial group are indexed by position modulo their size, so they get
+  S - 1 slots of slack (`window_slack`): a rejected write never lands on
+  a position the row still reads.
+- Two drafters share one interface: the model's own, and prompt lookup
+  for any model. DeepSeek-V4.1's own is DSpark: three stages (`mtp.*`,
+  7.9 GB) that draft a block of 5 tokens from the target's hidden states
+  at layers 37 to 39. `export --draft` makes it `draft.pt2`, a third
+  program next to prefill and decode, and sets S to 6.
+- The drafter reads the target's hidden states from state. The prefill
+  and decode graphs write them into the drafter's window rings; the
+  draft graph reads the rings and writes nothing. The engine sees three
+  programs and their shared state, and knows nothing of DSpark. Its
+  routed experts are external like the backbone's (layers 40 to 42).
+
+Measured on Oct 27 on the same VM, with S = 6, the drafter's experts on
+the CPU, and the same prompts:
+
+| rows | ms per step | tokens per row and step | decode tokens/s | without drafts |
+|---|---|---|---|---|
+| 1 | 79.3 | 2.56 | 32.8 | 28.4 |
+| 8 | 225.4 | 2.94 | 90.4 | 96.1 (9 rows) |
+
+The draft graph takes 9.8 ms of a step. Verifying 6 tokens a row takes
+the rest, and it grows with the token rows the way a batch does, because
+the experts dominate. So drafts pay only where a step has rows to spare:
+1.15 times at one row, nothing at eight. Per prompt, 33 to 65% of the
+drafts were accepted (2.6 to 4.3 tokens a step). Next: verify fewer
+drafts when the drafter's confidence head is low, and place the
+drafter's experts on the GPU.
+
+**Numerics across batches.** On the GPU, which kernel runs and how it
+sums depend on the number of token rows (the head's Triton kernel takes
+at most 8; the fp8 GEMV, 4). So a sequence's greedy tokens depend on
+what it was batched with. Over 8 prompts, batched runs left the batch-1
+run at a near-tie after 3 to 49 tokens, and both continuations read
+well ("main differences TCP vs UDP" against "TCP vs UDP main
+differences"). A row's tokens do not depend on when the other requests
+arrive: the same prompts, all at once or one every two steps, gave the
+same tokens. On the CPU the tiny models are exact, and the selftest
+checks batched and speculative decoding token for token against
+decoding each prompt alone.
+
+Still to build:
+- **Prefill alongside decode:** a long prompt stalls every row for its
+  prefill. Steps of several tokens could carry a prompt's chunks
+  alongside the other rows' decoding.
+- **Ranges:** a range server message that carries several rows.
+- **Idle rows:** every row computes in every step, so an artifact sized
+  for the peak load is slow for one request.
 
 ## 7. Numerics
 
