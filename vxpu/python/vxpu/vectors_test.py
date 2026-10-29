@@ -2542,6 +2542,47 @@ def _check_rings():
     return True
 
 
+def _check_gpu_rings():
+    """On a GPU: the GPU's end of the message rings (rings.py) against the CPU's (ring_echo), from a
+    captured CUDA graph replayed as a decode step would be: messages of 8 bytes to 1 MB (whole 8-byte
+    words and a ragged tail) go GPU -> CPU -> GPU through rings 2 slots deep, and come back as sent.
+    Skipped without CUDA and Triton."""
+    import threading
+    import torch
+    from . import kernels, rings, triton_ops
+    if not triton_ops.available() or kernels.load() is None:
+        print("gpu rings check skipped: no CUDA with Triton, or no native kernels")
+        return True
+    k = kernels.load()
+    for size in (8, 4093, 1 << 20):
+        out, back = rings.PinnedRing(2, size, "cuda"), rings.PinnedRing(2, size, "cuda")
+        src = torch.randint(0, 256, (size,), dtype=torch.uint8, device="cuda")
+        dst = torch.zeros(size, dtype=torch.uint8, device="cuda")
+        replays = 20
+        echo = threading.Thread(target=k.ring_echo, args=(out.region, back.region, replays + 1))
+        echo.start()
+        out.put(src)  # once eagerly (compiles the kernels), then captured
+        back.get(dst)
+        torch.cuda.synchronize()
+        graph = torch.cuda.CUDAGraph()
+        with torch.cuda.graph(graph):
+            out.put(src)
+            back.get(dst)
+        started = __import__("time").perf_counter()
+        for _ in range(replays):
+            dst.zero_()
+            graph.replay()
+        torch.cuda.synchronize()
+        took = (__import__("time").perf_counter() - started) / replays
+        echo.join()
+        if not torch.equal(dst, src):
+            print(f"gpu rings check: a {size}-byte message came back changed")
+            return False
+        print(f"gpu rings: {size}-byte messages GPU -> CPU -> GPU from a CUDA graph, {replays} replays, "
+              f"every one back as sent ({took * 1e6:.0f} us a round trip)")
+    return True
+
+
 def _check_speculative_decode(model, artifact, workdir):
     """Speculative decoding: decode steps of several tokens per row verify drafts, from the
     model's own drafter (draft.pt2, the DSpark stages) and from prompt lookup (any model). Four
@@ -2596,6 +2637,8 @@ def selftest(workdir, settings):
     _check_rotary()
     if not _check_rings():
         raise SystemExit("rings check failed")
+    if not _check_gpu_rings():
+        raise SystemExit("gpu rings check failed")
     from .export import export_artifact
     from .fixtures import tiny_fp8_moe
     models = [
