@@ -149,11 +149,11 @@ def moe_experts(x_in: torch.Tensor, weights: torch.Tensor, indices: torch.Tensor
     # decode-sized inputs cross through the engine's pinned buffers; a
     # prefill keeps plain copies (its crossing is noise against its compute,
     # and pinned buffers sized for the longest prompt would stay pinned)
-    crossing = x_in.device.type == "cuda" and host.type == "cpu" and x_in.shape[0] <= PINNED_MAX_ROWS
+    crossing = x_in.device.type == "cuda" and host.type == "cpu"
     rec = _recorder()
     t0 = time.perf_counter() if rec is not None else 0.0
     boxes = getattr(moe, "_vxpu_mailboxes", None)
-    if boxes is not None and x_in.shape[0] <= PINNED_MAX_ROWS:
+    if boxes is not None:
         impl = _plan(host.type).select("vxpu::moe_experts", host.type, key=f"rows={x_in.shape[0]}", moe=moe,
                                        rows=x_in.shape[0], mailboxes=True)
         if impl.fn is _moe_mailboxes:
@@ -202,7 +202,7 @@ def _cpu_experts(plan, moe=None, **_):
 @implementation("vxpu::moe_experts", "mailboxes", ("cpu",), "rounding",
                 "decode: each (token, k) pair answered by its expert's owner (the CPU kernels, a GPU pool) and the "
                 "replies summed in k order, so the sum does not depend on where each expert ran (mailboxes.py)",
-                applies=lambda plan, rows=0, mailboxes=False, **ctx: mailboxes and rows <= PINNED_MAX_ROWS
+                applies=lambda plan, rows=0, mailboxes=False, **ctx: mailboxes
                 and plan["fused_experts"] and _cpu_experts(plan, **ctx),
                 host=True)
 def _moe_mailboxes(moe, boxes, x_in, weights, indices, layer, rec, t0, crossing):
@@ -229,7 +229,7 @@ def _moe_mailboxes(moe, boxes, x_in, weights, indices, layer, rec, t0, crossing)
 @implementation("vxpu::moe_experts", "gpu-hot+cpu", ("cpu",), "rounding",
                 "a placement holds this layer's hot experts on the GPUs (experts_gpu.py): the token's hot pairs computed "
                 "there on side streams while the CPU kernels compute the cold ones, and the sums added",
-                applies=lambda plan, rows=0, hot=False, **ctx: hot and rows <= PINNED_MAX_ROWS and plan["triton"]
+                applies=lambda plan, rows=0, hot=False, **ctx: hot and plan["triton"]
                 and _cpu_experts(plan, **ctx), host=True)
 def _moe_gpu_hot(moe, res, x_in, weights, indices, layer, rec, t0):
     dev = x_in.device
@@ -292,36 +292,23 @@ def _moe_gpu_hot(moe, res, x_in, weights, indices, layer, rec, t0):
 
 # The routed experts' implementations, run on the banks' device: the fused
 # fp4 kernels (csrc/; same routings, no dequantized copy), or the module's
-# own routings (the reference computation).
-# Inputs of up to this many token rows take the decode kernels, which group
-# each expert's tokens and read its weights once: decode steps, batched and
-# speculative ones included, and prefills of up to this many tokens. Longer
-# prefills dequantize each expert once and run torch's GEMM. Measured on
-# DeepSeek-V4.1-Flash (hero VM, Oct 27 2026): prefills of 178 and 327 tokens
-# took 1.2 and 1.9 s on the decode kernels, 14.8 and 18.1 s the other way;
-# the two cross near 2,000 tokens (extrapolated).
-DECODE_MAX_ROWS = 1024
-
-
+# own routings (the reference computation). The kernels group each
+# expert's tokens and work in tiles, so one path serves every row count:
+# a decode step, batched or speculative, and a prefill. (A dequantize-
+# and-GEMM path for long prefills lost at every length measured: on the
+# hero VM, 2414 tokens took 18.3 s on the kernels against 29.7 s.)
 @implementation("vxpu::moe_experts", "cpu-fused", ("cpu",), "rounding",
-                "up to DECODE_MAX_ROWS tokens (decode, short prefill), kernels on, fused experts on: one C++ call per layer",
-                applies=lambda plan, rows=0, **ctx: 1 <= rows <= DECODE_MAX_ROWS and plan["fused_experts"] and _cpu_experts(plan, **ctx), host=True)
+                "kernels on, fused experts on: one C++ call per layer, any number of tokens",
+                applies=lambda plan, rows=0, **ctx: rows >= 1 and plan["fused_experts"] and _cpu_experts(plan, **ctx), host=True)
 def _moe_cpu_fused(moe, x, w, i):
     return experts_cpu.forward_batched(moe, x, w, i, fused=True)
 
 
 @implementation("vxpu::moe_experts", "cpu-three-call", ("cpu",), "rounding",
-                "up to DECODE_MAX_ROWS tokens (decode, short prefill), kernels on, fused experts off: three kernel calls with the module's SwiGLU between",
-                applies=lambda plan, rows=0, **ctx: 1 <= rows <= DECODE_MAX_ROWS and _cpu_experts(plan, **ctx), host=True)
+                "kernels on, fused experts off: three kernel calls with the module's SwiGLU between",
+                applies=lambda plan, rows=0, **ctx: rows >= 1 and _cpu_experts(plan, **ctx), host=True)
 def _moe_cpu_three_call(moe, x, w, i):
     return experts_cpu.forward_batched(moe, x, w, i, fused=False)
-
-
-@implementation("vxpu::moe_experts", "cpu-grouped", ("cpu",), "rounding",
-                "long prefill (more than DECODE_MAX_ROWS tokens), kernels on: each expert decoded once, torch's GEMM over its tokens",
-                applies=lambda plan, rows=0, **ctx: rows > DECODE_MAX_ROWS and _cpu_experts(plan, **ctx), host=True)
-def _moe_cpu_grouped(moe, x, w, i):
-    return experts_cpu.forward_grouped(moe, x, w, i)
 
 
 @implementation("vxpu::moe_experts", "reference", ("cpu", "cuda"), "bit-identical",
@@ -330,15 +317,10 @@ def _moe_reference(moe, x, w, i):
     return moe._forward_batched(x, w, i) if x.shape[0] == 1 else moe._forward_grouped(x, w, i)
 
 
-# inputs of up to this many token rows cross through pinned buffers, and may
-# use the GPU hot experts (at 8, a batch of 16 lost them)
-PINNED_MAX_ROWS = DECODE_MAX_ROWS
-
-
 def _pinned(name, like):
     """A pinned host tensor shaped and typed like `like`, kept by the bound
     engine (the op has already required one) and reused call to call;
-    regrown when a call needs more, at most PINNED_MAX_ROWS rows."""
+    regrown when a call needs more."""
     table = _active.external.pinned
     nbytes = like.numel() * like.element_size()
     buf = table.get(name)

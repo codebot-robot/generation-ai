@@ -32,11 +32,6 @@
 //       row i uses expert sel[i]: the decode routing, a token's top-k
 //       experts, each a matrix-vector product read once from the packed
 //       bank and never materialized (memory-bound by design).
-//   fp4_grouped_mm(x [M, K], w, scale, offs [E]) -> bf16 [M, N]
-//       rows offs[e-1]:offs[e] use expert e: the prefill routing. Each
-//       expert is decoded once to bf16 by the vectorized dequant and the
-//       FLOPs go to torch's bf16 GEMM, which is the right tool for them.
-//   fp4_dequant(w, scale, e) -> bf16 [N, K]      one expert, for tests.
 //
 // SIMD: AVX-512 (x86, runtime-dispatched) and NEON (arm64); a scalar
 // path everywhere else.
@@ -157,18 +152,6 @@ inline uint16_t bf16_bits(float f) {
 
 // ---------------------------------------------------------------- scalar
 
-inline void decode_row_scalar(const uint8_t* w, const uint8_t* s, int64_t K, uint16_t* out) {
-  for (int64_t b = 0; b < K / 32; ++b) {
-    const float sc = e8m0(s[b]);
-    const uint8_t* wb = w + b * 16;
-    uint16_t* ob = out + b * 32;
-    for (int j = 0; j < 16; ++j) {
-      ob[2 * j] = bf16_bits(kFp4[wb[j] & 15] * sc);
-      ob[2 * j + 1] = bf16_bits(kFp4[wb[j] >> 4] * sc);
-    }
-  }
-}
-
 inline float dot_packed_scalar(const float* x, const uint8_t* w, const uint8_t* s, int64_t K) {
   float acc = 0.f;
   for (int64_t b = 0; b < K / 32; ++b) {
@@ -217,24 +200,6 @@ inline float dot_packed_avx512(const float* xe, const float* xo, const uint8_t* 
   return _mm512_reduce_add_ps(acc);
 }
 
-__attribute__((target("avx512f,avx512bw,avx512vl")))
-inline void decode_row_avx512(const uint8_t* w, const uint8_t* s, int64_t K, uint16_t* out) {
-  const __m512 table = _mm512_loadu_ps(kFp4);
-  const __m512i lo_mask = _mm512_set1_epi32(0x0F);
-  // interleave lo/hi lanes back into element order: a = lo0 hi0 .. lo7 hi7, b = lo8 hi8 .. lo15 hi15
-  const __m512i ia = _mm512_set_epi32(23, 7, 22, 6, 21, 5, 20, 4, 19, 3, 18, 2, 17, 1, 16, 0);
-  const __m512i ib = _mm512_set_epi32(31, 15, 30, 14, 29, 13, 28, 12, 27, 11, 26, 10, 25, 9, 24, 8);
-  for (int64_t b = 0; b < K / 32; ++b) {
-    __m512i bytes = _mm512_cvtepu8_epi32(_mm_loadu_si128(reinterpret_cast<const __m128i*>(w + b * 16)));
-    __m512 vlo = _mm512_permutexvar_ps(_mm512_and_si512(bytes, lo_mask), table);
-    __m512 vhi = _mm512_permutexvar_ps(_mm512_srli_epi32(bytes, 4), table);
-    __m512 sc = _mm512_set1_ps(e8m0(s[b]));
-    __m512 a = _mm512_mul_ps(_mm512_permutex2var_ps(vlo, ia, vhi), sc);
-    __m512 c = _mm512_mul_ps(_mm512_permutex2var_ps(vlo, ib, vhi), sc);
-    _mm256_storeu_si256(reinterpret_cast<__m256i*>(out + b * 32), to_bf16_avx512(a));
-    _mm256_storeu_si256(reinterpret_cast<__m256i*>(out + b * 32 + 16), to_bf16_avx512(c));
-  }
-}
 #else
 bool have_avx512() { return false; }
 #endif
@@ -242,14 +207,6 @@ bool have_avx512() { return false; }
 // ---------------------------------------------------------------- NEON
 
 #if defined(__aarch64__)
-inline uint16x8_t to_bf16_neon(float32x4_t f0, float32x4_t f1) {
-  uint32x4_t u0 = vreinterpretq_u32_f32(f0), u1 = vreinterpretq_u32_f32(f1);
-  uint32x4_t one = vdupq_n_u32(1), bias = vdupq_n_u32(0x7FFF);
-  u0 = vaddq_u32(u0, vaddq_u32(bias, vandq_u32(vshrq_n_u32(u0, 16), one)));
-  u1 = vaddq_u32(u1, vaddq_u32(bias, vandq_u32(vshrq_n_u32(u1, 16), one)));
-  return vcombine_u16(vshrn_n_u32(u0, 16), vshrn_n_u32(u1, 16));
-}
-
 // 16 int8 (values doubled) -> four float32x4 (undoubled by the caller's scale)
 inline void widen_f32(int8x16_t v, float32x4_t out[4]) {
   int16x8_t l = vmovl_s8(vget_low_s8(v)), h = vmovl_s8(vget_high_s8(v));
@@ -289,25 +246,6 @@ inline float dot_packed_neon(const float* xe, const float* xo, const uint8_t* w,
   return vaddvq_f32(vaddq_f32(vaddq_f32(acc0, acc1), vaddq_f32(acc2, acc3)));
 }
 
-inline void decode_row_neon(const uint8_t* w, const uint8_t* s, int64_t K, uint16_t* out) {
-  const int8x16_t table = vld1q_s8(kFp4x2);
-  const uint8x16_t lo_mask = vdupq_n_u8(0x0F);
-  for (int64_t b = 0; b < K / 32; ++b) {
-    uint8x16_t bytes = vld1q_u8(w + b * 16);
-    int8x16_t lo = vqtbl1q_s8(table, vandq_u8(bytes, lo_mask));
-    int8x16_t hi = vqtbl1q_s8(table, vshrq_n_u8(bytes, 4));
-    int8x16_t a = vzip1q_s8(lo, hi), c = vzip2q_s8(lo, hi);  // element order
-    float32x4_t fa[4], fc[4];
-    widen_f32(a, fa);
-    widen_f32(c, fc);
-    const float32x4_t sc = vdupq_n_f32(0.5f * e8m0(s[b]));
-    uint16_t* ob = out + b * 32;
-    vst1q_u16(ob, to_bf16_neon(vmulq_f32(fa[0], sc), vmulq_f32(fa[1], sc)));
-    vst1q_u16(ob + 8, to_bf16_neon(vmulq_f32(fa[2], sc), vmulq_f32(fa[3], sc)));
-    vst1q_u16(ob + 16, to_bf16_neon(vmulq_f32(fc[0], sc), vmulq_f32(fc[1], sc)));
-    vst1q_u16(ob + 24, to_bf16_neon(vmulq_f32(fc[2], sc), vmulq_f32(fc[3], sc)));
-  }
-}
 #endif
 
 // ---------------------------------------------------------------- dispatch
@@ -328,16 +266,6 @@ inline float dot_packed(const float* x, const float* xe, const float* xo, const 
   return dot_packed_scalar(x, w, s, K);
 #else
   return dot_packed_scalar(x, w, s, K);
-#endif
-}
-
-inline void decode_row(const uint8_t* w, const uint8_t* s, int64_t K, uint16_t* out) {
-#if defined(__aarch64__)
-  decode_row_neon(w, s, K, out);
-#elif defined(__x86_64__) || defined(_M_X64)
-  if (have_avx512()) decode_row_avx512(w, s, K, out); else decode_row_scalar(w, s, K, out);
-#else
-  decode_row_scalar(w, s, K, out);
 #endif
 }
 
@@ -528,57 +456,6 @@ torch::Tensor fp4_gather_mm(torch::Tensor x, torch::Tensor w, torch::Tensor scal
 }
 
 // Decode expert e into `out` ([N, K] bf16, contiguous).
-void fp4_dequant_into(const torch::Tensor& w, const torch::Tensor& scale, int64_t e, torch::Tensor& out) {
-  const int64_t N = w.size(1), K = w.size(2) * 2;
-  const uint8_t* wp = w.data_ptr<uint8_t>() + e * N * (K / 2);
-  const uint8_t* sp = reinterpret_cast<const uint8_t*>(scale.data_ptr()) + e * N * (K / 32);
-  uint16_t* op = reinterpret_cast<uint16_t*>(out.data_ptr<at::BFloat16>());
-  parallel_range(N, 8, [&](int64_t n0, int64_t n1) {
-    for (int64_t n = n0; n < n1; ++n) decode_row(wp + n * (K / 2), sp + n * (K / 32), K, op + n * K);
-  });
-}
-
-torch::Tensor fp4_dequant(torch::Tensor w, torch::Tensor scale, int64_t e) {
-  TORCH_CHECK(w.dtype() == torch::kUInt8 && w.dim() == 3 && w.is_contiguous(), "w must be contiguous uint8 [E, N, K/2]");
-  TORCH_CHECK(scale.dtype() == torch::kFloat8_e8m0fnu && scale.dim() == 3 && scale.is_contiguous(),
-              "scale must be contiguous e8m0 [E, N, K/32]");
-  TORCH_CHECK(scale.size(0) == w.size(0) && scale.size(1) == w.size(1) && scale.size(2) * 16 == w.size(2),
-              "scale and w disagree on E, N or K");
-  TORCH_CHECK(w.device().is_cpu() && scale.device().is_cpu(), "CPU tensors only");
-  TORCH_CHECK(e >= 0 && e < w.size(0), "expert index out of range");
-  const int64_t N = w.size(1), K = w.size(2) * 2;
-  auto out = torch::empty({N, K}, w.options().dtype(torch::kBFloat16));
-  fp4_dequant_into(w, scale, e, out);
-  return out;
-}
-
-torch::Tensor fp4_grouped_mm(torch::Tensor x, torch::Tensor w, torch::Tensor scale, torch::Tensor offs) {
-  check_bank(x, w, scale);
-  TORCH_CHECK(offs.dtype() == torch::kInt32 && offs.dim() == 1 && offs.size(0) == w.size(0), "offs must be int32 [E]");
-  const int64_t M = x.size(0), E = w.size(0), N = w.size(1);
-  auto out = torch::empty({M, N}, x.options());
-  auto offc = offs.contiguous();
-  const int32_t* offp = offc.data_ptr<int32_t>();
-  TORCH_CHECK(E == 0 || offp[E - 1] == M, "offs must end at M");
-  for (int64_t e = 0; e < E; ++e)
-    TORCH_CHECK(offp[e] >= (e ? offp[e - 1] : 0), "offs must be non-decreasing and start at or above 0");
-  // one decode buffer, reused for every expert (a fresh allocation per
-  // expert would pay its page faults every time)
-  auto we = torch::empty({N, x.size(1)}, x.options());
-  int64_t r0 = 0;
-  for (int64_t e = 0; e < E; ++e) {
-    const int64_t r1 = offp[e];
-    if (r1 > r0) {
-      // decoded once per expert; the GEMM over its tokens is torch's bf16 mm
-      fp4_dequant_into(w, scale, e, we);
-      auto rows = out.slice(0, r0, r1);
-      at::mm_out(rows, x.slice(0, r0, r1), we.t());
-    }
-    r0 = r1;
-  }
-  return out;
-}
-
 // ---------------------------------------------------------------- fp8 dense
 
 // e4m3fn byte -> fp32 (no infinities; 0x7F/0xFF are NaN, decoded as NaN as torch does)
@@ -1241,8 +1118,6 @@ void register_rings(pybind11::module& m);  // ring.cpp: message rings
 
 PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
   m.def("fp4_gather_mm", &fp4_gather_mm, "x[M,K] bf16 x packed fp4 experts sel[M] -> bf16 [M,N]");
-  m.def("fp4_grouped_mm", &fp4_grouped_mm, "x[M,K] bf16 (sorted by expert, offs[E]) x packed fp4 experts -> bf16 [M,N]");
-  m.def("fp4_dequant", &fp4_dequant, "one expert of a packed bank -> bf16 [N,K]");
   m.def("set_expert_tile", [](int64_t tokens) { g_tile_tokens = std::max<int64_t>(1, std::min<int64_t>(tokens, kTileTokens)); },
         "tokens per tile in fp4_moe_decode (1: one pair at a time, the per-pair kernel's work; for comparisons)");
   m.def("fp4_moe_decode", &fp4_moe_decode, "one decode layer's routed experts: gate/up, SwiGLU, act_quant, down, sum -> fp32 [n, K]");

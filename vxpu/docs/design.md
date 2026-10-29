@@ -547,13 +547,17 @@ held on a GPU, are the next limit: 111 of the 130 ms at batch 32.
 - A row with nothing to decode feeds its last token again. Its next
   prefill replaces whatever that writes, so a step needs no mask.
 
-The kernels' row limit matters here. Inputs of up to `DECODE_MAX_ROWS`
-token rows take the decode kernels, which read each expert's weights
-once for all its tokens; larger ones dequantize every expert they touch.
-At 32 rows, a 45-token prefill took 7.5 s and dominated continuous
-batching end to end (8 rows: 7.9 tokens/s). At 1024 it takes 0.37 s.
+Prefill matters here, because it stalls every row. The CPU's expert
+kernels group each expert's tokens and work in tiles, so one path serves
+a decode step and a prefill alike. Until Oct 28 a separate path took
+anything over 32 token rows; it dequantized every expert it touched, and
+a 45-token prefill took 7.5 s, which dominated continuous batching end to
+end (8 rows: 7.9 tokens/s). On the decode kernels it takes 0.37 s. The
+separate path lost at every length measured (on the hero VM, every
+expert on the CPU: 626 tokens 4.8 s against 16.7 s; 2414 tokens 18.3 s
+against 29.7 s), so it is gone.
 
-Measured on Oct 27 on the same VM, with the limit at 1024, 37 to 47-token
+Measured on Oct 27 on the same VM, with prefills on the decode kernels, 37 to 47-token
 chat prompts arriving at once, and 64 new tokens:
 
 | rows | requests | prefill per prompt (s) | ms per step | decode tokens/s | end to end tokens/s |
@@ -562,7 +566,7 @@ chat prompts arriving at once, and 64 new tokens:
 | 9 | 8 | 0.37 | 84.0 | 96.1 | 61.3 |
 | 33 | 32 | 0.37 | 177.9 | 183.8 | 89.4 |
 
-With the limit at 32, the 8-request run spent 59.5 s in prefill. At 32
+With the old prefill path, the 8-request run spent 59.5 s in prefill. At 32
 requests, the prefills (11.8 s, one after another) are the larger part
 of the wall time. Every row computes in every step, so one request on a
 9-row artifact pays for nine (95.5 ms a step). About half the processes

@@ -2542,26 +2542,6 @@ def _check_rings():
     return True
 
 
-def _check_long_prefill(model, prompts, settings, artifact, plain):
-    """A prefill longer than ops.DECODE_MAX_ROWS takes cpu-grouped (each expert dequantized once,
-    then torch's GEMM) instead of the decode kernels. The selftest's prompts are shorter than the
-    limit, so the check lowers it to 32: the 100-token prompt's prefill takes cpu-grouped, and its
-    tokens match the plain engine's."""
-    from . import ops
-    saved = ops.DECODE_MAX_ROWS, ops.PINNED_MAX_ROWS
-    ops.DECODE_MAX_ROWS = ops.PINNED_MAX_ROWS = 32
-    try:
-        got = record_vxpu_engine(model, "main", prompts, settings, artifact)
-    finally:
-        ops.DECODE_MAX_ROWS, ops.PINNED_MAX_ROWS = saved
-    print("prefills of more than 32 tokens on cpu-grouped, against the plain engine:")
-    rows, ok = compare(plain, got, strict_tokens=True)
-    print(table(plain, got, rows))
-    if not ok:
-        print("long prefill check: cpu-grouped differs from the decode kernels")
-    return ok
-
-
 def _check_speculative_decode(model, artifact, workdir):
     """Speculative decoding: decode steps of several tokens per row verify drafts, from the
     model's own drafter (draft.pt2, the DSpark stages) and from prompt lookup (any model). Four
@@ -2680,8 +2660,6 @@ def selftest(workdir, settings):
             failed.append(name + " (batched decode)")
         if name == "tiny-deepseek-v41" and not _check_speculative_decode(model, artifact, workdir):
             failed.append(name + " (speculative decode)")
-        if name == "tiny-deepseek-v41" and not _check_long_prefill(model, prompts, settings, artifact, got):
-            failed.append(name + " (long prefill)")
         if name == "tiny-deepseek-v41" and not _check_cuts(artifact):
             failed.append(name + " (layer cuts)")
         if name == "tiny-deepseek-v41" and not _check_slices(model, prompts, settings, artifact, got):
