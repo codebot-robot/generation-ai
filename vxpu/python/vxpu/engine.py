@@ -1254,6 +1254,14 @@ class Engine:
                 session, list(input_ids), max_new_tokens, params,
                 extra_eos_ids, logits_sink, telemetry)
 
+    def _native_rows(self, sampler=None):
+        """Whether rows decode on the native loop (_NativeRows): the decode is the captured step
+        graph, one token a step, and the request is greedy (the graph chooses the argmax)."""
+        from .stepgraph import StepGraph
+        greedy = sampler is None or (not sampler.do_sample and sampler.repetition_penalty == 1.0)
+        return (greedy and self.step_tokens == 1 and isinstance(self._decode_split, StepGraph)
+                and self._decode_split.graph is not None)
+
     def _uses_rows(self):
         """Whether requests decode in rows (_Rows, through the scheduler): an artifact with several
         rows, or with decode steps of several tokens (speculative decoding)."""
@@ -1291,6 +1299,8 @@ class Engine:
         for request in requests:
             self._check_prompt(request.prompt)
         waiting = sorted(range(len(prompts)), key=lambda i: arrivals[i])
+        if not telemetry and all(self._native_rows(r.sampler) for r in requests):
+            return self._generate_rows_native(requests, waiting, arrivals)
         step_ms, rows_active = [], []
         recorder = None
         with self._lock:
@@ -1329,6 +1339,29 @@ class Engine:
             recorder.phase = "decode"
             out["telemetry"] = recorder.result(plan_record(self.explain()))
         return out
+
+    def _generate_rows_native(self, requests, waiting, arrivals):
+        """generate_rows on the native loop (_NativeRows): the loop steps by itself, and a prompt
+        joins at the first boundary after the loop has run `arrivals[i]` steps (at once when no
+        row decodes)."""
+        with self._lock:
+            rows = _NativeRows(self)
+            try:
+                with self.external_scope():
+                    rows.bind()
+                    while waiting or rows.requests:
+                        row = rows.free_row()
+                        while (row is not None and waiting
+                               and (arrivals[waiting[0]] <= rows.loop.steps() or not rows.requests)):
+                            rows.admit(requests[waiting.pop(0)], row)
+                            row = rows.free_row()
+                        rows.pump(0.001 if waiting else 0.05)
+                steps = rows.loop.take_steps()
+            finally:
+                rows.close()
+        return {"token_ids": [r.token_ids for r in requests], "prefill_ms": [r.prefill_ms for r in requests],
+                "step_ms": [ms for ms, _ in steps], "rows_active": [n for _, n in steps if n],
+                "drafted": 0, "accepted": 0, "native": True}
 
     def _check_prompt(self, prompt):
         if not self.min_prefill_len <= len(prompt) <= self.max_cache_len - 1:
@@ -1528,6 +1561,25 @@ class _Request:
             self.sink({"token_ids": [], "done": True, "error": error})
 
 
+def _prefill_row(engine, state, request, row, row0_decodes):
+    """Prefill request alone in row 0 (the prefill graph has one row), then move its state to
+    `row`. When row 0 decodes another request (row0_decodes), its state is set aside for the
+    prefill and put back. Returns the prefill's logits."""
+    e = engine
+    started = time.perf_counter()
+    live = e._live_state(state)
+    kept = {fqn: tensor[0].clone() for fqn, tensor in live.items()} if row != 0 and row0_decodes else None
+    logits = e._prefill_run(input_ids=torch.tensor([request.prompt], dtype=torch.long, device=e.device),
+                            cache_position=torch.arange(0, len(request.prompt), device=e.device))
+    if row != 0:
+        for fqn, tensor in live.items():
+            tensor[row].copy_(tensor[0])
+            if kept is not None:
+                tensor[0].copy_(kept[fqn])
+    request.prefill_ms = (time.perf_counter() - started) * 1e3
+    return logits
+
+
 class _Rows:
     """A batch engine's rows (continuous batching): each row decodes one request at its own
     position. A prompt is prefilled alone, in row 0 (the prefill graph's one row), and then moved
@@ -1566,21 +1618,8 @@ class _Rows:
         return [row for row in range(self.batch) if self.requests[row] is not None]
 
     def admit(self, request, row):
-        """Prefill request in row 0, then move its state to `row`. A request decoding in row 0
-        keeps its state: it is set aside for the prefill and put back."""
-        e = self.engine
-        started = time.perf_counter()
-        live = e._live_state(self.state)
-        kept = ({fqn: tensor[0].clone() for fqn, tensor in live.items()}
-                if row != 0 and self.requests[0] is not None else None)
-        logits = e._prefill_run(input_ids=torch.tensor([request.prompt], dtype=torch.long, device=e.device),
-                                cache_position=torch.arange(0, len(request.prompt), device=e.device))
-        if row != 0:
-            for fqn, tensor in live.items():
-                tensor[row].copy_(tensor[0])
-                if kept is not None:
-                    tensor[0].copy_(kept[fqn])
-        request.prefill_ms = (time.perf_counter() - started) * 1e3
+        """Prefill request in row 0, then move its state to `row` (_prefill_row)."""
+        logits = _prefill_row(self.engine, self.state, request, row, self.requests[0] is not None)
         self.requests[row], self.fed[row] = request, list(request.prompt)
         self.pending[row] = [request.sampler.pick(logits[0, -1], self.fed[row])]
 
@@ -1639,6 +1678,79 @@ class _Rows:
         return (time.perf_counter() - started) * 1e3
 
 
+class _NativeRows:
+    """_Rows' work with no Python between decode steps. The step graph's native loop
+    (StepGraph.native_loop, node_server.cpp's DecodeLoop) runs every step and chooses each row's
+    token in the graph (greedy); Python admits requests between steps (the loop paused for the
+    prefill) and hands the emitted tokens to their requests. For an engine whose decode is the
+    captured step graph, one token a step, and greedy requests (Engine._native_rows)."""
+
+    FINISH = {1: "eos", 2: "length"}
+
+    def __init__(self, engine):
+        self.engine = engine
+        self.batch = engine.binding.get("batch", 1)
+        self.state = {fqn: torch.zeros(shape, dtype=dtype, device=engine.device)
+                      for fqn, (shape, dtype) in engine.state_specs.items()}
+        self.loop = None
+        self.requests = {}  # id(request) -> request, while its row decodes
+
+    def bind(self):
+        e = self.engine
+        e._bind(self.state)
+        e._current = {"id": "rows", "state": self.state}
+        if self.loop is None:
+            self.loop = e._decode_split.native_loop()
+
+    def free_row(self):
+        free = self.loop.free_rows()
+        return free[0] if free else None
+
+    def admit(self, request, row):
+        """Prefill request into `row` with the loop held between steps, emit its first token,
+        and hand the row to the loop (unless that token already ends it)."""
+        e = self.engine
+        self.loop.pause()
+        try:
+            logits = _prefill_row(e, self.state, request, row, 0 not in self.loop.free_rows())
+            first = request.sampler.pick(logits[0, -1], list(request.prompt))
+            request.emit(first)
+            if first in request.eos_ids:
+                request.finish("eos")
+            elif request.max_new_tokens <= 1 or len(request.prompt) + 1 > e.max_cache_len:
+                request.finish("length")
+            else:
+                self.requests[id(request)] = request
+                self.loop.admit(row, id(request), first, len(request.prompt), 1, request.max_new_tokens,
+                                sorted(request.eos_ids), e.max_cache_len)
+        finally:
+            self.loop.resume()
+
+    def pump(self, timeout):
+        """Hand the loop's emitted tokens to their requests, waiting up to `timeout` s for some,
+        and stop the requests whose callers left. Returns how many requests still decode."""
+        for rid, request in list(self.requests.items()):
+            if request.cancelled:
+                self.loop.cancel(rid)
+        for rid, tokens, finish, error in self.loop.events(timeout):
+            request = self.requests.get(rid)
+            if request is None:
+                continue
+            for token_id in tokens:
+                request.emit(token_id)
+            if finish:
+                del self.requests[rid]
+                if finish in self.FINISH:
+                    request.finish(self.FINISH[finish])
+                elif error:
+                    request.fail(RuntimeError(error))
+        return len(self.requests)
+
+    def close(self):
+        if self.loop is not None:
+            self.loop.stop()
+
+
 class _ModelDrafter:
     """Drafts from the model's own drafter (draft.pt2): each row's next token, at its position,
     in; the drafter's block of tokens after it out."""
@@ -1679,14 +1791,17 @@ class _LookupDrafter:
 
 class _Scheduler:
     """Continuous batching for a batch engine's concurrent requests: a thread steps every decoding
-    row together, and admits waiting requests into free rows between steps."""
+    row together, and admits waiting requests into free rows between steps. With the step graph,
+    the native loop steps the rows (_NativeRows) and this thread only admits requests and hands
+    out their tokens."""
 
     def __init__(self, engine):
         self.engine = engine
-        self.rows = _Rows(engine)
+        native = engine._native_rows()
+        self.rows = _NativeRows(engine) if native else _Rows(engine)
         self.waiting = collections.deque()
         self.ready = threading.Condition()
-        threading.Thread(target=self._loop, name="vxpu-rows", daemon=True).start()
+        threading.Thread(target=self._native_loop if native else self._loop, name="vxpu-rows", daemon=True).start()
 
     def submit(self, prompt, max_new_tokens, params, extra_eos_ids=()):
         """Queue a request; yields its events as they come, as Engine.generate does."""
@@ -1732,6 +1847,34 @@ class _Scheduler:
                 for row in self.rows.active():
                     self.rows.requests[row].fail(error)
                     self.rows.requests[row] = None
+
+    def _native_loop(self):
+        while True:
+            with self.ready:
+                while not self.waiting and not self.rows.requests:
+                    self.ready.wait()
+            try:
+                with self.engine._lock, self.engine.external_scope():
+                    self.rows.bind()
+                    row = self.rows.free_row()
+                    while row is not None:
+                        with self.ready:
+                            request = self.waiting.popleft() if self.waiting else None
+                        if request is None:
+                            break
+                        if request.cancelled:
+                            continue
+                        if not self.engine._native_rows(request.sampler):
+                            request.fail(NotImplementedError(
+                                "the native decode loop chooses greedily; sampling there comes with GPU sampling"))
+                            continue
+                        self.rows.admit(request, row)
+                        row = self.rows.free_row()
+                self.rows.pump(0.002 if self.waiting else 0.05)
+            except Exception as error:  # noqa: BLE001  (every decoding request fails with it)
+                for request in self.rows.requests.values():
+                    request.fail(error)
+                self.rows.requests.clear()
 
 
 class SamplingParams:

@@ -196,6 +196,24 @@ class StepGraph(torch.nn.Module):
         out = out[0] if isinstance(out, (tuple, list)) and len(out) == 1 else out
         return out.clone() if isinstance(out, torch.Tensor) else out
 
+    def native_loop(self):
+        """The captured step, decoded by a native thread with no Python between steps
+        (node_server.cpp's DecodeLoop): it writes each row's token and position into the
+        graph's input buffers, replays the graphs and reads the greedy choices back. Needs the
+        graph captured, a step of one token per row, and greedy decoding."""
+        if self.graph is None or self._chosen is None:
+            raise RuntimeError("native loop: the step graph is not captured, or its output is not logits")
+        names = list(self.runner.graph.inputs)
+        if sorted(names) != ["cache_position", "input_ids"]:
+            raise RuntimeError(f"native loop: a decode step's inputs are input_ids and cache_position, not {names}")
+        ids, pos = (self._inputs[names.index(n)] for n in ("input_ids", "cache_position"))
+        index = ids.device.index if ids.device.index is not None else torch.cuda.current_device()
+        execs = [self.graph.raw_cuda_graph_exec()] + [g.raw_cuda_graph_exec() for _, g in self._peer_graphs]
+        streams = [torch.cuda.current_stream(index).cuda_stream] + [torch.cuda.current_stream(p).cuda_stream
+                                                                   for p, _ in self._peer_graphs]
+        devices = [index] + [torch.device(p).index for p, _ in self._peer_graphs]
+        return kernels.load().DecodeLoop(ids, pos, self._chosen, execs, streams, devices, self._host, self._flags)
+
     def _input_values(self, args, kwargs):
         values = dict(zip(self.runner.graph.inputs, args), **kwargs)
         return [values[name] for name in self.runner.graph.inputs]
@@ -440,6 +458,10 @@ class StepGraph(torch.nn.Module):
                 produced[node.name] = reply
                 mailboxes.append((node, pinned, kwargs_, outbox, F * i, pooled.get(node.name)))
             output = resolve(graph.output)
+            # the greedy choice, in the graph: a decode step's logits [rows, tokens, vocab] become each
+            # position's argmax, so a native loop (native_loop) reads token ids, not logits
+            logits = output[0] if isinstance(output, (tuple, list)) and len(output) == 1 else output
+            chosen = logits.argmax(-1) if isinstance(logits, torch.Tensor) and logits.dim() == 3 else None
         peer_graphs = [self._capture_peer(pdev, peers.index(pdev), driver, flags, F, host_nodes, boxes, pooled)
                        for pdev in peers]
         host = kernels.load().StepHost(flags)
@@ -457,6 +479,7 @@ class StepGraph(torch.nn.Module):
         host.start()
         # all at once: a capture that fails leaves the step graph as it was, and the next step tries again
         self.graph, self._output, self._peer_graphs, self._host = g, output, peer_graphs, host
+        self._chosen = chosen
         self._flags, self._box_info, self._events = flags, info, events
         # what the graphs use that lives outside their memory pools (the pinned boxes, the other
         # GPUs' inboxes, flags and reply buffers, the slot maps' copies): freed, that memory would

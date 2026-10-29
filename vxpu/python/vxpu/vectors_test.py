@@ -2583,6 +2583,51 @@ def _check_gpu_rings():
     return True
 
 
+def _check_native_rows(model, workdir):
+    """On a GPU: continuous batching with no Python between decode steps. With the step graph, rows
+    decode on its native loop (StepGraph.native_loop, _NativeRows): generate_rows gives four prompts
+    on three rows exactly the tokens the same step graph gives when Python drives each step, and
+    concurrent requests through the scheduler (also on the native loop) get them again."""
+    import threading
+    from .engine import Engine, SamplingParams
+    from .export import export_artifact
+    artifact = os.path.join(workdir, "tiny-deepseek-v41-artifact-native")
+    export_artifact(model, artifact, max_cache_len=1024, batch=3)
+    greedy = SamplingParams(do_sample=False)
+    prompts = [[(11 * i + 7 * j + 5) % 30000 + 100 for j in range(n)] for i, n in enumerate((9, 14, 21, 12))]
+    env = {"VXPU_DATAFLOW": "1", "VXPU_STEP_GRAPH": "1", "VXPU_SEGMENT_RUNTIME": "aoti",
+           "VXPU_AOTI_CACHE_DIR": os.path.join(workdir, "aoti"), "VXPU_DATAFLOW_PLACE": None,
+           "VXPU_EXPERT_MAILBOXES": None, "VXPU_GPU_EXPERTS": None}
+    engine = _with_env(env, Engine, artifact, device="cuda", compile_decode=True)
+    native = engine.generate_rows(prompts, 16, greedy)
+    python = engine.generate_rows(prompts, 16, greedy, telemetry=True)  # telemetry keeps Python driving the steps
+    if not native.get("native"):
+        print("native rows check: generate_rows did not take the native loop")
+        return False
+    differ = [i for i, (a, b) in enumerate(zip(native["token_ids"], python["token_ids"])) if a != b]
+    if differ:
+        print(f"native rows check: prompts {differ} differ between the native loop and Python driving the steps")
+        return False
+    got = [None] * len(prompts)
+
+    def run(i):
+        got[i] = [t for ev in engine.generate(engine.new_session(), prompts[i], 16, greedy) for t in ev["token_ids"]]
+    threads = [threading.Thread(target=run, args=(i,)) for i in range(len(prompts))]
+    for thread in threads:
+        thread.start()
+    for thread in threads:
+        thread.join(timeout=600)
+    if got != native["token_ids"]:
+        print(f"native rows check: the scheduler's requests differ from generate_rows ({got} vs {native['token_ids']})")
+        return False
+    def median(v):
+        return sorted(v)[len(v) // 2]
+    print(f"native rows: 4 prompts on 3 rows, every decode step run by the native loop ({len(native['step_ms'])} "
+          f"steps, median {median(native['step_ms']):.2f} ms; {median(python['step_ms']):.2f} ms with Python driving "
+          f"each step), the same tokens; 4 concurrent requests through the scheduler match")
+    return True
+
+
 def _check_speculative_decode(model, artifact, workdir):
     """Speculative decoding: decode steps of several tokens per row verify drafts, from the
     model's own drafter (draft.pt2, the DSpark stages) and from prompt lookup (any model). Four
@@ -2703,6 +2748,8 @@ def selftest(workdir, settings):
             failed.append(name + " (batched decode)")
         if name == "tiny-deepseek-v41" and not _check_speculative_decode(model, artifact, workdir):
             failed.append(name + " (speculative decode)")
+        if name == "tiny-deepseek-v41" and _cuda() and not _check_native_rows(model, workdir):
+            failed.append(name + " (native rows)")
         if name == "tiny-deepseek-v41" and not _check_cuts(artifact):
             failed.append(name + " (layer cuts)")
         if name == "tiny-deepseek-v41" and not _check_slices(model, prompts, settings, artifact, got):

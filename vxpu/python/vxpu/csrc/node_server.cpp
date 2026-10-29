@@ -50,6 +50,8 @@
 // round trip with no work, for measuring the wire.
 
 #include <torch/extension.h>
+#include <algorithm>
+#include <map>
 #include <torch/csrc/inductor/aoti_package/model_package_loader.h>
 
 #include <arpa/inet.h>
@@ -861,6 +863,258 @@ class RangeServer {
   std::atomic<int64_t> messages_{0}, native_{0};
 };
 
+// DecodeLoop: a batch engine's rows, decoded with no Python between steps.
+// The step graph is captured with the greedy choice at its end (each row's
+// argmax, into `chosen`). A native thread runs every step: it writes each
+// row's next token and position into the graph's input buffers, has the
+// step host go, launches the graphs, and reads the chosen tokens back. A
+// row then emits its token, stops on an end-of-turn id or its limits, or
+// feeds the token at its next position. A row with nothing to decode feeds
+// its last token again (whatever that writes, its next prefill replaces).
+// Python admits a request between steps (pause, prefill the row, admit,
+// resume), cancels one, and takes the emitted tokens as events.
+class DecodeLoop {
+ public:
+  // input_ids [B, 1] and positions [B] int64 on the GPU (the graph's input
+  // buffers), chosen [B, 1] int64 on the GPU (the graph's argmax), then the
+  // graphs to launch as RangeServer::set_decode takes them.
+  DecodeLoop(at::Tensor input_ids, at::Tensor positions, at::Tensor chosen, const std::vector<int64_t>& execs,
+             const std::vector<int64_t>& streams, const std::vector<int64_t>& devices, pybind11::object host,
+             at::Tensor flags)
+      : input_ids_(std::move(input_ids)), positions_(std::move(positions)), chosen_(std::move(chosen)),
+        execs_(execs), streams_(streams), devices_(devices), host_obj_(std::move(host)), flags_(std::move(flags)) {
+    TORCH_CHECK(input_ids_.scalar_type() == at::kLong && input_ids_.dim() == 2 && input_ids_.size(1) == 1,
+                "decode loop: input_ids must be int64 [B, 1] (one token a step)");
+    TORCH_CHECK(positions_.scalar_type() == at::kLong && positions_.numel() == input_ids_.size(0),
+                "decode loop: positions must be int64 [B]");
+    TORCH_CHECK(chosen_.scalar_type() == at::kLong && chosen_.numel() == input_ids_.size(0),
+                "decode loop: chosen must be int64 [B, 1]");
+    host_ = host_obj_.cast<StepHost*>();
+    rows_.resize(input_ids_.size(0));
+    auto pinned = at::TensorOptions().dtype(at::kLong).pinned_memory(true);
+    ids_host_ = at::zeros({input_ids_.size(0)}, pinned);
+    pos_host_ = at::zeros({input_ids_.size(0)}, pinned);
+    chosen_host_ = at::zeros({input_ids_.size(0)}, pinned);
+    for (int64_t d : devices_) {
+      void* c = nullptr;
+      Driver::check(Driver::get().primary_ctx_retain(&c, static_cast<int>(d)), "cuDevicePrimaryCtxRetain");
+      ctxs_.push_back(c);
+    }
+    thread_ = std::thread([this] { loop(); });
+  }
+
+  ~DecodeLoop() { stop(); }
+
+  // Hold the loop between steps (returns once no step runs).
+  void pause() {
+    std::unique_lock<std::mutex> lk(mu_);
+    paused_ = true;
+    idle_.wait(lk, [&] { return !stepping_; });
+  }
+
+  void resume() {
+    {
+      std::lock_guard<std::mutex> lk(mu_);
+      paused_ = false;
+    }
+    wake_.notify_one();
+  }
+
+  // Row `row` decodes request `request` from here: it feeds next_token at
+  // `position`, has emitted `emitted` tokens of at most max_new, stops on
+  // any of eos, and may not feed past max_position. Call while paused.
+  void admit(int64_t row, int64_t request, int64_t next_token, int64_t position, int64_t emitted, int64_t max_new,
+             const std::vector<int64_t>& eos, int64_t max_position) {
+    std::lock_guard<std::mutex> lk(mu_);
+    TORCH_CHECK(row >= 0 && row < static_cast<int64_t>(rows_.size()), "decode loop: no row ", row);
+    TORCH_CHECK(!rows_[row].active, "decode loop: row ", row, " is decoding another request");
+    Row& r = rows_[row];
+    r = Row{};
+    r.active = r.used = true;
+    r.request = request;
+    r.next = next_token;
+    r.position = position;
+    r.emitted = emitted;
+    r.max_new = max_new;
+    r.max_position = max_position;
+    r.eos = eos;
+  }
+
+  // The request stops at the next step boundary (its row frees).
+  void cancel(int64_t request) {
+    std::lock_guard<std::mutex> lk(mu_);
+    for (Row& r : rows_)
+      if (r.active && r.request == request) finish(r, kCancelled, "");
+  }
+
+  // The rows that are free.
+  std::vector<int64_t> free_rows() {
+    std::lock_guard<std::mutex> lk(mu_);
+    std::vector<int64_t> out;
+    for (size_t i = 0; i < rows_.size(); ++i)
+      if (!rows_[i].active) out.push_back(static_cast<int64_t>(i));
+    return out;
+  }
+
+  // Emitted tokens since the last call, per request: (request, tokens,
+  // finish: 0 still decoding, 1 eos, 2 length, 3 cancelled, 4 error, the
+  // error). Waits up to timeout_s for something to report.
+  std::vector<std::tuple<int64_t, std::vector<int64_t>, int64_t, std::string>> events(double timeout_s) {
+    std::unique_lock<std::mutex> lk(mu_);
+    events_cv_.wait_for(lk, std::chrono::duration<double>(timeout_s), [&] { return !pending_.empty() || stop_; });
+    std::vector<std::tuple<int64_t, std::vector<int64_t>, int64_t, std::string>> out;
+    for (auto& [request, e] : pending_) out.emplace_back(request, std::move(e.tokens), e.finish, e.error);
+    pending_.clear();
+    return out;
+  }
+
+  // Steps run, and since the last call each step's time in ms (the native
+  // loop's own timing: inputs written to chosen tokens read) and how many
+  // rows it decoded.
+  int64_t steps() const { return steps_.load(); }
+  std::vector<std::pair<double, int64_t>> take_steps() {
+    std::lock_guard<std::mutex> lk(mu_);
+    std::vector<std::pair<double, int64_t>> out;
+    std::swap(out, step_log_);
+    return out;
+  }
+
+  void stop() {
+    {
+      std::lock_guard<std::mutex> lk(mu_);
+      if (stop_) return;
+      stop_ = true;
+    }
+    wake_.notify_all();
+    events_cv_.notify_all();
+    if (thread_.joinable()) thread_.join();
+  }
+
+ private:
+  enum Finish : int64_t { kDecoding = 0, kEos = 1, kLength = 2, kCancelled = 3, kError = 4 };
+  struct Row {
+    bool active = false, used = false;
+    int64_t request = -1, next = 0, position = 0, emitted = 0, max_new = 0, max_position = 0;
+    int64_t fed = 0, fed_position = 0;  // the token it fed last, and where: an idle row feeds it again
+    std::vector<int64_t> eos;
+  };
+  struct Event {
+    std::vector<int64_t> tokens;
+    int64_t finish = kDecoding;
+    std::string error;
+  };
+
+  void finish(Row& r, int64_t why, const std::string& error) {  // with mu_ held
+    Event& e = pending_[r.request];
+    e.finish = why;
+    e.error = error;
+    r.active = false;
+    events_cv_.notify_all();
+  }
+
+  bool any_active() const {
+    for (const Row& r : rows_)
+      if (r.active) return true;
+    return false;
+  }
+
+  void loop() {
+    auto& cu = Driver::get();
+    Driver::check(cu.ctx_set_current(ctxs_[0]), "cuCtxSetCurrent");
+    void* stream = reinterpret_cast<void*>(streams_[0]);
+    int64_t* ids = ids_host_.data_ptr<int64_t>();
+    int64_t* pos = pos_host_.data_ptr<int64_t>();
+    const int64_t* chosen = chosen_host_.data_ptr<int64_t>();
+    const size_t n = rows_.size(), bytes = n * sizeof(int64_t);
+    int64_t decoding = 0;  // rows decoding in the step
+    for (;;) {
+      {
+        std::unique_lock<std::mutex> lk(mu_);
+        wake_.wait(lk, [&] { return stop_ || (!paused_ && any_active()); });
+        if (stop_) return;
+        stepping_ = true;
+        decoding = 0;
+        for (size_t i = 0; i < n; ++i) {
+          Row& r = rows_[i];
+          if (r.active) {
+            r.fed = r.next;
+            r.fed_position = r.position;
+            decoding++;
+          }
+          ids[i] = r.used ? r.fed : 0;  // an idle row feeds its last token again; a row never used, 0 at 0
+          pos[i] = r.used ? r.fed_position : 0;
+        }
+      }
+      const int64_t t0 = now_ns();
+      std::string error;
+      try {
+        Driver::check(cu.memcpy_async(reinterpret_cast<uint64_t>(input_ids_.data_ptr()), reinterpret_cast<uint64_t>(ids),
+                                      bytes, stream), "cuMemcpyAsync");
+        Driver::check(cu.memcpy_async(reinterpret_cast<uint64_t>(positions_.data_ptr()), reinterpret_cast<uint64_t>(pos),
+                                      bytes, stream), "cuMemcpyAsync");
+        host_->go();
+        for (size_t g = 0; g < execs_.size(); ++g) {  // the engine's GPU's graph first: the others wait on its flags
+          Driver::check(cu.ctx_set_current(ctxs_[g]), "cuCtxSetCurrent");
+          Driver::check(cu.graph_launch(reinterpret_cast<void*>(execs_[g]), reinterpret_cast<void*>(streams_[g])),
+                        "cuGraphLaunch");
+        }
+        Driver::check(cu.ctx_set_current(ctxs_[0]), "cuCtxSetCurrent");
+        Driver::check(cu.memcpy_async(reinterpret_cast<uint64_t>(chosen_host_.data_ptr()),
+                                      reinterpret_cast<uint64_t>(chosen_.data_ptr()), bytes, stream), "cuMemcpyAsync");
+        for (size_t g = 0; g < execs_.size(); ++g) {
+          Driver::check(cu.ctx_set_current(ctxs_[g]), "cuCtxSetCurrent");
+          Driver::check(cu.stream_sync(reinterpret_cast<void*>(streams_[g])), "cuStreamSynchronize");
+        }
+        Driver::check(cu.ctx_set_current(ctxs_[0]), "cuCtxSetCurrent");
+        error = host_->take_error();
+      } catch (const std::exception& e) {
+        error = e.what();
+      }
+      const double ms = (now_ns() - t0) / 1e6;
+      std::lock_guard<std::mutex> lk(mu_);
+      stepping_ = false;
+      steps_++;
+      step_log_.emplace_back(ms, decoding);
+      if (!error.empty()) {
+        flags_.zero_();  // the host released every flag; the next step starts clean
+        for (Row& r : rows_)
+          if (r.active) finish(r, kError, "decode loop: " + error);
+      } else {
+        for (size_t i = 0; i < n; ++i) {
+          Row& r = rows_[i];
+          if (!r.active) continue;
+          const int64_t token = chosen[i];
+          pending_[r.request].tokens.push_back(token);
+          events_cv_.notify_all();
+          r.emitted++;
+          r.position++;
+          r.next = token;
+          if (std::find(r.eos.begin(), r.eos.end(), token) != r.eos.end())
+            finish(r, kEos, "");
+          else if (r.emitted >= r.max_new || r.position + 1 > r.max_position)
+            finish(r, kLength, "");
+        }
+      }
+      idle_.notify_all();
+    }
+  }
+
+  at::Tensor input_ids_, positions_, chosen_;
+  std::vector<int64_t> execs_, streams_, devices_;
+  std::vector<void*> ctxs_;
+  pybind11::object host_obj_;
+  StepHost* host_ = nullptr;
+  at::Tensor flags_, ids_host_, pos_host_, chosen_host_;
+  std::vector<Row> rows_;
+  std::map<int64_t, Event> pending_;
+  std::vector<std::pair<double, int64_t>> step_log_;
+  std::atomic<int64_t> steps_{0};
+  std::mutex mu_;
+  std::condition_variable wake_, idle_, events_cv_;
+  bool paused_ = false, stepping_ = false, stop_ = false;
+  std::thread thread_;
+};
+
 void register_node_server(pybind11::module& m) {
   pybind11::class_<NodeClient, std::shared_ptr<NodeClient>>(m, "NodeClient")
       .def(pybind11::init<const std::string&, int64_t>())
@@ -883,6 +1137,18 @@ void register_node_server(pybind11::module& m) {
       .def("times", &StepHost::times)
       .def("running", &StepHost::running)
       .def("stop", &StepHost::stop, pybind11::call_guard<pybind11::gil_scoped_release>());
+  pybind11::class_<DecodeLoop>(m, "DecodeLoop")
+      .def(pybind11::init<at::Tensor, at::Tensor, at::Tensor, const std::vector<int64_t>&, const std::vector<int64_t>&,
+                          const std::vector<int64_t>&, pybind11::object, at::Tensor>())
+      .def("pause", &DecodeLoop::pause, pybind11::call_guard<pybind11::gil_scoped_release>())
+      .def("resume", &DecodeLoop::resume)
+      .def("admit", &DecodeLoop::admit)
+      .def("cancel", &DecodeLoop::cancel)
+      .def("free_rows", &DecodeLoop::free_rows)
+      .def("events", &DecodeLoop::events, pybind11::call_guard<pybind11::gil_scoped_release>())
+      .def("steps", &DecodeLoop::steps)
+      .def("take_steps", &DecodeLoop::take_steps)
+      .def("stop", &DecodeLoop::stop, pybind11::call_guard<pybind11::gil_scoped_release>());
   pybind11::class_<RangeServer>(m, "RangeServer")
       .def(pybind11::init<int64_t, pybind11::function>())
       .def("port", &RangeServer::port)
