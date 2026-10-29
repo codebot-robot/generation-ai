@@ -86,6 +86,18 @@ def _launcher(kernel, device, traced):
 
 if triton is not None:
     @triton.jit
+    def _round_e4m3(q):
+        """q (fp32, within +-448) rounded to the nearest fp8 e4m3 value, ties to even, as a cast to
+        float8_e4m3fn and back does, in fp32 arithmetic: a normal value keeps 3 of its 23 mantissa
+        bits (round to nearest even on the 20 dropped), a subnormal one (below 2^-6) becomes a
+        multiple of 2^-9. Any GPU (Triton's fp8e4nv type needs sm_89)."""
+        bits = q.to(tl.int32, bitcast=True)
+        lsb = (bits >> 20) & 1
+        normal = ((bits + 0x7FFFF + lsb) & ~0xFFFFF).to(tl.float32, bitcast=True)
+        sub = tl.extra.cuda.libdevice.rint(q * 512.0) / 512.0
+        return tl.where(tl.abs(q) < 0.015625, sub, normal)
+
+    @triton.jit
     def _act_quant_dequant_kernel(x_ptr, y_ptr, n_groups, G: tl.constexpr):
         pid = tl.program_id(0)
         g = pid.to(tl.int64) * G + tl.arange(0, G)  # int64: offsets of activations past 2^31 elements
@@ -101,7 +113,7 @@ if triton is not None:
         exponent = tl.where((bits & 0x7FFFFF) == 0, exponent, exponent + 1)
         scale = (exponent << 23).to(tl.float32, bitcast=True)
         q = tl.minimum(tl.maximum(x / scale[:, None], -448.0), 448.0)
-        y = q.to(tl.float8e4nv).to(tl.float32) * scale[:, None]
+        y = _round_e4m3(q) * scale[:, None]
         tl.store(y_ptr + offs, y.to(tl.bfloat16), mask=live[:, None])
 
 
@@ -411,7 +423,7 @@ if triton is not None:
         exponent = tl.where((bits & 0x7FFFFF) == 0, exponent, exponent + 1)
         scale = (exponent << 23).to(tl.float32, bitcast=True)
         q = tl.minimum(tl.maximum(h / scale[:, None], -448.0), 448.0)
-        y = q.to(tl.float8e4nv).to(tl.float32) * scale[:, None]
+        y = _round_e4m3(q) * scale[:, None]
         tl.store(h_ptr + offs, y.to(tl.bfloat16), mask=live[:, None])
 
 

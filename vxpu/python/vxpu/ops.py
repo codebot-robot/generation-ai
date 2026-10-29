@@ -30,6 +30,7 @@ cudagraph_unsafe and, for torch.compile, kept out of the compiled graph
 (prepare_compile), so CUDA graphs cover the dense segments between.
 """
 
+import functools
 import contextlib
 import threading
 import time
@@ -475,7 +476,8 @@ def _fp8_linear_cpu(x, weight, scale):
 # dequantized once and kept, and torch's GEMM.
 @implementation("vxpu::fp8_linear", "gpu-fp8-gemv", ("cuda",), "rounding",
                 f"Triton, at most {4} rows (decode): the activation quantized by one kernel, the fp8 weight read directly",
-                applies=lambda plan, rows=0, **_: plan["triton"] and rows <= FP8_GEMV_MAX_ROWS, lowerable=True)
+                applies=lambda plan, rows=0, **_: plan["triton"] and rows <= FP8_GEMV_MAX_ROWS and _fp8_native(),
+                lowerable=True)
 def _fp8_linear_gemv(x, weight, scale, tk=triton_ops):
     xf = tk.act_quant_dequant(x)
     y = tk.fp8_gemv(xf.reshape(-1, xf.shape[-1]), weight, scale)
@@ -535,7 +537,8 @@ def _grouped_context(o, weight, scale):
 
 @implementation("vxpu::fp8_grouped_linear", "gpu-fp8-gemv", ("cuda",), "rounding",
                 "Triton, at most 4 rows (decode): the grouped fp8 GEMV, the weight read once as fp8",
-                applies=lambda plan, rows=0, **_: plan["triton"] and rows <= FP8_GEMV_MAX_ROWS, lowerable=True)
+                applies=lambda plan, rows=0, **_: plan["triton"] and rows <= FP8_GEMV_MAX_ROWS and _fp8_native(),
+                lowerable=True)
 def _grouped_gemv(o, weight, scale, tk=triton_ops):
     *lead, g, d = o.shape
     r = weight.shape[0] // g
@@ -567,6 +570,13 @@ def _grouped_reference(o, weight, scale):
 def _(o, weight, scale):
     *lead, g, d = o.shape
     return o.new_empty(tuple(lead) + (g, weight.shape[0] // g))
+
+
+@functools.lru_cache(1)
+def _fp8_native():
+    """Whether this GPU has fp8 (e4m3) in hardware, which the fp8 GEMV loads its weights as
+    (sm_89 and newer; an A100 is sm_80). Without it the bf16 copy serves the fp8 linears."""
+    return torch.cuda.is_available() and torch.cuda.get_device_capability() >= (8, 9)
 
 
 # inputs up to this many rows take the fp8 GEMV on a GPU; longer ones the
