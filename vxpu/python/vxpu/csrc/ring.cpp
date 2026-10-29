@@ -22,6 +22,7 @@
 
 #include <torch/extension.h>
 
+#include <cstddef>
 #include <vector>
 
 #include "ring.h"
@@ -83,6 +84,17 @@ void register_rings(pybind11::module& m) {
   m.def("ring_bytes", [](int64_t slots, int64_t slot_bytes) { return vxpu::Ring::bytes_for(slots, slot_bytes); },
         "bytes a ring of `slots` slots of `slot_bytes` payload takes");
   m.def("ring_init", &ring_init, "lay out an empty ring in a uint8 tensor's memory");
+  m.def("ring_layout", []() {
+        // byte offsets, for a GPU producer or consumer that addresses the ring itself
+        pybind11::dict d;
+        d["control"] = sizeof(vxpu::RingControl);
+        d["head"] = offsetof(vxpu::RingControl, head);
+        d["tail"] = offsetof(vxpu::RingControl, tail);
+        d["slot_header"] = sizeof(vxpu::SlotHeader);
+        d["seq"] = offsetof(vxpu::SlotHeader, seq);
+        d["bytes"] = offsetof(vxpu::SlotHeader, bytes);
+        return d;
+      }, "the ring's layout: the control block's size, head and tail offsets, the slot header's size and fields");
   m.def("ring_echo", &ring_echo, "answer messages from one ring with the same bytes on another (releases the GIL)");
   m.def("ring_ping", &ring_ping, "send messages on one ring and time each reply on another, in ns");
 }
