@@ -1583,7 +1583,7 @@ def _check_step_graph(model, prompts, settings, artifact, workdir):
         return True
     base = {"VXPU_DATAFLOW": "1", "VXPU_SEGMENT_RUNTIME": "aoti", "VXPU_AOTI_CACHE_DIR": os.path.join(workdir, "aoti"),
             "VXPU_DATAFLOW_PLACE": None, "VXPU_EXPERT_MAILBOXES": None, "VXPU_GPU_EXPERTS": None}
-    ref = _with_env({**base, "VXPU_STEP_GRAPH": None}, record_vxpu_engine, model, "main", prompts, settings, artifact,
+    ref = _with_env({**base, "VXPU_STEP_GRAPH": "0"}, record_vxpu_engine, model, "main", prompts, settings, artifact,
                     device="cuda", compile_decode=True)
     keep = []
     got = _with_env({**base, "VXPU_STEP_GRAPH": "1"}, record_vxpu_engine, model, "main", prompts, settings, artifact,
@@ -1629,7 +1629,7 @@ def _check_step_graph_pools(model, prompts, settings, artifact, workdir):
                    "gpus": [{"layers": {layer: held[g::gpus] for layer in experts}} for g in range(gpus)]}, f)
     base = {"VXPU_DATAFLOW": "1", "VXPU_SEGMENT_RUNTIME": "aoti", "VXPU_AOTI_CACHE_DIR": os.path.join(workdir, "aoti"),
             "VXPU_DATAFLOW_PLACE": None, "VXPU_EXPERT_MAILBOXES": "1", "VXPU_GPU_EXPERTS": path}
-    ref = _with_env({**base, "VXPU_STEP_GRAPH": None}, record_vxpu_engine, model, "main", prompts, settings, artifact,
+    ref = _with_env({**base, "VXPU_STEP_GRAPH": "0"}, record_vxpu_engine, model, "main", prompts, settings, artifact,
                     device="cuda", compile_decode=True, telemetry=vxpu_pb2.TELEMETRY_SUMMARY)
     keep = []
     got = _with_env({**base, "VXPU_STEP_GRAPH": "1"}, record_vxpu_engine, model, "main", prompts, settings, artifact,
@@ -1667,7 +1667,7 @@ def _check_dataflow(model, prompts, settings, artifact, plain):
     print(table(plain, got, rows))
     if not torch.cuda.is_available() or not any(n.kind != "dense" for n in runner.graph.nodes):
         return ok
-    ref = _with_env({"VXPU_DATAFLOW": None}, record_vxpu_engine, model, "main", prompts, settings, artifact,
+    ref = _with_env({"VXPU_DATAFLOW": "0"}, record_vxpu_engine, model, "main", prompts, settings, artifact,
                     device="cuda")
     keep = []
     placed = _with_env({"VXPU_DATAFLOW": "1", "VXPU_DATAFLOW_PLACE": "experts=cpu,engram=cpu"}, record_vxpu_engine,

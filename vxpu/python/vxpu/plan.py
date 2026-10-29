@@ -320,7 +320,10 @@ class Plan:
         on, src = env_flag("VXPU_DIRECT_HOST_OPS", True)
         self._set("direct_host_ops", on, src, (True, False),
                   "eager host-op segments call the op's implementation directly, not through torch's dispatcher")
-        runtime, rsrc = env_choice("VXPU_SEGMENT_RUNTIME", "jit", ("jit", "aoti"))
+        # on a GPU the default is the step graph's: AOTInductor segments, the dataflow runner, one CUDA
+        # graph a step with the host ops as native mailboxes (and with rows, the native decode loop)
+        aoti_default = "aoti" if cuda and self["split_decode"] and self["split_compile"] else "jit"
+        runtime, rsrc = env_choice("VXPU_SEGMENT_RUNTIME", aoti_default, ("jit", "aoti"))
         if runtime == "aoti" and not (cuda and self["split_decode"] and self["split_compile"]):
             runtime, rsrc = "jit", "aoti requires CUDA and a compiled split decode"
         on, src = env_flag("VXPU_LOWER_DECODE", False)
@@ -357,7 +360,7 @@ class Plan:
                   "where other executors serve the ranges of layers after this engine's range, in order, as "
                   "START:END=tcp://host:port,... (an empty END means the last layer). This engine sends each step "
                   "on to them (rangeserver.py, #387)")
-        on, src = env_flag("VXPU_DATAFLOW", False)
+        on, src = env_flag("VXPU_DATAFLOW", cuda and self["segment_runtime"] == "aoti")
         self._set("dataflow", on, src, (True, False),
                   "run the decode step as a dataflow graph: its segments as nodes, each fired when the inboxes "
                   "its inputs are written into are full (dataflow.py, the reference runner; #372)")
@@ -365,7 +368,7 @@ class Plan:
             raise ConfigError("VXPU_LAYER_RANGE requires VXPU_DATAFLOW=1")
         if self["remote_ranges"] and not on:
             raise ConfigError("VXPU_REMOTE_RANGES requires VXPU_DATAFLOW=1")
-        on, src = env_flag("VXPU_STEP_GRAPH", False)
+        on, src = env_flag("VXPU_STEP_GRAPH", True)
         if on and not (cuda and self["dataflow"] and self["segment_runtime"] == "aoti" and self["kernels"]):
             on, src = False, "requires CUDA, dataflow, segment_runtime=aoti and the CPU kernels (the step host)"
         self._set("step_graph", on, src, (True, False),
