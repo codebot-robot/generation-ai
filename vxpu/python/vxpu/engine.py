@@ -923,6 +923,10 @@ class Engine:
         if self.plan["step_graph"]:
             from .stepgraph import StepGraph
             self._decode_split = StepGraph(runner)
+            draft = self._draft_run
+            if draft is not None and hasattr(draft, "split") and not self.plan["layer_range"]:
+                # the drafter's step too, so the native loop runs a speculative step with no Python
+                self._draft_run = StepGraph(dataflow.Runner(draft.split, *draft.vxpu_segments, device=self.device))
         self._segment_info = segment_info(self._decode_split.split)
         self._decode_run = self._decode_split
         msg = runner.graph.describe() + (", the step one CUDA graph" if self.plan["step_graph"] else "")
@@ -1256,10 +1260,12 @@ class Engine:
 
     def _native_rows(self, sampler=None):
         """Whether rows decode on the native loop (_NativeRows): the decode is the captured step
-        graph, one token a step, and the request is greedy (the graph chooses the argmax)."""
+        graph, with steps of several tokens the drafter's too, and the request needs no repetition
+        penalty (the graph samples by temperature, top-k and top-p: stepgraph.choose)."""
         from .stepgraph import StepGraph
-        greedy = sampler is None or (not sampler.do_sample and sampler.repetition_penalty == 1.0)
-        return (greedy and self.step_tokens == 1 and isinstance(self._decode_split, StepGraph)
+        sampled = sampler is None or sampler.repetition_penalty == 1.0  # the graph samples, without the penalty
+        drafter = self.step_tokens == 1 or (isinstance(self._draft_run, StepGraph) and self._draft_run.graph is not None)
+        return (sampled and drafter and isinstance(self._decode_split, StepGraph)
                 and self._decode_split.graph is not None)
 
     def _uses_rows(self):
@@ -1357,11 +1363,12 @@ class Engine:
                             row = rows.free_row()
                         rows.pump(0.001 if waiting else 0.05)
                 steps = rows.loop.take_steps()
+                drafted, accepted = rows.loop.drafts()
             finally:
                 rows.close()
         return {"token_ids": [r.token_ids for r in requests], "prefill_ms": [r.prefill_ms for r in requests],
                 "step_ms": [ms for ms, _ in steps], "rows_active": [n for _, n in steps if n],
-                "drafted": 0, "accepted": 0, "native": True}
+                "drafted": drafted, "accepted": accepted, "native": True}
 
     def _check_prompt(self, prompt):
         if not self.min_prefill_len <= len(prompt) <= self.max_cache_len - 1:
@@ -1681,9 +1688,10 @@ class _Rows:
 class _NativeRows:
     """_Rows' work with no Python between decode steps. The step graph's native loop
     (StepGraph.native_loop, node_server.cpp's DecodeLoop) runs every step and chooses each row's
-    token in the graph (greedy); Python admits requests between steps (the loop paused for the
-    prefill) and hands the emitted tokens to their requests. For an engine whose decode is the
-    captured step graph, one token a step, and greedy requests (Engine._native_rows)."""
+    tokens in the graph, by its sampling settings; with steps of several tokens it also runs the drafter's step
+    graph and keeps the drafts the choices agree with. Python admits requests between steps (the
+    loop paused for the prefill) and hands the emitted tokens to their requests. For an engine
+    whose decode is the captured step graph (Engine._native_rows)."""
 
     FINISH = {1: "eos", 2: "length"}
 
@@ -1700,7 +1708,7 @@ class _NativeRows:
         e._bind(self.state)
         e._current = {"id": "rows", "state": self.state}
         if self.loop is None:
-            self.loop = e._decode_split.native_loop()
+            self.loop = e._decode_split.native_loop(draft=e._draft_run if e.step_tokens > 1 else None)
 
     def free_row(self):
         free = self.loop.free_rows()
@@ -1717,12 +1725,14 @@ class _NativeRows:
             request.emit(first)
             if first in request.eos_ids:
                 request.finish("eos")
-            elif request.max_new_tokens <= 1 or len(request.prompt) + 1 > e.max_cache_len:
+            elif request.max_new_tokens <= 1 or len(request.prompt) + e.step_tokens > e.max_cache_len:
                 request.finish("length")
             else:
                 self.requests[id(request)] = request
+                sampler = request.sampler  # its settings, in the graph (stepgraph.choose)
                 self.loop.admit(row, id(request), first, len(request.prompt), 1, request.max_new_tokens,
-                                sorted(request.eos_ids), e.max_cache_len)
+                                sorted(request.eos_ids), e.max_cache_len,
+                                sampler.temperature if sampler.do_sample else 0.0, sampler.top_k, sampler.top_p)
         finally:
             self.loop.resume()
 
@@ -1866,7 +1876,7 @@ class _Scheduler:
                             continue
                         if not self.engine._native_rows(request.sampler):
                             request.fail(NotImplementedError(
-                                "the native decode loop chooses greedily; sampling there comes with GPU sampling"))
+                                "the native decode loop samples in the graph, without a repetition penalty"))
                             continue
                         self.rows.admit(request, row)
                         row = self.rows.free_row()

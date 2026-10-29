@@ -864,46 +864,89 @@ class RangeServer {
 };
 
 // DecodeLoop: a batch engine's rows, decoded with no Python between steps.
-// The step graph is captured with the greedy choice at its end (each row's
-// argmax, into `chosen`). A native thread runs every step: it writes each
-// row's next token and position into the graph's input buffers, has the
-// step host go, launches the graphs, and reads the chosen tokens back. A
-// row then emits its token, stops on an end-of-turn id or its limits, or
-// feeds the token at its next position. A row with nothing to decode feeds
-// its last token again (whatever that writes, its next prefill replaces).
-// Python admits a request between steps (pause, prefill the row, admit,
-// resume), cancels one, and takes the emitted tokens as events.
+// The step graph is captured with the greedy choice at its end (each
+// position's argmax, into `chosen`). A native thread runs every step: it
+// writes each row's tokens and position into the graph's input buffers, has
+// the step host go, launches the graphs, and reads the chosen tokens back.
+// With steps of S tokens (speculative decoding) and the drafter's captured
+// step (set_draft), each step first runs the drafter on the row's next token
+// and position, then verifies its S - 1 tokens: the row keeps each draft
+// that equals the choice before it, then the choice where they first
+// differ, as _Rows does. A row then emits its tokens, stops on an
+// end-of-turn id or its limits, or goes on from its new position. A row
+// with nothing to decode feeds its last token again (whatever that writes,
+// its next prefill replaces). Python admits a request between steps
+// (pause, prefill the row, admit, resume), cancels one, and takes the
+// emitted tokens as events.
 class DecodeLoop {
  public:
-  // input_ids [B, 1] and positions [B] int64 on the GPU (the graph's input
-  // buffers), chosen [B, 1] int64 on the GPU (the graph's argmax), then the
-  // graphs to launch as RangeServer::set_decode takes them.
+  // input_ids [B, S] and positions [B] int64 on the GPU (the graph's input
+  // buffers), chosen [B, S] int64 on the GPU (the graph's argmax), then the
+  // graphs to launch as RangeServer::set_decode takes them. Call start()
+  // (after set_draft, for speculative steps).
   DecodeLoop(at::Tensor input_ids, at::Tensor positions, at::Tensor chosen, const std::vector<int64_t>& execs,
              const std::vector<int64_t>& streams, const std::vector<int64_t>& devices, pybind11::object host,
              at::Tensor flags)
-      : input_ids_(std::move(input_ids)), positions_(std::move(positions)), chosen_(std::move(chosen)),
-        execs_(execs), streams_(streams), devices_(devices), host_obj_(std::move(host)), flags_(std::move(flags)) {
-    TORCH_CHECK(input_ids_.scalar_type() == at::kLong && input_ids_.dim() == 2 && input_ids_.size(1) == 1,
-                "decode loop: input_ids must be int64 [B, 1] (one token a step)");
-    TORCH_CHECK(positions_.scalar_type() == at::kLong && positions_.numel() == input_ids_.size(0),
+      : verify_{std::move(input_ids), std::move(positions), std::move(chosen), execs, streams, devices,
+                std::move(host), std::move(flags)} {
+    const at::Tensor& ids = verify_.ids;
+    TORCH_CHECK(ids.scalar_type() == at::kLong && ids.dim() == 2, "decode loop: input_ids must be int64 [B, S]");
+    rows_n_ = ids.size(0);
+    S_ = ids.size(1);
+    TORCH_CHECK(verify_.pos.scalar_type() == at::kLong && verify_.pos.numel() == rows_n_,
                 "decode loop: positions must be int64 [B]");
-    TORCH_CHECK(chosen_.scalar_type() == at::kLong && chosen_.numel() == input_ids_.size(0),
-                "decode loop: chosen must be int64 [B, 1]");
-    host_ = host_obj_.cast<StepHost*>();
-    rows_.resize(input_ids_.size(0));
+    TORCH_CHECK(verify_.out.scalar_type() == at::kLong && verify_.out.numel() == rows_n_ * S_,
+                "decode loop: chosen must be int64 [B, S]");
+    verify_.retain();
+    rows_.resize(rows_n_);
     auto pinned = at::TensorOptions().dtype(at::kLong).pinned_memory(true);
-    ids_host_ = at::zeros({input_ids_.size(0)}, pinned);
-    pos_host_ = at::zeros({input_ids_.size(0)}, pinned);
-    chosen_host_ = at::zeros({input_ids_.size(0)}, pinned);
-    for (int64_t d : devices_) {
-      void* c = nullptr;
-      Driver::check(Driver::get().primary_ctx_retain(&c, static_cast<int>(d)), "cuDevicePrimaryCtxRetain");
-      ctxs_.push_back(c);
-    }
-    thread_ = std::thread([this] { loop(); });
+    ids_host_ = at::zeros({rows_n_ * S_}, pinned);
+    pos_host_ = at::zeros({rows_n_}, pinned);
+    chosen_host_ = at::zeros({rows_n_ * S_}, pinned);
   }
 
   ~DecodeLoop() { stop(); }
+
+  // The drafter's captured step: input_ids [B, 1] and positions [B] int64
+  // on the GPU, its tokens out [B, K] int64 (K >= S - 1), its graphs.
+  void set_draft(at::Tensor input_ids, at::Tensor positions, at::Tensor out, const std::vector<int64_t>& execs,
+                 const std::vector<int64_t>& streams, const std::vector<int64_t>& devices, pybind11::object host,
+                 at::Tensor flags) {
+    TORCH_CHECK(!thread_.joinable(), "decode loop: set_draft before start");
+    TORCH_CHECK(S_ > 1, "decode loop: a drafter needs steps of several tokens");
+    TORCH_CHECK(input_ids.scalar_type() == at::kLong && input_ids.numel() == rows_n_ && positions.numel() == rows_n_,
+                "decode loop: the drafter takes int64 input_ids [B, 1] and positions [B]");
+    TORCH_CHECK(out.scalar_type() == at::kLong && out.dim() == 2 && out.size(0) == rows_n_ && out.size(1) >= S_ - 1,
+                "decode loop: the drafter's tokens must be int64 [B, K] with K >= S - 1");
+    draft_ = std::make_unique<Graphs>(Graphs{std::move(input_ids), std::move(positions), std::move(out), execs, streams,
+                                             devices, std::move(host), std::move(flags)});
+    draft_->retain();
+    auto pinned = at::TensorOptions().dtype(at::kLong).pinned_memory(true);
+    draft_out_host_ = at::zeros({rows_n_ * draft_->out.size(1)}, pinned);
+  }
+
+  // The graph's sampling settings, one per row on the GPU: temperature
+  // (float32; 0 chooses the argmax), top_k (int64; 0 is off), top_p
+  // (float32; 1 is off). The loop writes each row's before every step.
+  void set_sampling(at::Tensor temperature, at::Tensor top_k, at::Tensor top_p) {
+    TORCH_CHECK(!thread_.joinable(), "decode loop: set_sampling before start");
+    TORCH_CHECK(temperature.scalar_type() == at::kFloat && temperature.numel() == rows_n_ &&
+                    top_k.scalar_type() == at::kLong && top_k.numel() == rows_n_ &&
+                    top_p.scalar_type() == at::kFloat && top_p.numel() == rows_n_,
+                "decode loop: sampling settings are float32 temperature, int64 top_k and float32 top_p, one per row");
+    temperature_ = std::move(temperature);
+    top_k_ = std::move(top_k);
+    top_p_ = std::move(top_p);
+    temperature_host_ = at::zeros({rows_n_}, at::TensorOptions().dtype(at::kFloat).pinned_memory(true));
+    top_k_host_ = at::zeros({rows_n_}, at::TensorOptions().dtype(at::kLong).pinned_memory(true));
+    top_p_host_ = at::ones({rows_n_}, at::TensorOptions().dtype(at::kFloat).pinned_memory(true));
+  }
+
+  void start() {
+    TORCH_CHECK(!thread_.joinable(), "decode loop: already started");
+    TORCH_CHECK(S_ == 1 || draft_, "decode loop: steps of several tokens need a drafter (set_draft)");
+    thread_ = std::thread([this] { loop(); });
+  }
 
   // Hold the loop between steps (returns once no step runs).
   void pause() {
@@ -924,9 +967,9 @@ class DecodeLoop {
   // `position`, has emitted `emitted` tokens of at most max_new, stops on
   // any of eos, and may not feed past max_position. Call while paused.
   void admit(int64_t row, int64_t request, int64_t next_token, int64_t position, int64_t emitted, int64_t max_new,
-             const std::vector<int64_t>& eos, int64_t max_position) {
+             const std::vector<int64_t>& eos, int64_t max_position, double temperature, int64_t top_k, double top_p) {
     std::lock_guard<std::mutex> lk(mu_);
-    TORCH_CHECK(row >= 0 && row < static_cast<int64_t>(rows_.size()), "decode loop: no row ", row);
+    TORCH_CHECK(row >= 0 && row < rows_n_, "decode loop: no row ", row);
     TORCH_CHECK(!rows_[row].active, "decode loop: row ", row, " is decoding another request");
     Row& r = rows_[row];
     r = Row{};
@@ -938,6 +981,9 @@ class DecodeLoop {
     r.max_new = max_new;
     r.max_position = max_position;
     r.eos = eos;
+    r.temperature = static_cast<float>(temperature);
+    r.top_k = top_k;
+    r.top_p = static_cast<float>(top_p);
   }
 
   // The request stops at the next step boundary (its row frees).
@@ -951,8 +997,8 @@ class DecodeLoop {
   std::vector<int64_t> free_rows() {
     std::lock_guard<std::mutex> lk(mu_);
     std::vector<int64_t> out;
-    for (size_t i = 0; i < rows_.size(); ++i)
-      if (!rows_[i].active) out.push_back(static_cast<int64_t>(i));
+    for (int64_t i = 0; i < rows_n_; ++i)
+      if (!rows_[i].active) out.push_back(i);
     return out;
   }
 
@@ -968,15 +1014,19 @@ class DecodeLoop {
     return out;
   }
 
-  // Steps run, and since the last call each step's time in ms (the native
-  // loop's own timing: inputs written to chosen tokens read) and how many
-  // rows it decoded.
+  // Steps run; since the last call, each step's time in ms (inputs written
+  // to chosen tokens read, the drafter included) and how many rows decoded;
+  // drafts made and accepted, in all.
   int64_t steps() const { return steps_.load(); }
   std::vector<std::pair<double, int64_t>> take_steps() {
     std::lock_guard<std::mutex> lk(mu_);
     std::vector<std::pair<double, int64_t>> out;
     std::swap(out, step_log_);
     return out;
+  }
+  std::pair<int64_t, int64_t> drafts() {
+    std::lock_guard<std::mutex> lk(mu_);
+    return {drafted_, accepted_};
   }
 
   void stop() {
@@ -997,11 +1047,59 @@ class DecodeLoop {
     int64_t request = -1, next = 0, position = 0, emitted = 0, max_new = 0, max_position = 0;
     int64_t fed = 0, fed_position = 0;  // the token it fed last, and where: an idle row feeds it again
     std::vector<int64_t> eos;
+    float temperature = 0.f, top_p = 1.f;  // the row's sampling settings (greedy by default)
+    int64_t top_k = 0;
   };
   struct Event {
     std::vector<int64_t> tokens;
     int64_t finish = kDecoding;
     std::string error;
+  };
+  // A captured step: its input buffers, its output, its graphs, its step host.
+  struct Graphs {
+    at::Tensor ids, pos, out;
+    std::vector<int64_t> execs, streams, devices;
+    pybind11::object host_obj;
+    at::Tensor flags;
+    std::vector<void*> ctxs;
+    StepHost* host = nullptr;
+    void retain() {
+      host = host_obj.cast<StepHost*>();
+      for (int64_t d : devices) {
+        void* c = nullptr;
+        Driver::check(Driver::get().primary_ctx_retain(&c, static_cast<int>(d)), "cuDevicePrimaryCtxRetain");
+        ctxs.push_back(c);
+      }
+    }
+    // One replay: the inputs (pinned host arrays) in, the output back into `out_host`.
+    void run(const int64_t* ids_host, size_t ids_bytes, const int64_t* pos_host, size_t pos_bytes, int64_t* out_host) {
+      auto& cu = Driver::get();
+      void* stream = reinterpret_cast<void*>(streams[0]);
+      Driver::check(cu.ctx_set_current(ctxs[0]), "cuCtxSetCurrent");
+      Driver::check(cu.memcpy_async(reinterpret_cast<uint64_t>(ids.data_ptr()), reinterpret_cast<uint64_t>(ids_host),
+                                    ids_bytes, stream), "cuMemcpyAsync");
+      Driver::check(cu.memcpy_async(reinterpret_cast<uint64_t>(pos.data_ptr()), reinterpret_cast<uint64_t>(pos_host),
+                                    pos_bytes, stream), "cuMemcpyAsync");
+      host->go();
+      for (size_t g = 0; g < execs.size(); ++g) {  // the engine's GPU's graph first: the others wait on its flags
+        Driver::check(cu.ctx_set_current(ctxs[g]), "cuCtxSetCurrent");
+        Driver::check(cu.graph_launch(reinterpret_cast<void*>(execs[g]), reinterpret_cast<void*>(streams[g])),
+                      "cuGraphLaunch");
+      }
+      Driver::check(cu.ctx_set_current(ctxs[0]), "cuCtxSetCurrent");
+      Driver::check(cu.memcpy_async(reinterpret_cast<uint64_t>(out_host), reinterpret_cast<uint64_t>(out.data_ptr()),
+                                    static_cast<size_t>(out.numel()) * sizeof(int64_t), stream), "cuMemcpyAsync");
+      for (size_t g = 0; g < execs.size(); ++g) {
+        Driver::check(cu.ctx_set_current(ctxs[g]), "cuCtxSetCurrent");
+        Driver::check(cu.stream_sync(reinterpret_cast<void*>(streams[g])), "cuStreamSynchronize");
+      }
+      Driver::check(cu.ctx_set_current(ctxs[0]), "cuCtxSetCurrent");
+      std::string error = host->take_error();
+      if (!error.empty()) {
+        flags.zero_();  // the host released every flag; the next step starts clean
+        throw std::runtime_error(error);
+      }
+    }
   };
 
   void finish(Row& r, int64_t why, const std::string& error) {  // with mu_ held
@@ -1018,55 +1116,73 @@ class DecodeLoop {
     return false;
   }
 
+  // Emit `token` for row r; true once the row is finished by it.
+  bool emit(Row& r, int64_t token) {  // with mu_ held
+    pending_[r.request].tokens.push_back(token);
+    events_cv_.notify_all();
+    r.emitted++;
+    if (std::find(r.eos.begin(), r.eos.end(), token) != r.eos.end()) {
+      finish(r, kEos, "");
+      return true;
+    }
+    if (r.emitted >= r.max_new) {
+      finish(r, kLength, "");
+      return true;
+    }
+    return false;
+  }
+
   void loop() {
-    auto& cu = Driver::get();
-    Driver::check(cu.ctx_set_current(ctxs_[0]), "cuCtxSetCurrent");
-    void* stream = reinterpret_cast<void*>(streams_[0]);
     int64_t* ids = ids_host_.data_ptr<int64_t>();
     int64_t* pos = pos_host_.data_ptr<int64_t>();
-    const int64_t* chosen = chosen_host_.data_ptr<int64_t>();
-    const size_t n = rows_.size(), bytes = n * sizeof(int64_t);
-    int64_t decoding = 0;  // rows decoding in the step
+    int64_t* chosen = chosen_host_.data_ptr<int64_t>();
+    const int64_t K = draft_ ? draft_->out.size(1) : 0;
+    int64_t* drafted = draft_ ? draft_out_host_.data_ptr<int64_t>() : nullptr;
+    std::vector<int64_t> first(rows_n_);  // each row's first token of the step
     for (;;) {
+      int64_t decoding = 0;
       {
         std::unique_lock<std::mutex> lk(mu_);
         wake_.wait(lk, [&] { return stop_ || (!paused_ && any_active()); });
         if (stop_) return;
         stepping_ = true;
-        decoding = 0;
-        for (size_t i = 0; i < n; ++i) {
+        for (int64_t i = 0; i < rows_n_; ++i) {
           Row& r = rows_[i];
           if (r.active) {
             r.fed = r.next;
             r.fed_position = r.position;
             decoding++;
           }
-          ids[i] = r.used ? r.fed : 0;  // an idle row feeds its last token again; a row never used, 0 at 0
+          first[i] = r.used ? r.fed : 0;  // an idle row feeds its last token again; a row never used, 0 at 0
           pos[i] = r.used ? r.fed_position : 0;
+          if (temperature_.defined()) {
+            temperature_host_.data_ptr<float>()[i] = r.active ? r.temperature : 0.f;
+            top_k_host_.data_ptr<int64_t>()[i] = r.active ? r.top_k : 0;
+            top_p_host_.data_ptr<float>()[i] = r.active ? r.top_p : 1.f;
+          }
         }
       }
       const int64_t t0 = now_ns();
       std::string error;
       try {
-        Driver::check(cu.memcpy_async(reinterpret_cast<uint64_t>(input_ids_.data_ptr()), reinterpret_cast<uint64_t>(ids),
-                                      bytes, stream), "cuMemcpyAsync");
-        Driver::check(cu.memcpy_async(reinterpret_cast<uint64_t>(positions_.data_ptr()), reinterpret_cast<uint64_t>(pos),
-                                      bytes, stream), "cuMemcpyAsync");
-        host_->go();
-        for (size_t g = 0; g < execs_.size(); ++g) {  // the engine's GPU's graph first: the others wait on its flags
-          Driver::check(cu.ctx_set_current(ctxs_[g]), "cuCtxSetCurrent");
-          Driver::check(cu.graph_launch(reinterpret_cast<void*>(execs_[g]), reinterpret_cast<void*>(streams_[g])),
-                        "cuGraphLaunch");
+        if (draft_) {  // the drafter on each row's next token: its K tokens after it
+          draft_->run(first.data(), rows_n_ * sizeof(int64_t), pos, rows_n_ * sizeof(int64_t), drafted);
         }
-        Driver::check(cu.ctx_set_current(ctxs_[0]), "cuCtxSetCurrent");
-        Driver::check(cu.memcpy_async(reinterpret_cast<uint64_t>(chosen_host_.data_ptr()),
-                                      reinterpret_cast<uint64_t>(chosen_.data_ptr()), bytes, stream), "cuMemcpyAsync");
-        for (size_t g = 0; g < execs_.size(); ++g) {
-          Driver::check(cu.ctx_set_current(ctxs_[g]), "cuCtxSetCurrent");
-          Driver::check(cu.stream_sync(reinterpret_cast<void*>(streams_[g])), "cuStreamSynchronize");
+        for (int64_t i = 0; i < rows_n_; ++i) {
+          ids[i * S_] = first[i];
+          for (int64_t j = 1; j < S_; ++j) ids[i * S_ + j] = drafted[i * K + j - 1];
         }
-        Driver::check(cu.ctx_set_current(ctxs_[0]), "cuCtxSetCurrent");
-        error = host_->take_error();
+        if (temperature_.defined()) {  // the rows' sampling settings, ahead of the step on its stream
+          auto& cu = Driver::get();
+          void* stream = reinterpret_cast<void*>(verify_.streams[0]);
+          Driver::check(cu.ctx_set_current(verify_.ctxs[0]), "cuCtxSetCurrent");
+          for (auto* t : {&temperature_, &top_k_, &top_p_}) {
+            const at::Tensor& host = t == &temperature_ ? temperature_host_ : t == &top_k_ ? top_k_host_ : top_p_host_;
+            Driver::check(cu.memcpy_async(reinterpret_cast<uint64_t>(t->data_ptr()), reinterpret_cast<uint64_t>(host.data_ptr()),
+                                          static_cast<size_t>(host.numel() * host.element_size()), stream), "cuMemcpyAsync");
+          }
+        }
+        verify_.run(ids, rows_n_ * S_ * sizeof(int64_t), pos, rows_n_ * sizeof(int64_t), chosen);
       } catch (const std::exception& e) {
         error = e.what();
       }
@@ -1076,39 +1192,40 @@ class DecodeLoop {
       steps_++;
       step_log_.emplace_back(ms, decoding);
       if (!error.empty()) {
-        flags_.zero_();  // the host released every flag; the next step starts clean
         for (Row& r : rows_)
           if (r.active) finish(r, kError, "decode loop: " + error);
       } else {
-        for (size_t i = 0; i < n; ++i) {
+        for (int64_t i = 0; i < rows_n_; ++i) {
           Row& r = rows_[i];
           if (!r.active) continue;
-          const int64_t token = chosen[i];
-          pending_[r.request].tokens.push_back(token);
-          events_cv_.notify_all();
-          r.emitted++;
-          r.position++;
-          r.next = token;
-          if (std::find(r.eos.begin(), r.eos.end(), token) != r.eos.end())
-            finish(r, kEos, "");
-          else if (r.emitted >= r.max_new || r.position + 1 > r.max_position)
-            finish(r, kLength, "");
+          // keep each draft that equals the choice before it, then the choice where they first differ
+          int64_t n = 0;
+          while (n < S_ - 1 && ids[i * S_ + n + 1] == chosen[i * S_ + n]) n++;
+          drafted_ += S_ - 1;
+          accepted_ += n;
+          bool done = false;
+          for (int64_t j = 1; j <= n && !done; ++j) done = emit(r, ids[i * S_ + j]);
+          if (!done) done = emit(r, chosen[i * S_ + n]);
+          if (done) continue;
+          r.position += n + 1;
+          r.next = chosen[i * S_ + n];
+          if (r.position + S_ > r.max_position) finish(r, kLength, "");
         }
       }
       idle_.notify_all();
     }
   }
 
-  at::Tensor input_ids_, positions_, chosen_;
-  std::vector<int64_t> execs_, streams_, devices_;
-  std::vector<void*> ctxs_;
-  pybind11::object host_obj_;
-  StepHost* host_ = nullptr;
-  at::Tensor flags_, ids_host_, pos_host_, chosen_host_;
+  Graphs verify_;
+  std::unique_ptr<Graphs> draft_;
+  int64_t rows_n_ = 0, S_ = 1;
+  at::Tensor ids_host_, pos_host_, chosen_host_, draft_out_host_;
+  at::Tensor temperature_, top_k_, top_p_, temperature_host_, top_k_host_, top_p_host_;
   std::vector<Row> rows_;
   std::map<int64_t, Event> pending_;
   std::vector<std::pair<double, int64_t>> step_log_;
   std::atomic<int64_t> steps_{0};
+  int64_t drafted_ = 0, accepted_ = 0;
   std::mutex mu_;
   std::condition_variable wake_, idle_, events_cv_;
   bool paused_ = false, stepping_ = false, stop_ = false;
@@ -1140,6 +1257,9 @@ void register_node_server(pybind11::module& m) {
   pybind11::class_<DecodeLoop>(m, "DecodeLoop")
       .def(pybind11::init<at::Tensor, at::Tensor, at::Tensor, const std::vector<int64_t>&, const std::vector<int64_t>&,
                           const std::vector<int64_t>&, pybind11::object, at::Tensor>())
+      .def("set_draft", &DecodeLoop::set_draft)
+      .def("set_sampling", &DecodeLoop::set_sampling)
+      .def("start", &DecodeLoop::start)
       .def("pause", &DecodeLoop::pause, pybind11::call_guard<pybind11::gil_scoped_release>())
       .def("resume", &DecodeLoop::resume)
       .def("admit", &DecodeLoop::admit)
@@ -1148,6 +1268,7 @@ void register_node_server(pybind11::module& m) {
       .def("events", &DecodeLoop::events, pybind11::call_guard<pybind11::gil_scoped_release>())
       .def("steps", &DecodeLoop::steps)
       .def("take_steps", &DecodeLoop::take_steps)
+      .def("drafts", &DecodeLoop::drafts)
       .def("stop", &DecodeLoop::stop, pybind11::call_guard<pybind11::gil_scoped_release>());
   pybind11::class_<RangeServer>(m, "RangeServer")
       .def(pybind11::init<int64_t, pybind11::function>())

@@ -142,6 +142,33 @@ def _slot_maps(entry):
     return [pool.slot_cpu for pool in list(here) + [box[0] for box in peer_boxes.values()]]
 
 
+TOP_CANDIDATES = 1024  # the tokens top-k and top-p choose among
+
+
+def choose(logits, temperature, top_k, top_p):
+    """Each position's token from logits [rows, tokens, vocab], in the graph, by each row's
+    sampling settings: the argmax where its temperature is 0; else a sample of softmax(logits /
+    temperature), by Gumbel-max (the argmax of the scaled logits plus Gumbel noise), over the whole
+    vocabulary, or with top_k > 0 or top_p < 1 over the TOP_CANDIDATES most likely tokens kept by
+    top-k (the k most likely) and then top-p (the most likely, until their mass reaches top_p), as
+    transformers' processors keep them. Returns [rows, tokens] int64."""
+    greedy = logits.argmax(-1)
+    scaled = logits / temperature.clamp_min(1e-5).view(-1, 1, 1)
+
+    def gumbel(like):
+        return -torch.log(-torch.log(torch.rand_like(like).clamp_(min=1e-20)))
+    full = (scaled + gumbel(scaled)).argmax(-1)
+    vals, idx = scaled.topk(min(TOP_CANDIDATES, scaled.shape[-1]), dim=-1)  # most likely first
+    ranks = torch.arange(vals.shape[-1], device=vals.device)
+    k = top_k.view(-1, 1, 1)
+    vals = vals.masked_fill((k > 0) & (ranks >= k), float("-inf"))
+    probs = vals.softmax(-1)
+    vals = vals.masked_fill(probs.cumsum(-1) - probs > top_p.view(-1, 1, 1), float("-inf"))
+    kept = idx.gather(-1, (vals + gumbel(vals)).argmax(-1, keepdim=True)).squeeze(-1)
+    sampled = torch.where(((top_k > 0) | (top_p < 1)).view(-1, 1), kept, full)
+    return torch.where((temperature > 0).view(-1, 1), sampled, greedy)
+
+
 class StepGraph(torch.nn.Module):
     """A dataflow runner's step as one CUDA graph (module docstring)."""
 
@@ -151,6 +178,7 @@ class StepGraph(torch.nn.Module):
         self.split = runner.split
         self.vxpu_segments = runner.vxpu_segments
         self.graph = None
+        self._chosen = self._sampling = None
         self._peer_graphs = []
         self.steps = 0
         self.recorder = None
@@ -196,23 +224,43 @@ class StepGraph(torch.nn.Module):
         out = out[0] if isinstance(out, (tuple, list)) and len(out) == 1 else out
         return out.clone() if isinstance(out, torch.Tensor) else out
 
-    def native_loop(self):
-        """The captured step, decoded by a native thread with no Python between steps
-        (node_server.cpp's DecodeLoop): it writes each row's token and position into the
-        graph's input buffers, replays the graphs and reads the greedy choices back. Needs the
-        graph captured, a step of one token per row, and greedy decoding."""
-        if self.graph is None or self._chosen is None:
-            raise RuntimeError("native loop: the step graph is not captured, or its output is not logits")
-        names = list(self.runner.graph.inputs)
-        if sorted(names) != ["cache_position", "input_ids"]:
-            raise RuntimeError(f"native loop: a decode step's inputs are input_ids and cache_position, not {names}")
-        ids, pos = (self._inputs[names.index(n)] for n in ("input_ids", "cache_position"))
-        index = ids.device.index if ids.device.index is not None else torch.cuda.current_device()
+    def native_parts(self):
+        """What a native loop needs to run this captured step: the input buffers by name, the
+        output (a decode step's chosen tokens, or the step's own output when it is not logits:
+        a drafter's tokens), the graphs to launch (cudaGraphExec_t), their streams and devices,
+        the step host and its flags."""
+        if self.graph is None:
+            raise RuntimeError("native loop: the step graph is not captured")
+        inputs = dict(zip(self.runner.graph.inputs, self._inputs))
+        out = self._chosen if self._chosen is not None else self._output
+        out = out[0] if isinstance(out, (tuple, list)) and len(out) == 1 else out
+        any_input = next(iter(inputs.values()))
+        index = any_input.device.index if any_input.device.index is not None else torch.cuda.current_device()
         execs = [self.graph.raw_cuda_graph_exec()] + [g.raw_cuda_graph_exec() for _, g in self._peer_graphs]
         streams = [torch.cuda.current_stream(index).cuda_stream] + [torch.cuda.current_stream(p).cuda_stream
                                                                    for p, _ in self._peer_graphs]
         devices = [index] + [torch.device(p).index for p, _ in self._peer_graphs]
-        return kernels.load().DecodeLoop(ids, pos, self._chosen, execs, streams, devices, self._host, self._flags)
+        return inputs, out, execs, streams, devices, self._host, self._flags
+
+    def native_loop(self, draft=None):
+        """The captured step, decoded by a native thread with no Python between steps
+        (node_server.cpp's DecodeLoop): it writes each row's tokens and position into the graph's
+        input buffers and each row's sampling settings into the graph's (choose), replays the graphs
+        and reads the chosen tokens back. With `draft` (the drafter's captured StepGraph), each step
+        first runs the drafter, verifies its tokens in this step and keeps those the choices agree
+        with."""
+        inputs, chosen, execs, streams, devices, host, flags = self.native_parts()
+        if self._chosen is None or sorted(inputs) != ["cache_position", "input_ids"]:
+            raise RuntimeError(f"native loop: a decode step of logits from input_ids and cache_position, not {sorted(inputs)}")
+        loop = kernels.load().DecodeLoop(inputs["input_ids"], inputs["cache_position"], chosen, execs, streams, devices,
+                                         host, flags)
+        loop.set_sampling(*self._sampling)
+        if draft is not None:
+            d_inputs, d_out, d_execs, d_streams, d_devices, d_host, d_flags = draft.native_parts()
+            loop.set_draft(d_inputs["input_ids"], d_inputs["cache_position"], d_out, d_execs, d_streams, d_devices,
+                           d_host, d_flags)
+        loop.start()
+        return loop
 
     def _input_values(self, args, kwargs):
         values = dict(zip(self.runner.graph.inputs, args), **kwargs)
@@ -224,6 +272,14 @@ class StepGraph(torch.nn.Module):
         driver = _Driver()
         self._inputs = [v.clone() for v in self._input_values(args, kwargs)]
         inputs = dict(zip(graph.inputs, self._inputs))
+        # each row's sampling settings (choose), outside the graph's memory: the native loop writes them
+        ids = inputs.get("input_ids")
+        self._sampling = None
+        if isinstance(ids, torch.Tensor) and ids.dim() == 2:
+            rows = ids.shape[0]
+            self._sampling = (torch.zeros(rows, device=ids.device),  # temperature: 0 is greedy
+                              torch.zeros(rows, dtype=torch.long, device=ids.device),  # top_k: 0 is off
+                              torch.ones(rows, device=ids.device))  # top_p: 1 is off
         host_nodes = [n for n in graph.nodes if n.kind != "dense"]
         produced = {}  # node -> its output tensors on the GPU, as captured
         dev = runner.device
@@ -461,7 +517,9 @@ class StepGraph(torch.nn.Module):
             # the greedy choice, in the graph: a decode step's logits [rows, tokens, vocab] become each
             # position's argmax, so a native loop (native_loop) reads token ids, not logits
             logits = output[0] if isinstance(output, (tuple, list)) and len(output) == 1 else output
-            chosen = logits.argmax(-1) if isinstance(logits, torch.Tensor) and logits.dim() == 3 else None
+            chosen = None
+            if isinstance(logits, torch.Tensor) and logits.dim() == 3 and self._sampling is not None:
+                chosen = choose(logits, *self._sampling)
         peer_graphs = [self._capture_peer(pdev, peers.index(pdev), driver, flags, F, host_nodes, boxes, pooled)
                        for pdev in peers]
         host = kernels.load().StepHost(flags)

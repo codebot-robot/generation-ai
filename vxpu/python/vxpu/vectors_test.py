@@ -2625,6 +2625,55 @@ def _check_native_rows(model, workdir):
     print(f"native rows: 4 prompts on 3 rows, every decode step run by the native loop ({len(native['step_ms'])} "
           f"steps, median {median(native['step_ms']):.2f} ms; {median(python['step_ms']):.2f} ms with Python driving "
           f"each step), the same tokens; 4 concurrent requests through the scheduler match")
+    # sampling in the graph (stepgraph.choose): its distributions on made-up logits, then sampled
+    # rows beside greedy ones, which must not change the greedy rows' tokens
+    import torch
+    from .stepgraph import choose
+    logits = torch.tensor([[0.0, 1.0, 2.0, 3.0, -1.0, 0.5]], device="cuda").repeat(20000, 1).unsqueeze(1)
+    ones = torch.ones(20000, device="cuda")
+    zeros = torch.zeros(20000, dtype=torch.long, device="cuda")
+    freq = torch.bincount(choose(logits, ones, zeros, ones).view(-1), minlength=6).float() / 20000
+    expected = logits[0, 0].softmax(-1)
+    topk = set(choose(logits, ones, zeros + 2, ones).unique().tolist())
+    topp = set(choose(logits, ones, zeros, ones * 0.7).unique().tolist())  # 3 (64%), then 2 (24%): 88% >= 70%
+    greedy_ok = bool((choose(logits, ones * 0, zeros, ones) == 3).all())
+    if (freq - expected).abs().max() > 0.02 or topk != {2, 3} or topp != {2, 3} or not greedy_ok:
+        print(f"native rows check: sampling in the graph is off: frequencies {freq.tolist()} against "
+              f"{expected.tolist()}, top-2 {topk}, top-p 0.7 {topp}, greedy {greedy_ok}")
+        return False
+    mixed = [greedy, SamplingParams(do_sample=True, temperature=0.8, top_p=0.9), greedy,
+             SamplingParams(do_sample=True, temperature=1.0, top_k=5)]
+    got = [None] * len(prompts)
+
+    def run_mixed(i):
+        got[i] = [t for ev in engine.generate(engine.new_session(), prompts[i], 16, mixed[i]) for t in ev["token_ids"]]
+    threads = [threading.Thread(target=run_mixed, args=(i,)) for i in range(len(prompts))]
+    for thread in threads:
+        thread.start()
+    for thread in threads:
+        thread.join(timeout=600)
+    if got[0] != native["token_ids"][0] or got[2] != native["token_ids"][2] or not got[1] or not got[3]:
+        print(f"native rows check: sampled rows beside greedy ones changed the greedy rows, or produced nothing: {got}")
+        return False
+    print("native rows: sampling in the graph matches softmax within 2% (20,000 draws), keeps top-k and top-p's "
+          "tokens; sampled requests beside greedy ones leave the greedy ones' tokens unchanged")
+    # speculative steps: the drafter's step graph and the verifying step, both on the native loop
+    spec = os.path.join(workdir, "tiny-deepseek-v41-artifact-native-draft")
+    export_artifact(model, spec, max_cache_len=1024, batch=3, draft=True)
+    engine = _with_env(env, Engine, spec, device="cuda", compile_decode=True)
+    native = engine.generate_rows(prompts, 16, greedy)
+    python = engine.generate_rows(prompts, 16, greedy, telemetry=True)
+    if not native.get("native"):
+        print("native rows check: speculative generate_rows did not take the native loop")
+        return False
+    differ = [i for i, (a, b) in enumerate(zip(native["token_ids"], python["token_ids"])) if a != b]
+    if differ or not native["accepted"]:
+        print(f"native rows check: speculative prompts {differ} differ from Python driving the steps, or no draft "
+              f"was accepted ({native['accepted']} of {native['drafted']})")
+        return False
+    print(f"native rows: speculative steps of {engine.step_tokens} tokens, the drafter's step graph and the verifying "
+          f"one on the native loop ({len(native['step_ms'])} steps, median {median(native['step_ms']):.2f} ms; "
+          f"{native['accepted']} of {native['drafted']} drafts accepted), the same tokens as Python driving them")
     return True
 
 
