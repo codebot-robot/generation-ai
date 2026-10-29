@@ -353,6 +353,129 @@ void check_bank(const torch::Tensor& x, const torch::Tensor& w, const torch::Ten
 }
 
 // x as fp32, and de-interleaved even/odd copies for the SIMD packed dot.
+// ---------------------------------------------------------------- tiles
+
+// Dot products for a tile of up to kTileRows rows of one expert's bank and
+// kTileTokens tokens: out[r * kTileTokens + t] = row r . token t, each one
+// bit-identical to dot_packed's (the same operations in the same order).
+// With AVX-512 a tile decodes each 32-weight block of a row once for all its
+// tokens, and loads each token's activations once for all its rows. That
+// reuse is what several tokens per expert (batched or speculative decode,
+// prefill) need: the per-pair kernel decoded a row again for every token.
+// NEON decodes each block once for the tile's tokens, a row at a time.
+// Elsewhere a tile is dot_packed for each pair.
+constexpr int kTileRows = 4, kTileTokens = 4;
+
+// tokens per tile, at most kTileTokens; set_expert_tile(1) computes one
+// (row, token) pair at a time, the per-pair kernel's work, for comparisons
+int64_t g_tile_tokens = kTileTokens;
+
+#if defined(__x86_64__) || defined(_M_X64)
+template <int NR, int NT>
+__attribute__((target("avx512f,avx512bw,avx512vl")))
+void dot_tile_avx512(const uint8_t* const* w, const uint8_t* const* s, const float* const* xe,
+                     const float* const* xo, int64_t K, float* out) {
+  const __m512 table = _mm512_loadu_ps(kFp4);
+  const __m512i lo_mask = _mm512_set1_epi32(0x0F);
+  __m512 acc[NR][NT];
+  for (int r = 0; r < NR; ++r)
+    for (int t = 0; t < NT; ++t) acc[r][t] = _mm512_setzero_ps();
+  for (int64_t b = 0; b < K / 32; ++b) {
+    __m512 vlo[NR], vhi[NR], sc[NR];
+    for (int r = 0; r < NR; ++r) {
+      __m512i bytes = _mm512_cvtepu8_epi32(_mm_loadu_si128(reinterpret_cast<const __m128i*>(w[r] + b * 16)));
+      vlo[r] = _mm512_permutexvar_ps(_mm512_and_si512(bytes, lo_mask), table);
+      vhi[r] = _mm512_permutexvar_ps(_mm512_srli_epi32(bytes, 4), table);
+      sc[r] = _mm512_set1_ps(e8m0(s[r][b]));
+    }
+    for (int t = 0; t < NT; ++t) {
+      const __m512 x0 = _mm512_loadu_ps(xe[t] + b * 16), x1 = _mm512_loadu_ps(xo[t] + b * 16);
+      for (int r = 0; r < NR; ++r) {
+        __m512 part = _mm512_mul_ps(vlo[r], x0);
+        part = _mm512_fmadd_ps(vhi[r], x1, part);
+        acc[r][t] = _mm512_fmadd_ps(part, sc[r], acc[r][t]);
+      }
+    }
+  }
+  for (int r = 0; r < NR; ++r)
+    for (int t = 0; t < NT; ++t) out[r * kTileTokens + t] = _mm512_reduce_add_ps(acc[r][t]);
+}
+
+template <int NR>
+void dot_tile_avx512_rows(int nt, const uint8_t* const* w, const uint8_t* const* s, const float* const* xe,
+                          const float* const* xo, int64_t K, float* out) {
+  switch (nt) {
+    case 1: dot_tile_avx512<NR, 1>(w, s, xe, xo, K, out); break;
+    case 2: dot_tile_avx512<NR, 2>(w, s, xe, xo, K, out); break;
+    case 3: dot_tile_avx512<NR, 3>(w, s, xe, xo, K, out); break;
+    default: dot_tile_avx512<NR, 4>(w, s, xe, xo, K, out); break;
+  }
+}
+#endif
+
+#if defined(__aarch64__)
+// NEON has room for one row's decoded block and four tokens' accumulators,
+// so a tile there is one row at a time, each block decoded once for its tokens.
+template <int NT>
+void dot_tile_neon(const uint8_t* w, const uint8_t* s, const float* const* xe, const float* const* xo, int64_t K,
+                   float* out) {
+  const int8x16_t table = vld1q_s8(kFp4x2);
+  const uint8x16_t lo_mask = vdupq_n_u8(0x0F);
+  float32x4_t acc[NT][4];
+  for (int t = 0; t < NT; ++t)
+    for (int j = 0; j < 4; ++j) acc[t][j] = vdupq_n_f32(0.f);
+  for (int64_t b = 0; b < K / 32; ++b) {
+    uint8x16_t bytes = vld1q_u8(w + b * 16);
+    int8x16_t lo = vqtbl1q_s8(table, vandq_u8(bytes, lo_mask));
+    int8x16_t hi = vqtbl1q_s8(table, vshrq_n_u8(bytes, 4));
+    float32x4_t vl[4], vh[4];
+    widen_f32(lo, vl);
+    widen_f32(hi, vh);
+    const float32x4_t sc = vdupq_n_f32(0.5f * e8m0(s[b]));  // undo the doubling
+    for (int t = 0; t < NT; ++t) {
+      const float* xeb = xe[t] + b * 16;
+      const float* xob = xo[t] + b * 16;
+      for (int j = 0; j < 4; ++j) {
+        float32x4_t p = vmulq_f32(vl[j], vld1q_f32(xeb + 4 * j));
+        p = vfmaq_f32(p, vh[j], vld1q_f32(xob + 4 * j));
+        acc[t][j] = vfmaq_f32(acc[t][j], p, sc);
+      }
+    }
+  }
+  for (int t = 0; t < NT; ++t)
+    out[t] = vaddvq_f32(vaddq_f32(vaddq_f32(acc[t][0], acc[t][1]), vaddq_f32(acc[t][2], acc[t][3])));
+}
+#endif
+
+inline void dot_tile(int nr, int nt, const uint8_t* const* w, const uint8_t* const* s, const float* const* x,
+                     const float* const* xe, const float* const* xo, int64_t K, float* out) {
+#if defined(__aarch64__)
+  for (int r = 0; r < nr; ++r) {
+    float* o = out + r * kTileTokens;
+    switch (nt) {
+      case 1: dot_tile_neon<1>(w[r], s[r], xe, xo, K, o); break;
+      case 2: dot_tile_neon<2>(w[r], s[r], xe, xo, K, o); break;
+      case 3: dot_tile_neon<3>(w[r], s[r], xe, xo, K, o); break;
+      default: dot_tile_neon<4>(w[r], s[r], xe, xo, K, o); break;
+    }
+  }
+  return;
+#endif
+#if defined(__x86_64__) || defined(_M_X64)
+  if (have_avx512()) {
+    switch (nr) {
+      case 1: dot_tile_avx512_rows<1>(nt, w, s, xe, xo, K, out); return;
+      case 2: dot_tile_avx512_rows<2>(nt, w, s, xe, xo, K, out); return;
+      case 3: dot_tile_avx512_rows<3>(nt, w, s, xe, xo, K, out); return;
+      default: dot_tile_avx512_rows<4>(nt, w, s, xe, xo, K, out); return;
+    }
+  }
+#endif
+  for (int r = 0; r < nr; ++r)
+    for (int t = 0; t < nt; ++t)
+      out[r * kTileTokens + t] = dot_packed(x[t], xe ? xe[t] : nullptr, xo ? xo[t] : nullptr, w[r], s[r], K);
+}
+
 struct XRows {
   std::vector<float> full, even, odd;
   int64_t M, K;
@@ -689,22 +812,41 @@ torch::Tensor fp4_moe_decode(torch::Tensor x_in, torch::Tensor weights, torch::T
   starts.push_back(active);
   const int64_t groups = static_cast<int64_t>(starts.size()) - 1;
 
-  // phase 1: gate and up for every (token, k) pair, each expert row read once per projection
+  // phase 1: gate and up for every (token, k) pair, an expert's rows taken
+  // kTileRows at a time and its pairs kTileTokens at a time (dot_tile)
   std::vector<float> gate(rows * I), up(rows * I);
   const int64_t blk = 16, nb = (I + blk - 1) / blk;
+  const int max_nr = g_tile_tokens > 1 ? kTileRows : 1, max_nt = static_cast<int>(g_tile_tokens);
   parallel_range(groups * nb, 1, [&](int64_t t0, int64_t t1) {
+    const uint8_t *w1r[kTileRows], *s1r[kTileRows], *w3r[kTileRows], *s3r[kTileRows];
+    const float *xf[kTileTokens], *xe[kTileTokens], *xo[kTileTokens];
+    float og[kTileRows * kTileTokens], ou[kTileRows * kTileTokens];
     for (int64_t t = t0; t < t1; ++t) {
-      const int64_t g = t / nb, i0 = (t % nb) * blk, e = sel[order[starts[g]]];
-      for (int64_t i = i0; i < std::min(I, i0 + blk); ++i) {
-        const int64_t row = e * I + i;
-        for (int64_t p = starts[g]; p < starts[g + 1]; ++p) {
-          const int64_t r = order[p], tok = r / topk;
-          const float* xf = xr.full.data() + tok * K;
-          const float* xe = xr.even.empty() ? nullptr : xr.even.data() + tok * (K / 2);
-          const float* xo = xr.odd.empty() ? nullptr : xr.odd.data() + tok * (K / 2);
-          // rounded to bf16 as the reference's bf16 matmul output is
-          gate[r * I + i] = static_cast<float>(static_cast<at::BFloat16>(dot_packed(xf, xe, xo, w1p + row * (K / 2), s1p + row * (K / 32), K)));
-          up[r * I + i] = static_cast<float>(static_cast<at::BFloat16>(dot_packed(xf, xe, xo, w3p + row * (K / 2), s3p + row * (K / 32), K)));
+      const int64_t g = t / nb, i0 = (t % nb) * blk, i1 = std::min(I, i0 + blk), e = sel[order[starts[g]]];
+      for (int64_t i = i0; i < i1; i += max_nr) {
+        const int nr = static_cast<int>(std::min<int64_t>(max_nr, i1 - i));
+        for (int q = 0; q < nr; ++q) {
+          const int64_t row = e * I + i + q;
+          w1r[q] = w1p + row * (K / 2), s1r[q] = s1p + row * (K / 32);
+          w3r[q] = w3p + row * (K / 2), s3r[q] = s3p + row * (K / 32);
+        }
+        for (int64_t p = starts[g]; p < starts[g + 1]; p += max_nt) {
+          const int nt = static_cast<int>(std::min<int64_t>(max_nt, starts[g + 1] - p));
+          for (int q = 0; q < nt; ++q) {
+            const int64_t tok = order[p + q] / topk;
+            xf[q] = xr.full.data() + tok * K;
+            xe[q] = xr.even.empty() ? nullptr : xr.even.data() + tok * (K / 2);
+            xo[q] = xr.odd.empty() ? nullptr : xr.odd.data() + tok * (K / 2);
+          }
+          dot_tile(nr, nt, w1r, s1r, xf, xe, xo, K, og);
+          dot_tile(nr, nt, w3r, s3r, xf, xe, xo, K, ou);
+          for (int a = 0; a < nr; ++a)
+            for (int q = 0; q < nt; ++q) {
+              const int64_t r = order[p + q];
+              // rounded to bf16 as the reference's bf16 matmul output is
+              gate[r * I + i + a] = static_cast<float>(static_cast<at::BFloat16>(og[a * kTileTokens + q]));
+              up[r * I + i + a] = static_cast<float>(static_cast<at::BFloat16>(ou[a * kTileTokens + q]));
+            }
         }
       }
     }
@@ -746,15 +888,27 @@ torch::Tensor fp4_moe_decode(torch::Tensor x_in, torch::Tensor weights, torch::T
   const int64_t kb = (K + blk - 1) / blk;
   std::vector<float> down(rows * K, 0.f);  // each pair's bf16 down output; 0 for a pair left out
   parallel_range(groups * kb, 1, [&](int64_t t0, int64_t t1) {
+    const uint8_t *w2r[kTileRows], *s2r[kTileRows];
+    const float *hx[kTileTokens], *hxe[kTileTokens], *hxo[kTileTokens];
+    float od[kTileRows * kTileTokens];
     for (int64_t t = t0; t < t1; ++t) {
-      const int64_t g = t / kb, o0 = (t % kb) * blk, e = sel[order[starts[g]]];
-      for (int64_t o = o0; o < std::min(K, o0 + blk); ++o) {
-        const int64_t row = e * K + o;
-        for (int64_t p = starts[g]; p < starts[g + 1]; ++p) {
-          const int64_t r = order[p];
-          const float d = dot_packed(hf.data() + r * I, he.data() + r * (I / 2), ho.data() + r * (I / 2),
-                                     w2p + row * (I / 2), s2p + row * (I / 32), I);
-          down[r * K + o] = static_cast<float>(static_cast<at::BFloat16>(d));
+      const int64_t g = t / kb, o0 = (t % kb) * blk, o1 = std::min(K, o0 + blk), e = sel[order[starts[g]]];
+      for (int64_t o = o0; o < o1; o += max_nr) {
+        const int nr = static_cast<int>(std::min<int64_t>(max_nr, o1 - o));
+        for (int q = 0; q < nr; ++q) {
+          const int64_t row = e * K + o + q;
+          w2r[q] = w2p + row * (I / 2), s2r[q] = s2p + row * (I / 32);
+        }
+        for (int64_t p = starts[g]; p < starts[g + 1]; p += max_nt) {
+          const int nt = static_cast<int>(std::min<int64_t>(max_nt, starts[g + 1] - p));
+          for (int q = 0; q < nt; ++q) {
+            const int64_t r = order[p + q];
+            hx[q] = hf.data() + r * I, hxe[q] = he.data() + r * (I / 2), hxo[q] = ho.data() + r * (I / 2);
+          }
+          dot_tile(nr, nt, w2r, s2r, hx, hxe, hxo, I, od);
+          for (int a = 0; a < nr; ++a)
+            for (int q = 0; q < nt; ++q)
+              down[order[p + q] * K + o + a] = static_cast<float>(static_cast<at::BFloat16>(od[a * kTileTokens + q]));
         }
       }
     }
@@ -1088,6 +1242,8 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
   m.def("fp4_gather_mm", &fp4_gather_mm, "x[M,K] bf16 x packed fp4 experts sel[M] -> bf16 [M,N]");
   m.def("fp4_grouped_mm", &fp4_grouped_mm, "x[M,K] bf16 (sorted by expert, offs[E]) x packed fp4 experts -> bf16 [M,N]");
   m.def("fp4_dequant", &fp4_dequant, "one expert of a packed bank -> bf16 [N,K]");
+  m.def("set_expert_tile", [](int64_t tokens) { g_tile_tokens = std::max<int64_t>(1, std::min<int64_t>(tokens, kTileTokens)); },
+        "tokens per tile in fp4_moe_decode (1: one pair at a time, the per-pair kernel's work; for comparisons)");
   m.def("fp4_moe_decode", &fp4_moe_decode, "one decode layer's routed experts: gate/up, SwiGLU, act_quant, down, sum -> fp32 [n, K]");
   m.def("fp8_linear", &fp8_linear, "x[M,K] bf16 (quantized per 32-block inside, as the fork's act_quant) x fp8 [N,K] with e8m0 32x32 block scales -> bf16 [M,N]");
   m.def("gather_rows", &gather_rows, "rows of a 2-D table by index, copied concurrently (page faults overlap) -> [*indices.shape, cols]");

@@ -1418,23 +1418,27 @@ def _check_gpu_experts(model, prompts, settings, artifact, workdir):
         sc = torch.randint(120, 125, (S, n_out, n_in // 32), dtype=torch.uint8, device=dev, generator=g)
         return w, sc.view(torch.float8_e8m0fnu)
     (w1, s1), (w3, s3), (w2, s2) = bank(I, K), bank(I, K), bank(K, I)
-    x = triton_ops.act_quant_dequant(torch.randn(1, K, device=dev, generator=g).to(torch.bfloat16))
-    weights = torch.rand(1, 3, device=dev, generator=g)
-    slots = torch.tensor([[2, -1, 0]], device=dev)
+    # 8 tokens, 3 experts each, over 4 slots and one expert not held: tokens share experts, so
+    # the kernels' grouping (several tokens per block) is exercised
+    n = 8
+    x = triton_ops.act_quant_dequant(torch.randn(n, K, device=dev, generator=g).to(torch.bfloat16))
+    weights = torch.rand(n, 3, device=dev, generator=g)
+    slots = torch.randint(-1, S, (n, 3), device=dev, generator=g)
     y = triton_ops.fp4_experts_decode(x, weights, slots, w1, s1, w3, s3, w2, s2, 10.0)
 
     class _M:
         swiglu_limit = 10.0
         def _quantized_input(self, t):
             return ds.MoE._quantized_input(self, t)
-    ref = torch.zeros(1, K, device=dev)
-    for k, sl in enumerate(slots[0].tolist()):
-        if sl < 0:
-            continue
-        deq = [ds.MoE._dequant(w[sl:sl + 1], sc[sl:sl + 1]) for w, sc in ((w1, s1), (w3, s3), (w2, s2))]
-        gate, up = (torch.bmm(m, x.view(1, K, 1)).squeeze(-1) for m in deq[:2])
-        h = ds.MoE._ffn(_M(), gate, up, weights[0, k:k + 1])
-        ref[0] += torch.bmm(deq[2], h.unsqueeze(-1)).squeeze(-1).float()[0]
+    ref = torch.zeros(n, K, device=dev)
+    for t in range(n):
+        for k, sl in enumerate(slots[t].tolist()):
+            if sl < 0:
+                continue
+            deq = [ds.MoE._dequant(w[sl:sl + 1], sc[sl:sl + 1]) for w, sc in ((w1, s1), (w3, s3), (w2, s2))]
+            gate, up = (torch.bmm(m, x[t].view(1, K, 1)).squeeze(-1) for m in deq[:2])
+            h = ds.MoE._ffn(_M(), gate, up, weights[t, k:k + 1])
+            ref[t] += torch.bmm(deq[2], h.unsqueeze(-1)).squeeze(-1).float()[0]
     rel = ((y - ref).abs().max() / ref.abs().max()).item()
     if rel > 1e-2:
         print(f"gpu experts check: the kernels differ from the module's arithmetic (relative {rel:.3g})")
