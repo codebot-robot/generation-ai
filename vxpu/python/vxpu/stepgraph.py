@@ -95,6 +95,30 @@ class _Driver:
         self.dptr = self.lib.cuMemHostGetDevicePointer_v2
         self.dptr.argtypes = [ctypes.POINTER(ctypes.c_uint64), ctypes.c_void_p, ctypes.c_uint]
         self.dptr.restype = ctypes.c_int
+        self.nodes = self.lib.cuGraphGetNodes
+        self.nodes.argtypes = [ctypes.c_void_p, ctypes.POINTER(ctypes.c_void_p), ctypes.POINTER(ctypes.c_size_t)]
+        self.nodes.restype = ctypes.c_int
+        self.node_type = self.lib.cuGraphNodeGetType
+        self.node_type.argtypes = [ctypes.c_void_p, ctypes.POINTER(ctypes.c_int)]
+        self.node_type.restype = ctypes.c_int
+
+    # CUgraphNodeType, the kinds a step's graph holds
+    NODE_KINDS = {0: "kernels", 1: "copies", 2: "memsets", 12: "mailbox operations"}
+
+    def node_counts(self, graph):
+        """{kind: count} of a captured graph's nodes (cudaGraph_t, as an int): its kernels,
+        copies, memsets and stream memory operations (the mailboxes' flags), and anything else."""
+        count = ctypes.c_size_t(0)
+        _check(self.nodes(ctypes.c_void_p(graph), None, ctypes.byref(count)), "cuGraphGetNodes")
+        nodes = (ctypes.c_void_p * count.value)()
+        _check(self.nodes(ctypes.c_void_p(graph), nodes, ctypes.byref(count)), "cuGraphGetNodes")
+        out = {}
+        for node in nodes:
+            kind = ctypes.c_int(0)
+            _check(self.node_type(node, ctypes.byref(kind)), "cuGraphNodeGetType")
+            name = self.NODE_KINDS.get(kind.value, "other")
+            out[name] = out.get(name, 0) + 1
+        return out
 
     def device_address(self, pinned):
         out = ctypes.c_uint64()
@@ -179,6 +203,7 @@ class StepGraph(torch.nn.Module):
         self.vxpu_segments = runner.vxpu_segments
         self.graph = None
         self._chosen = self._sampling = None
+        self.node_counts = {}
         self._peer_graphs = []
         self.steps = 0
         self.recorder = None
@@ -449,7 +474,7 @@ class StepGraph(torch.nn.Module):
                      produced, host_nodes, answers):
         from . import aoti
         events = []  # per host node: (sent, back), timing events recorded in the graph
-        g = torch.cuda.CUDAGraph()
+        g = torch.cuda.CUDAGraph(keep_graph=True)  # kept, to count its nodes (node_counts)
         with torch.cuda.graph(g):
             stream = torch.cuda.current_stream()
             for node in graph.nodes:
@@ -520,6 +545,10 @@ class StepGraph(torch.nn.Module):
             chosen = None
             if isinstance(logits, torch.Tensor) and logits.dim() == 3 and self._sampling is not None:
                 chosen = choose(logits, *self._sampling)
+        # the step's shape, as the plan's statistics: how many kernels, copies and mailbox
+        # operations one decode step launches (fusion shows as fewer kernels)
+        self.node_counts = driver.node_counts(g.raw_cuda_graph())
+        g.instantiate()
         peer_graphs = [self._capture_peer(pdev, peers.index(pdev), driver, flags, F, host_nodes, boxes, pooled)
                        for pdev in peers]
         host = kernels.load().StepHost(flags)

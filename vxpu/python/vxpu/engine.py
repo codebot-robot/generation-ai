@@ -1006,6 +1006,11 @@ class Engine:
         msg = f"warm-up: decode steps in {time.time() - started:.1f}s (weight copies made, segments built or loaded, graphs captured)"
         print(f"[vxpu] {msg}", flush=True)
         self.plan.note(msg)
+        counts = getattr(run, "node_counts", None)
+        if counts:  # the captured step's shape: what fusion and the plan's choices change
+            msg = "the decode step launches " + ", ".join(f"{n} {kind}" for kind, n in sorted(counts.items()))
+            print(f"[vxpu] {msg}", flush=True)
+            self.plan.note(msg)
 
     def _zero_inputs(self, runner):
         """Zeros shaped like each input of a decode step: from the dataflow
