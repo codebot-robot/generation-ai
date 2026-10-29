@@ -539,16 +539,18 @@ def _grouped_schedule(slot, S, BM):
     P = slot.numel()
     blocks = triton.cdiv(P, BM) + min(S, P)  # an upper bound: every held slot adds at most one partial block
     if P <= 8192 and S + 1 < 16384:  # one program sorts and cuts: one launch instead of a dozen
+        # two sizes only (a decode step or a short prompt; a long prompt), so that prompts of every
+        # length share two compiled kernels instead of one per power of two
+        PP = 1024 if P <= 1024 else 8192
         dev = slot.device
         order = torch.empty(P, dtype=torch.int32, device=dev)
-        scratch = torch.empty(triton.next_power_of_2(P), dtype=torch.int32, device=dev)
+        scratch = torch.empty(PP, dtype=torch.int32, device=dev)
         bslot = torch.empty(blocks, dtype=torch.int32, device=dev)
         bfirst = torch.empty(blocks, dtype=torch.int32, device=dev)
         bcount = torch.empty(blocks, dtype=torch.int32, device=dev)
         with torch.cuda.device(dev):
             _grouped_schedule_kernel[(1,)](slot.contiguous(), scratch, order, bslot, bfirst, bcount, P, S, blocks,
-                                           BM=BM, PP=triton.next_power_of_2(P), NBP=triton.next_power_of_2(blocks),
-                                           num_warps=8)
+                                           BM=BM, PP=PP, NBP=2 * PP, num_warps=8)
         return order, bslot, bfirst, bcount, blocks
     key = torch.where(slot < 0, S, slot).to(torch.int64)
     order = torch.argsort(key, stable=True).to(torch.int32)
