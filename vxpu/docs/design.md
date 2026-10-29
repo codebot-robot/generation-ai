@@ -510,6 +510,66 @@ code. A mailbox becomes a ring instead:
   between compiled segments (42 a decode step for DeepSeek-V4.1-Flash)
   go away.
 
+**Three scenarios.** Where the experts live decides what a step costs,
+and three settings want different plans:
+1. **A service:** enough GPUs, maybe across machines, to hold every
+   weight in GPU memory (DeepSeek-V4.1-Flash: 10.5 GB dense, 288.8 GB of
+   routed experts); high throughput at low latency.
+2. **A personal device:** a GPU that holds only the dense layers, the
+   experts in host memory; high throughput for one session.
+3. **Many background agents:** many sessions, too little GPU memory;
+   high aggregate throughput, at the expense of latency. One plan cycles
+   the experts through the GPUs, layer by layer, for the tokens waiting
+   on them. A session's decode state is small (18.4 MB at 4096 tokens),
+   so thousands of sessions fit; the cycle's length is the cost. At the
+   host-to-GPU bandwidth measured below, streaming every expert takes
+   about 2.6 s (estimated), shorter when a hot set stays resident.
+
+They are policies over one mechanism: which experts are on which GPU
+during a step, and which tokens wait for them. The hot-expert placement
+and its mover are the static and slowly moving ends; cycling is the
+fast end.
+
+Measured on Oct 29 on one g4-standard-192 (4 RTX PRO 6000, an AMD EPYC
+9B45 with 96 cores), 37 to 47-token chat prompts, 64 new tokens. One
+session (tokens/s, decode only):
+
+| plan | ms per token | tokens/s | with drafts (S = 6) |
+|---|---|---|---|
+| experts on the CPU (scenario 2), default path | 39.7 | 25.6 | 27.0 |
+| every expert on the GPUs, each layer split across 4, default path | 41.9 | 24.2 | 49.7 |
+| every expert on the GPUs, each layer on one GPU, default path | 24.2 | 42.0 | 49.4 |
+| every expert on the GPUs, step graph | 22.1 | 46.0 | 53.2 |
+
+Several sessions at once (decode tokens/s): with every expert on the
+GPUs split across them, 195 at 9 rows (46.4 ms a step), 236 with drafts
+at 8 rows, and 473 at 32 rows (69.7 ms); each layer on one GPU, 154 at
+9 rows; experts on the CPU, 77 at 9 rows.
+
+What the numbers say:
+- On the default path, fixed costs dominate a small step: each layer's
+  experts are a host op, with a Python segment and a synchronization
+  around it, and splitting a layer across four GPUs adds copies to and
+  from three of them. The step graph (one CUDA graph a step, the host
+  ops as native mailboxes) removes most of it: 22.1 ms a token with
+  every expert on the GPUs, and with half of them on the CPU too.
+- Placement trades latency for throughput: a layer whole on one GPU is
+  faster for one session (24.2 against 41.9 ms), a layer split across
+  the GPUs faster for many (195 against 154 tokens/s at 9 rows), since
+  its expert work runs on four GPUs at once. Keeping every GPU busy with
+  whole layers needs several batches of rows in flight, which is what
+  rings with depth allow.
+- Drafts pay where an extra token costs little: 2.05 times with every
+  expert on the GPUs and the default path's expensive step, 1.16 times
+  on the step graph, 1.05 times with the experts on the CPU, whose
+  verification grows with the tokens.
+- The machine: memory reads at 474 to 523 GB/s; one token's experts on
+  the CPU take 0.39 ms a layer on 48 or more threads (290 GB/s, 56% of
+  the read rate; one core reaches 14 GB/s); host-to-GPU copies at 56.9
+  GB/s a GPU, 113 GB/s for all four at once; no steal time and 2.7 to
+  4.1 GHz throughout, and no run as slow as the outliers of Oct 27 (a
+  g4-standard-96).
+
 **Batched decode.** Decode is bound by memory bandwidth, so stepping
 several sequences together reads each dense weight once for all of them.
 `export --batch B` exports the graphs with B rows. Every state tensor
