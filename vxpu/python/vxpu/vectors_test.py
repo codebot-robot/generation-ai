@@ -2518,6 +2518,30 @@ def _check_batched_decode(model, artifact, workdir):
     return True
 
 
+def _check_rings():
+    """The message rings (csrc/ring.h): a thread answers every message on one ring with its bytes on
+    another, through rings one slot deep and four deep; ring_ping checks every reply is its message.
+    Prints the median round trip."""
+    import threading
+    import torch
+    from . import kernels
+    k = kernels.load()
+    if k is None or not hasattr(k, "ring_ping"):
+        print("rings check skipped: no native kernels")
+        return True
+    for slots in (1, 4):
+        a, b = (torch.zeros(k.ring_bytes(slots, 4096), dtype=torch.uint8) for _ in range(2))
+        k.ring_init(a, slots, 4096)
+        k.ring_init(b, slots, 4096)
+        echo = threading.Thread(target=k.ring_echo, args=(a, b, 2000))
+        echo.start()
+        rtt = sorted(k.ring_ping(a, b, 2000, 4096))
+        echo.join()
+        print(f"rings: {slots} slot(s), 2000 messages of 4 KB answered in order, median round trip "
+              f"{rtt[len(rtt) // 2] / 1e3:.2f} us")
+    return True
+
+
 def _check_long_prefill(model, prompts, settings, artifact, plain):
     """A prefill longer than ops.DECODE_MAX_ROWS takes cpu-grouped (each expert dequantized once,
     then torch's GEMM) instead of the decode kernels. The selftest's prompts are shorter than the
@@ -2590,6 +2614,8 @@ def selftest(workdir, settings):
     _check_local_blobs_copy(workdir)
     _check_expert_sim()
     _check_rotary()
+    if not _check_rings():
+        raise SystemExit("rings check failed")
     from .export import export_artifact
     from .fixtures import tiny_fp8_moe
     models = [

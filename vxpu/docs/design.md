@@ -477,6 +477,39 @@ computes.
   experts each layer selected. The site is Go, served by the coordinator
   (#331).
 
+**Direction: mailboxes as message rings.** Today a mailbox holds one
+message: the step graph's flag in pinned memory, raised once per node per
+step, and a TCP frame to a node server. So the producer of a step waits
+for every reply before it can go on, and each transport has its own
+code. A mailbox becomes a ring instead:
+- A ring is a single-producer, single-consumer queue of fixed-size slots
+  in one region of memory. The producer writes a slot's payload, then
+  publishes it by writing the slot's sequence number (a release store);
+  the consumer polls the sequence number (an acquire load), reads the
+  payload, and hands the slot back by advancing its own sequence. When
+  the ring is full, the producer waits. A GPU producer publishes with a
+  system-scope release store from a kernel, as the flags do today.
+- The kind of memory is the address: pinned host memory between a GPU
+  and the CPU in one process, shared memory between processes on one
+  machine (a node server without TCP), RDMA-registered memory between
+  machines (an RDMA write of the payload, then of the sequence number;
+  Soft-iWARP where there is no RDMA NIC), GPU memory between GPUs. The
+  producer and consumer code is the same for all of them.
+- Depth lets work overlap. With several slots, a GPU can go on to other
+  rows' dense work while the experts answer a layer, a node can answer
+  one message while the next arrives, and experts streamed through a GPU
+  (cycling, §6) arrive in slots while the previous ones compute. Replies
+  still sum in a fixed order: a reply carries its pair's index.
+- Each slot's header carries its timestamps (written, read), so every
+  crossing is timed without extra code.
+- The rings are native code (C++ for the CPU side, a kernel for the GPU's
+  publish), with Python only creating them. Today's flags are rings one
+  slot deep, so the step graph moves over first, unchanged in behaviour;
+  then node servers over shared memory, then RDMA. When the step graph
+  on rings is the default, the host-op segments that run in Python
+  between compiled segments (42 a decode step for DeepSeek-V4.1-Flash)
+  go away.
+
 **Batched decode.** Decode is bound by memory bandwidth, so stepping
 several sequences together reads each dense weight once for all of them.
 `export --batch B` exports the graphs with B rows. Every state tensor

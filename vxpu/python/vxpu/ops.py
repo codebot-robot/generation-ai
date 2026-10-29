@@ -245,11 +245,16 @@ def _moe_gpu_hot(moe, res, x_in, weights, indices, layer, rec, t0):
             slots = pool.slot_gpu[i - moe.experts_start_idx]
             partial.append((pool, triton_ops.fp4_experts_decode(x, w, slots, pool.w1, pool.s1, pool.w3, pool.s3,
                                                                 pool.w2, pool.s2, moe.swiglu_limit)))
-    x, w, i = _to_host(x_in, weights, indices)  # the GPUs compute the hot pairs meanwhile
-    t1 = time.perf_counter()
-    cold = ~res.held_cpu[i - moe.experts_start_idx]
-    n_cold = int(cold.sum())
+    # With every expert of the layer on a GPU, nothing goes to the host and nothing waits for it:
+    # the step's work stays queued on the GPUs.
+    i = None
+    n_cold = 0
     y_cold = None
+    if not bool(res.held_cpu.all()):
+        x, w, i = _to_host(x_in, weights, indices)  # the GPUs compute the hot pairs meanwhile
+        cold = ~res.held_cpu[i - moe.experts_start_idx]
+        n_cold = int(cold.sum())
+    t1 = time.perf_counter()
     if n_cold:
         fused = _plan("cpu")["fused_experts"]
         if x.shape[0] == 1:  # one token: only its cold pairs reach the CPU kernels
@@ -268,8 +273,12 @@ def _moe_gpu_hot(moe, res, x_in, weights, indices, layer, rec, t0):
             current.wait_stream(pool.stream)
             y_pool.record_stream(current)
         y = y_pool if y is None else y + y_pool
-    selected = i.flatten().tolist()
     started = completed = 0
+    if res.mover is None and rec is None:
+        return y
+    if i is None:  # observed only: the indices come to the host for the mover and the recorder
+        i = indices.cpu()
+    selected = i.flatten().tolist()
     if res.mover is not None:  # after this call's kernels, so a move's unmapping is ordered after them
         started, completed = res.mover.observe(res, selected)
     if rec is not None:
