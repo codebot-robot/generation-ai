@@ -222,6 +222,19 @@ def choose(logits, temperature, top_k, top_p):
     return torch.where((temperature > 0).view(-1, 1), sampled, greedy)
 
 
+def _all_held(moe, here, peer_boxes):
+    """Whether the GPU pools (this GPU's and the other GPUs') hold every expert of the node's
+    layer, so no pair can fall to the host."""
+    del moe
+    maps = [pool.slot_cpu for pool in here] + [box[0].slot_cpu for box in peer_boxes.values()]  # CPU copies: this
+    if not maps:                                                                                 # runs inside a capture
+        return False
+    held = torch.zeros_like(maps[0], dtype=torch.bool)  # a slot map has one entry per expert of the layer
+    for m in maps:
+        held |= m >= 0
+    return bool(held.all())
+
+
 class StepGraph(torch.nn.Module):
     """A dataflow runner's step as one CUDA graph (module docstring)."""
 
@@ -521,6 +534,7 @@ class StepGraph(torch.nn.Module):
                      produced, host_nodes, answers):
         from . import aoti
         events = []  # per host node: (sent, back), timing events recorded in the graph
+        self._gpu_only = 0  # experts nodes answered by GPU pools alone, with no host crossing
         g = torch.cuda.CUDAGraph(keep_graph=True)  # kept, to count its nodes (node_counts)
         with torch.cuda.graph(g):
             stream = torch.cuda.current_stream()
@@ -536,6 +550,11 @@ class StepGraph(torch.nn.Module):
                 i = len(mailboxes)
                 pinned, outbox, like = boxes[node.name]
                 moe, here, peer_boxes, where, _ = pooled.get(node.name, (None, [], {}, None, None))
+                # every expert of the layer in a GPU pool: the node never needs the host. No pinned
+                # copies, no flags, no outbox; the reply is the pools' alone, and the step host does
+                # not get the node (it is not in mailboxes). Decided here, at capture, from the slot
+                # maps: a placement holding whole layers is static.
+                on_gpus = moe is not None and _all_held(moe, here, peer_boxes)
                 hot = []
                 if here:
                     x_, w_, i_ = (args_[k] for k in where)
@@ -549,18 +568,21 @@ class StepGraph(torch.nn.Module):
                     for dst, k in zip(inbox, where):                              # wait on copies, not on the CPU
                         driver.memcpy(stream, dst, args_[k])
                     driver.write_value(stream, flag_in.data_ptr(), 1)
-                for p, a in zip(pinned, args_):
-                    if isinstance(a, torch.Tensor):
-                        p.copy_(a, non_blocking=True)
-                sent, back = (torch.cuda.Event(enable_timing=True, external=True) for _ in range(2))
-                sent.record(stream)  # the GPU's side of the crossing: from raising its flag to seeing the reply's
-                driver.write_value(stream, flag(i, 0), 1)
-                driver.wait_value(stream, flag(i, 1), 1)
-                driver.write_value(stream, flag(i, 1), 0)
-                back.record(stream)
-                events.append((sent, back))
-                reply = torch.empty_like(like, device=dev)
-                reply.copy_(outbox, non_blocking=True)
+                if on_gpus:
+                    reply = torch.empty_like(like, device=dev)  # the CPU's share: none; never read
+                else:
+                    for p, a in zip(pinned, args_):
+                        if isinstance(a, torch.Tensor):
+                            p.copy_(a, non_blocking=True)
+                    sent, back = (torch.cuda.Event(enable_timing=True, external=True) for _ in range(2))
+                    sent.record(stream)  # the GPU's side of the crossing: from raising its flag to seeing the reply's
+                    driver.write_value(stream, flag(i, 0), 1)
+                    driver.wait_value(stream, flag(i, 1), 1)
+                    driver.write_value(stream, flag(i, 1), 0)
+                    back.record(stream)
+                    events.append((sent, back))
+                    reply = torch.empty_like(like, device=dev)
+                    reply.copy_(outbox, non_blocking=True)
                 if moe is not None:  # per-pair replies: each from whoever holds the expert, then the k-order sum
                     i_ = args_[where[2]]
                     start = moe.experts_start_idx
@@ -584,7 +606,10 @@ class StepGraph(torch.nn.Module):
                             y = y + reply[:, k]
                         reply = y
                 produced[node.name] = reply
-                mailboxes.append((node, pinned, kwargs_, outbox, F * i, pooled.get(node.name)))
+                if on_gpus:
+                    self._gpu_only += 1
+                else:
+                    mailboxes.append((node, pinned, kwargs_, outbox, F * i, pooled.get(node.name)))
             output = resolve(graph.output)
             # the greedy choice, in the graph: a decode step's logits [rows, tokens, vocab] become each
             # position's argmax, so a native loop (native_loop) reads token ids, not logits
