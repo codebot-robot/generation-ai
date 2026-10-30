@@ -1338,6 +1338,100 @@ if triton is not None:
 
 if triton is not None:
     @triton.jit
+    def _fp4_direct_one(x_ptr, w_ptr, s_ptr, o_ptr, p, tok, bank_rows, rows, live_n, I, K,
+                        BM: tl.constexpr, BN: tl.constexpr, BK: tl.constexpr, NATIVE: tl.constexpr):
+        """One pair's product with BN rows of one fp4 matrix (gate or up), stored as bf16."""
+        live_m = tl.arange(0, BM) == 0
+        acc = tl.zeros((BM, BN), dtype=tl.float32)
+        for k0 in range(0, K, BK):
+            x = tl.load(x_ptr + tok * K + k0 + tl.arange(0, BK)[None, :], mask=live_m[:, None], other=0.0)
+            if NATIVE:
+                b, e = _fp4_raw(w_ptr, s_ptr, bank_rows, live_n, k0, K // 2, K // 32, BN, BK)
+                acc = tl.dot_scaled(x, None, "bf16", tl.trans(b), e, "e2m1", acc)
+            else:
+                acc = tl.dot(x, tl.trans(_fp4_tile(w_ptr, s_ptr, bank_rows, live_n, k0, K // 2, K // 32, BN, BK)), acc)
+        # the other BM - 1 rows of the accumulator are exactly zero (their x rows were), so the sum is row 0
+        tl.store(o_ptr + p.to(tl.int64) * I + rows, tl.sum(acc, axis=0).to(tl.bfloat16), mask=live_n)
+
+    @triton.jit
+    def _fp4_direct_gate_up_kernel(x_ptr, idx_ptr, map_ptr, start, w1_ptr, s1_ptr, w3_ptr, s3_ptr, g_ptr, u_ptr,
+                                   I, K, TOPK, BM: tl.constexpr, BN: tl.constexpr, BK: tl.constexpr,
+                                   NATIVE: tl.constexpr):
+        """Gate or up (the third grid axis) for one pair (a token and one of its chosen experts), BN
+        of the expert's rows: the decode step's path, with no schedule. The program finds its
+        expert's slot itself from the pair's expert id and the pool's slot map (a pair whose expert
+        is not held here writes nothing; the down kernel writes its reply as zero). Each pair reads
+        its expert's weights whole; a decode step's few pairs rarely share an expert, and the
+        grouped kernels take the prefill's many. Gate and up are separate programs on purpose: one
+        tensor-core dot per load keeps the loads flowing (measured cold at one token on an RTX PRO
+        6000: 70 us for 75 MB against 78 with both in one program)."""
+        p = tl.program_id(0)
+        slot = tl.load(map_ptr + tl.load(idx_ptr + p) - start).to(tl.int64)
+        if slot < 0:
+            return
+        tok = (p // TOPK).to(tl.int64)
+        rows = tl.program_id(1) * BN + tl.arange(0, BN)
+        live_n = rows < I
+        bank_rows = slot * I + rows
+        if tl.program_id(2) == 0:
+            _fp4_direct_one(x_ptr, w1_ptr, s1_ptr, g_ptr, p, tok, bank_rows, rows, live_n, I, K, BM, BN, BK, NATIVE)
+        else:
+            _fp4_direct_one(x_ptr, w3_ptr, s3_ptr, u_ptr, p, tok, bank_rows, rows, live_n, I, K, BM, BN, BK, NATIVE)
+
+    @triton.jit
+    def _fp4_direct_down_kernel(g_ptr, u_ptr, wt_ptr, idx_ptr, map_ptr, start, w2_ptr, s2_ptr, part_ptr, cnt_ptr,
+                                y_ptr, D, I, limit, TOPK, NT,
+                                BM: tl.constexpr, BN: tl.constexpr, BK: tl.constexpr, NATIVE: tl.constexpr,
+                                SUM: tl.constexpr):
+        """The down projection for one pair, BN of its expert's rows, with the SwiGLU folded into the
+        loads: each BK tile of the pair's input is w * silu(g) * u from the gate/up outputs, rounded
+        and quantized per 32 exactly as _swiglu_quant_kernel does (the tile is a multiple of 32, the
+        quantization's block). The pair's reply, rounded to bf16 as the module rounds it, goes to
+        part[pair]. With SUM, the last of a token's TOPK programs on this row tile (a counter per
+        token and tile, which it resets) adds the token's replies in k order into y: the combine
+        with no launch of its own and a fixed order of summation."""
+        limit = limit.to(tl.float32)
+        p = tl.program_id(0)
+        tile = tl.program_id(1)
+        t = (p // TOPK).to(tl.int64)
+        rows = tile * BN + tl.arange(0, BN)
+        live_n = rows < D
+        slot = tl.load(map_ptr + tl.load(idx_ptr + p) - start).to(tl.int64)
+        acc = tl.zeros((BM, BN), dtype=tl.float32)
+        if slot >= 0:
+            bank_rows = slot * D + rows
+            w = tl.load(wt_ptr + p).to(tl.float32)
+            live_m = tl.arange(0, BM) == 0
+            for i0 in range(0, I, BK):
+                offs = p.to(tl.int64) * I + i0 + tl.arange(0, BK)
+                g = tl.load(g_ptr + offs).to(tl.bfloat16).to(tl.float32)
+                u = tl.load(u_ptr + offs).to(tl.bfloat16).to(tl.float32)
+                if limit > 0:
+                    u = tl.minimum(tl.maximum(u, -limit), limit)
+                    g = tl.minimum(g, limit)
+                h = (w * ((g * tl.sigmoid(g)) * u)).to(tl.bfloat16).to(tl.float32)
+                h = tl.reshape(_quant_tile(tl.reshape(h, (1, BK)), 1, BK), (BK,))
+                hx = tl.where(live_m[:, None], h[None, :], 0.0).to(tl.bfloat16)
+                if NATIVE:
+                    b2, e2 = _fp4_raw(w2_ptr, s2_ptr, bank_rows, live_n, i0, I // 2, I // 32, BN, BK)
+                    acc = tl.dot_scaled(hx, None, "bf16", tl.trans(b2), e2, "e2m1", acc)
+                else:
+                    acc = tl.dot(hx, tl.trans(_fp4_tile(w2_ptr, s2_ptr, bank_rows, live_n, i0, I // 2, I // 32, BN, BK)), acc)
+        r = tl.sum(acc, axis=0).to(tl.bfloat16).to(tl.float32)
+        tl.store(part_ptr + p.to(tl.int64) * D + rows, r, mask=live_n)
+        if SUM:
+            tl.debug_barrier()
+            old = tl.atomic_add(cnt_ptr + t * NT + tile, 1, sem="acq_rel")
+            if old == TOPK - 1:
+                y = tl.zeros((BN,), dtype=tl.float32)
+                for k in range(TOPK):
+                    y += tl.load(part_ptr + (t * TOPK + k) * D + rows, mask=live_n, other=0.0, cache_modifier=".cg")
+                tl.store(y_ptr + t * D + rows, y, mask=live_n)
+                tl.atomic_xchg(cnt_ptr + t * NT + tile, 0)
+
+
+if triton is not None:
+    @triton.jit
     def _max_combine(a, b):
         return tl.maximum(a, b)
 
@@ -1418,6 +1512,8 @@ def _block_k(dim, want):
 
 FP4_KSPLIT = os.environ.get("VXPU_FP4_KSPLIT")  # override: the K split of the fp4 expert kernels (measurement)
 FP4_NATIVE = os.environ.get("VXPU_FP4_NATIVE")  # override: force the native (1) or software-decode (0) body (A/B)
+FP4_DIRECT = os.environ.get("VXPU_FP4_DIRECT")  # override: force the direct (1) or grouped (0) decode path (A/B)
+FP4_DIRECT_MAX = 64  # pairs up to which the direct kernels run (no schedule; each pair reads its expert whole)
 
 
 @functools.lru_cache(maxsize=None)
@@ -1466,6 +1562,10 @@ def fp4_experts_decode(x_in, weights, slots, w1, s1, w3, s3, w2, s2, swiglu_limi
     (measured on an L4: narrow, deep tiles for a few pairs; taller blocks for many)."""
     pairs_n = (indices if indices is not None else slots).numel()
     native = _fp4_native(x_in.device.index)
+    direct = indices is not None and pairs_n <= FP4_DIRECT_MAX if FP4_DIRECT is None else FP4_DIRECT == "1"
+    if direct and indices is not None:
+        return _fp4_experts_direct(x_in, weights, slots, indices, start, w1, s1, w3, s3, w2, s2, swiglu_limit,
+                                   per_pair, native)
     BM = 32 if pairs_n >= 768 else 16
     if native:  # measured on an RTX PRO 6000 at one token with a cold L2: BN 64, BK 256, no K split (75.6 us for 75 MB)
         BN, BK = (64, 256) if pairs_n <= 64 else (64, 128)
@@ -1505,6 +1605,58 @@ def fp4_experts_decode(x_in, weights, slots, w1, s1, w3, s3, w2, s2, swiglu_limi
             h, order, blk_slot, blk_first, blk_count, w2, s2.view(torch.uint8), d, K, I, BM=BM, BN=BN,
             BK=bk2, KS=ks2, NATIVE=native)
     return d.view(n, topk, K) if per_pair else d.view(n, topk, K).sum(1)
+
+
+_FP4_COUNTERS = {}
+
+
+def _fp4_counters(dev, size):
+    """The down kernel's arrival counters, one buffer per GPU and size, zero between calls: the
+    last program of each (token, row tile) resets its counter, so no fill launch is needed per
+    layer. The layers of a step run in order on their GPU, so they share the buffer."""
+    key = (str(dev), size)
+    buf = _FP4_COUNTERS.get(key)
+    if buf is None:
+        buf = _FP4_COUNTERS[key] = torch.zeros(size, dtype=torch.int32, device=dev)
+    return buf
+
+
+def _fp4_experts_direct(x_in, weights, slot_map, indices, start, w1, s1, w3, s3, w2, s2, swiglu_limit, per_pair,
+                        native):
+    """fp4_experts_decode's decode path: two launches a layer. The gate/up kernel per (pair, row
+    tile) with the slot looked up in the kernel, then the down kernel per (pair, row tile) with the
+    SwiGLU in its loads and, unless per_pair, the token's sum done by the last of its programs.
+    No schedule, no SwiGLU kernel, no zeroed reply buffer, no separate sum."""
+    n, topk = indices.shape
+    K = x_in.shape[1]
+    S, I, _ = w1.shape
+    pairs = n * topk
+    dev = x_in.device
+    BM, BN, BK = 16, 64, 256
+    g = torch.empty(pairs, I, dtype=torch.bfloat16, device=dev)
+    u = torch.empty(pairs, I, dtype=torch.bfloat16, device=dev)
+    part = torch.empty(pairs, K, dtype=torch.float32, device=dev)
+    x = x_in.contiguous()
+    wt = weights.to(torch.float32).contiguous().view(-1)
+    idx = indices.contiguous().view(-1)
+    smap = slot_map.contiguous()
+    with torch.cuda.device(dev):
+        bk1, bk2 = _block_k(K, BK), _block_k(I, BK)
+        nt = triton.cdiv(K, BN)
+        _fp4_direct_gate_up_kernel[(pairs, triton.cdiv(I, BN), 2)](
+            x, idx, smap, start, w1, s1.view(torch.uint8), w3, s3.view(torch.uint8), g, u, I, K, topk,
+            BM=BM, BN=BN, BK=bk1, NATIVE=native)
+        if per_pair:
+            _fp4_direct_down_kernel[(pairs, nt)](
+                g, u, wt, idx, smap, start, w2, s2.view(torch.uint8), part, part, part, K, I, float(swiglu_limit),
+                topk, nt, BM=BM, BN=BN, BK=bk2, NATIVE=native, SUM=False)
+            return part.view(n, topk, K)
+        y = torch.empty(n, K, dtype=torch.float32, device=dev)
+        counters = _fp4_counters(dev, n * nt)
+        _fp4_direct_down_kernel[(pairs, nt)](
+            g, u, wt, idx, smap, start, w2, s2.view(torch.uint8), part, counters, y, K, I, float(swiglu_limit),
+            topk, nt, BM=BM, BN=BN, BK=bk2, NATIVE=native, SUM=True)
+    return y
 
 
 if triton is not None:
