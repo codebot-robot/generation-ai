@@ -331,6 +331,62 @@ def gemv_rows(x, weight, scale=None, group_rows=None, out_dtype=torch.bfloat16, 
     return y
 
 
+if triton is not None:
+    @triton.jit
+    def _gate_select_kernel(s_ptr, b_ptr, w_ptr, i_ptr, E, temp, route_scale,
+                            K: tl.constexpr, KP: tl.constexpr, BE: tl.constexpr, SCORE: tl.constexpr,
+                            NORM: tl.constexpr):
+        """One row of the gate: the scoring function over E raw scores (SCORE 0: sqrt(softplus), 1:
+        sigmoid, 2: softmax), the K largest of score + bias taken one at a time (ties to the lower
+        index), their unbiased scores normalized to sum to one when NORM, times route_scale."""
+        row = tl.program_id(0).to(tl.int64)
+        e = tl.arange(0, BE)
+        live = e < E
+        s = tl.load(s_ptr + row * E + e, mask=live, other=0.0) / temp
+        if SCORE == 2:
+            m = tl.max(tl.where(live, s, float("-inf")), axis=0)
+            p = tl.where(live, tl.exp(s - m), 0.0)
+            s = p / tl.sum(p, axis=0)
+        elif SCORE == 1:
+            s = tl.sigmoid(s)
+        else:  # torch's softplus: x itself above 20, else log1p(exp(x))
+            s = tl.sqrt(tl.where(s > 20.0, s, tl.extra.cuda.libdevice.log1p(tl.exp(s))))
+        b = tl.load(b_ptr + e, mask=live, other=0.0).to(tl.float32)
+        cand = tl.where(live, s + b, float("-inf"))
+        ks = tl.arange(0, KP)
+        chosen = tl.zeros((KP,), dtype=tl.int32)
+        picked = tl.zeros((KP,), dtype=tl.float32)
+        for k in tl.static_range(K):
+            idx = tl.argmax(cand, axis=0)
+            chosen = tl.where(ks == k, idx, chosen)
+            picked = tl.where(ks == k, tl.sum(tl.where(e == idx, s, 0.0), axis=0), picked)
+            cand = tl.where(e == idx, float("-inf"), cand)
+        if NORM:
+            picked = picked / (tl.sum(picked, axis=0) + 1e-20)
+        tl.store(w_ptr + row * K + ks, picked * route_scale, mask=ks < K)
+        tl.store(i_ptr + row * K + ks, chosen.to(tl.int64), mask=ks < K)
+
+
+def gate_select(scores, bias, topk, score_func, gate_temp, norm_topk_prob, route_scale, traced=False):
+    """The MoE gate after its projection: scores [n, E] fp32, bias [E] -> (weights [n, k] fp32,
+    indices [n, k] int64), as the fork's Gate.forward computes them, one program per row."""
+    n, E = scores.shape
+    be = kp = 1
+    while be < E:
+        be *= 2
+    while kp < topk:
+        kp *= 2
+    weights = torch.empty(n, topk, dtype=torch.float32, device=scores.device)
+    indices = torch.empty(n, topk, dtype=torch.int64, device=scores.device)
+    if n:
+        kernel, ctx = _launcher(_gate_select_kernel, scores.device, traced)
+        with ctx:
+            kernel[(n,)](scores.contiguous(), bias.contiguous(), weights, indices, E, float(gate_temp),
+                         float(route_scale), K=topk, KP=kp, BE=be,
+                         SCORE={"softmax": 2, "sigmoid": 1}.get(score_func, 0), NORM=bool(norm_topk_prob and topk > 1))
+    return weights, indices
+
+
 def _gemv_blocks(K):
     """Block shape for fp8_gemv: 8 rows per program and the widest K step
     that divides K, measured best or within 3% of best for every
@@ -452,6 +508,11 @@ if triton is not None:
                      out_dtype: torch.dtype) -> torch.Tensor:
         return fp8_gemv(x, weight, scale, group_rows or None, out_dtype, traced=True)
 
+    @torch.library.triton_op("vxpu_triton::gate_select", mutates_args=())
+    def _gate_select_op(scores: torch.Tensor, bias: torch.Tensor, topk: int, score_func: str, gate_temp: float,
+                        norm_topk_prob: bool, route_scale: float) -> tuple[torch.Tensor, torch.Tensor]:
+        return gate_select(scores, bias, topk, score_func, gate_temp, norm_topk_prob, route_scale, traced=True)
+
     @torch.library.triton_op("vxpu_triton::rotary", mutates_args=())
     def _rotary_op(x: torch.Tensor, cos: torch.Tensor, sin: torch.Tensor) -> torch.Tensor:
         return rotary(x, cos, sin, traced=True)
@@ -470,6 +531,7 @@ lowered = types.SimpleNamespace(
     linear_f32=lambda x, weight: torch.ops.vxpu_triton.linear_f32(x, weight),
     fp8_gemv=_lowered_fp8_gemv,
     rotary=lambda x, cos, sin: torch.ops.vxpu_triton.rotary(x, cos, sin),
+    gate_select=lambda *a: torch.ops.vxpu_triton.gate_select(*a),
 )
 
 
