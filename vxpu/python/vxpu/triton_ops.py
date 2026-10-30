@@ -290,19 +290,21 @@ if triton is not None:
                  mask=live[:, None] & mlive[None, :])
 
 
-GEMV_ROWS_MAX = 32  # rows one pass over the weight serves (BM); beyond, a GEMM
+GEMV_ROWS_MAX = 64  # rows one pass over the weight serves (BM); beyond, a GEMM
 
 
 def _rows_blocks(M, K):
     """Block shape for _gemv_rows_kernel: rows padded to a tensor-core tile, 16 weight rows per
-    program, a K step of 256 where K allows it."""
+    program (32 above 32 rows: measured on an L4, 16 fell to 130-175 GB/s at 33-64 rows where 32
+    held 180-255), a K step of 256 where K allows it."""
     bm = 16
     while bm < M:
         bm *= 2
+    bn = 32 if bm > 32 else 16
     for bk in (256, 128, 64, 32):
         if K % bk == 0:
-            return bm, 16, bk
-    return bm, 16, 32
+            return bm, bn, bk
+    return bm, bn, 32
 
 
 def gemv_rows(x, weight, scale=None, group_rows=None, out_dtype=torch.bfloat16, blocks=None, traced=False):
