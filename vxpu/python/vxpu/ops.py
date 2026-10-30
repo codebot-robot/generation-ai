@@ -678,55 +678,6 @@ def _may_cache_bf16(ext, w):
     return False
 
 
-@custom_op("vxpu::moe_gate", mutates_args=())  # pure tensor work: capturable
-def moe_gate(x: torch.Tensor, weight: torch.Tensor, bias: torch.Tensor, topk: int, score_func: str,
-             gate_temp: float, norm_topk_prob: bool, route_scale: float) -> tuple[torch.Tensor, torch.Tensor]:
-    """The MoE gate (the fork's Gate.forward): scores of x [n, dim] against weight [E, dim] through
-    the scoring function, the top-k experts by score plus bias, their weights from the unbiased
-    scores, normalized and scaled. Returns (weights [n, k] fp32, indices [n, k] int64)."""
-    impl = select("vxpu::moe_gate", x, weight, bias, topk, score_func, gate_temp, norm_topk_prob, route_scale)
-    return impl.fn(x, weight, bias, topk, score_func, gate_temp, norm_topk_prob, route_scale)
-
-
-@moe_gate.register_fake
-def _(x, weight, bias, topk, score_func, gate_temp, norm_topk_prob, route_scale):
-    return (x.new_empty((x.shape[0], topk), dtype=torch.float32),
-            x.new_empty((x.shape[0], topk), dtype=torch.int64))
-
-
-def _gate_context(x, weight, bias, topk, score_func, gate_temp, norm_topk_prob, route_scale):
-    return x.device.type, f"rows={x.shape[0]} experts={weight.shape[0]} k={topk}", {
-        "rows": x.shape[0], "experts": weight.shape[0], "topk": topk, "score_func": score_func, "dtype": x.dtype}
-
-
-@implementation("vxpu::moe_gate", "gpu-triton", ("cuda",), "rounding",
-                "Triton: the scores by one pass over the gate's weight (gemv_rows), then one kernel for the scoring "
-                "function, the top-k selection and the weights (aten launches about six)",
-                applies=lambda plan, rows=0, experts=0, topk=0, score_func="", dtype=None, **_: plan["triton"]
-                and dtype == torch.bfloat16 and rows <= triton_ops.GEMV_ROWS_MAX and experts <= 1024 and topk <= 16,
-                lowerable=True)
-def _gate_triton(x, weight, bias, topk, score_func, gate_temp, norm_topk_prob, route_scale, tk=triton_ops):
-    scores = tk.linear_f32(x, weight.to(torch.bfloat16))
-    return tk.gate_select(scores, bias, topk, score_func, gate_temp, norm_topk_prob, route_scale)
-
-
-@implementation("vxpu::moe_gate", "reference", ("cpu", "cuda"), "bit-identical", "the fork's computation (aten)",
-                reference=True)
-def _gate_reference(x, weight, bias, topk, score_func, gate_temp, norm_topk_prob, route_scale):
-    scores = torch.nn.functional.linear(x.float(), weight.float()) / gate_temp
-    if score_func == "softmax":
-        scores = scores.softmax(dim=-1)
-    elif score_func == "sigmoid":
-        scores = scores.sigmoid()
-    else:
-        scores = torch.nn.functional.softplus(scores).sqrt()
-    indices = (scores + bias).topk(topk, dim=-1)[1]
-    weights = scores.gather(1, indices)
-    if norm_topk_prob and topk > 1:
-        weights = weights / (weights.sum(dim=-1, keepdim=True) + 1e-20)
-    return weights * route_scale, indices
-
-
 @custom_op("vxpu::hc_sinkhorn", mutates_args=())
 def hc_sinkhorn(mixes: torch.Tensor, hc_scale: torch.Tensor, hc_base: torch.Tensor, hc_mult: int,
                 sinkhorn_iters: int, eps: float) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
@@ -917,7 +868,6 @@ SELECTION = {
     "vxpu::fp8_linear": _fp8_linear_context,
     "vxpu::fp8_grouped_linear": _grouped_context,
     "vxpu::hc_sinkhorn": _sinkhorn_context,
-    "vxpu::moe_gate": _gate_context,
     "vxpu::head_linear": _head_context,
     "vxpu::rotary": _rotary_context,
 }
