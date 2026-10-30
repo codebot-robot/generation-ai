@@ -150,10 +150,12 @@ def _preallocate(fd, length, chunk=64 << 20):
     each allocating a page and a block: a 289 GB expert bank assembled that way ran at 170 MB/s
     on a network disk (one fault at a time, on one thread), against 1.1 GB/s for sequential
     writes on the same disk. After this, the fill's writes dirty pages that exist."""
-    try:
-        os.posix_fallocate(fd, 0, length)
-    except OSError:
-        pass  # a filesystem without it (tmpfs on some kernels): the writes below still allocate
+    fallocate = getattr(os, "posix_fallocate", None)  # Linux; macOS has no such call
+    if fallocate is not None:
+        try:
+            fallocate(fd, 0, length)
+        except OSError:
+            pass  # a filesystem without it: the writes below still allocate
     zeros = bytearray(min(chunk, length))
     view = memoryview(zeros)
     done = 0
