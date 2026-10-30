@@ -224,8 +224,12 @@ def _cheaper(op, fused, other, args, report):
     their measured cost at these shapes (costs.py). Only a lowerable other competes: one
     that is not runs through its op, as the plan chose it (a bf16 weight copy kept in the
     engine's cache, say), which a measurement on its own could not reproduce."""
-    if not other.lowerable or other.name == fused.name:
+    if other.name == fused.name:
         return other
+    if not other.lowerable:
+        # the reference computation (plain tensor operations) is better inlined as the body
+        # than kept as a call the compiler cannot take; any other unlowerable choice stays
+        return fused if other.reference else other
     chosen, times = costs.choose(op, {fused.name: (_implementation(op, fused), True),
                                       other.name: (_implementation(op, other), False)}, args, _device(args))
     if times:

@@ -356,6 +356,7 @@ if triton is not None:
           scores[r, e] = dot(gate_w[e].float(), xn.float()) for the program's EB experts
         Passes over the row BD elements at a time: the norms' statistics first, then the mix dots
         this program owns (one pass each), then xn, x_in and the gate's scores."""
+        norm_eps = norm_eps.to(tl.float32)  # inductor passes a Python float as fp64 (lower.py: Numerics)
         r = tl.program_id(0).to(tl.int64)
         p = tl.program_id(1)
         ds = tl.arange(0, BD)
@@ -408,6 +409,9 @@ if triton is not None:
         stochastic by `iters` Sinkhorn iterations), then Gate.forward's choice on its E raw scores
         (the scoring function, the K largest of score + bias one at a time, their unbiased
         scores normalized when NORM, times route_scale). One warp."""
+        hc_eps = hc_eps.to(tl.float32)  # inductor passes Python floats as fp64 (lower.py: Numerics)
+        temp = temp.to(tl.float32)
+        route_scale = route_scale.to(tl.float32)
         r = tl.program_id(0).to(tl.int64)
         hs = tl.arange(0, HC)
         m_pre = tl.load(mixes_ptr + r * NMIX + hs)
@@ -563,6 +567,7 @@ if triton is not None:
         the scores from bf16 inputs (exact products, fp32 sums), the output from the
         probabilities split into a bf16 high and low part (about 16 bits each), so the result
         differs from the fork's fp32 computation by summation order and that split."""
+        scale = scale.to(tl.float32)  # inductor passes a Python float as fp64 (lower.py: Numerics)
         r = tl.program_id(0).to(tl.int64)
         hg = tl.program_id(1)
         sp = tl.program_id(2)
