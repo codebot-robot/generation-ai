@@ -144,6 +144,24 @@ def _clean_strays(dirname, basename):
                 pass
 
 
+def _preallocate(fd, length, chunk=64 << 20):
+    """Give a fresh file its blocks and page-cache pages up front, with large sequential writes
+    of zeros. Filling a sparse file through its memory map instead costs a page fault per 4 KB,
+    each allocating a page and a block: a 289 GB expert bank assembled that way ran at 170 MB/s
+    on a network disk (one fault at a time, on one thread), against 1.1 GB/s for sequential
+    writes on the same disk. After this, the fill's writes dirty pages that exist."""
+    try:
+        os.posix_fallocate(fd, 0, length)
+    except OSError:
+        pass  # a filesystem without it (tmpfs on some kernels): the writes below still allocate
+    zeros = bytearray(min(chunk, length))
+    view = memoryview(zeros)
+    done = 0
+    while done < length:
+        n = min(chunk, length - done)
+        done += os.pwrite(fd, view[:n], done)
+
+
 def file_backed(path, length):
     """A uint8 tensor of `length` bytes whose storage is the file at
     `path`, memory-mapped shared: writes land in the page cache and reach
@@ -171,6 +189,7 @@ def file_backed(path, length):
     fd, tmp = tempfile.mkstemp(dir=dirname, prefix=basename + ".partial.")
     fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
     os.ftruncate(fd, length)
+    _preallocate(fd, length)
     tensor = torch.from_file(tmp, shared=True, size=length, dtype=torch.uint8)
     fin = weakref.finalize(tensor, os.close, fd)
 
@@ -283,28 +302,29 @@ def fetch_stacked(spec, manifest_tensors, files, cas_dir=None, workers=16, mmap_
             slots.append((r, offset, n))
             offset += manifest_tensors[n]["shape"][cat_dim]
     downloaded = 0
+
+    def fetch_and_place(slot):
+        # the worker that read a part also places it: the placement is the expensive half (the copy
+        # into the bank, faulting its pages in), and on one thread it ran at 170 MB/s
+        r, offset, n = slot
+        part, nbytes = fetch_tensor(manifest_tensors[n], files, cas_dir)
+        _place_part(out, slot, part, cat_dim, stack)
+        return nbytes
+
     with ThreadPoolExecutor(max_workers=workers) as pool:
         pending = {}
-        for i, (r, offset, n) in enumerate(slots):
-            pending[i] = pool.submit(fetch_tensor, manifest_tensors[n], files, cas_dir)
+        for i, slot in enumerate(slots):
+            pending[i] = pool.submit(fetch_and_place, slot)
             if len(pending) >= 2 * workers:
-                j = min(pending)
-                _place_part(out, slots[j], pending.pop(j).result(), cat_dim, stack)
-                downloaded += _last_bytes
+                downloaded += pending.pop(min(pending)).result()
         for j in sorted(pending):
-            _place_part(out, slots[j], pending.pop(j).result(), cat_dim, stack)
-            downloaded += _last_bytes
+            downloaded += pending.pop(j).result()
     commit()
     return out, downloaded
 
 
-_last_bytes = 0
-
-
-def _place_part(out, slot, fetched, cat_dim, stack):
-    global _last_bytes
+def _place_part(out, slot, part, cat_dim, stack):
     r, offset, _ = slot
-    part, _last_bytes = fetched
     target = out[r] if stack else out
     target.narrow(cat_dim, offset, part.shape[cat_dim]).copy_(part)
 
