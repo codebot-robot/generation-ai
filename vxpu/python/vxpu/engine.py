@@ -1681,9 +1681,12 @@ class _Request:
 
 
 def _move_module_tensors(module, device):
-    """Move every tensor a segment module holds itself (buffers, parameters, and plain tensor
-    attributes such as export's lifted constants) to device, in place, following a compiled
-    wrapper's `sub`. Returns the bytes moved."""
+    """Give a segment module a copy on device of every tensor it holds itself (buffers,
+    parameters, and plain tensor attributes such as export's lifted constants), following a
+    compiled wrapper's `sub`. A copy, not a move: a constant can be shared by two segments on
+    different GPUs, and moving it in place would pull it from under the other. These are the
+    small tensors; the weights a segment reads come as arguments and move in place. Returns the
+    bytes copied."""
     moved = 0
     seen = set()
     stack = [module]
@@ -1692,13 +1695,17 @@ def _move_module_tensors(module, device):
         if id(m) in seen or not isinstance(m, torch.nn.Module):
             continue
         seen.add(id(m))
-        for name, t in list(m.named_buffers(recurse=False)) + list(m.named_parameters(recurse=False)):
+        for name, t in list(m.named_buffers(recurse=False)):
             if t.is_cuda and t.device != device:
-                t.data = t.data.to(device)
+                m._buffers[name] = t.to(device)
+                moved += t.numel() * t.element_size()
+        for name, t in list(m.named_parameters(recurse=False)):
+            if t.is_cuda and t.device != device:
+                m._parameters[name] = torch.nn.Parameter(t.detach().to(device), requires_grad=False)
                 moved += t.numel() * t.element_size()
         for name, v in list(vars(m).items()):
             if isinstance(v, torch.Tensor) and v.is_cuda and v.device != device:
-                v.data = v.data.to(device)
+                setattr(m, name, v.to(device))
                 moved += v.numel() * v.element_size()
         stack.extend(m.children())
         sub = getattr(m, "sub", None)
