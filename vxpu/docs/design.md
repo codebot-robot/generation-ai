@@ -190,6 +190,37 @@ bodies for `attn_q` and `shared_ffn`, and the count stays at 310; the
 hero machine measures for itself. [TODO hero 7: the step with the ops
 on the real model, kernels per layer and ms.]
 
+**Direction: the planner chooses the kernels, in Go (hero run 8).** Today
+two planners exist and the split is the wrong one. The coordinator's
+planner (Go) decides placement, which machines and GPUs run which layers
+and experts, and hands each executor its plan as named switches. The
+choice of implementation per op and call shape is made in Python at
+engine load: the registry's preference order and `applies` rules, then
+the lowering timing the fused body against the kernel per call site on
+whatever GPU it finds, cached on disk per GPU and shape. Nothing above
+Python sees that decision, it costs the hero machine minutes of warm-up,
+and it is untestable without a GPU. The change:
+- **The substitution table is data.** Per call site (op, shape key,
+  layer): the implementation name and its block parameters (the GEMV
+  handover row count, the FFN front's width, the K step). The measured
+  cost record behind it is data too: per (op, shape, GPU model,
+  implementation), the microseconds and the kernel count, recorded by a
+  measuring step that runs on a GPU once per card type and is checked in
+  as fixtures.
+- **Python applies a given table** (the "plan given" path, extended from
+  switches to the table) and measures only when asked. Loading a model
+  then runs no timing.
+- **Go owns the search and the record.** The planner reads the cost
+  tables and emits the substitution table, with the placement, in
+  `LoadModelRequest.plan`. Its decisions are unit-tested against the
+  fixtures with no GPU; a CPU-only Python test checks that a given table
+  is applied exactly.
+- The templates are what it chooses among: with the GEMV template's
+  prologue and epilogue flags and the per-row kernel as its catalogue,
+  "fold the norm and the quantization into this GEMV, or not" becomes an
+  enumerable choice the planner makes from measurements, not an op a
+  person writes.
+
 **The roofline, and the production stacks.** A decode step at one row
 reads every dense weight once and the selected experts once, so its floor
 on one GPU is those bytes over the GPU's copy bandwidth. On an RTX PRO
