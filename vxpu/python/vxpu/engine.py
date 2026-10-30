@@ -951,8 +951,13 @@ class Engine:
             if shared:
                 names = sorted(shared)
                 stale = [n for n in names if n in state]
-                msg += (f"; {len(names)} tensors read from two GPUs (copied for the second)"
-                        + (f", STATE among them: {', '.join(stale)}" if stale else ""))
+                msg += f"; {len(names)} tensors read from two GPUs (copied for the second)"
+                if stale:  # a cache written on one GPU and read on another: the copy would go stale
+                    raise RuntimeError(
+                        f"layer sharding ({name}): state tensors are read by segments on two GPUs, so a range "
+                        f"boundary splits a group of layers that share a cache (the compressed KV or index keys "
+                        f"written by the group's first layer): {', '.join(stale)}. Move the boundary to the "
+                        f"group's first layer (VXPU_LAYER_DEVICES).")
             print(f"[vxpu] {msg}", flush=True)
             self.plan.note(msg)
 
