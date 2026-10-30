@@ -232,6 +232,10 @@ def set_external(model, on):
     if not hasattr(ds, "_vxpu_apply_rotary_emb"):
         ds._vxpu_apply_rotary_emb = ds.apply_rotary_emb
     ds.apply_rotary_emb = _rotary_op if on else ds._vxpu_apply_rotary_emb
+    # the sparse attention: the fork calls it through a module-level name too
+    if not hasattr(ds, "_vxpu_sparse_attn"):
+        ds._vxpu_sparse_attn = ds.sparse_attn
+    ds.sparse_attn = torch.ops.vxpu.sparse_attn if on else ds._vxpu_sparse_attn
     if getattr(ds, "world_size", 1) == 1:
         _set_head(model.head, on)
     for layer in list(model.layers) + list(model.mtp):

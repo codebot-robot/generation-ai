@@ -773,6 +773,45 @@ def _ffn_front_reference(stream, pre_mix, hc_fn, hc_scale, hc_base, hc_mult, sin
     return pre, post, comb, xn, x_in, weights, indices
 
 
+@custom_op("vxpu::sparse_attn", mutates_args=())  # pure tensor work: capturable
+def sparse_attn(q: torch.Tensor, kv: torch.Tensor, attn_sink: torch.Tensor, topk_idxs: torch.Tensor,
+                softmax_scale: float) -> torch.Tensor:
+    """The fork's sparse attention: each query (q [b, m, h, d]) over the KV rows its topk_idxs
+    [b, m, t] select from kv [b, n, d] (-1 for an absent slot), softmax with a sink term per head
+    that only adds to the denominator. One kernel on a GPU; the fork's aten version (a gather,
+    two products and a softmax, about ten kernels) elsewhere."""
+    impl = select("vxpu::sparse_attn", q, kv, attn_sink, topk_idxs, softmax_scale)
+    return impl.fn(q, kv, attn_sink, topk_idxs, softmax_scale)
+
+
+@sparse_attn.register_fake
+def _(q, kv, attn_sink, topk_idxs, softmax_scale):
+    return q.new_empty(q.shape)
+
+
+def _sparse_attn_context(q, kv, attn_sink, topk_idxs, softmax_scale):
+    b, m, h, d = q.shape
+    return q.device.type, f"queries={b * m} heads={h} d={d} t={topk_idxs.shape[-1]}", {
+        "queries": b * m, "heads": h, "d": d, "t": topk_idxs.shape[-1]}
+
+
+@implementation("vxpu::sparse_attn", "gpu-triton", ("cuda",), "rounding",
+                "Triton: a program per query, group of 16 heads and 32 selected rows gathers the rows and forms the "
+                "scores and the softmax partials on the tensor cores (the probabilities as a bf16 pair); a second "
+                "kernel combines the partials with the sink term (aten launches about ten)",
+                applies=lambda plan, d=0, heads=0, **_: plan["triton"] and d in (64, 128, 256, 512) and heads % 16 == 0,
+                lowerable=True)
+def _sparse_attn_triton(q, kv, attn_sink, topk_idxs, softmax_scale, tk=triton_ops):
+    return tk.sparse_attn(q, kv, attn_sink, topk_idxs, softmax_scale)
+
+
+@implementation("vxpu::sparse_attn", "reference", ("cpu", "cuda"), "bit-identical", "the fork's aten sparse_attn",
+                reference=True)
+def _sparse_attn_reference(q, kv, attn_sink, topk_idxs, softmax_scale):
+    ds, ka = _fork_kernels()
+    return ka.sparse_attn(q, kv, attn_sink, topk_idxs, softmax_scale)
+
+
 @custom_op("vxpu::hc_sinkhorn", mutates_args=())
 def hc_sinkhorn(mixes: torch.Tensor, hc_scale: torch.Tensor, hc_base: torch.Tensor, hc_mult: int,
                 sinkhorn_iters: int, eps: float) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
@@ -964,6 +1003,7 @@ SELECTION = {
     "vxpu::fp8_grouped_linear": _grouped_context,
     "vxpu::hc_sinkhorn": _sinkhorn_context,
     "vxpu::ffn_front": _ffn_front_context,
+    "vxpu::sparse_attn": _sparse_attn_context,
     "vxpu::head_linear": _head_context,
     "vxpu::rotary": _rotary_context,
 }

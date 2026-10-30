@@ -532,6 +532,100 @@ def ffn_front(stream, pre_mix, hc_fn, hc_scale, hc_base, hc_mult, sinkhorn_iters
             weights, indices)
 
 
+# ---------------------------------------------------------------------------
+# sparse attention for decode (ops.sparse_attn): one kernel per (query, group
+# of heads) gathers the selected KV rows, forms the scores, the softmax with
+# the sink term and the output, in fp32 as the fork's aten version does
+
+if triton is not None:
+    @triton.jit
+    def _sparse_attn_kernel(q_ptr, kv_ptr, idx_ptr, m_ptr, l_ptr, acc_ptr, M, H, T, N, S, scale,
+                            D: tl.constexpr, HB: tl.constexpr, TB: tl.constexpr):
+        """Query row r (of b * M: row b's token m), heads hg * HB ..., and split sp of its T selected
+        KV rows (idx, -1 for an absent slot; TB rows per split): scores = q . kv * scale, and the
+        split's softmax partials: the max, the sum of exp, and sum exp * kv. On the tensor cores:
+        the scores from bf16 inputs (exact products, fp32 sums), the output from the
+        probabilities split into a bf16 high and low part (about 16 bits each), so the result
+        differs from the fork's fp32 computation by summation order and that split."""
+        r = tl.program_id(0).to(tl.int64)
+        hg = tl.program_id(1)
+        sp = tl.program_id(2)
+        b = r // M
+        ds = tl.arange(0, D)
+        hs = hg * HB + tl.arange(0, HB)
+        hl = hs < H
+        q = tl.load(q_ptr + (r * H + hs)[:, None] * D + ds[None, :], mask=hl[:, None], other=0.0).to(tl.bfloat16)
+        ts = sp * TB + tl.arange(0, TB)
+        ids = tl.load(idx_ptr + r * T + ts, mask=ts < T, other=-1)
+        valid = ids >= 0
+        rows = tl.load(kv_ptr + (b * N + tl.maximum(ids, 0).to(tl.int64))[:, None] * D + ds[None, :],
+                       mask=valid[:, None], other=0.0).to(tl.bfloat16)  # [TB, D]
+        sc = tl.dot(q, tl.trans(rows)) * scale  # [HB, TB] fp32
+        sc = tl.where(valid[None, :], sc, float("-inf"))
+        m_i = tl.max(sc, axis=1)
+        m_safe = tl.where(m_i == float("-inf"), 0.0, m_i)
+        pr = tl.exp(sc - m_safe[:, None])
+        l_i = tl.sum(pr, axis=1)
+        p_hi = pr.to(tl.bfloat16)
+        p_lo = (pr - p_hi.to(tl.float32)).to(tl.bfloat16)
+        acc = tl.dot(p_hi, rows) + tl.dot(p_lo, rows)  # [HB, D]
+        part = (r * H + hs) * S + sp
+        tl.store(m_ptr + part, m_i, mask=hl)
+        tl.store(l_ptr + part, l_i, mask=hl)
+        tl.store(acc_ptr + part[:, None] * D + ds[None, :], acc, mask=hl[:, None])
+
+    @triton.jit
+    def _sparse_attn_combine_kernel(m_ptr, l_ptr, acc_ptr, sink_ptr, o_ptr, H, S,
+                                    D: tl.constexpr, SP: tl.constexpr):
+        """Query row r, head h: the S splits' partials combined under the global max, the sink term
+        added to the denominator (only there), o = acc / denominator. A query with no valid slot
+        gives zeros."""
+        r = tl.program_id(0).to(tl.int64)
+        h = tl.program_id(1)
+        ss = tl.arange(0, SP)
+        sl = ss < S
+        part = (r * H + h) * S + ss
+        m_s = tl.load(m_ptr + part, mask=sl, other=float("-inf"))
+        m = tl.max(m_s, axis=0)
+        m_safe = tl.where(m == float("-inf"), 0.0, m)
+        w = tl.where(sl, tl.exp(m_s - m_safe), 0.0)
+        l = tl.sum(w * tl.load(l_ptr + part, mask=sl, other=0.0), axis=0)
+        ds = tl.arange(0, D)
+        acc = tl.sum(w[:, None] * tl.load(acc_ptr + part[:, None] * D + ds[None, :], mask=sl[:, None], other=0.0), axis=0)
+        denom = l + tl.exp(tl.load(sink_ptr + h).to(tl.float32) - m_safe)
+        tl.store(o_ptr + (r * H + h) * D + ds, (acc / denom).to(o_ptr.dtype.element_ty))
+
+
+def sparse_attn(q, kv, attn_sink, topk_idxs, softmax_scale, traced=False):
+    """The fork's sparse_attn: q [b, m, h, d], kv [b, n, d] (K and V the same rows), attn_sink [h],
+    topk_idxs [b, m, t] int32 with -1 for an absent slot -> o [b, m, h, d] in q's dtype."""
+    b, m, h, d = q.shape
+    n = kv.shape[1]
+    t = topk_idxs.shape[-1]
+    if kv.shape[-1] != d or (d & (d - 1)):
+        raise ValueError(f"sparse_attn: q {tuple(q.shape)} against kv {tuple(kv.shape)}; d must be a power of two")
+    o = torch.empty_like(q)
+    if q.numel():
+        HB, TB = (16 if h >= 16 else h), 32  # 64-row tiles overflow shared memory at d = 512
+        S = triton.cdiv(t, TB)
+        sp = 1
+        while sp < S:
+            sp *= 2
+        dev = q.device
+        m_part = torch.empty(b * m * h * S, dtype=torch.float32, device=dev)
+        l_part = torch.empty_like(m_part)
+        acc_part = torch.empty(b * m * h * S, d, dtype=torch.float32, device=dev)
+        kernel, ctx = _launcher(_sparse_attn_kernel, dev, traced)
+        with ctx:
+            kernel[(b * m, triton.cdiv(h, HB), S)](q.contiguous(), kv.contiguous(), topk_idxs.contiguous(), m_part,
+                                                  l_part, acc_part, m, h, t, n, S, float(softmax_scale),
+                                                  D=d, HB=HB, TB=TB, num_warps=4)
+        combine, ctx = _launcher(_sparse_attn_combine_kernel, dev, traced)
+        with ctx:
+            combine[(b * m, h)](m_part, l_part, acc_part, attn_sink.contiguous(), o, h, S, D=d, SP=sp, num_warps=4)
+    return o
+
+
 def _gemv_blocks(K):
     """Block shape for fp8_gemv: 8 rows per program and the widest K step
     that divides K, measured best or within 3% of best for every
@@ -664,6 +758,11 @@ if triton is not None:
                          norm_eps, gate_weight, gate_bias, topk, score_func, gate_temp, norm_topk_prob, route_scale,
                          traced=True)
 
+    @torch.library.triton_op("vxpu_triton::sparse_attn", mutates_args=())
+    def _sparse_attn_op(q: torch.Tensor, kv: torch.Tensor, attn_sink: torch.Tensor, topk_idxs: torch.Tensor,
+                        softmax_scale: float) -> torch.Tensor:
+        return sparse_attn(q, kv, attn_sink, topk_idxs, softmax_scale, traced=True)
+
     @torch.library.triton_op("vxpu_triton::rotary", mutates_args=())
     def _rotary_op(x: torch.Tensor, cos: torch.Tensor, sin: torch.Tensor) -> torch.Tensor:
         return rotary(x, cos, sin, traced=True)
@@ -683,6 +782,7 @@ lowered = types.SimpleNamespace(
     fp8_gemv=_lowered_fp8_gemv,
     rotary=lambda x, cos, sin: torch.ops.vxpu_triton.rotary(x, cos, sin),
     ffn_front=lambda *a: torch.ops.vxpu_triton.ffn_front(*a),
+    sparse_attn=lambda *a: torch.ops.vxpu_triton.sparse_attn(*a),
 )
 
 
