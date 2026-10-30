@@ -338,7 +338,7 @@ class Plan:
         self._set("lower_decode", on and self["split_decode"], src if self["split_decode"] else "requires split_decode",
                   (True, False), "before compiling, rewrite each dense segment's vxpu op calls into the selected "
                   "implementation, its Triton kernels as torch ops (lower.py): the compiler sees the kernels")
-        fuse, src = env_text("VXPU_FUSE", "ffn_front,fp8_linear,hc_front,hc_sinkhorn,matmul,rotary")
+        fuse, src = env_text("VXPU_FUSE", "attn_out,attn_q,ffn_front,fp8_linear,hc_front,hc_sinkhorn,matmul,rotary,shared_ffn,window_kv")
         fuse = tuple(sorted(op.strip() for op in fuse.split(",") if op.strip()))
         self._set("fuse", fuse if self["lower_decode"] else (), src if self["lower_decode"] else "requires lower_decode",
                   (), "what the lowering may rewrite into plain tensor operations, which the compiler fuses with "

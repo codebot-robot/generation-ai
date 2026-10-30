@@ -224,6 +224,10 @@ def set_external(model, on):
     ds.grouped_linear_fn = torch.ops.vxpu.fp8_grouped_linear if on else None  # the attention's wo_a
     ds.ffn_front_fn = torch.ops.vxpu.ffn_front if on else None  # a block's FFN front half, up to the experts
     ds.hc_front_fn = torch.ops.vxpu.hc_front if on else None  # and the attention half's, up to the attention
+    ds.shared_ffn_fn = torch.ops.vxpu.shared_ffn if on else None  # the MoE's shared expert
+    ds.attn_q_fn = torch.ops.vxpu.attn_q if on else None  # the attention's query path
+    ds.window_kv_fn = torch.ops.vxpu.window_kv if on else None  # and its window key
+    ds.attn_out_fn = torch.ops.vxpu.attn_out if on else None  # and its output path
     # the hyper-connection mixing: the fork calls it through a module-level
     # name, so it is swapped for the op while tracing and restored after
     if not hasattr(ds, "_vxpu_hc_split_sinkhorn"):

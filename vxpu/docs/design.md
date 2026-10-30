@@ -143,6 +143,46 @@ the op boundary cost the fusion inductor had already done around the
 gate, and the region got slower. A region's kernels are judged in the
 region.
 
+**Region ops from two kernel templates.** The dense half's gap is launches, not
+bytes: a plain layer ran about 40 kernels, 134 µs over its 118 µs floor
+on the hero machine, most of them small kernels around the GEMVs (norms,
+rotary, quantization, index arithmetic). Four regions of the attention
+block and the MoE are now ops, each the fork's computation as a
+bit-identical reference, a fused tensor body the lowering may choose, and
+Triton kernels built from two templates:
+- a GEMV over a block-scaled fp8 weight with an optional prologue (RMS
+  norm, rotary, quantization to the fp8 grid per 32) and epilogue (rotary,
+  or a SwiGLU over two weights' products with the quantization of the
+  result), `_gemv_pe_kernel` and `_dual_gemv_swiglu_kernel`;
+- a per-row finishing kernel (norm, rotary, quantization), `_row_post_kernel`.
+
+| op | replaces | kernels before | after | on an L4, one row |
+|---|---|---|---|---|
+| `vxpu::shared_ffn` | the shared expert: three fp8 linears and the SwiGLU | 9 | 3 | 152 µs against 154 |
+| `vxpu::attn_q` | q down-projection, q_norm, up-projection, rotary | about 9 | 4 | 208 µs against 206 |
+| `vxpu::window_kv` | kv projection, kv_norm, rotary, act_quant | about 6 | 3 | 21 µs against 25, bit-identical |
+| `vxpu::attn_out` | inverse rotary, act_quant, grouped and output projections | 5 | 4 | 310 µs against 312 |
+
+(Measured against the fork's reference at the released model's shapes,
+1 to 64 rows; "against" is the compiled fused body on the same card. The
+L4 is bandwidth-bound at these sizes, so the kernel count shows in time
+only on a faster card.) Two lessons from writing them. A prologue that
+needs the whole row, a norm or a rotary with quantization, must not be
+folded into a GEMV whose programs tile a wide output: every program
+recomputes it, 2,048 times for the query up-projection, and the kernel
+lost to the compiler's version by 25% at one row and 2.7 times at 33.
+The per-row work runs once in the per-row kernel; the GEMV keeps only
+the epilogue, which runs once per output. And the fork rounds to bf16
+between its steps (the linear's output before the rotary, the rotated
+tail before quantization); a kernel that skips a rounding differs at a
+few elements per row, which the random-weight fixture turns into
+different tokens. The selection among them is the planner's: the
+lowering times the fused body against the kernels per call shape and
+GPU. The ops are instances of templates on purpose: the next step is
+for the planner to instantiate the templates (which norm, rotary or
+quantization to fold where) rather than for a person to write each op.
+[TODO hero 7: the step with the ops, kernels per layer and ms.]
+
 **The roofline, and the production stacks.** A decode step at one row
 reads every dense weight once and the selected experts once, so its floor
 on one GPU is those bytes over the GPU's copy bandwidth. On an RTX PRO
