@@ -926,6 +926,8 @@ class Engine:
         for name, split in programs:
             graph = dataflow.Graph.from_split(split)
             device = torch.device(self.device)
+            if device.index is None:  # "cuda" is "cuda:0" here; the comparisons below need the index
+                device = torch.device(device.type, torch.cuda.current_device())
             moved, bytes_moved, shared = {}, collections.Counter(), {}
             for node in graph.nodes:
                 if node.kind != "dense":
