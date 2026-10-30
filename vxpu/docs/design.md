@@ -187,8 +187,98 @@ graph launched 310, nine fewer a layer; the step time is unchanged
 there (14.7 against 14.3 ms), since the L4 is bandwidth-bound at that
 size. With the lowering's measured choices on the L4 it keeps the fused
 bodies for `attn_q` and `shared_ffn`, and the count stays at 310; the
-hero machine measures for itself. [TODO hero 7: the step with the ops
-on the real model, kernels per layer and ms.]
+hero machine measures for itself.
+
+**Hero run 7: layer sharding and the region ops on the real model (Oct 30,
+GKE, four RTX PRO 6000; measured).** Each GPU holds a contiguous range of
+layers whole, dense weights and experts (`VXPU_LAYER_DEVICES`, ranges
+0:8, 8:20, 20:32, 32:40 and the drafter's 40:43 back on the first; 65,
+87, 87 and 58 GB of experts), and the step crosses GPUs once per range
+instead of fanning every layer's experts out to four GPUs and back. The
+aim was the one-GPU floor at one row, 10.3 ms. It was not reached:
+
+| one row, no drafter | step | kernels a step |
+|---|---|---|
+| hero 6's code, every layer's experts over four GPUs | 21.2 ms | about 2,090 |
+| the same placement, the region ops in the graph | 21.3 ms | |
+| sharded, the region ops | 20.3 ms | 1,742 |
+| sharded, the ops' Triton kernels forced | 20.2 ms | |
+| floor (10.5 GB dense + 4.5 GB of experts at 1,460 GB/s) | 10.3 ms | |
+
+The region ops took 350 kernels out of the step and no time: on this
+card the small kernels they fold away were already cheap, and the GEMVs
+they wrap were already near their bytes. The per-kernel profile of the
+sharded step (torch.profiler over the captured step) says where the 10
+ms went: the dense GEMVs 7.7 ms against a 7.2 ms floor; the expert
+kernels 6.9 ms against 3.1; the FFN and hyper-connection front kernels
+1.9 ms against 0.2; small kernels 2.3 ms; gaps 1.5 ms. The sharding
+itself works, token-identical to one GPU on two L4s, and it cost two
+more fixes on the real model than on the fixture: a cache written by a
+layer on one GPU and read by layers on another (the compressed KV that
+layers 20 to 39 share, which no single card can hold with its experts)
+is replicated and refreshed once a step; and torch.export reads a
+graph's "cuda" factories as cuda:0 whatever the current device, so each
+segment's graph gets its factories pointed at its GPU when it is moved.
+
+**7(b): the fp4 experts go to the tensor cores as they are.** The expert
+kernels decoded every fp4 nibble to bf16 in software before a bf16 dot,
+because they were written on an L4, whose tensor cores take no fp4, and
+carried to Blackwell unchanged. At one token the gate/up kernel read its
+75 MB in 113 µs (666 GB/s); the same loop without the decode ran at 914
+GB/s and the loads alone at 1,660 (above the card's copy bandwidth: the
+128 MB L2 was holding part of the 75 MB, which a benchmark that replays
+one layer's weights must not let it). DeepSeek's expert format is MXFP4,
+e2m1 with an e8m0 scale per 32, which Blackwell's tensor cores take
+directly. Each expert kernel now has two bodies and the card chooses:
+compute capability 10 and later pass the packed bytes and the scale
+bytes to `tl.dot_scaled` unchanged; earlier cards keep the software
+decode. Nothing configures it. With a cold cache (eight layers' experts
+a replay, 600 MB) at one token, gate/up: software body 117 µs, native
+75.6 µs with its own tile shape (the best of 108), floor 52 µs. In the
+step the expert kernels fell from 6.9 to 4.9 ms and the one-row step
+from 20.5 to 18.2 ms (p10/p90 18/24; the same pod, the same code, the
+body switched by `VXPU_FP4_NATIVE` for the A/B). Still 1.8 times the
+floor. The lesson is the thesis in one row: a kernel written on one card
+and carried to another silently loses the new card's formats, and the
+library needs a native body per format per card with the choice made
+from the card, later from the planner's measurements. The same audit
+found the batched fp8 GEMV templates converting MXFP8 weights to bf16
+and applying scales in software before a bf16 dot (a native body for
+hero 9), the fp8 round trip emulated in fp32 arithmetic in six kernels
+(the hardware cast exists on every card we run on), and the compressed
+KV's fp4 quantization running as the aten emulation. The remaining gap
+at one row is the FFN and hyper-connection fronts (1.9 ms for 0.2 ms of
+bytes), the expert kernels' last 1.8 ms, the small kernels and the gaps.
+
+Batched rows, sharded, with the native expert body (the same session;
+measured; "same" is one prompt in every row, "different" a prompt per
+row):
+
+| rows | one prompt | same prompt per row | different prompts | floor, different (estimated from expert counts) |
+|---|---|---|---|---|
+| 1 | 18.2 ms | | | 10.3 ms |
+| 9 | 26.1 ms | 23.1 ms, 366 tok/s | 41.4 ms, 216 tok/s | about 35 ms (up to 54 experts a layer) |
+| 33 | 42.6 ms | 44.4 ms, 722 tok/s | 120 ms, 282 tok/s | about 100 ms (up to 198 experts a layer) |
+
+With different prompts the step is within 20% of its own bytes: each
+row's six experts are mostly distinct, so 33 rows read about 150 GB a
+step, and the time is the bandwidth. The same-prompt rows are
+token-identical to each other; on hero 6's placement, with every layer's
+experts over four GPUs and the replies exchanged between them, they were
+not (and that placement's 9-row step was 60 ms in the new code against
+31 in hero 6's, a regression the sharded placement does not have). The
+drafter under sharding is broken: one row accepts 1 draft of 310 where
+the unsharded run accepts 40 of 115. The drafter's stages (layers 40 to
+42) sat on the first GPU while the backbone ends on the fourth, and the
+decode's last segment writes the drafter's rings (state tensors the
+drafter owns on another GPU): the runner's replica rule covers a state
+written by its owner and read elsewhere, not one written elsewhere, so
+the writes went into the replica and the drafter read a ring that never
+changed. The placement with the drafter on the last GPU is the fix being
+measured; the rule needs the other direction too. The batched drafter on
+hero 6's placement accepted 49 of 2,285 drafts at eight rows with the
+same prompt in every row: the exchange path's rows differ, and that is
+the suspect for it.
 
 **Direction: the planner chooses the kernels, in Go (hero run 8).** Today
 two planners exist and the split is the wrong one. The coordinator's
