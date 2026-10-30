@@ -208,11 +208,14 @@ if triton is not None:
 def linear_f32(x, weight, block_n=16, block_k=512, traced=False):
     """x [M, K] (any float dtype, taken as fp32) times weight [N, K]
     (bf16, read as is) transposed -> fp32 [M, N], fp32 accumulation. For
-    the few rows of a decode step: each row reads the whole weight."""
+    a decode step's rows: up to GEMV_ROWS_MAX bf16 rows, one pass over the
+    weight serves them all (gemv_rows); otherwise each row reads it."""
     M, K = x.shape
     N = weight.shape[0]
     if weight.dim() != 2 or weight.shape[1] != K:
         raise ValueError(f"linear_f32: x {tuple(x.shape)} and weight {tuple(weight.shape)} disagree on K")
+    if x.dtype == torch.bfloat16 and weight.dtype == torch.bfloat16 and M <= GEMV_ROWS_MAX and K % 32 == 0 and N % 32 == 0:
+        return gemv_rows(x, weight, None, out_dtype=torch.float32, traced=traced)
     # x is widened to fp32 in the kernel, not here: traced, a torch-side
     # cast would let inductor fuse it into x's producer and skip the
     # rounding to x's dtype that the eager path does
@@ -254,6 +257,80 @@ if triton is not None:
         tl.store(y_ptr + m * N + rows, tl.sum(acc, axis=1).to(y_ptr.dtype.element_ty), mask=live)
 
 
+if triton is not None:
+    @triton.jit
+    def _gemv_rows_kernel(x_ptr, w_ptr, s_ptr, y_ptr, M, N, K, XS, R, KS,
+                          HAS_SCALE: tl.constexpr, BM: tl.constexpr, BN: tl.constexpr, BK: tl.constexpr):
+        """x [M, K] (bf16) times weight [N, K] transposed, every row of x by one pass over the
+        weight: a program owns BN weight rows, streams them once, and multiplies each tile by all
+        M rows of x on the tensor cores (tl.dot, bf16 in, fp32 accumulation; an fp8 weight times
+        its e8m0 block scale is exact in bf16, so the products are exact). Up to BM rows."""
+        pid = tl.program_id(0)
+        rows = pid.to(tl.int64) * BN + tl.arange(0, BN)  # int64: weights past 2^31 elements
+        live = rows < N
+        g = (pid * BN) // R  # BN divides R: one group per program
+        ms = tl.arange(0, BM)
+        mlive = ms < M
+        acc = tl.zeros((BN, BM), dtype=tl.float32)
+        for k0 in range(0, K, BK):
+            ks = k0 + tl.arange(0, BK)
+            kin = ks < K
+            w = tl.load(w_ptr + rows[:, None] * K + ks[None, :], mask=live[:, None] & kin[None, :], other=0.0)
+            if HAS_SCALE:
+                kb = k0 // 32 + tl.arange(0, BK // 32)
+                e = tl.load(s_ptr + (rows // 32)[:, None] * KS + kb[None, :],
+                            mask=live[:, None] & (kb < KS)[None, :], other=127).to(tl.int32)
+                sc = tl.where(e == 0, 5.877471754111438e-39, (e << 23).to(tl.float32, bitcast=True))
+                sc = tl.where(e == 255, float("nan"), sc)
+                w = tl.reshape(tl.reshape(w.to(tl.float32), (BN, BK // 32, 32)) * sc[:, :, None], (BN, BK))
+            x = tl.load(x_ptr + ms[:, None] * XS + g * K + ks[None, :],
+                        mask=mlive[:, None] & kin[None, :], other=0.0)
+            acc += tl.dot(w.to(tl.bfloat16), tl.trans(x.to(tl.bfloat16)))
+        tl.store(y_ptr + ms[None, :] * N + rows[:, None], acc.to(y_ptr.dtype.element_ty),
+                 mask=live[:, None] & mlive[None, :])
+
+
+GEMV_ROWS_MAX = 32  # rows one pass over the weight serves (BM); beyond, a GEMM
+
+
+def _rows_blocks(M, K):
+    """Block shape for _gemv_rows_kernel: rows padded to a tensor-core tile, 16 weight rows per
+    program, a K step of 256 where K allows it."""
+    bm = 16
+    while bm < M:
+        bm *= 2
+    for bk in (256, 128, 64, 32):
+        if K % bk == 0:
+            return bm, 16, bk
+    return bm, 16, 32
+
+
+def gemv_rows(x, weight, scale=None, group_rows=None, out_dtype=torch.bfloat16, blocks=None, traced=False):
+    """x [M, G*K] bf16 times weight [N, K] (bf16, or fp8 e4m3 with [N/32, K/32] e8m0 block
+    scales) transposed -> [M, N] in out_dtype, the weight read once for all M <= GEMV_ROWS_MAX
+    rows. group_rows as fp8_gemv."""
+    M = x.shape[0]
+    N, K = weight.shape
+    R = group_rows or N
+    bm, bn, bk = blocks or _rows_blocks(M, K)
+    if M > bm or N % R or R % bn or x.shape[1] != (N // R) * K or K % 32 or N % 32 or bk % 32:
+        raise ValueError(f"gemv_rows: x {tuple(x.shape)}, weight {tuple(weight.shape)}, group_rows {group_rows}")
+    if scale is not None and (weight.dtype != torch.float8_e4m3fn or scale.dtype != torch.float8_e8m0fnu
+                              or tuple(scale.shape) != (N // 32, K // 32)):
+        raise ValueError(f"gemv_rows: weight {weight.dtype} {tuple(weight.shape)} needs e8m0 scales "
+                         f"[{N // 32}, {K // 32}], got {scale.dtype} {tuple(scale.shape)}")
+    y = torch.empty(M, N, dtype=out_dtype, device=x.device)
+    if M and N:
+        w = weight.contiguous()
+        s = scale.contiguous().view(torch.uint8) if scale is not None else w
+        kernel, ctx = _launcher(_gemv_rows_kernel, x.device, traced)
+        with ctx:
+            kernel[(triton.cdiv(N, bn),)](x.contiguous(), w, s, y, M, N, K, x.shape[1], R,
+                                         scale.shape[1] if scale is not None else 0,
+                                         HAS_SCALE=scale is not None, BM=bm, BN=bn, BK=bk)
+    return y
+
+
 def _gemv_blocks(K):
     """Block shape for fp8_gemv: 8 rows per program and the widest K step
     that divides K, measured best or within 3% of best for every
@@ -269,11 +346,14 @@ def fp8_gemv(x, weight, scale, group_rows=None, out_dtype=torch.bfloat16, block_
     """x [M, G*K] times weight [N, K] (fp8 e4m3 with [N/32, K/32] e8m0
     block scales) transposed -> [M, N] in out_dtype, fp32 accumulation.
     With group_rows R, rows n read x[:, g*K:(g+1)*K] for g = n // R (a
-    block-diagonal weight, G = N / R groups); otherwise G = 1. For the
-    few rows of a decode step: each row of x reads the whole weight."""
+    block-diagonal weight, G = N / R groups); otherwise G = 1. For a
+    decode step's rows: up to GEMV_ROWS_MAX bf16 rows, one pass over the
+    weight serves them all (gemv_rows); otherwise each row reads it."""
     M = x.shape[0]
     N, K = weight.shape
     R = group_rows or N
+    if x.dtype == torch.bfloat16 and M <= GEMV_ROWS_MAX and block_n is None and block_k is None:
+        return gemv_rows(x, weight, scale, group_rows, out_dtype, traced=traced)
     if block_n is None or block_k is None:
         block_n, block_k = _gemv_blocks(K)
     if N % R or R % block_n or x.shape[1] != (N // R) * K or K % 32 or N % 32 or block_k % 32:

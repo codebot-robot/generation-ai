@@ -521,7 +521,8 @@ def _fp8_linear_fused(x, weight, scale, tk=None):
 # weight (fp8 values times a power-of-two block scale are exact in bf16),
 # dequantized once and kept, and torch's GEMM.
 @implementation("vxpu::fp8_linear", "gpu-fp8-gemv", ("cuda",), "rounding",
-                f"Triton, at most {4} rows (decode): the activation quantized by one kernel, the fp8 weight read directly",
+                f"Triton, at most {triton_ops.GEMV_ROWS_MAX} rows (decode): the activation quantized by one kernel, "
+                "the fp8 weight read once for all rows",
                 applies=lambda plan, rows=0, **_: plan["triton"] and rows <= FP8_GEMV_MAX_ROWS and _fp8_native(),
                 lowerable=True)
 def _fp8_linear_gemv(x, weight, scale, tk=triton_ops):
@@ -625,9 +626,10 @@ def _fp8_native():
     return torch.cuda.is_available() and torch.cuda.get_device_capability() >= (8, 9)
 
 
-# inputs up to this many rows take the fp8 GEMV on a GPU; longer ones the
-# bf16 copy and a GEMM (the GEMV reads the weight once per row)
-FP8_GEMV_MAX_ROWS = 4
+# inputs up to this many rows take the fp8 GEMV on a GPU, one pass over the
+# weight for all of them (triton_ops.gemv_rows); longer ones the bf16 copy
+# and a GEMM
+FP8_GEMV_MAX_ROWS = triton_ops.GEMV_ROWS_MAX
 
 
 def _bf16_weight(weight, scale):
@@ -754,8 +756,10 @@ def _head_context(x, weight):
 
 
 @implementation("vxpu::head_linear", "gpu-triton-bf16", ("cuda",), "rounding",
-                "Triton, bf16 weight, at most 8 rows: reads the bf16 weight, accumulates in fp32",
-                applies=lambda plan, rows=0, dtype=None, **_: plan["triton"] and dtype == torch.bfloat16 and rows <= 8,
+                f"Triton, bf16 weight, at most {triton_ops.GEMV_ROWS_MAX} rows: reads the bf16 weight once for all "
+                "rows, accumulates in fp32",
+                applies=lambda plan, rows=0, dtype=None, **_: plan["triton"] and dtype == torch.bfloat16
+                and rows <= triton_ops.GEMV_ROWS_MAX,
                 lowerable=True)
 def _head_triton(x2, weight, tk=triton_ops):
     return tk.linear_f32(x2, weight)
