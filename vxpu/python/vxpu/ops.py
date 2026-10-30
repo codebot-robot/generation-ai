@@ -1006,10 +1006,26 @@ def _ffn_front_fused(stream, pre_mix, hc_fn, hc_scale, hc_base, hc_mult, sinkhor
                                 norm_topk_prob, route_scale)
 
 
+@implementation("vxpu::ffn_front", "gpu-triton-split", ("cuda",), "rounding",
+                "three Triton kernels, the row in chunks: the norms' statistics and the collapsed row per chunk; "
+                "the normalized and quantized row, the mix dots and the gate's scores as partial sums per chunk and "
+                "group of experts (hundreds of short programs); then the Sinkhorn iterations and the top-k choice "
+                "per row over the summed partials (measured on an RTX PRO 6000 at one row with a cold L2: 13.5 us "
+                "against the one-pass pair's 31.5)",
+                applies=lambda plan, rows=0, experts=0, topk=0, hc_mult=0, dim=0, **_: plan["triton"] and rows <= 64
+                and experts <= 1024 and topk <= 16 and hc_mult in (2, 4, 8) and dim % 32 == 0, lowerable=True)
+def _ffn_front_triton_split(stream, pre_mix, hc_fn, hc_scale, hc_base, hc_mult, sinkhorn_iters, hc_eps, norm_weight,
+                            norm_eps, gate_weight, gate_bias, topk, score_func, gate_temp, norm_topk_prob, route_scale,
+                            tk=triton_ops):
+    return tk.ffn_front_split(stream, pre_mix, hc_fn, hc_scale, hc_base, hc_mult, sinkhorn_iters, hc_eps, norm_weight,
+                              norm_eps, gate_weight, gate_bias, topk, score_func, gate_temp, norm_topk_prob,
+                              route_scale)
+
+
 @implementation("vxpu::ffn_front", "gpu-triton", ("cuda",), "rounding",
-                "three Triton kernels: the mix dots and norm statistics per chunk of the row, the normalized and "
-                "quantized row and the gate's scores per group of experts, then the Sinkhorn iterations and the "
-                "top-k choice per row (aten launches about fifteen)",
+                "two Triton kernels, each program walking the whole row: the norm statistics, the mix dots and the "
+                "gate's scores per group of experts, then the Sinkhorn iterations and the top-k choice per row "
+                "(aten launches about fifteen)",
                 applies=lambda plan, rows=0, experts=0, topk=0, hc_mult=0, dim=0, **_: plan["triton"] and rows <= 64
                 and experts <= 1024 and topk <= 16 and hc_mult in (2, 4, 8) and dim % 32 == 0, lowerable=True)
 def _ffn_front_triton(stream, pre_mix, hc_fn, hc_scale, hc_base, hc_mult, sinkhorn_iters, hc_eps, norm_weight,
@@ -1126,6 +1142,18 @@ def _hc_front_fused(stream, pre_mix, hc_fn, hc_scale, hc_base, hc_mult, sinkhorn
                     norm_eps, tk=None):
     return _hc_front_reference(stream, pre_mix, hc_fn, hc_scale, hc_base, hc_mult, sinkhorn_iters, hc_eps,
                                norm_weight, norm_eps)
+
+
+@implementation("vxpu::hc_front", "gpu-triton-split", ("cuda",), "rounding",
+                "ffn_front's split kernels without the gate: the norms' statistics per chunk, then the mix dots and "
+                "the normalized row per chunk, then the Sinkhorn iterations (one row, cold L2, RTX PRO 6000: 6.8 us "
+                "against the one-pass pair's 14.7)",
+                applies=lambda plan, rows=0, hc_mult=0, dim=0, **_: plan["triton"] and rows <= 64
+                and hc_mult in (2, 4, 8) and dim % 32 == 0, lowerable=True)
+def _hc_front_triton_split(stream, pre_mix, hc_fn, hc_scale, hc_base, hc_mult, sinkhorn_iters, hc_eps, norm_weight,
+                           norm_eps, tk=triton_ops):
+    return tk.hc_front_split(stream, pre_mix, hc_fn, hc_scale, hc_base, hc_mult, sinkhorn_iters, hc_eps, norm_weight,
+                             norm_eps)
 
 
 @implementation("vxpu::hc_front", "gpu-triton", ("cuda",), "rounding",
