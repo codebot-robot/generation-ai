@@ -1685,8 +1685,10 @@ def _move_module_tensors(module, device):
     parameters, and plain tensor attributes such as export's lifted constants), following a
     compiled wrapper's `sub`. A copy, not a move: a constant can be shared by two segments on
     different GPUs, and moving it in place would pull it from under the other. These are the
-    small tensors; the weights a segment reads come as arguments and move in place. Returns the
-    bytes copied."""
+    small tensors; the weights a segment reads come as arguments and move in place. Also points
+    the segment graph's tensor factories (arange, zeros: the exported graphs name "cuda", which
+    torch.export reads as cuda:0 whatever the current device) at device. Returns the bytes
+    copied."""
     moved = 0
     seen = set()
     stack = [module]
@@ -1695,6 +1697,16 @@ def _move_module_tensors(module, device):
         if id(m) in seen or not isinstance(m, torch.nn.Module):
             continue
         seen.add(id(m))
+        graph = getattr(m, "graph", None)
+        if isinstance(graph, torch.fx.Graph):
+            changed = False
+            for node in graph.nodes:
+                d = node.kwargs.get("device")
+                if isinstance(d, (str, torch.device)) and torch.device(d).type == "cuda" and torch.device(d) != device:
+                    node.kwargs = {**node.kwargs, "device": device}
+                    changed = True
+            if changed:
+                m.recompile()
         for name, t in list(m.named_buffers(recurse=False)):
             if t.is_cuda and t.device != device:
                 m._buffers[name] = t.to(device)
