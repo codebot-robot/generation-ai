@@ -120,6 +120,29 @@ on a 40-layer model at one row is a seventh of the step: the third
 kernel shape. So a handful of kernels covers the dense step, and the
 region table says which to write first.
 
+The first of them, one pass over a weight for up to 64 rows
+(`triton_ops.gemv_rows`), ran as hero run 5 on the real model (Oct 30,
+g4-standard-192, four RTX PRO 6000, every expert on the GPUs; the old
+code is hero 4's, in the same session; measured):
+
+| rows | step, new | step, old | decode tok/s, new | old |
+|---|---|---|---|---|
+| 1 | 22.0 ms | 22.1 ms | 46 | 46 |
+| 9 | 36.9 ms | 42.7 ms | 252 | 216 |
+| 33 | 62.6 ms | 67.6 ms | 525 | 488 |
+
+With the drafter, one row decodes at 68 tok/s (hero 4: 53). At one row
+nothing changed, and the region profile of the real model says why: the
+dense regions take 12.5 ms of the 22 ms step while their floor is about
+5 ms. They launch 2,089 kernels, 164 copies and 126 mailbox operations
+per step, so at one row the step is bound by launches, not bytes; the
+rest is the experts and their mailboxes. That is the next target. The
+MoE gate as its own op with a two-kernel body was tried and reverted:
+alone its kernels were three times faster than aten's, but in the step
+the op boundary cost the fusion inductor had already done around the
+gate, and the region got slower. A region's kernels are judged in the
+region.
+
 The planner also generates the layouts a model could run in on a set of
 machines and ranks them by the cost model (`planner.Candidates`, #409),
 without running anything:
