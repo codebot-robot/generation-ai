@@ -934,6 +934,9 @@ class Engine:
                     continue
                 layers = [int(x) for x in node.layers]
                 device = (self._layer_device(max(layers)) if layers else None) or device
+                # the segment's own tensors too: the constants export lifted into it (an n-gram
+                # layer's tables of offsets, a norm's epsilon tensor), which no argument names
+                bytes_moved[str(device)] += _move_module_tensors(getattr(split, node.name), device)
                 for r in dataflow._flat(node.refs()):
                     if not (isinstance(r, dataflow.Ref) and r.kind == "resident"):
                         continue
@@ -1675,6 +1678,34 @@ class _Request:
         self.finish_reason = "error"
         if self.sink is not None:
             self.sink({"token_ids": [], "done": True, "error": error})
+
+
+def _move_module_tensors(module, device):
+    """Move every tensor a segment module holds itself (buffers, parameters, and plain tensor
+    attributes such as export's lifted constants) to device, in place, following a compiled
+    wrapper's `sub`. Returns the bytes moved."""
+    moved = 0
+    seen = set()
+    stack = [module]
+    while stack:
+        m = stack.pop()
+        if id(m) in seen or not isinstance(m, torch.nn.Module):
+            continue
+        seen.add(id(m))
+        for name, t in list(m.named_buffers(recurse=False)) + list(m.named_parameters(recurse=False)):
+            if t.is_cuda and t.device != device:
+                t.data = t.data.to(device)
+                moved += t.numel() * t.element_size()
+        for name, v in list(vars(m).items()):
+            if isinstance(v, torch.Tensor) and v.is_cuda and v.device != device:
+                v.data = v.data.to(device)
+                moved += v.numel() * v.element_size()
+        stack.extend(m.children())
+        sub = getattr(m, "sub", None)
+        if isinstance(sub, torch.nn.Module):
+            stack.append(sub)
+    return moved
+
 
 
 def _prefill_row(engine, state, request, row, row0_decodes):
