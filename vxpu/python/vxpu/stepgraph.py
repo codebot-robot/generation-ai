@@ -101,13 +101,24 @@ class _Driver:
         self.node_type = self.lib.cuGraphNodeGetType
         self.node_type.argtypes = [ctypes.c_void_p, ctypes.POINTER(ctypes.c_int)]
         self.node_type.restype = ctypes.c_int
+        self.kernel_params = self.lib.cuGraphKernelNodeGetParams_v2
+        self.kernel_params.argtypes = [ctypes.c_void_p, ctypes.c_void_p]
+        self.kernel_params.restype = ctypes.c_int
+        self.func_name = self.lib.cuFuncGetName
+        self.func_name.argtypes = [ctypes.POINTER(ctypes.c_char_p), ctypes.c_void_p]
+        self.func_name.restype = ctypes.c_int
+        self.kernel_name = getattr(self.lib, "cuKernelGetName", None)
+        if self.kernel_name is not None:
+            self.kernel_name.argtypes = [ctypes.POINTER(ctypes.c_char_p), ctypes.c_void_p]
+            self.kernel_name.restype = ctypes.c_int
 
     # CUgraphNodeType, the kinds a step's graph holds
     NODE_KINDS = {0: "kernels", 1: "copies", 2: "memsets", 12: "mailbox operations"}
 
-    def node_counts(self, graph):
+    def node_counts(self, graph, names=None):
         """{kind: count} of a captured graph's nodes (cudaGraph_t, as an int): its kernels,
-        copies, memsets and stream memory operations (the mailboxes' flags), and anything else."""
+        copies, memsets and stream memory operations (the mailboxes' flags), and anything else.
+        With names (a dict), each kernel's function name is counted into it too."""
         count = ctypes.c_size_t(0)
         _check(self.nodes(ctypes.c_void_p(graph), None, ctypes.byref(count)), "cuGraphGetNodes")
         nodes = (ctypes.c_void_p * count.value)()
@@ -118,7 +129,25 @@ class _Driver:
             _check(self.node_type(node, ctypes.byref(kind)), "cuGraphNodeGetType")
             name = self.NODE_KINDS.get(kind.value, "other")
             out[name] = out.get(name, 0) + 1
+            if names is not None and kind.value == 0:
+                fn = self._kernel_name(node)
+                names[fn] = names.get(fn, 0) + 1
         return out
+
+    def _kernel_name(self, node):
+        """A kernel node's function name (CUDA_KERNEL_NODE_PARAMS_v2: the CUfunction first, the
+        CUkernel after the grid, block, shared memory and parameter fields)."""
+        params = (ctypes.c_byte * 256)()
+        if self.kernel_params(node, ctypes.byref(params)) != 0:
+            return "?"
+        func = ctypes.c_void_p.from_buffer(params, 0).value
+        out = ctypes.c_char_p()
+        if func and self.func_name(ctypes.byref(out), ctypes.c_void_p(func)) == 0 and out.value:
+            return out.value.decode()
+        kern = ctypes.c_void_p.from_buffer(params, 8 + 7 * 4 + 4 + 2 * 8).value  # 8-aligned after 7 uints
+        if kern and self.kernel_name is not None and self.kernel_name(ctypes.byref(out), ctypes.c_void_p(kern)) == 0:
+            return out.value.decode() if out.value else "?"
+        return "?"
 
     def device_address(self, pinned):
         out = ctypes.c_uint64()
@@ -547,7 +576,8 @@ class StepGraph(torch.nn.Module):
                 chosen = choose(logits, *self._sampling)
         # the step's shape, as the plan's statistics: how many kernels, copies and mailbox
         # operations one decode step launches (fusion shows as fewer kernels)
-        self.node_counts = driver.node_counts(g.raw_cuda_graph())
+        self.kernel_names = {}
+        self.node_counts = driver.node_counts(g.raw_cuda_graph(), self.kernel_names)
         g.instantiate()
         peer_graphs = [self._capture_peer(pdev, peers.index(pdev), driver, flags, F, host_nodes, boxes, pooled)
                        for pdev in peers]
