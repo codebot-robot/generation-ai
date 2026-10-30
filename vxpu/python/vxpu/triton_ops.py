@@ -261,14 +261,18 @@ if triton is not None:
     @triton.jit
     def _gemv_rows_kernel(x_ptr, w_ptr, s_ptr, y_ptr, M, N, K, XS, R, KS,
                           HAS_SCALE: tl.constexpr, BM: tl.constexpr, BN: tl.constexpr, BK: tl.constexpr,
-                          EPI_QUANT: tl.constexpr = False):
+                          EPI_QUANT: tl.constexpr = False, KSPLIT: tl.constexpr = 1):
         """x [M, K] (bf16) times weight [N, K] transposed, every row of x by one pass over the
         weight: a program owns BN weight rows, streams them once, and multiplies each tile by all
         M rows of x on the tensor cores (tl.dot, bf16 in, fp32 accumulation; an fp8 weight times
         its e8m0 block scale is exact in bf16, so the products are exact). Up to BM rows. With
         EPI_QUANT the bf16 outputs are quantized to the fp8 grid per 32 consecutive outputs of a
         row (the fork's act_quant before the next linear) before the store; BN is then a multiple
-        of 32, so a program holds whole blocks."""
+        of 32, so a program holds whole blocks. With KSPLIT > 1, that many programs share a row
+        tile, each reducing a K/KSPLIT slice and storing its fp32 partial sums in y[split] (y is
+        [KSPLIT, M, N] fp32); the consumer adds them. A narrow weight (1,280 or 512 rows) gives
+        too few programs otherwise: 80 or 32 for 188 SMs, and the kernel runs at a third of the
+        card's bandwidth."""
         pid = tl.program_id(0)
         rows = pid.to(tl.int64) * BN + tl.arange(0, BN)  # int64: weights past 2^31 elements
         live = rows < N
@@ -276,7 +280,9 @@ if triton is not None:
         ms = tl.arange(0, BM)
         mlive = ms < M
         acc = tl.zeros((BN, BM), dtype=tl.float32)
-        for k0 in range(0, K, BK):
+        span = K // KSPLIT
+        k_start = tl.program_id(1) * span
+        for k0 in range(k_start, k_start + span, BK):
             ks = k0 + tl.arange(0, BK)
             kin = ks < K
             w = tl.load(w_ptr + rows[:, None] * K + ks[None, :], mask=live[:, None] & kin[None, :], other=0.0)
@@ -300,6 +306,8 @@ if triton is not None:
             scale = (exponent << 23).to(tl.float32, bitcast=True)
             q = tl.minimum(tl.maximum(hg / scale[:, None, :], -448.0), 448.0)
             acc = tl.reshape(_round_e4m3(q) * scale[:, None, :], (BN, BM))
+        if KSPLIT > 1:
+            y_ptr += tl.program_id(1).to(tl.int64) * M * N
         tl.store(y_ptr + ms[None, :] * N + rows[:, None], acc.to(y_ptr.dtype.element_ty),
                  mask=live[:, None] & mlive[None, :])
 
@@ -337,34 +345,54 @@ def _pe_blocks(M, K, tiles=3, device=None):
 
 
 def gemv_rows(x, weight, scale=None, group_rows=None, out_dtype=torch.bfloat16, blocks=None, traced=False,
-              quant_out=False):
+              quant_out=False, ksplit=1):
     """x [M, G*K] bf16 times weight [N, K] (bf16, or fp8 e4m3 with [N/32, K/32] e8m0 block
     scales) transposed -> [M, N] in out_dtype, the weight read once for all M <= GEMV_ROWS_MAX
     rows. group_rows as fp8_gemv. quant_out quantizes the bf16 result to the fp8 grid per 32
     outputs in the kernel's epilogue (the fork's act_quant before the next linear) instead of in
-    a kernel of its own; the programs then own 32 rows of the weight."""
+    a kernel of its own; the programs then own 32 rows of the weight. ksplit > 1 returns the
+    fp32 partial sums [ksplit, M, N] of that many K slices for the consumer to add (a narrow
+    weight's programs, see the kernel); the K step is shrunk until it divides the slice."""
     M = x.shape[0]
     N, K = weight.shape
     R = group_rows or N
     bm, bn, bk = blocks or _rows_blocks(M, K)
     if quant_out:
         bn = max(bn, 32)
+    if ksplit > 1:
+        if K % ksplit or quant_out:
+            raise ValueError(f"gemv_rows: a K split of {ksplit} needs K {K} divisible and no quant_out")
+        while bk > 32 and (K // ksplit) % bk:
+            bk //= 2
+        out_dtype = torch.float32
     if M > bm or N % R or R % bn or x.shape[1] != (N // R) * K or K % 32 or N % 32 or bk % 32:
         raise ValueError(f"gemv_rows: x {tuple(x.shape)}, weight {tuple(weight.shape)}, group_rows {group_rows}")
     if scale is not None and (weight.dtype != torch.float8_e4m3fn or scale.dtype != torch.float8_e8m0fnu
                               or tuple(scale.shape) != (N // 32, K // 32)):
         raise ValueError(f"gemv_rows: weight {weight.dtype} {tuple(weight.shape)} needs e8m0 scales "
                          f"[{N // 32}, {K // 32}], got {scale.dtype} {tuple(scale.shape)}")
-    y = torch.empty(M, N, dtype=out_dtype, device=x.device)
+    y = torch.empty((ksplit, M, N) if ksplit > 1 else (M, N), dtype=out_dtype, device=x.device)
     if M and N:
         w = weight.contiguous()
         s = scale.contiguous().view(torch.uint8) if scale is not None else w
         kernel, ctx = _launcher(_gemv_rows_kernel, x.device, traced)
         with ctx:
-            kernel[(triton.cdiv(N, bn),)](x.contiguous(), w, s, y, M, N, K, x.shape[1], R,
-                                         scale.shape[1] if scale is not None else 0,
-                                         HAS_SCALE=scale is not None, BM=bm, BN=bn, BK=bk, EPI_QUANT=quant_out)
+            kernel[(triton.cdiv(N, bn), ksplit)](x.contiguous(), w, s, y, M, N, K, x.shape[1], R,
+                                                scale.shape[1] if scale is not None else 0,
+                                                HAS_SCALE=scale is not None, BM=bm, BN=bn, BK=bk,
+                                                EPI_QUANT=quant_out, KSPLIT=ksplit)
     return y
+
+
+def _narrow_ksplit(N, bn, K, bk, device=None):
+    """How many programs share a row tile's reduction in a GEMV over a weight of N rows: the
+    smallest power of two that gives at least two programs per SM, as long as the slices keep
+    whole K steps. The planner's choice per shape and GPU; this is the stopgap."""
+    sms = torch.cuda.get_device_properties(device if device is not None else torch.cuda.current_device()).multi_processor_count
+    ks = 1
+    while triton.cdiv(N, bn) * ks < 2 * sms and ks < 16 and K % (2 * ks * bk) == 0:
+        ks *= 2
+    return ks
 
 
 if triton is not None:
@@ -565,7 +593,9 @@ def attn_q(x, wq_a, sa, norm_weight, norm_eps, wq_b, sb, freqs, heads, head_dim,
         raise ValueError(f"attn_q: x {tuple(x.shape)}, wq_a {tuple(wq_a.shape)}, wq_b {tuple(wq_b.shape)}, "
                          f"heads {heads} x {head_dim}, rope {rope_dim}, freqs {tuple(freqs.shape)}")
     freqs = freqs.contiguous()
-    qr = gemv_rows(xq, wq_a, sa, traced=traced)
+    rbm, rbn, rbk = _rows_blocks(M, K)
+    ks = _narrow_ksplit(R, rbn, K, rbk, x.device)
+    qr = gemv_rows(xq, wq_a, sa, traced=traced, ksplit=ks)
     qn = torch.empty(M, R, dtype=torch.bfloat16, device=x.device)
     qq = torch.empty(M, R, dtype=torch.bfloat16, device=x.device)
     q = torch.empty(M, N, dtype=torch.bfloat16, device=x.device)
@@ -573,7 +603,7 @@ def attn_q(x, wq_a, sa, norm_weight, norm_eps, wq_b, sb, freqs, heads, head_dim,
         post, ctx = _launcher(_row_post_kernel, x.device, traced)
         with ctx:
             post[(M,)](qr, norm_weight.contiguous(), freqs, 1.0, qq, qn, M, R, 1, float(norm_eps),
-                       NORM=True, RD=0, QUANT=True, STORE_PRE=True, BD=BR)
+                       NORM=True, RD=0, QUANT=True, STORE_PRE=True, BD=BR, KSUM=ks)
         kernel, ctx = _launcher(_gemv_pe_kernel, x.device, traced)
         with ctx:
             kernel[(triton.cdiv(N, bn),)](qq, wq_b.contiguous(), sb.contiguous().view(torch.uint8), q, q, qq,
@@ -588,7 +618,7 @@ if triton is not None:
     @triton.jit
     def _row_post_kernel(x_ptr, nw_ptr, freqs_ptr, sign, y_ptr, pre_ptr, M, D, HPR, eps,
                          NORM: tl.constexpr, RD: tl.constexpr, QUANT: tl.constexpr, STORE_PRE: tl.constexpr,
-                         BD: tl.constexpr):
+                         BD: tl.constexpr, KSUM: tl.constexpr = 1):
         """A row's finishing after a projection, one program per row of x [M, D] (bf16): RMSNorm
         with nw_ptr's weight (NORM; fp32, rounded to bf16), the rotary of the last RD elements in
         adjacent pairs (freqs_ptr: the complex frequencies' real view [M, RD / 2, 2], cos and sin
@@ -597,13 +627,21 @@ if triton is not None:
         as bf16. The fork's kv_norm, apply_rotary_emb and act_quant, each a kernel or more, as
         one. BD is D rounded up to a power of two; RD divides D and is even. HPR consecutive rows
         share a frequency row (the heads of one token). STORE_PRE also stores the row before the
-        quantization (pre_ptr), for a reader that wants it unquantized."""
+        quantization (pre_ptr), for a reader that wants it unquantized. With KSUM > 1, x holds
+        that many fp32 partial sums [KSUM, M, D] of a split GEMV (gemv_rows(ksplit)); their sum,
+        rounded to bf16 as the linear's output, is the row."""
         eps = eps.to(tl.float32)
         sign = sign.to(tl.float32)
         m = tl.program_id(0)
         d = tl.arange(0, BD)
         live = d < D
-        x = tl.load(x_ptr + m * D + d, mask=live, other=0.0).to(tl.float32)
+        if KSUM > 1:
+            x = tl.zeros((BD,), dtype=tl.float32)
+            for k in tl.static_range(KSUM):
+                x += tl.load(x_ptr + (k * M + m) * D + d, mask=live, other=0.0)
+            x = x.to(tl.bfloat16).to(tl.float32)
+        else:
+            x = tl.load(x_ptr + m * D + d, mask=live, other=0.0).to(tl.float32)
         if NORM:
             rstd = tl.math.rsqrt(tl.sum(x * x) / D + eps)
             nw = tl.load(nw_ptr + d, mask=live, other=0.0).to(tl.float32)
@@ -646,13 +684,15 @@ def window_kv(x, wkv, scale, norm_weight, norm_eps, freqs, rope_dim, traced=Fals
     BD = triton.next_power_of_2(D)  # the per-row kernel masks past D
     if M > GEMV_ROWS_MAX or K % 32 or D % 32 or rope_dim % 2 or tuple(freqs.shape) != (M, rope_dim // 2, 2):
         raise ValueError(f"window_kv: x {tuple(x.shape)}, wkv {tuple(wkv.shape)}, rope {rope_dim}, freqs {tuple(freqs.shape)}")
-    kv = gemv_rows(xq, wkv, scale, traced=traced)
+    rbm, rbn, rbk = _rows_blocks(M, K)
+    ks = _narrow_ksplit(D, rbn, K, rbk, x.device)
+    kv = gemv_rows(xq, wkv, scale, traced=traced, ksplit=ks)
     y = torch.empty(M, D, dtype=torch.bfloat16, device=x.device)
     if M:
         kernel, ctx = _launcher(_row_post_kernel, x.device, traced)
         with ctx:
             kernel[(M,)](kv, norm_weight.contiguous(), freqs.contiguous(), 1.0, y, y, M, D, 1,
-                         float(norm_eps), NORM=True, RD=rope_dim, QUANT=True, STORE_PRE=False, BD=BD)
+                         float(norm_eps), NORM=True, RD=rope_dim, QUANT=True, STORE_PRE=False, BD=BD, KSUM=ks)
     return y.reshape(tuple(x.shape[:-1]) + (D,))
 
 
