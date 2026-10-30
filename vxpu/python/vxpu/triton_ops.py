@@ -61,6 +61,8 @@ this module.
 import contextlib
 import types
 
+import os
+
 import torch
 
 try:
@@ -290,7 +292,9 @@ if triton is not None:
                  mask=live[:, None] & mlive[None, :])
 
 
-GEMV_ROWS_MAX = 64  # rows one pass over the weight serves (BM); beyond, a GEMM
+# rows one pass over the weight serves (BM); beyond, a GEMM. VXPU_GEMV_ROWS_MAX overrides it, to
+# measure where the one-pass kernel should hand over (hero 6: 33 rows were slower at 64 than at 32)
+GEMV_ROWS_MAX = int(os.environ.get("VXPU_GEMV_ROWS_MAX", "64"))
 
 
 def _rows_blocks(M, K):
