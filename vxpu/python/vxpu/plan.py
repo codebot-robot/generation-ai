@@ -75,7 +75,7 @@ _given = contextvars.ContextVar("vxpu_plan_given", default=None)
 COORDINATOR_SWITCHES = frozenset({
     "VXPU_FUSED_EXPERTS", "VXPU_SPLIT_DECODE", "VXPU_COMPILE_MODE", "VXPU_SPLIT_COMPILE", "VXPU_DIRECT_HOST_OPS",
     "VXPU_LOWER_DECODE", "VXPU_SEGMENT_RUNTIME", "VXPU_EXPERT_MAILBOXES", "VXPU_REMOTE_NODES", "VXPU_DATAFLOW",
-    "VXPU_STEP_GRAPH", "VXPU_LAYER_RANGE", "VXPU_REMOTE_RANGES",
+    "VXPU_STEP_GRAPH", "VXPU_LAYER_RANGE", "VXPU_REMOTE_RANGES", "VXPU_FUSE",
     "VXPU_DATAFLOW_PLACE", "VXPU_GPU_EXPERTS", "VXPU_GPU_EXPERTS_MOVES", "VXPU_GPU_EXPERTS_REQUEST_WEIGHT",
     "VXPU_EXPERTS_IN_RAM", "VXPU_BF16_WEIGHT_CACHE", "VXPU_BF16_CACHE_HEADROOM_GB",
 })
@@ -211,20 +211,26 @@ class Impl:
     reference: bool = False   # the reference computation: always applicable, on any device
     host: bool = False        # runs where its data lives on the host (the expert banks, the n-gram tables)
     lowerable: bool = False   # fn(..., tk=triton_ops.lowered) is traceable: the plan's lowering may inline it (lower.py)
+    fused: bool = False       # a decomposed body for the compiler to fuse, chosen where measured cheaper (costs.py)
 
 
 REGISTRY = collections.defaultdict(list)  # op -> [Impl], in preference order
 
 
-def implementation(op, name, devices, numerics, when, applies=None, reference=False, host=False, lowerable=False):
+def implementation(op, name, devices, numerics, when, applies=None, reference=False, host=False, lowerable=False,
+                   fused=False):
     """Register fn as an implementation of op. Registration order is the
     preference order: the first one that applies is selected. host=True
     marks an op that runs where its data is (on the host for host-placed
     banks and tables), whatever the engine's device. lowerable=True marks
     one whose fn takes its Triton kernels as tk= and, given the traced
-    ones, is pure tensor work a compiler can trace through."""
+    ones, is pure tensor work a compiler can trace through. fused=True
+    marks a lowerable body of plain tensor operations, which the lowering
+    chooses over the kernel it would replace only where it measures
+    cheaper (costs.py)."""
     def register(fn):
-        REGISTRY[op].append(Impl(op, name, fn, tuple(devices), numerics, when, applies, reference, host, lowerable))
+        REGISTRY[op].append(Impl(op, name, fn, tuple(devices), numerics, when, applies, reference, host, lowerable,
+                                 fused))
         return fn
     return register
 
@@ -332,6 +338,13 @@ class Plan:
         self._set("lower_decode", on and self["split_decode"], src if self["split_decode"] else "requires split_decode",
                   (True, False), "before compiling, rewrite each dense segment's vxpu op calls into the selected "
                   "implementation, its Triton kernels as torch ops (lower.py): the compiler sees the kernels")
+        fuse, src = env_text("VXPU_FUSE", "fp8_linear,hc_sinkhorn,matmul,rotary")
+        fuse = tuple(sorted(op.strip() for op in fuse.split(",") if op.strip()))
+        self._set("fuse", fuse if self["lower_decode"] else (), src if self["lower_decode"] else "requires lower_decode",
+                  (), "what the lowering may rewrite into plain tensor operations, which the compiler fuses with "
+                  "their neighbours (comma-separated): the dense ops fp8_linear, rotary and hc_sinkhorn, in place of "
+                  "our hand-written kernels, and matmul, small aten matmuls (linear, einsum) as reductions; each call "
+                  "is rewritten only where that measures cheaper at its shapes (lower.py, costs.py)")
         self._set("segment_runtime", runtime, rsrc, ("jit", "aoti"),
                   "how dense segments run: jit (torch.compile, CUDA graphs by its cudagraph trees) or aoti "
                   "(AOTInductor packages, built once and cached, in the engine's own CUDA graphs; aoti.py)")

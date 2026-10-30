@@ -853,9 +853,10 @@ class Engine:
                 # reduce-overhead there), the host ops eager between
                 if self.plan["lower_decode"]:
                     report = lower.lower(self._decode, self.plan)
-                    msg = lower.describe(report)
-                    print(f"[vxpu] {msg}", flush=True)
-                    self.plan.note(msg)
+                    for msg in (lower.describe(report), lower.describe_measured(report)):
+                        if msg:
+                            print(f"[vxpu] {msg}", flush=True)
+                            self.plan.note(msg)
                 self._decode_split = segments.compile_segments(
                     self._decode, self.device, mode,
                     split_compile=self.plan["split_compile"], direct=self.plan["direct_host_ops"],

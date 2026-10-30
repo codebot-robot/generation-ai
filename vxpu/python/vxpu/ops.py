@@ -467,6 +467,52 @@ def _fp8_linear_cpu(x, weight, scale):
     return y.reshape(tuple(x.shape[:-1]) + (weight.shape[0],)).to(x.dtype)
 
 
+def _fusing(plan, lowering, op):
+    """Whether op's decomposed body applies: only when the plan lowers a graph for a compiler to
+    fuse, and the plan fuses that op (an eager call would run the body op by op)."""
+    return lowering and op in plan["fuse"]
+
+
+def round_e4m3(q):
+    """q (fp32, within +-448) onto the fp8 e4m3 grid, ties to even, in plain tensor operations a
+    compiler fuses (a cast to float8 needs sm_89 in Triton): a normal value keeps 3 of its 23
+    mantissa bits, a subnormal one (below 2^-6) becomes a multiple of 2^-9."""
+    bits = q.view(torch.int32)
+    normal = ((bits + 0x7FFFF + ((bits >> 20) & 1)) & ~0xFFFFF).view(torch.float32)
+    return torch.where(q.abs() < 0.015625, torch.round(q * 512.0) / 512.0, normal)
+
+
+def act_quant_dequant(x):
+    """The fork's act_quant and its dequantization in tensor operations: per block of 32 along the
+    last dimension, a power-of-two scale (ue8m0) putting the block's amax at most at 448, and the
+    values rounded to fp8 e4m3, returned in fp32."""
+    blocks = x.float().unflatten(-1, (-1, 32))
+    amax = blocks.abs().amax(-1, keepdim=True).clamp_min(1e-4)
+    scale = torch.exp2(torch.ceil(torch.log2(amax / 448.0)))
+    return (round_e4m3((blocks / scale).clamp(-448.0, 448.0)) * scale).flatten(-2)
+
+
+FUSED_GEMV_MAX_ROWS = 32  # up to here a fused linear is one reduction kernel; beyond, a GEMM
+
+
+@implementation("vxpu::fp8_linear", "gpu-fused", ("cuda",), "rounding",
+                "decomposed for the compiler (lowering, VXPU_FUSE; where it measures cheaper): the activation's "
+                "quantization fused with what produces it, the fp8 weight dequantized inside the product's reduction "
+                "(a GEMM beyond 32 rows)",
+                applies=lambda plan, lowering=False, **_: _fusing(plan, lowering, "fp8_linear"),
+                lowerable=True, fused=True)
+def _fp8_linear_fused(x, weight, scale, tk=None):
+    N, K = weight.shape
+    xq = act_quant_dequant(x).reshape(-1, K)
+    w = (weight.float().unflatten(1, (K // 32, 32)).unflatten(0, (N // 32, 32))
+         * scale.float()[:, None, :, None]).reshape(N, K)
+    if xq.shape[0] <= FUSED_GEMV_MAX_ROWS:
+        y = (xq[:, None, :] * w[None, :, :]).sum(-1)
+    else:
+        y = torch.mm(xq.to(torch.bfloat16), w.to(torch.bfloat16).t()).float()
+    return y.to(x.dtype).reshape(*x.shape[:-1], N)
+
+
 # On a GPU the reference expands the fp8 weight to fp32 on every call, about
 # 15x the cost of the matmul. The quantized activation is exact in bf16, and
 # one Triton kernel computes it (the aten version is a dozen kernels). A
@@ -644,6 +690,15 @@ def _sinkhorn_context(mixes, hc_scale, hc_base, hc_mult, sinkhorn_iters, eps):
     return mixes.device.type, f"tokens={mixes.numel() // mixes.shape[-1]} hc={hc_mult}", {"hc_mult": hc_mult}
 
 
+@implementation("vxpu::hc_sinkhorn", "gpu-fused", ("cuda",), "rounding",
+                "decomposed for the compiler (lowering, VXPU_FUSE; where it measures cheaper): the fork's Sinkhorn "
+                "iterations as tensor operations, fused with their neighbours",
+                applies=lambda plan, lowering=False, **_: _fusing(plan, lowering, "hc_sinkhorn"),
+                lowerable=True, fused=True)
+def _sinkhorn_fused(mixes, hc_scale, hc_base, hc_mult, sinkhorn_iters, eps, tk=None):
+    return _sinkhorn_reference(mixes, hc_scale, hc_base, hc_mult, sinkhorn_iters, eps)
+
+
 @implementation("vxpu::hc_sinkhorn", "gpu-triton", ("cuda",), "rounding",
                 "Triton, power-of-two width: one kernel per call, the matrix in registers",
                 applies=lambda plan, hc_mult=0, **_: plan["triton"] and triton_ops.hc_split_sinkhorn_supported(hc_mult),
@@ -755,6 +810,23 @@ def _rotary_context(x, freqs_cis, inverse=False):
     return x.device.type, f"{shape}{inv}", {}
 
 
+@implementation("vxpu::rotary", "gpu-fused", ("cuda",), "rounding",
+                "decomposed for the compiler (lowering, VXPU_FUSE; where it measures cheaper): each interleaved pair "
+                "rotated in real arithmetic (a compiler cannot fuse complex numbers), fused with the projection before it",
+                applies=lambda plan, lowering=False, **_: _fusing(plan, lowering, "rotary"),
+                lowerable=True, fused=True)
+def _rotary_fused(x, freqs_cis, inverse=False, tk=None):
+    c, s = freqs_cis.real, freqs_cis.imag
+    if inverse:
+        s = -s
+    rows = x.size(0) if freqs_cis.dim() == 3 else 1
+    shape = (rows, x.size(1), 1, x.size(-1) // 2) if x.ndim == 4 else (rows, x.size(1), x.size(-1) // 2)
+    c, s = c.reshape(shape), s.reshape(shape)
+    pairs = x.float().unflatten(-1, (-1, 2))
+    xe, xo = pairs[..., 0], pairs[..., 1]
+    return torch.stack((xe * c - xo * s, xe * s + xo * c), dim=-1).flatten(-2).to(x.dtype)
+
+
 @implementation("vxpu::rotary", "gpu-triton", ("cuda",), "rounding",
                 "Triton kernel: interleaved pairs rotated in registers",
                 applies=lambda plan, **_: plan["triton"], lowerable=True)
@@ -798,12 +870,14 @@ SELECTION = {
 CALL = {"vxpu::head_linear": _call_head}
 
 
-def select(op, *args, plan=None):
+def select(op, *args, plan=None, **extra):
     """The implementation of op the plan selects for these arguments:
     tensors when the op runs, fake tensors (shapes only) when the plan's
-    lowering rewrites a graph. plan defaults to the bound engine's."""
+    lowering rewrites a graph (which passes lowering=True: a decomposed
+    body only makes sense where a compiler fuses it). plan defaults to the
+    bound engine's."""
     device_type, key, ctx = SELECTION[op](*args)
-    return (plan or _plan(device_type)).select(op, device_type, key=key, **ctx)
+    return (plan or _plan(device_type)).select(op, device_type, key=key, **ctx, **extra)
 
 
 def call(op, fn, *args):

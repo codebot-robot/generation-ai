@@ -70,6 +70,24 @@ becomes the selected implementation, its Triton kernels visible to the
 compiler. Dense segments then compile ahead of time with AOTInductor
 (`aoti.py`), cached per artifact, plan and machine.
 
+The lowering also chooses what the compiler fuses. Some ops have a
+second lowerable implementation: a decomposed body of plain tensor
+operations, which inductor fuses with its neighbours. Small aten
+matmuls (linear, einsum) can likewise become reductions. Fusing saves a
+kernel launch and a round trip through memory, which is most of what an
+op on small tensors costs. But inductor turns a matrix-vector product
+into one reduction per output element, which reads the weight again for
+each row. At DeepSeek's shapes on an L4, the fused fp8 linear took
+290 µs where our GEMV took 32 µs (5120×8192, one row, measured). So the
+lowering measures both candidates at each call's shapes on the engine's
+GPU and keeps the cheaper (`costs.py`), as a database optimizer costs
+its alternatives. The decisions are cached per GPU and shape. On the
+tiny DeepSeek on an L4 at 3 rows, it fuses rotary, the small linears
+and einsums, and most fp8 linears, and keeps the Sinkhorn kernel. With
+the sampling epilogue compiled too, a decode step went from 364 kernels
+to 234, and from 1.13 ms to 0.93 ms (measured; the two numbers come
+from different sessions).
+
 The planner also generates the layouts a model could run in on a set of
 machines and ranks them by the cost model (`planner.Candidates`, #409),
 without running anything:
