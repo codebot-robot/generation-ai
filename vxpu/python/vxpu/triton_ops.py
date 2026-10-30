@@ -91,14 +91,11 @@ if triton is not None:
     @triton.jit
     def _round_e4m3(q):
         """q (fp32, within +-448) rounded to the nearest fp8 e4m3 value, ties to even, as a cast to
-        float8_e4m3fn and back does, in fp32 arithmetic: a normal value keeps 3 of its 23 mantissa
-        bits (round to nearest even on the 20 dropped), a subnormal one (below 2^-6) becomes a
-        multiple of 2^-9. Any GPU (Triton's fp8e4nv type needs sm_89)."""
-        bits = q.to(tl.int32, bitcast=True)
-        lsb = (bits >> 20) & 1
-        normal = ((bits + 0x7FFFF + lsb) & ~0xFFFFF).to(tl.float32, bitcast=True)
-        sub = tl.extra.cuda.libdevice.rint(q * 512.0) / 512.0
-        return tl.where(tl.abs(q) < 0.015625, sub, normal)
+        float8_e4m3fn and back does: the hardware's cast (sm_89 and later, which every GPU that
+        runs these kernels is: the fp8 GEMVs load fp8 weights). The same values as the fp32 bit
+        arithmetic this replaced (bit-identical outputs on the four region ops at 1, 9 and 33
+        rows), and cheaper: the arithmetic ran on the padded rows of a tile too."""
+        return q.to(tl.float8e4nv).to(tl.float32)
 
     @triton.jit
     def _act_quant_dequant_kernel(x_ptr, y_ptr, n_groups, G: tl.constexpr):
