@@ -323,15 +323,16 @@ def profile(engine, plan=None, reps=12):
             g = torch.cuda.CUDAGraph(keep_graph=True)
             with torch.cuda.graph(g):
                 compiled(*args)
+            names = {}
             try:
-                kernels = _Driver().node_counts(g.raw_cuda_graph()).get("kernels", 0)
+                kernels = _Driver().node_counts(g.raw_cuda_graph(), names).get("kernels", 0)
             except RuntimeError:
                 kernels = 0  # an empty graph
             g.instantiate()
             weights, state, act, top = _bytes(sub, args, params, rows)
             records.append({"region": region, "host": False, "nodes": nodes, "kernels": kernels,
                             "weight_bytes": weights, "state_bytes": state, "activation_bytes": act,
-                            "largest": top, "roofline_us": (weights + state) / (bw * 1e3)})
+                            "largest": top, "roofline_us": (weights + state) / (bw * 1e3), "kernel_names": names})
             graphs.append((len(records) - 1, g))
         events = [torch.cuda.Event(enable_timing=True) for _ in range(len(graphs) + 1)]
         times = collections.defaultdict(list)
@@ -381,6 +382,12 @@ def main(argv):
         return
     records, bw = profile(engine)
     print(describe(records, bw))
+    if "--names" in argv:  # the kernels of the regions furthest from their floor, by name
+        worst = sorted((r for r in records if not r["host"]), key=lambda r: r["roofline_us"] - r["us"])[:4]
+        for r in worst:
+            print(f"\n{r['region']}: {r['kernels']} kernels, {r['us']:.0f} us, floor {r['roofline_us']:.0f} us")
+            for name, n in sorted(r["kernel_names"].items(), key=lambda x: -x[1]):
+                print(f"  {n:3d}  {name[:140]}")
 
 
 if __name__ == "__main__":
