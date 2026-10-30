@@ -250,6 +250,25 @@ KV's fp4 quantization running as the aten emulation. The remaining gap
 at one row is the FFN and hyper-connection fronts (1.9 ms for 0.2 ms of
 bytes), the expert kernels' last 1.8 ms, the small kernels and the gaps.
 
+**7(b), the rest, as four parallel workstreams (Oct 31, each on its own
+branch and GPU, each measured cold on the RTX PRO 6000 with argument sets
+larger than the L2; merged into one step afterwards).** The per-kernel
+profile separates their effects, which is what lets them run at once.
+
+| workstream | change | per call at one row, before → after | launches a step |
+|---|---|---|---|
+| fronts | the FFN and HC fronts split the row across programs: a per-chunk statistics kernel, a chunk × group dots kernel, the finishing kernel summing partials (`gpu-triton-split`, chosen ahead of the one-pass pair) | ffn_front 31.5 → 13.5 µs, hc_front 14.7 → 6.8 µs | +39 |
+| experts | a decode step's experts in two launches a layer: the gate/up kernel looks its slot up itself, the down kernel forms h from g and u in its loads (SwiGLU + per-32 quantization), the token's last program sums its replies; the step graph skips the combine when one pool holds the layer | whole op 127.9 → 107.3 µs | −240 |
+| glue | the fp8 round trip is the hardware cast; wo_a's GEMV quantizes in its epilogue; the narrow projections (attn_q, window_kv) and the shared expert's dual GEMV split K across programs with the per-row kernel summing partials | attn_out 62 → 60, attn_q 56 → 49, window_kv 17 → 9, shared_ffn 44 → 42 µs | −40, and −120 if the lowering takes the 4-kernel shared_ffn body |
+| drafter | the drafter's segments get their layer ids so sharding places them; a state tensor written away from its owner GPU is detected | correctness (1 of 310 drafts accepted) | |
+
+Measured and dropped on the way: quantizing a GEMV's input in its
+prologue costs 7 to 10 µs at one row (every program redoes it on the
+padded tile); quantization belongs in the producer's epilogue. The
+expert kernels' tail stays: the loads alone reach 1,400 GB/s, the dot
+with one live row in a 16-row tile adds 18 µs, and no tile shape moves
+it. [combined step: pending]
+
 Batched rows, sharded, with the native expert body (the same session;
 measured; "same" is one prompt in every row, "different" a prompt per
 row):

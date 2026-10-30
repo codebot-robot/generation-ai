@@ -770,7 +770,7 @@ def attn_out(o, freqs, wo_a, sa, groups, rank, wo_b, sb, head_dim, rope_dim, tra
         post, ctx = _launcher(_row_post_kernel, o.device, traced)
         with ctx:
             post[(M * heads,)](x, x, freqs.contiguous(), -1.0, oq, oq, M * heads, hd, heads, 0.0,
-                               NORM=False, RD=rope_dim, QUANT=True, STORE_PRE=False, BD=hd)
+                               NORM=False, RD=rope_dim, QUANT=True, STORE_PRE=False, BD=hd, KSUM=1)
     mid = gemv_rows(oq.view(M, heads * hd), wo_a, sa, group_rows=rank, traced=traced, quant_out=True)
     y = gemv_rows(mid, wo_b, sb, traced=traced)
     return y.reshape(tuple(lead) + (dim,))
