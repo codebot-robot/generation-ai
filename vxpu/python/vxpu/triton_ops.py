@@ -59,6 +59,7 @@ this module.
 """
 
 import contextlib
+import functools
 import types
 
 import os
@@ -1191,8 +1192,8 @@ if triton is not None:
         blocks = tl.program_id(0) * G + tl.arange(0, G)
         live = blocks < I // 32
         offs = p.to(tl.int64) * I + blocks[:, None] * 32 + tl.arange(0, 32)[None, :]
-        g = tl.load(g_ptr + offs, mask=live[:, None], other=0.0).to(tl.float32)
-        u = tl.load(u_ptr + offs, mask=live[:, None], other=0.0).to(tl.float32)
+        g = tl.load(g_ptr + offs, mask=live[:, None], other=0.0).to(tl.bfloat16).to(tl.float32)
+        u = tl.load(u_ptr + offs, mask=live[:, None], other=0.0).to(tl.bfloat16).to(tl.float32)
         if limit > 0:
             u = tl.minimum(tl.maximum(u, -limit), limit)
             g = tl.minimum(g, limit)
@@ -1240,6 +1241,16 @@ if triton is not None:
         return tl.reshape(bits, (BN, BK)).to(tl.int16).to(tl.bfloat16, bitcast=True)
 
     @triton.jit
+    def _fp4_raw(w_ptr, s_ptr, rows, live, k0, KB, KS, BN: tl.constexpr, BK: tl.constexpr):
+        """The same rows and columns as _fp4_tile, undecoded: the packed bytes [BN, BK/2] and the
+        e8m0 scales [BN, BK/32], the operands of a scaled dot on a tensor core that takes MXFP4."""
+        kb = k0 // 2 + tl.arange(0, BK // 2)
+        b = tl.load(w_ptr + rows[:, None] * KB + kb[None, :], mask=live[:, None], other=0)
+        ks = k0 // 32 + tl.arange(0, BK // 32)
+        e = tl.load(s_ptr + rows[:, None] * KS + ks[None, :], mask=live[:, None], other=127)
+        return b, e
+
+    @triton.jit
     def _grouped_block(order_ptr, blk_slot_ptr, blk_first_ptr, blk_count_ptr, b, BM: tl.constexpr):
         """Block b of the schedule: its expert's slot, its pairs (up to BM, in the sorted order) and
         which of them are real."""
@@ -1252,9 +1263,16 @@ if triton is not None:
     @triton.jit
     def _fp4_grouped_gate_up_kernel(x_ptr, order_ptr, blk_slot_ptr, blk_first_ptr, blk_count_ptr,
                                     w1_ptr, s1_ptr, w3_ptr, s3_ptr, g_ptr, u_ptr, I, K, TOPK,
-                                    BM: tl.constexpr, BN: tl.constexpr, BK: tl.constexpr):
-        """Gate and up for one block of pairs sharing an expert, BN of its rows: each weight tile
-        decoded once for all the block's tokens, the products on the tensor cores (fp32 sums)."""
+                                    BM: tl.constexpr, BN: tl.constexpr, BK: tl.constexpr, KS: tl.constexpr,
+                                    NATIVE: tl.constexpr):
+        """Gate and up for one block of pairs sharing an expert, BN of its rows, the products on the
+        tensor cores (fp32 sums). NATIVE: the packed fp4 and the e8m0 scales go to the tensor core
+        as they are (MXFP4, Blackwell and later); otherwise each weight tile is decoded to bf16 in
+        software once for all the block's tokens (the decode, not the bytes, bounds that body: 666
+        against 1,220 GB/s native at one token on an RTX PRO 6000). With KS > 1 the reduction over K is split across KS programs (a decode step's few pairs
+        leave too few programs otherwise: at one token, six experts and BN 32 gave 432 programs
+        on 188 SMs and 45% of the card's bandwidth); each adds its partial sums into fp32 g and u,
+        zeroed by the caller, and the SwiGLU kernel rounds them to bf16 as the module does."""
         slot, pairs, live_m, cnt = _grouped_block(order_ptr, blk_slot_ptr, blk_first_ptr, blk_count_ptr,
                                                   tl.program_id(0), BM)
         if cnt <= 0:
@@ -1265,18 +1283,34 @@ if triton is not None:
         tok = (pairs // TOPK).to(tl.int64)
         acc_g = tl.zeros((BM, BN), dtype=tl.float32)
         acc_u = tl.zeros((BM, BN), dtype=tl.float32)
-        for k0 in range(0, K, BK):
+        span = K // KS
+        k_start = tl.program_id(2) * span
+        for k0 in range(k_start, k_start + span, BK):
             x = tl.load(x_ptr + tok[:, None] * K + k0 + tl.arange(0, BK)[None, :], mask=live_m[:, None], other=0.0)
-            acc_g = tl.dot(x, tl.trans(_fp4_tile(w1_ptr, s1_ptr, bank_rows, live_n, k0, K // 2, K // 32, BN, BK)), acc_g)
-            acc_u = tl.dot(x, tl.trans(_fp4_tile(w3_ptr, s3_ptr, bank_rows, live_n, k0, K // 2, K // 32, BN, BK)), acc_u)
+            if NATIVE:
+                b1, e1 = _fp4_raw(w1_ptr, s1_ptr, bank_rows, live_n, k0, K // 2, K // 32, BN, BK)
+                b3, e3 = _fp4_raw(w3_ptr, s3_ptr, bank_rows, live_n, k0, K // 2, K // 32, BN, BK)
+                acc_g = tl.dot_scaled(x, None, "bf16", tl.trans(b1), e1, "e2m1", acc_g)
+                acc_u = tl.dot_scaled(x, None, "bf16", tl.trans(b3), e3, "e2m1", acc_u)
+            else:
+                acc_g = tl.dot(x, tl.trans(_fp4_tile(w1_ptr, s1_ptr, bank_rows, live_n, k0, K // 2, K // 32, BN, BK)), acc_g)
+                acc_u = tl.dot(x, tl.trans(_fp4_tile(w3_ptr, s3_ptr, bank_rows, live_n, k0, K // 2, K // 32, BN, BK)), acc_u)
         out = pairs.to(tl.int64)[:, None] * I + rows[None, :]
         mask = live_m[:, None] & live_n[None, :]
-        tl.store(g_ptr + out, acc_g.to(tl.bfloat16), mask=mask)
-        tl.store(u_ptr + out, acc_u.to(tl.bfloat16), mask=mask)
+        if KS == 1:
+            tl.store(g_ptr + out, acc_g.to(g_ptr.dtype.element_ty), mask=mask)
+            tl.store(u_ptr + out, acc_u.to(u_ptr.dtype.element_ty), mask=mask)
+        else:
+            tl.atomic_add(g_ptr + out, acc_g, mask=mask)
+            tl.atomic_add(u_ptr + out, acc_u, mask=mask)
 
     @triton.jit
     def _fp4_grouped_down_kernel(h_ptr, order_ptr, blk_slot_ptr, blk_first_ptr, blk_count_ptr, w2_ptr, s2_ptr,
-                                 d_ptr, D, I, BM: tl.constexpr, BN: tl.constexpr, BK: tl.constexpr):
+                                 d_ptr, D, I, BM: tl.constexpr, BN: tl.constexpr, BK: tl.constexpr, KS: tl.constexpr,
+                                 NATIVE: tl.constexpr):
+        """The down projection, the two bodies of the gate/up kernel; with KS > 1 the reduction over I is split across KS programs, each
+        adding its partial sums into d (fp32, zeroed by the caller). The module rounds a pair's
+        reply to bf16; the split keeps it in fp32 (a rounding-level difference)."""
         slot, pairs, live_m, cnt = _grouped_block(order_ptr, blk_slot_ptr, blk_first_ptr, blk_count_ptr,
                                                   tl.program_id(0), BM)
         if cnt <= 0:
@@ -1286,11 +1320,20 @@ if triton is not None:
         bank_rows = slot * D + rows
         prow = pairs.to(tl.int64)
         acc = tl.zeros((BM, BN), dtype=tl.float32)
-        for k0 in range(0, I, BK):
+        span = I // KS
+        k_start = tl.program_id(2) * span
+        for k0 in range(k_start, k_start + span, BK):
             h = tl.load(h_ptr + prow[:, None] * I + k0 + tl.arange(0, BK)[None, :], mask=live_m[:, None], other=0.0)
-            acc = tl.dot(h, tl.trans(_fp4_tile(w2_ptr, s2_ptr, bank_rows, live_n, k0, I // 2, I // 32, BN, BK)), acc)
+            if NATIVE:
+                b2, e2 = _fp4_raw(w2_ptr, s2_ptr, bank_rows, live_n, k0, I // 2, I // 32, BN, BK)
+                acc = tl.dot_scaled(h, None, "bf16", tl.trans(b2), e2, "e2m1", acc)
+            else:
+                acc = tl.dot(h, tl.trans(_fp4_tile(w2_ptr, s2_ptr, bank_rows, live_n, k0, I // 2, I // 32, BN, BK)), acc)
         mask = live_m[:, None] & live_n[None, :]
-        tl.store(d_ptr + prow[:, None] * D + rows[None, :], acc.to(tl.bfloat16).to(tl.float32), mask=mask)
+        if KS == 1:
+            tl.store(d_ptr + prow[:, None] * D + rows[None, :], acc.to(tl.bfloat16).to(tl.float32), mask=mask)
+        else:
+            tl.atomic_add(d_ptr + prow[:, None] * D + rows[None, :], acc, mask=mask)
 
 
 if triton is not None:
@@ -1373,6 +1416,37 @@ def _block_k(dim, want):
     return bk
 
 
+FP4_KSPLIT = os.environ.get("VXPU_FP4_KSPLIT")  # override: the K split of the fp4 expert kernels (measurement)
+FP4_NATIVE = os.environ.get("VXPU_FP4_NATIVE")  # override: force the native (1) or software-decode (0) body (A/B)
+
+
+@functools.lru_cache(maxsize=None)
+def _fp4_native(device_index):
+    """Whether the expert kernels hand fp4 to the tensor cores on this GPU: Blackwell (compute
+    capability 10 and 12) and later take MXFP4 directly; earlier cards get the software decode.
+    Chosen from the card, not configured; VXPU_FP4_NATIVE only overrides it for an A/B."""
+    if FP4_NATIVE is not None:
+        return FP4_NATIVE == "1"
+    if triton is None or not hasattr(tl, "dot_scaled"):
+        return False
+    major, _ = torch.cuda.get_device_capability(device_index)
+    return major >= 10
+
+
+def _fp4_ksplit(pairs):
+    """How many programs share the reduction of one (pair block, row tile) in the fp4 expert
+    kernels. A decode step's few pairs give few programs otherwise; a prefill's many need none.
+    The right value is the planner's, per shape and GPU; this is the stopgap it will replace."""
+    if FP4_KSPLIT:
+        return int(FP4_KSPLIT)
+    if pairs <= 16:
+        return 4
+    if pairs <= 64:
+        return 2
+    return 1
+
+
+
 def fp4_experts_decode(x_in, weights, slots, w1, s1, w3, s3, w2, s2, swiglu_limit, per_pair=False,
                        indices=None, start=0):
     """The routed experts of some tokens, for the pairs whose expert is held on the GPU: x_in [n, K]
@@ -1391,8 +1465,14 @@ def fp4_experts_decode(x_in, weights, slots, w1, s1, w3, s3, w2, s2, swiglu_limi
     re-quantized per 32-block, its output rounded to bf16. Tile shapes follow the number of pairs
     (measured on an L4: narrow, deep tiles for a few pairs; taller blocks for many)."""
     pairs_n = (indices if indices is not None else slots).numel()
+    native = _fp4_native(x_in.device.index)
     BM = 32 if pairs_n >= 768 else 16
-    BN, BK = (32, 256) if pairs_n <= 64 else (64, 128)
+    if native:  # measured on an RTX PRO 6000 at one token with a cold L2: BN 64, BK 256, no K split (75.6 us for 75 MB)
+        BN, BK = (64, 256) if pairs_n <= 64 else (64, 128)
+        KS = int(FP4_KSPLIT) if FP4_KSPLIT else 1
+    else:
+        BN, BK = (32, 256) if pairs_n <= 64 else (64, 128)
+        KS = _fp4_ksplit(pairs_n)
     n, topk = (indices if indices is not None else slots).shape
     K = x_in.shape[1]
     S, I, _ = w1.shape
@@ -1403,20 +1483,27 @@ def fp4_experts_decode(x_in, weights, slots, w1, s1, w3, s3, w2, s2, swiglu_limi
     else:
         slot = slots.reshape(-1).to(torch.int32)
     order, blk_slot, blk_first, blk_count, blocks = _grouped_schedule(slot, S, BM)
-    g = torch.empty(pairs, I, dtype=torch.bfloat16, device=dev)
-    u = torch.empty(pairs, I, dtype=torch.bfloat16, device=dev)
+    if KS == 1:
+        g = torch.empty(pairs, I, dtype=torch.bfloat16, device=dev)
+        u = torch.empty(pairs, I, dtype=torch.bfloat16, device=dev)
+    else:  # the K splits add their partial sums here
+        g = torch.zeros(pairs, I, dtype=torch.float32, device=dev)
+        u = torch.zeros(pairs, I, dtype=torch.float32, device=dev)
     h = torch.empty(pairs, I, dtype=torch.bfloat16, device=dev)
     d = torch.zeros(pairs, K, dtype=torch.float32, device=dev)  # 0 for the pairs not held here
     x = x_in.contiguous()
     wt = weights.to(torch.float32).contiguous().view(-1)
     with torch.cuda.device(dev):
-        _fp4_grouped_gate_up_kernel[(blocks, triton.cdiv(I, BN))](
+        bk1, bk2 = _block_k(K, BK), _block_k(I, BK)
+        ks1 = KS if K % (KS * bk1) == 0 else 1
+        ks2 = KS if I % (KS * bk2) == 0 else 1
+        _fp4_grouped_gate_up_kernel[(blocks, triton.cdiv(I, BN), ks1)](
             x, order, blk_slot, blk_first, blk_count, w1, s1.view(torch.uint8), w3, s3.view(torch.uint8), g, u,
-            I, K, topk, BM=BM, BN=BN, BK=_block_k(K, BK))
+            I, K, topk, BM=BM, BN=BN, BK=bk1, KS=ks1, NATIVE=native)
         _swiglu_quant_kernel[(triton.cdiv(I // 32, 16), pairs)](g, u, wt, slot, h, I, float(swiglu_limit), G=16)
-        _fp4_grouped_down_kernel[(blocks, triton.cdiv(K, BN))](
+        _fp4_grouped_down_kernel[(blocks, triton.cdiv(K, BN), ks2)](
             h, order, blk_slot, blk_first, blk_count, w2, s2.view(torch.uint8), d, K, I, BM=BM, BN=BN,
-            BK=_block_k(I, BK))
+            BK=bk2, KS=ks2, NATIVE=native)
     return d.view(n, topk, K) if per_pair else d.view(n, topk, K).sum(1)
 
 
