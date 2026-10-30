@@ -75,7 +75,7 @@ _given = contextvars.ContextVar("vxpu_plan_given", default=None)
 COORDINATOR_SWITCHES = frozenset({
     "VXPU_FUSED_EXPERTS", "VXPU_SPLIT_DECODE", "VXPU_COMPILE_MODE", "VXPU_SPLIT_COMPILE", "VXPU_DIRECT_HOST_OPS",
     "VXPU_LOWER_DECODE", "VXPU_SEGMENT_RUNTIME", "VXPU_EXPERT_MAILBOXES", "VXPU_REMOTE_NODES", "VXPU_DATAFLOW",
-    "VXPU_STEP_GRAPH", "VXPU_LAYER_RANGE", "VXPU_REMOTE_RANGES", "VXPU_FUSE",
+    "VXPU_STEP_GRAPH", "VXPU_LAYER_RANGE", "VXPU_REMOTE_RANGES", "VXPU_FUSE", "VXPU_LAYER_DEVICES",
     "VXPU_DATAFLOW_PLACE", "VXPU_GPU_EXPERTS", "VXPU_GPU_EXPERTS_MOVES", "VXPU_GPU_EXPERTS_REQUEST_WEIGHT",
     "VXPU_EXPERTS_IN_RAM", "VXPU_BF16_WEIGHT_CACHE", "VXPU_BF16_CACHE_HEADROOM_GB",
 })
@@ -368,6 +368,11 @@ class Plan:
         self._set("layer_range", rng, src, (),
                   "run only layers START..END-1 of the step (START:END, END empty for the last layer): their slice of "
                   "decode and prefill, their experts and n-gram tables; other executors run the other ranges (#387)")
+        devices, src = env_text("VXPU_LAYER_DEVICES", None)
+        self._set("layer_devices", devices, src, (),
+                  "the GPUs the layers run on, as START:END=cuda:N,... (layer sharding): each range's dense weights, "
+                  "caches and segments live on its GPU and the step graph is one CUDA graph per GPU, crossing once "
+                  "per range; the head goes with the last range (requires dataflow)")
         ranges, src = env_text("VXPU_REMOTE_RANGES", None)
         self._set("remote_ranges", ranges, src, (),
                   "where other executors serve the ranges of layers after this engine's range, in order, as "

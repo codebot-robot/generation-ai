@@ -886,9 +886,11 @@ class DecodeLoop {
   // (after set_draft, for speculative steps).
   DecodeLoop(at::Tensor input_ids, at::Tensor positions, at::Tensor chosen, const std::vector<int64_t>& execs,
              const std::vector<int64_t>& streams, const std::vector<int64_t>& devices, pybind11::object host,
-             at::Tensor flags)
+             at::Tensor flags, int64_t out_graph = 0)
       : verify_{std::move(input_ids), std::move(positions), std::move(chosen), execs, streams, devices,
-                std::move(host), std::move(flags)} {
+                std::move(host), std::move(flags), out_graph} {
+    TORCH_CHECK(out_graph >= 0 && out_graph < static_cast<int64_t>(verify_.execs.size()),
+                "decode loop: out_graph must index the graphs");
     const at::Tensor& ids = verify_.ids;
     TORCH_CHECK(ids.scalar_type() == at::kLong && ids.dim() == 2, "decode loop: input_ids must be int64 [B, S]");
     rows_n_ = ids.size(0);
@@ -1061,6 +1063,7 @@ class DecodeLoop {
     std::vector<int64_t> execs, streams, devices;
     pybind11::object host_obj;
     at::Tensor flags;
+    int64_t out_graph = 0;  // the graph (and GPU) that writes `out`: the one holding the head
     std::vector<void*> ctxs;
     StepHost* host = nullptr;
     void retain() {
@@ -1086,9 +1089,11 @@ class DecodeLoop {
         Driver::check(cu.graph_launch(reinterpret_cast<void*>(execs[g]), reinterpret_cast<void*>(streams[g])),
                       "cuGraphLaunch");
       }
-      Driver::check(cu.ctx_set_current(ctxs[0]), "cuCtxSetCurrent");
+      // the output read on its own GPU's stream, after that GPU's graph (the last, with layers sharded)
+      Driver::check(cu.ctx_set_current(ctxs[out_graph]), "cuCtxSetCurrent");
       Driver::check(cu.memcpy_async(reinterpret_cast<uint64_t>(out_host), reinterpret_cast<uint64_t>(out.data_ptr()),
-                                    static_cast<size_t>(out.numel()) * sizeof(int64_t), stream), "cuMemcpyAsync");
+                                    static_cast<size_t>(out.numel()) * sizeof(int64_t),
+                                    reinterpret_cast<void*>(streams[out_graph])), "cuMemcpyAsync");
       for (size_t g = 0; g < execs.size(); ++g) {
         Driver::check(cu.ctx_set_current(ctxs[g]), "cuCtxSetCurrent");
         Driver::check(cu.stream_sync(reinterpret_cast<void*>(streams[g])), "cuStreamSynchronize");
@@ -1257,6 +1262,8 @@ void register_node_server(pybind11::module& m) {
   pybind11::class_<DecodeLoop>(m, "DecodeLoop")
       .def(pybind11::init<at::Tensor, at::Tensor, at::Tensor, const std::vector<int64_t>&, const std::vector<int64_t>&,
                           const std::vector<int64_t>&, pybind11::object, at::Tensor>())
+      .def(pybind11::init<at::Tensor, at::Tensor, at::Tensor, const std::vector<int64_t>&, const std::vector<int64_t>&,
+                          const std::vector<int64_t>&, pybind11::object, at::Tensor, int64_t>())  // + out_graph
       .def("set_draft", &DecodeLoop::set_draft)
       .def("set_sampling", &DecodeLoop::set_sampling)
       .def("start", &DecodeLoop::start)

@@ -143,6 +143,74 @@ the op boundary cost the fusion inductor had already done around the
 gate, and the region got slower. A region's kernels are judged in the
 region.
 
+**The roofline, and the production stacks.** A decode step at one row
+reads every dense weight once and the selected experts once, so its floor
+on one GPU is those bytes over the GPU's copy bandwidth. On an RTX PRO
+6000 (copy measured at 1,460 GB/s) DeepSeek-V4.1-Flash reads 10.5 GB of
+dense weights and about 4.5 GB of selected experts a step: a floor of
+10.3 ms, 97 tokens/s. We measure against that floor and against the
+production stacks on the same cards, not against our previous run. Hero
+run 6 (Oct 30, four RTX PRO 6000, every expert on the GPUs) took 20.6 ms
+a step at one row:
+- 11.8 ms in the dense segments, against a floor of 7.2 ms. They launch
+  2,089 kernels a step, and a kernel boundary inside a CUDA graph costs
+  1.9 µs (measured on an A100), so about 4 ms of the step is boundaries.
+- 8.8 ms in the experts, against a floor of about 3 ms. Each layer's
+  experts sat on all four GPUs, so every layer went out to three GPUs
+  and back, about twelve PCIe transactions a layer.
+
+The production stacks on these cards (reported by others in Oct 2026,
+on 250 W cards; decode is memory-bound, so comparable): SGLang's plain
+step decodes at 36 tokens/s on eight GPUs; with DSpark speculation
+SGLang reaches 112 tokens/s on four GPUs and a vLLM fork 247 to 252
+(494 on code). Our plain step is faster than theirs. Our speculative
+decode is three times slower than the vLLM fork's: 84 tokens/s at one
+row, and at eight rows it accepted 52 of 2,270 drafts where one row
+accepts a third of them.
+
+**Layer sharding** (`VXPU_LAYER_DEVICES=0:9=cuda:0,9:20=cuda:1,...`).
+Each GPU holds a contiguous range of layers whole: those layers' dense
+weights and caches, and all of their experts. The token ids enter on the
+first GPU, the chosen tokens leave the last, and in between the step
+crosses GPUs once per range, carrying the hyper-connection stream. The
+exchange between GPUs for the experts disappears. One GPU streams at a
+time, which is the roofline we aim at first: one GPU's bandwidth at one
+row. The four GPUs hold the model; they do not add bandwidth to one row.
+Several batches in flight, one per range, use all four later. In the
+code:
+- the engine moves each dense segment's resident tensors to its layers'
+  GPU in place, so the prefill and draft programs that share them follow
+  (`_shard_layers`); a segment spanning two layers goes with the later
+  one, and the head stays with the last;
+- the host nodes (a layer's experts, an n-gram lookup) run with their
+  layer, so their inputs and replies never cross;
+- the dataflow runner runs each node on its GPU, with that GPU current,
+  and copies step inputs, shared residents (norm weights, tables) and
+  crossing edges there, once a step;
+- the step graph captures one CUDA graph per GPU, the crossings as
+  copies and flags between them, and the native loop reads the chosen
+  tokens from the last GPU.
+
+Measured on two L4s with the shaped fixture (five layers, 16 experts,
+the released model's dimensions) at one row, every run token-identical
+to the others:
+
+| placement | step | kernels | copies | mailbox operations |
+|---|---|---|---|---|
+| everything on one GPU | 14.31 ms | 310 | 2 | 3 |
+| dense on one GPU, layers 3 and 4's experts in a pool on the other | 14.06 ms | 294 | 8 | 9 |
+| sharded: layers 0 to 2 on one GPU, 3 and 4 on the other, one graph per GPU | 13.92 ms | 310 | 12 | 30 |
+| sharded, the dataflow runner without the step graph | 14.77 ms | | | |
+
+The crossing between the GPUs costs nothing measurable at this size:
+the sharded step is no slower than the single GPU's. The prefill program
+turned out to hold its own copies of the dense weights (1.7 GB here,
+10.5 GB on the real model), so the sharding moves every program's
+tensors, not the decode's alone, and reports any state tensor read from
+two GPUs, since its copy on the second would go stale. The real model
+runs as `0:9=cuda:0,9:20=cuda:1,20:31=cuda:2,31:43=cuda:3` with each
+range's experts on its GPU (67, 82, 82 and 78 GB; hero run 7).
+
 The planner also generates the layouts a model could run in on a set of
 machines and ranks them by the cost model (`planner.Candidates`, #409),
 without running anything:

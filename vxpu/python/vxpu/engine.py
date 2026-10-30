@@ -884,6 +884,8 @@ class Engine:
             else:
                 ops.prepare_compile()
                 self._decode_run = torch.compile(self._decode, mode=mode)
+        if self.plan["layer_devices"]:
+            self._shard_layers()
         if self.plan["dataflow"]:
             self._run_as_dataflow(scratch)
         if self.plan["remote_ranges"]:  # other executors run the layers after this engine's range (#387)
@@ -895,6 +897,62 @@ class Engine:
                 print(f"[vxpu] layers {span} on {address}", flush=True)
             self.attach_ranges(ranges)
         self._timing_graph = time.time() - t_start
+
+    def _layer_device(self, layer):
+        """The GPU of `layer` under layer_devices (START:END=cuda:N,...), or None."""
+        for item in self.plan["layer_devices"].split(","):
+            span, device = item.split("=", 1)
+            first, end = span.split(":")
+            if int(first) <= layer and (end == "" or layer < int(end)):
+                return torch.device(device)
+        return None
+
+    def _shard_layers(self):
+        """Layer sharding: move each dense segment's resident tensors (its layers' weights and
+        caches) to the GPU layer_devices gives its layers, in the decode, prefill and draft
+        programs alike (their state is shared; their weights may be copies per program). A
+        segment spanning two layers (one layer's tail and the next's attention) goes with the
+        later layer; a segment with no layer (the head) goes where the segment before it went. A
+        tensor read by segments on two GPUs stays where it was first placed and the dataflow
+        runner copies it for the other (dataflow.Runner._arg); a state tensor must not be one,
+        since the copy would go stale, so those are reported. The runner then runs every segment
+        where its tensors are, and the step crosses GPUs once per range."""
+        from . import dataflow
+        state = set(self.binding["state"])
+        programs = [("decode", self._decode_split.split)]
+        for name, program in (("prefill", self._prefill), ("draft", self._draft)):
+            if program is not None:
+                programs.append((name, segments.split_at_host_ops(program)[0]))
+        for name, split in programs:
+            graph = dataflow.Graph.from_split(split)
+            device = torch.device(self.device)
+            moved, bytes_moved, shared = {}, collections.Counter(), {}
+            for node in graph.nodes:
+                if node.kind != "dense":
+                    continue
+                layers = [int(x) for x in node.layers]
+                device = (self._layer_device(max(layers)) if layers else None) or device
+                for r in dataflow._flat(node.refs()):
+                    if not (isinstance(r, dataflow.Ref) and r.kind == "resident"):
+                        continue
+                    if r.name in moved:
+                        if moved[r.name] != device:
+                            shared[r.name] = (moved[r.name], device)
+                        continue
+                    t = dataflow._attr(split, r.name)
+                    if isinstance(t, torch.Tensor) and t.device != device:
+                        t.data = t.data.to(device)  # in place: every program holding this tensor follows
+                        bytes_moved[str(device)] += t.numel() * t.element_size()
+                    moved[r.name] = device
+            msg = f"layer sharding, {name}: " + (", ".join(f"{b / 1e9:.1f} GB to {d}" for d, b in sorted(bytes_moved.items()))
+                                                  or "nothing to move")
+            if shared:
+                names = sorted(shared)
+                stale = [n for n in names if n in state]
+                msg += (f"; {len(names)} tensors read from two GPUs (copied for the second)"
+                        + (f", STATE among them: {', '.join(stale)}" if stale else ""))
+            print(f"[vxpu] {msg}", flush=True)
+            self.plan.note(msg)
 
     def _run_as_dataflow(self, scratch):
         """Run decode through the dataflow runner (dataflow.py): over the
@@ -917,6 +975,18 @@ class Engine:
             self._prefill_run = dataflow.Runner(prefill, len(graph.nodes), 0, device=self.device, graph=graph)
             print(f"[vxpu] layers {self._range_text()}: decode {len(runner.graph.nodes)} nodes, "
                   f"prefill {len(graph.nodes)}", flush=True)
+        elif self.plan["layer_devices"]:  # prefill segment by segment too, each where its tensors are
+            # a host node (a layer's experts, an n-gram lookup) runs with its layer: its pools are
+            # there, and its inputs and reply never cross
+            runner.place(self._host_placement(runner.graph))
+            prefill, _ = segments.split_at_host_ops(self._prefill)
+            graph = dataflow.Graph.from_split(prefill)
+            self._prefill_run = dataflow.Runner(prefill, len(graph.nodes), 0, device=self.device, graph=graph,
+                                                placement=self._host_placement(graph))
+            devices = collections.Counter(str(d) for d in runner._devices.values())
+            pdevices = collections.Counter(str(d) for d in self._prefill_run._devices.values())
+            print(f"[vxpu] layer sharding: decode nodes by GPU {dict(devices)}, prefill nodes {dict(pdevices)}",
+                  flush=True)
         if self.plan["dataflow_placement"]:
             kinds = dict(item.split("=", 1) for item in self.plan["dataflow_placement"].split(","))
             runner.place({n.name: kinds[n.kind] for n in runner.graph.nodes if n.kind in kinds})
@@ -927,7 +997,10 @@ class Engine:
             draft = self._draft_run
             if draft is not None and hasattr(draft, "split") and not self.plan["layer_range"]:
                 # the drafter's step too, so the native loop runs a speculative step with no Python
-                self._draft_run = StepGraph(dataflow.Runner(draft.split, *draft.vxpu_segments, device=self.device))
+                draft_runner = dataflow.Runner(draft.split, *draft.vxpu_segments, device=self.device)
+                if self.plan["layer_devices"]:
+                    draft_runner.place(self._host_placement(draft_runner.graph))
+                self._draft_run = StepGraph(draft_runner)
         self._segment_info = segment_info(self._decode_split.split)
         self._decode_run = self._decode_split
         msg = runner.graph.describe() + (", the step one CUDA graph" if self.plan["step_graph"] else "")
@@ -993,12 +1066,12 @@ class Engine:
         started = time.time()
         with self._lock, self.external_scope():
             if not self.plan["layer_range"]:  # eager, a range engine would call the other ranges' experts
-                self._decode(**self._zero_inputs(self._decode))
+                self._eager_step(self._decode)
             for _ in range(2):
                 run(**values)
             if self._draft is not None:
                 draft_values = self._zero_inputs(self._draft)
-                self._draft(**draft_values)
+                self._eager_step(self._draft)
                 for _ in range(2):
                     self._draft_run(**draft_values)
             torch.cuda.synchronize(self.device)
@@ -1012,6 +1085,27 @@ class Engine:
             msg = "the decode step launches " + ", ".join(f"{n} {kind}" for kind, n in sorted(counts.items()))
             print(f"[vxpu] {msg}", flush=True)
             self.plan.note(msg)
+
+    def _host_placement(self, graph):
+        """Under layer sharding, where each host node of graph (a layer's experts, an n-gram lookup)
+        runs: with its layer. Its expert pools are there, and its inputs and reply never cross."""
+        return {n.name: str(self._layer_device(max(int(x) for x in n.layers)) or self.device)
+                for n in graph.nodes if n.kind != "dense" and n.layers}
+
+    def _eager_step(self, program):
+        """One eager decode step of program (the decode or draft graph module) on zeros. With the
+        layers sharded across GPUs the whole module cannot run as one (its weights are on several),
+        so it runs segment by segment through the dataflow runner, each where its tensors are, as
+        the prefill does; the host nodes go with their layer."""
+        if not self.plan["layer_devices"]:
+            program(**self._zero_inputs(program))
+            return
+        from . import dataflow
+        split, _ = segments.split_at_host_ops(program)
+        graph = dataflow.Graph.from_split(split)
+        runner = dataflow.Runner(split, len(graph.nodes), 0, device=self.device, graph=graph,
+                                 placement=self._host_placement(graph))
+        runner(**self._zero_inputs(runner))
 
     def _zero_inputs(self, runner):
         """Zeros shaped like each input of a decode step: from the dataflow
