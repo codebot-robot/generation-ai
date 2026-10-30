@@ -812,6 +812,69 @@ def _sparse_attn_reference(q, kv, attn_sink, topk_idxs, softmax_scale):
     return ka.sparse_attn(q, kv, attn_sink, topk_idxs, softmax_scale)
 
 
+@custom_op("vxpu::hc_front", mutates_args=())  # pure tensor work: capturable
+def hc_front(stream: torch.Tensor, pre_mix: torch.Tensor, hc_fn: torch.Tensor, hc_scale: torch.Tensor,
+             hc_base: torch.Tensor, hc_mult: int, sinkhorn_iters: int, hc_eps: float, norm_weight: torch.Tensor,
+             norm_eps: float) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+    """A block's attention front: the hyper-connection mix of stream [b, s, hc, d] for the
+    attention (pre, post, comb), and the stream collapsed by pre_mix and normalized (x_normed
+    [b, s, d]). ffn_front without the gate: the same kernels."""
+    impl = select("vxpu::hc_front", stream, pre_mix, hc_fn, hc_scale, hc_base, hc_mult, sinkhorn_iters, hc_eps,
+                  norm_weight, norm_eps)
+    return impl.fn(stream, pre_mix, hc_fn, hc_scale, hc_base, hc_mult, sinkhorn_iters, hc_eps, norm_weight, norm_eps)
+
+
+@hc_front.register_fake
+def _(stream, pre_mix, hc_fn, hc_scale, hc_base, hc_mult, sinkhorn_iters, hc_eps, norm_weight, norm_eps):
+    b, s_, hc, d = stream.shape
+    f32 = dict(dtype=torch.float32)
+    return (stream.new_empty((b, s_, hc), **f32), stream.new_empty((b, s_, hc), **f32),
+            stream.new_empty((b, s_, hc, hc), **f32), stream.new_empty((b, s_, d)))
+
+
+def _hc_front_context(stream, pre_mix, hc_fn, hc_scale, hc_base, hc_mult, sinkhorn_iters, hc_eps, norm_weight,
+                      norm_eps):
+    rows = stream.shape[0] * stream.shape[1]
+    return stream.device.type, f"rows={rows} hc={hc_mult}", {"rows": rows, "hc_mult": hc_mult, "dim": stream.shape[-1]}
+
+
+@implementation("vxpu::hc_front", "gpu-fused", ("cuda",), "bit-identical",
+                "the fork's computation as tensor operations for the compiler to fuse (lowering, VXPU_FUSE; where it "
+                "measures cheaper than the kernels)",
+                applies=lambda plan, lowering=False, **_: _fusing(plan, lowering, "hc_front"), lowerable=True,
+                fused=True)
+def _hc_front_fused(stream, pre_mix, hc_fn, hc_scale, hc_base, hc_mult, sinkhorn_iters, hc_eps, norm_weight,
+                    norm_eps, tk=None):
+    return _hc_front_reference(stream, pre_mix, hc_fn, hc_scale, hc_base, hc_mult, sinkhorn_iters, hc_eps,
+                               norm_weight, norm_eps)
+
+
+@implementation("vxpu::hc_front", "gpu-triton", ("cuda",), "rounding",
+                "ffn_front's two Triton kernels without the gate: the mix dots, the stream's collapse and the norm, "
+                "then the Sinkhorn iterations (aten launches about six)",
+                applies=lambda plan, rows=0, hc_mult=0, dim=0, **_: plan["triton"] and rows <= 64
+                and hc_mult in (2, 4, 8) and dim % 32 == 0, lowerable=True)
+def _hc_front_triton(stream, pre_mix, hc_fn, hc_scale, hc_base, hc_mult, sinkhorn_iters, hc_eps, norm_weight,
+                     norm_eps, tk=triton_ops):
+    return tk.hc_front(stream, pre_mix, hc_fn, hc_scale, hc_base, hc_mult, sinkhorn_iters, hc_eps, norm_weight,
+                       norm_eps)
+
+
+@implementation("vxpu::hc_front", "reference", ("cpu", "cuda"), "bit-identical",
+                "the fork's computation (aten): hc_mixes, hc_pre and RMSNorm", reference=True)
+def _hc_front_reference(stream, pre_mix, hc_fn, hc_scale, hc_base, hc_mult, sinkhorn_iters, hc_eps, norm_weight,
+                        norm_eps):
+    F = torch.nn.functional
+    xf = stream.flatten(2).float()  # hc_mixes
+    rsqrt = torch.rsqrt(xf.square().mean(-1, keepdim=True) + norm_eps)
+    mixes = F.linear(xf, hc_fn) * rsqrt
+    pre, post, comb = _sinkhorn_reference(mixes, hc_scale, hc_base, hc_mult, sinkhorn_iters, hc_eps)
+    x = torch.sum(pre_mix.unsqueeze(-1) * stream.float(), dim=2).to(stream.dtype)  # hc_pre
+    xn = x.float()  # RMSNorm
+    xn = xn * torch.rsqrt(xn.square().mean(-1, keepdim=True) + norm_eps)
+    return pre, post, comb, (norm_weight * xn).to(stream.dtype)
+
+
 @custom_op("vxpu::hc_sinkhorn", mutates_args=())
 def hc_sinkhorn(mixes: torch.Tensor, hc_scale: torch.Tensor, hc_base: torch.Tensor, hc_mult: int,
                 sinkhorn_iters: int, eps: float) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
@@ -1004,6 +1067,7 @@ SELECTION = {
     "vxpu::hc_sinkhorn": _sinkhorn_context,
     "vxpu::ffn_front": _ffn_front_context,
     "vxpu::sparse_attn": _sparse_attn_context,
+    "vxpu::hc_front": _hc_front_context,
     "vxpu::head_linear": _head_context,
     "vxpu::rotary": _rotary_context,
 }
