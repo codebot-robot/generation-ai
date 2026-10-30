@@ -1063,7 +1063,7 @@ def ffn_front(stream, pre_mix, hc_fn, hc_scale, hc_base, hc_mult, sinkhorn_iters
                         gate_bias.contiguous() if gate else scores, pre, post, comb, weights, indices, E,
                         float(hc_eps), float(gate_temp), float(route_scale), int(sinkhorn_iters), HC=hc, NMIX=nmix,
                         K=topk, KP=kp, BE=be, SCORE={"softmax": 2, "sigmoid": 1}.get(score_func, 0),
-                        NORM=bool(norm_topk_prob and topk > 1), GATE=gate, num_warps=1)
+                        NORM=bool(norm_topk_prob and topk > 1), GATE=gate, NC=1, NCP=1, num_warps=1)
     return (pre.view(b, s_, hc), post.view(b, s_, hc), comb.view(b, s_, hc, hc), xn.view(b, s_, d), x_in,
             weights, indices)
 
