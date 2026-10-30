@@ -88,6 +88,38 @@ the sampling epilogue compiled too, a decode step went from 364 kernels
 to 234, and from 1.13 ms to 0.93 ms (measured; the two numbers come
 from different sessions).
 
+The graph has natural regions, and each has a floor. The step's state
+between blocks is one tensor (DeepSeek's hyper-connection stream); inside
+a block, that tensor stays live beside the block's own intermediates. So
+the lowering cuts the graph where live state falls to the stream alone
+(`regions.py`), and the cuts land after each block's `hc_post`, around
+the engram layer, and nowhere inside an attention block: a five-layer
+model has 22 dense regions. Regions can be costed on their own, and a
+kernel from a database could replace one whole. Decode is memory-bound,
+so each region's floor is the bytes it reads over the GPU's bandwidth,
+and `python -m vxpu.regions ARTIFACT` measures every region in step
+order against it. On a fixture with the released model's dimensions
+(`tiny_deepseek_v41 --shaped`: five layers, 16 experts, 6 GB) on an L4,
+measured:
+
+| rows | dense regions | the head | attention blocks |
+|---|---|---|---|
+| 1 | 9.8 ms | 5.2 ms (114% of its floor) | 89–98% of their floors |
+| 8 | 50.1 ms | 40.6 ms (15%) | 89–96%, of twice the fp8 bytes |
+| 32 | 25.1 ms | 12.1 ms (50%) | 74–87%, of twice the fp8 bytes |
+
+At one row every region that reads weights is at its floor. At 8 rows
+the head's kernel reads its 1.3 GB weight once per row, and every fp8
+linear reads a bf16 copy because the fp8 GEMV applies up to 4 rows. The
+gap to the floor, in every regime, is two kernel shapes: a product over
+several rows that reads its weight once, for bf16 weights and for
+block-scaled fp8 weights. The small regions between blocks (the
+hyper-connection mixes and the gate: 2 MB of weights in 13–19 kernels)
+are launch-bound at 11–23% of their floors, about 80 µs a layer, which
+on a 40-layer model at one row is a seventh of the step: the third
+kernel shape. So a handful of kernels covers the dense step, and the
+region table says which to write first.
+
 The planner also generates the layouts a model could run in on a set of
 machines and ranks them by the cost model (`planner.Candidates`, #409),
 without running anything:
