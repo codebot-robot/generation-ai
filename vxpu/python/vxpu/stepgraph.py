@@ -464,10 +464,13 @@ class StepGraph(torch.nn.Module):
             x_, w_, i_ = (example[k] for k in where)
             start = moe.experts_start_idx
             local = None
+            summed = _all_held(moe, here, peer_boxes) and len(here) == 1 and not peer_boxes
             for pool in here:
                 local = triton_ops.fp4_experts_decode(x_, w_, pool.slot_gpu, pool.w1, pool.s1, pool.w3, pool.s3,
-                                                      pool.w2, pool.s2, moe.swiglu_limit, per_pair=True,
+                                                      pool.w2, pool.s2, moe.swiglu_limit, per_pair=not summed,
                                                       indices=i_, start=start)
+            if summed:
+                continue
             peer = None
             for pdev, (pool, inbox, _, theirs, _, slot_here) in peer_boxes.items():
                 with torch.cuda.device(pdev):
@@ -676,6 +679,9 @@ class StepGraph(torch.nn.Module):
         # not get the node (it is not in mailboxes). Decided here, at capture, from the slot
         # maps: a placement holding whole layers is static.
         on_gpus = moe is not None and _all_held(moe, here, peer_boxes)
+        # one pool holding every expert of the layer (a sharded placement): the kernels sum the
+        # token's pairs themselves, and no combine runs
+        summed = on_gpus and len(here) == 1 and not peer_boxes
         hot = []
         if here:
             x_, w_, i_ = (args_[k] for k in where)
@@ -684,7 +690,7 @@ class StepGraph(torch.nn.Module):
                 for pool in here:
                     hot.append((pool, triton_ops.fp4_experts_decode(
                         x_, w_, pool.slot_gpu, pool.w1, pool.s1, pool.w3, pool.s3, pool.w2, pool.s2,
-                        moe.swiglu_limit, per_pair=True, indices=i_, start=moe.experts_start_idx)))
+                        moe.swiglu_limit, per_pair=not summed, indices=i_, start=moe.experts_start_idx)))
         for pdev, (pool, inbox, flag_in, _, _, _) in peer_boxes.items():  # the other GPUs first: they
             for dst, k in zip(inbox, where):                              # wait on copies, not on the CPU
                 driver.memcpy(stream, dst, args_[k])
@@ -712,7 +718,9 @@ class StepGraph(torch.nn.Module):
                 driver.write_value(stream, flag_back.data_ptr(), 0)
             if hot:
                 stream.wait_stream(side)
-            if len(hot) <= 1 and len(peer_boxes) <= 1:  # one kernel for the choice and the sum
+            if summed:
+                reply = hot[0][1]
+            elif len(hot) <= 1 and len(peer_boxes) <= 1:  # one kernel for the choice and the sum
                 peer = next(iter(peer_boxes.values()), None)
                 reply = triton_ops.combine_replies(
                     reply, i_, start, local=hot[0][1] if hot else None, local_map=hot[0][0].slot_gpu if hot else None,
