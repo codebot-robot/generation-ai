@@ -369,6 +369,7 @@ class StepGraph(torch.nn.Module):
                               torch.ones(rows, device=ids.device))  # top_p: 1 is off
         host_nodes = [n for n in graph.nodes if n.kind != "dense"]
         produced = {}  # node -> its output tensors on the GPU, as captured
+        runner.begin_step()  # the captured step's per-step copies (step inputs, shared state) are captured too
         dev = runner.device
         if dev.index is None:  # the pools name their GPU by index
             dev = torch.device(dev.type, torch.cuda.current_device())

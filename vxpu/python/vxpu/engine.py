@@ -952,12 +952,10 @@ class Engine:
                 names = sorted(shared)
                 stale = [n for n in names if n in state]
                 msg += f"; {len(names)} tensors read from two GPUs (copied for the second)"
-                if stale:  # a cache written on one GPU and read on another: the copy would go stale
-                    raise RuntimeError(
-                        f"layer sharding ({name}): state tensors are read by segments on two GPUs, so a range "
-                        f"boundary splits a group of layers that share a cache (the compressed KV or index keys "
-                        f"written by the group's first layer): {', '.join(stale)}. Move the boundary to the "
-                        f"group's first layer (VXPU_LAYER_DEVICES).")
+                if stale:  # a cache written on one GPU and read on another: its replica is refreshed once a step
+                    msg += (f"; {len(stale)} of them state (a cache shared by layers on two GPUs: the compressed KV "
+                            f"or index keys written by a group's first layer), replicated and refreshed once a "
+                            f"step at the first read on the other GPU: {', '.join(stale)}")
             print(f"[vxpu] {msg}", flush=True)
             self.plan.note(msg)
 
@@ -974,6 +972,7 @@ class Engine:
             self._resident = scratch
             self._resident_owner = None
         runner = dataflow.Runner(split.split, *split.vxpu_segments, device=self.device)
+        runner.state = set(self.binding["state"])
         if self.plan["layer_range"]:  # only this engine's range of layers, decode and prefill (#387)
             runner = dataflow.Runner(split.split, *split.vxpu_segments, device=self.device,
                                      graph=self._range_slice(runner.graph))
@@ -990,6 +989,7 @@ class Engine:
             graph = dataflow.Graph.from_split(prefill)
             self._prefill_run = dataflow.Runner(prefill, len(graph.nodes), 0, device=self.device, graph=graph,
                                                 placement=self._host_placement(graph))
+            self._prefill_run.state = set(self.binding["state"])
             devices = collections.Counter(str(d) for d in runner._devices.values())
             pdevices = collections.Counter(str(d) for d in self._prefill_run._devices.values())
             print(f"[vxpu] layer sharding: decode nodes by GPU {dict(devices)}, prefill nodes {dict(pdevices)}",
@@ -1005,6 +1005,7 @@ class Engine:
             if draft is not None and hasattr(draft, "split") and not self.plan["layer_range"]:
                 # the drafter's step too, so the native loop runs a speculative step with no Python
                 draft_runner = dataflow.Runner(draft.split, *draft.vxpu_segments, device=self.device)
+                draft_runner.state = set(self.binding["state"])
                 if self.plan["layer_devices"]:
                     draft_runner.place(self._host_placement(draft_runner.graph))
                 self._draft_run = StepGraph(draft_runner)
@@ -1112,6 +1113,7 @@ class Engine:
         graph = dataflow.Graph.from_split(split)
         runner = dataflow.Runner(split, len(graph.nodes), 0, device=self.device, graph=graph,
                                  placement=self._host_placement(graph))
+        runner.state = set(self.binding["state"])
         runner(**self._zero_inputs(runner))
 
     def _zero_inputs(self, runner):

@@ -222,6 +222,10 @@ class Runner(torch.nn.Module):
         self._copies = {}  # {(resident name, device): its copy there}, for a resident a node on another GPU reads
         self._input_copies = {}  # {(step input name, device): its copy there}, filled once a step
         self._step_inputs = {}
+        # the state tensors (caches) among the residents: a copy of one on another GPU is refreshed from the
+        # owner once a step, at the step's first read there (the owner's segments ran earlier in the step)
+        self.state = set()
+        self._fresh = set()
         self.returned = {}  # the nodes that fed the last step's output, and what they made
         self._index = {name: i for i, (name, _) in enumerate(segments.segments_of(split))}
         self.place(self.placement)
@@ -285,7 +289,7 @@ class Runner(torch.nn.Module):
         if recorder is not None:
             recorder.begin_step()
         inputs = dict(zip(self.graph.inputs, args), **kwargs)
-        self._step_inputs = {}
+        self.begin_step()
         waiting = collections.Counter(self._waiting)
         ready = collections.deque(n.name for n in self.graph.nodes if not waiting[n.name])
         returned = {}
@@ -339,6 +343,11 @@ class Runner(torch.nn.Module):
         result = result[0] if isinstance(result, (tuple, list)) and len(result) == 1 else result
         return result.clone() if isinstance(result, torch.Tensor) else result
 
+    def begin_step(self):
+        """A step starts: the per-step copies of step inputs and of shared state are made again."""
+        self._step_inputs = {}
+        self._fresh = set()
+
     def _arg(self, r, device, inputs):
         if isinstance(r, (tuple, list)):
             return type(r)(self._arg(x, device, inputs) for x in r)
@@ -362,6 +371,12 @@ class Runner(torch.nn.Module):
                 key = (r.name, device)  # a table or norm weight shared by layers on different GPUs
                 if key not in self._copies:
                     self._copies[key] = t.to(device)
+                elif r.name in self.state and key not in self._fresh:
+                    # a cache the owner GPU's layers wrote this step (a shared compressed KV, index keys):
+                    # the replica here takes the owner's contents once a step, before its first reader
+                    self._copies[key].copy_(t)
+                if r.name in self.state:
+                    self._fresh.add(key)
                 return self._copies[key]
             return t
         return self.inboxes[(r.node, r.index, device)]
