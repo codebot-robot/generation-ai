@@ -254,15 +254,20 @@ Batched rows, sharded, with the native expert body (the same session;
 measured; "same" is one prompt in every row, "different" a prompt per
 row):
 
-| rows | one prompt | same prompt per row | different prompts | floor, different (estimated from expert counts) |
-|---|---|---|---|---|
-| 1 | 18.2 ms | | | 10.3 ms |
-| 9 | 26.1 ms | 23.1 ms, 366 tok/s | 41.4 ms, 216 tok/s | about 35 ms (up to 54 experts a layer) |
-| 33 | 42.6 ms | 44.4 ms, 722 tok/s | 120 ms, 282 tok/s | about 100 ms (up to 198 experts a layer) |
+| rows | one prompt | same prompt per row | different prompts |
+|---|---|---|---|
+| 1 | 18.2 ms | | |
+| 9 | 26.1 ms | 23.1 ms, 366 tok/s | 41.4 ms, 216 tok/s |
+| 33 | 42.6 ms | 44.4 ms, 722 tok/s | 120 ms, 282 tok/s |
 
-With different prompts the step is within 20% of its own bytes: each
-row's six experts are mostly distinct, so 33 rows read about 150 GB a
-step, and the time is the bandwidth. The same-prompt rows are
+The floor with different prompts depends on how many distinct experts
+the rows select a layer, which is not measured yet: at most 198 for 33
+rows (150 GB a step, 100 ms), about 156 if routing were uniform over
+the 384 (120 GB, 80 ms), and fewer with the skew real routing has. So
+the 120 ms step is somewhere between 60% and 85% of its bytes, and the
+distinct-expert count per step is a statistic the planner must record
+(section 5) before any of these floors is more than a bound. The
+same-prompt rows are
 token-identical to each other; on hero 6's placement, with every layer's
 experts over four GPUs and the replies exchanged between them, they were
 not (and that placement's 9-row step was 60 ms in the new code against
