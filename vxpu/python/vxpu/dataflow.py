@@ -374,7 +374,7 @@ class Runner(torch.nn.Module):
                 elif r.name in self.state and key not in self._fresh:
                     # a cache the owner GPU's layers wrote this step (a shared compressed KV, index keys):
                     # the replica here takes the owner's contents once a step, before its first reader
-                    self._copies[key].copy_(t)
+                    _refresh_replica(self._copies[key], t)
                 if r.name in self.state:
                     self._fresh.add(key)
                 return self._copies[key]
@@ -416,6 +416,20 @@ class Chain(torch.nn.Module):
             if isinstance(out, dict):
                 made.update(out)
         return out
+
+
+def _refresh_replica(dst, src):
+    """dst (on this GPU) takes src's contents (on another). Under a CUDA graph capture, torch's
+    cross-device copy would make the source GPU's legacy stream depend on the capturing stream
+    (an event it records there), which the capture refuses; a plain asynchronous memcpy on the
+    capturing stream carries no such dependency, and the capture's flag wait before this node
+    already ordered it after the owner's writes."""
+    if torch.cuda.is_current_stream_capturing():
+        from .stepgraph import _Driver
+        _Driver().memcpy(torch.cuda.current_stream(), dst, src)
+    else:
+        dst.copy_(src)
+
 
 
 def _flat(refs):

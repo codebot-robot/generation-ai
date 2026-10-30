@@ -129,6 +129,39 @@ def cache_key(sub, args, extra="", code=None):
     return h.hexdigest()[:32]
 
 
+def _report_device_mix(sub, args):
+    """A segment's export failed on tensors of two devices: replay the segment eagerly under a
+    dispatch mode that names the first operator whose arguments sit on different devices, with
+    their shapes and devices, and say where the segment's arguments are. Diagnostic only."""
+    from torch.utils._python_dispatch import TorchDispatchMode
+    from torch.utils._pytree import tree_flatten
+    where = []
+    for i, a in enumerate(args):
+        if isinstance(a, torch.Tensor):
+            where.append(f"arg{i}:{tuple(a.shape)}@{a.device}")
+    print(f"[vxpu] segment export mixed devices; its arguments: {' '.join(where)}", flush=True)
+
+    class Report(TorchDispatchMode):
+        def __torch_dispatch__(self, func, types, a=(), kw=None):
+            kw = kw or {}
+            flat, _ = tree_flatten((a, kw))
+            ts = [t for t in flat if isinstance(t, torch.Tensor) and t.device.type == "cuda"]
+            devs = {t.device for t in ts}
+            if len(devs) > 1:
+                print(f"[vxpu] first mixed op: {func} with " + " ".join(f"{tuple(t.shape)}{t.dtype}@{t.device}" for t in ts),
+                      flush=True)
+                raise RuntimeError(f"mixed devices at {func}")
+            return func(*a, **kw)
+
+    try:
+        with Report():
+            sub(*args)
+        print("[vxpu] the eager replay mixed no devices: the mix is in export's own placement", flush=True)
+    except Exception as e:
+        print(f"[vxpu] eager replay: {type(e).__name__}: {str(e)[:200]}", flush=True)
+
+
+
 class Packages:
     """The package cache: a directory of <key>.pt2."""
 
@@ -171,7 +204,12 @@ class Packages:
                 print(f"[vxpu] building AOTInductor packages (once per artifact, plan and "
                       f"machine; kept in {self.cache_dir})", flush=True)
             t = time.perf_counter()
-            ep = torch.export.export(sub, tuple(args), dynamic_shapes=dynamic_shapes, strict=False)
+            try:
+                ep = torch.export.export(sub, tuple(args), dynamic_shapes=dynamic_shapes, strict=False)
+            except Exception as e:
+                if "same device" in str(e):
+                    _report_device_mix(sub, args)
+                raise
             tmp = f"{path[:-len('.pt2')]}.{os.getpid()}.tmp.pt2"  # aoti_compile_and_package wants .pt2
             torch._inductor.aoti_compile_and_package(ep, package_path=tmp)
             os.replace(tmp, path)  # another process building the same key writes the same package
