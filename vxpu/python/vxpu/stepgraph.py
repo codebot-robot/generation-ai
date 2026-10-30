@@ -232,6 +232,7 @@ class StepGraph(torch.nn.Module):
         self.vxpu_segments = runner.vxpu_segments
         self.graph = None
         self._chosen = self._sampling = None
+        self._choose = choose  # compiled after the first step (_compile_choose)
         self.node_counts = {}
         self._peer_graphs = []
         self.steps = 0
@@ -245,7 +246,9 @@ class StepGraph(torch.nn.Module):
     def forward(self, *args, **kwargs):
         self.steps += 1
         if self.steps == 1:
-            return self.runner(*args, **kwargs)  # the first step loads the packages and allocates the inboxes
+            out = self.runner(*args, **kwargs)  # the first step loads the packages and allocates the inboxes
+            self._compile_choose(out)
+            return out
         if self.graph is None:
             gc.disable()  # a collection inside a capture can unload a kernel's module, which a capture forbids
             try:
@@ -315,6 +318,21 @@ class StepGraph(torch.nn.Module):
                            d_host, d_flags)
         loop.start()
         return loop
+
+    def _compile_choose(self, out):
+        """Compile choose for this step's logits, before the capture (compiling inside one would
+        load modules mid-capture). Inductor fuses its elementwise work: 8 kernels instead of 38
+        (an L4, 20,000 rows); only top-k stays a library kernel. Inductor's random numbers
+        are drawn by the graph on every replay, as eager rand_like's are. Not fullgraph: past
+        dynamo's limit on recompiles (8 shapes of choose in a process), choose runs eagerly
+        instead of failing."""
+        logits = out[0] if isinstance(out, (tuple, list)) and len(out) == 1 else out
+        if not (isinstance(logits, torch.Tensor) and logits.dim() == 3 and logits.is_cuda):
+            return
+        self._choose = torch.compile(choose, dynamic=False)
+        rows = logits.shape[0]
+        self._choose(logits, torch.zeros(rows, device=logits.device),
+                     torch.zeros(rows, dtype=torch.long, device=logits.device), torch.ones(rows, device=logits.device))
 
     def _input_values(self, args, kwargs):
         values = dict(zip(self.runner.graph.inputs, args), **kwargs)
@@ -573,7 +591,7 @@ class StepGraph(torch.nn.Module):
             logits = output[0] if isinstance(output, (tuple, list)) and len(output) == 1 else output
             chosen = None
             if isinstance(logits, torch.Tensor) and logits.dim() == 3 and self._sampling is not None:
-                chosen = choose(logits, *self._sampling)
+                chosen = self._choose(logits, *self._sampling)
         # the step's shape, as the plan's statistics: how many kernels, copies and mailbox
         # operations one decode step launches (fusion shows as fewer kernels)
         self.kernel_names = {}
