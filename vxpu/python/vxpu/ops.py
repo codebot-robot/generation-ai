@@ -678,6 +678,101 @@ def _may_cache_bf16(ext, w):
     return False
 
 
+@custom_op("vxpu::ffn_front", mutates_args=())  # pure tensor work: capturable
+def ffn_front(stream: torch.Tensor, pre_mix: torch.Tensor, hc_fn: torch.Tensor, hc_scale: torch.Tensor,
+              hc_base: torch.Tensor, hc_mult: int, sinkhorn_iters: int, hc_eps: float, norm_weight: torch.Tensor,
+              norm_eps: float, gate_weight: torch.Tensor, gate_bias: torch.Tensor, topk: int, score_func: str,
+              gate_temp: float, norm_topk_prob: bool, route_scale: float
+              ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+    """A block's FFN front half (the fork's Block.forward from the FFN's hc_mixes to the experts'
+    call): the hyper-connection mix of stream [b, s, hc, d] for the FFN (pre, post, comb), the
+    stream collapsed by pre_mix and normalized (x_normed [b, s, d]), the experts' quantized input
+    (x_in [n, d], n = b * s), and the gate's choice (weights [n, k] fp32, indices [n, k] int64). One region of the decode step: about fifteen small kernels as aten, two as
+    Triton."""
+    impl = select("vxpu::ffn_front", stream, pre_mix, hc_fn, hc_scale, hc_base, hc_mult, sinkhorn_iters, hc_eps,
+                  norm_weight, norm_eps, gate_weight, gate_bias, topk, score_func, gate_temp, norm_topk_prob,
+                  route_scale)
+    return impl.fn(stream, pre_mix, hc_fn, hc_scale, hc_base, hc_mult, sinkhorn_iters, hc_eps, norm_weight,
+                   norm_eps, gate_weight, gate_bias, topk, score_func, gate_temp, norm_topk_prob, route_scale)
+
+
+@ffn_front.register_fake
+def _(stream, pre_mix, hc_fn, hc_scale, hc_base, hc_mult, sinkhorn_iters, hc_eps, norm_weight, norm_eps,
+      gate_weight, gate_bias, topk, score_func, gate_temp, norm_topk_prob, route_scale):
+    b, s_, hc, d = stream.shape
+    f32 = dict(dtype=torch.float32)
+    return (stream.new_empty((b, s_, hc), **f32), stream.new_empty((b, s_, hc), **f32),
+            stream.new_empty((b, s_, hc, hc), **f32), stream.new_empty((b, s_, d)), stream.new_empty((b * s_, d)),
+            stream.new_empty((b * s_, topk), **f32), stream.new_empty((b * s_, topk), dtype=torch.int64))
+
+
+def _ffn_front_context(stream, pre_mix, hc_fn, hc_scale, hc_base, hc_mult, sinkhorn_iters, hc_eps, norm_weight,
+                       norm_eps, gate_weight, gate_bias, topk, score_func, gate_temp, norm_topk_prob, route_scale):
+    rows = stream.shape[0] * stream.shape[1]
+    return stream.device.type, f"rows={rows} experts={gate_weight.shape[0]} k={topk}", {
+        "rows": rows, "experts": gate_weight.shape[0], "topk": topk, "hc_mult": hc_mult, "dim": stream.shape[-1],
+        "score_func": score_func}
+
+
+@implementation("vxpu::ffn_front", "gpu-fused", ("cuda",), "bit-identical",
+                "the fork's computation as tensor operations for the compiler to fuse (lowering, VXPU_FUSE; where it "
+                "measures cheaper than the kernels: a model with few experts)",
+                applies=lambda plan, lowering=False, **_: _fusing(plan, lowering, "ffn_front"), lowerable=True,
+                fused=True)
+def _ffn_front_fused(stream, pre_mix, hc_fn, hc_scale, hc_base, hc_mult, sinkhorn_iters, hc_eps, norm_weight,
+                     norm_eps, gate_weight, gate_bias, topk, score_func, gate_temp, norm_topk_prob, route_scale,
+                     tk=None):
+    return _ffn_front_reference(stream, pre_mix, hc_fn, hc_scale, hc_base, hc_mult, sinkhorn_iters, hc_eps,
+                                norm_weight, norm_eps, gate_weight, gate_bias, topk, score_func, gate_temp,
+                                norm_topk_prob, route_scale)
+
+
+@implementation("vxpu::ffn_front", "gpu-triton", ("cuda",), "rounding",
+                "three Triton kernels: the mix dots and norm statistics per chunk of the row, the normalized and "
+                "quantized row and the gate's scores per group of experts, then the Sinkhorn iterations and the "
+                "top-k choice per row (aten launches about fifteen)",
+                applies=lambda plan, rows=0, experts=0, topk=0, hc_mult=0, dim=0, **_: plan["triton"] and rows <= 64
+                and experts <= 1024 and topk <= 16 and hc_mult in (2, 4, 8) and dim % 32 == 0, lowerable=True)
+def _ffn_front_triton(stream, pre_mix, hc_fn, hc_scale, hc_base, hc_mult, sinkhorn_iters, hc_eps, norm_weight,
+                      norm_eps, gate_weight, gate_bias, topk, score_func, gate_temp, norm_topk_prob, route_scale,
+                      tk=triton_ops):
+    return tk.ffn_front(stream, pre_mix, hc_fn, hc_scale, hc_base, hc_mult, sinkhorn_iters, hc_eps, norm_weight,
+                        norm_eps, gate_weight, gate_bias, topk, score_func, gate_temp, norm_topk_prob, route_scale)
+
+
+@implementation("vxpu::ffn_front", "reference", ("cpu", "cuda"), "bit-identical",
+                "the fork's computation (aten): hc_mixes, hc_pre, RMSNorm, Gate.forward and the experts' act_quant",
+                reference=True)
+def _ffn_front_reference(stream, pre_mix, hc_fn, hc_scale, hc_base, hc_mult, sinkhorn_iters, hc_eps, norm_weight,
+                         norm_eps, gate_weight, gate_bias, topk, score_func, gate_temp, norm_topk_prob, route_scale):
+    ds, ka = _fork_kernels()
+    F = torch.nn.functional
+    xf = stream.flatten(2).float()  # hc_mixes
+    rsqrt = torch.rsqrt(xf.square().mean(-1, keepdim=True) + norm_eps)
+    mixes = F.linear(xf, hc_fn) * rsqrt
+    pre, post, comb = _sinkhorn_reference(mixes, hc_scale, hc_base, hc_mult, sinkhorn_iters, hc_eps)
+    x = torch.sum(pre_mix.unsqueeze(-1) * stream.float(), dim=2).to(stream.dtype)  # hc_pre
+    xn = x.float()  # RMSNorm
+    xn = xn * torch.rsqrt(xn.square().mean(-1, keepdim=True) + norm_eps)
+    xn = (norm_weight * xn).to(stream.dtype)
+    x2 = xn.view(-1, xn.shape[-1])
+    scores = F.linear(x2.float(), gate_weight.float()) / gate_temp  # Gate.forward
+    if score_func == "softmax":
+        scores = scores.softmax(dim=-1)
+    elif score_func == "sigmoid":
+        scores = scores.sigmoid()
+    else:
+        scores = F.softplus(scores).sqrt()
+    indices = (scores + gate_bias).topk(topk, dim=-1)[1]
+    weights = scores.gather(1, indices)
+    if norm_topk_prob and topk > 1:
+        weights = weights / (weights.sum(dim=-1, keepdim=True) + 1e-20)
+    weights = weights * route_scale
+    q, sc = ka.act_quant(x2, ds.fp8_block_size, ds.scale_fmt, ds.scale_dtype)  # MoE._quantized_input
+    x_in = (q.to(torch.bfloat16).unflatten(-1, (-1, ds.fp8_block_size)) * sc.to(torch.bfloat16).unsqueeze(-1)).flatten(-2)
+    return pre, post, comb, xn, x_in, weights, indices
+
+
 @custom_op("vxpu::hc_sinkhorn", mutates_args=())
 def hc_sinkhorn(mixes: torch.Tensor, hc_scale: torch.Tensor, hc_base: torch.Tensor, hc_mult: int,
                 sinkhorn_iters: int, eps: float) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
@@ -868,6 +963,7 @@ SELECTION = {
     "vxpu::fp8_linear": _fp8_linear_context,
     "vxpu::fp8_grouped_linear": _grouped_context,
     "vxpu::hc_sinkhorn": _sinkhorn_context,
+    "vxpu::ffn_front": _ffn_front_context,
     "vxpu::head_linear": _head_context,
     "vxpu::rotary": _rotary_context,
 }

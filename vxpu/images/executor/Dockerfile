@@ -57,7 +57,7 @@ RUN if [ -f /src/transformers/pyproject.toml ]; then \
 # the executor import it from VXPU_DEEPSEEK_V41. DEEPSEEK_V41_COMMIT must
 # equal the submodule's gitlink; TestDeepseekPinMatchesSubmodule checks.
 ARG DEEPSEEK_V41_REPO=https://github.com/justinsb/deepseek-v41-flash
-ARG DEEPSEEK_V41_COMMIT=b69e28966e7cc12be42947caaf66da2b9836184d
+ARG DEEPSEEK_V41_COMMIT=29c999f388d83c1fb668c1b7e67e480ca31cbb1c
 COPY third_party/deepseek_v41/ /src/deepseek_v41/
 RUN if [ ! -f /src/deepseek_v41/inference/model.py ]; then \
         rm -rf /src/deepseek_v41 \

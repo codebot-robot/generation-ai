@@ -333,6 +333,205 @@ def gemv_rows(x, weight, scale=None, group_rows=None, out_dtype=torch.bfloat16, 
     return y
 
 
+# ---------------------------------------------------------------------------
+# a block's FFN front half as two kernels (ops.ffn_front): the mix dots, the
+# stream's collapse, the norm, the quantized input and the gate's scores in
+# the first (its programs share the gate's projection), the Sinkhorn
+# iterations and the top-k choice in the second (one warp per row)
+
+if triton is not None:
+    @triton.jit
+    def _ffn_front_a_kernel(stream_ptr, premix_ptr, hcfn_ptr, normw_ptr, gatew_ptr,
+                            mixes_ptr, xn_ptr, xin_ptr, scores_ptr,
+                            D, E, norm_eps,
+                            HC: tl.constexpr, NMIX: tl.constexpr, P: tl.constexpr, EB: tl.constexpr,
+                            BD: tl.constexpr):
+        """Row r of the stream [rows, HC, D] (bf16), program p of P:
+          mixes[r, j] = dot(hc_fn[j], stream[r].flatten().float()) * rsqrt(mean(stream[r]^2) + eps)
+                        for j = p, p + P, ... (the fork's hc_mixes)
+          x = sum_h pre_mix[r, h] * stream[r, h]          -> bf16 (hc_pre)
+          xn = norm_w * x / sqrt(mean(x^2) + eps)          -> bf16 (RMSNorm; every program recomputes it)
+          program 0 stores xn and x_in = act_quant(xn) (the experts' input, per 32, fp8 grid, bf16)
+          scores[r, e] = dot(gate_w[e].float(), xn.float()) for the program's EB experts
+        Passes over the row BD elements at a time: the norms' statistics first, then the mix dots
+        this program owns (one pass each), then xn, x_in and the gate's scores."""
+        r = tl.program_id(0).to(tl.int64)
+        p = tl.program_id(1)
+        ds = tl.arange(0, BD)
+        hs = tl.arange(0, HC)
+        premix = tl.load(premix_ptr + r * HC + hs)  # [HC] fp32
+        base = stream_ptr + r * HC * D
+        sumsq_stream = 0.0
+        sumsq_x = 0.0
+        for d0 in range(0, D, BD):
+            st = tl.load(base + hs[:, None] * D + (d0 + ds)[None, :]).to(tl.float32)  # [HC, BD]
+            sumsq_stream += tl.sum(tl.sum(st * st, axis=1), axis=0)
+            x = tl.sum(premix[:, None] * st, axis=0).to(tl.bfloat16).to(tl.float32)  # hc_pre, rounded to bf16
+            sumsq_x += tl.sum(x * x, axis=0)
+        rs_stream = 1.0 / tl.sqrt(sumsq_stream / (HC * D) + norm_eps)
+        rs_x = 1.0 / tl.sqrt(sumsq_x / D + norm_eps)
+        # the mix dots this program owns: hc_fn [NMIX, HC * D] in the flattened stream's order
+        for j in range(p, NMIX, P):
+            acc = tl.zeros((HC, BD), dtype=tl.float32)
+            for d0 in range(0, D, BD):
+                fn = tl.load(hcfn_ptr + j * (HC * D) + hs[:, None] * D + (d0 + ds)[None, :])
+                st = tl.load(base + hs[:, None] * D + (d0 + ds)[None, :]).to(tl.float32)
+                acc += fn * st
+            tl.store(mixes_ptr + r * NMIX + j, tl.sum(tl.sum(acc, axis=1), axis=0) * rs_stream)
+        es = p * EB + tl.arange(0, EB)
+        el = es < E
+        acc_scores = tl.zeros((EB,), dtype=tl.float32)
+        for d0 in range(0, D, BD):
+            st = tl.load(base + hs[:, None] * D + (d0 + ds)[None, :]).to(tl.float32)
+            x = tl.sum(premix[:, None] * st, axis=0).to(tl.bfloat16).to(tl.float32)
+            w = tl.load(normw_ptr + d0 + ds).to(tl.float32)
+            xn = (w * (x * rs_x)).to(tl.bfloat16)  # the normalized row, bf16 as the fork rounds it
+            if p == 0:
+                tl.store(xn_ptr + r * D + d0 + ds, xn)
+                xq = _quant_tile(tl.reshape(xn.to(tl.float32), (1, BD)), 1, BD)
+                tl.store(xin_ptr + r * D + d0 + ds, tl.reshape(xq, (BD,)).to(tl.bfloat16))
+            gw = tl.load(gatew_ptr + es[:, None] * D + (d0 + ds)[None, :], mask=el[:, None], other=0.0).to(tl.float32)
+            acc_scores += tl.sum(gw * xn.to(tl.float32)[None, :], axis=1)
+        tl.store(scores_ptr + r * E + es, acc_scores, mask=el)
+
+    @triton.jit
+    def _ffn_front_b_kernel(mixes_ptr, hcscale_ptr, hcbase_ptr, scores_ptr, bias_ptr,
+                            pre_ptr, post_ptr, comb_ptr, w_ptr, i_ptr,
+                            E, hc_eps, temp, route_scale, iters,
+                            HC: tl.constexpr, NMIX: tl.constexpr, K: tl.constexpr, KP: tl.constexpr,
+                            BE: tl.constexpr, SCORE: tl.constexpr, NORM: tl.constexpr):
+        """Row r: the fork's hc_split_sinkhorn on its NMIX mixes (pre, post, and comb made doubly
+        stochastic by `iters` Sinkhorn iterations), then Gate.forward's choice on its E raw scores
+        (the scoring function, the K largest of score + bias one at a time, their unbiased
+        scores normalized when NORM, times route_scale). One warp."""
+        r = tl.program_id(0).to(tl.int64)
+        hs = tl.arange(0, HC)
+        m_pre = tl.load(mixes_ptr + r * NMIX + hs)
+        m_post = tl.load(mixes_ptr + r * NMIX + HC + hs)
+        m_comb = tl.load(mixes_ptr + r * NMIX + 2 * HC + hs[:, None] * HC + hs[None, :])
+        s0 = tl.load(hcscale_ptr)
+        s1 = tl.load(hcscale_ptr + 1)
+        s2 = tl.load(hcscale_ptr + 2)
+        pre = tl.sigmoid(m_pre * s0 + tl.load(hcbase_ptr + hs)) + hc_eps
+        post = 2.0 * tl.sigmoid(m_post * s1 + tl.load(hcbase_ptr + HC + hs))
+        c = m_comb * s2 + tl.load(hcbase_ptr + 2 * HC + hs[:, None] * HC + hs[None, :])
+        c = c - tl.max(c, axis=1)[:, None]
+        c = tl.exp(c)
+        c = c / tl.sum(c, axis=1)[:, None] + hc_eps
+        c = c / (tl.sum(c, axis=0)[None, :] + hc_eps)
+        for _ in range(iters - 1):
+            c = c / (tl.sum(c, axis=1)[:, None] + hc_eps)
+            c = c / (tl.sum(c, axis=0)[None, :] + hc_eps)
+        tl.store(pre_ptr + r * HC + hs, pre)
+        tl.store(post_ptr + r * HC + hs, post)
+        tl.store(comb_ptr + r * HC * HC + hs[:, None] * HC + hs[None, :], c)
+        # the gate's choice
+        e = tl.arange(0, BE)
+        live = e < E
+        raw = tl.load(scores_ptr + r * E + e, mask=live, other=0.0) / temp
+        sc = _score(raw, live, SCORE)
+        b = tl.load(bias_ptr + e, mask=live, other=0.0).to(tl.float32)
+        cand = tl.where(live, sc + b, float("-inf"))
+        ks = tl.arange(0, KP)
+        chosen = tl.zeros((KP,), dtype=tl.int32)
+        for k in tl.static_range(K):
+            idx = tl.argmax(cand, axis=0)
+            chosen = tl.where(ks == k, idx, chosen)
+            cand = tl.where(e == idx, float("-inf"), cand)
+        kin = ks < K
+        picked_raw = tl.load(scores_ptr + r * E + chosen, mask=kin, other=0.0) / temp
+        if SCORE == 2:
+            mx = tl.max(tl.where(live, raw, float("-inf")), axis=0)
+            picked = tl.where(kin, tl.exp(picked_raw - mx), 0.0) / tl.sum(tl.where(live, tl.exp(raw - mx), 0.0), axis=0)
+        else:
+            picked = tl.where(kin, _score(picked_raw, kin, SCORE), 0.0)
+        if NORM:
+            picked = picked / (tl.sum(picked, axis=0) + 1e-20)
+        tl.store(w_ptr + r * K + ks, picked * route_scale, mask=kin)
+        tl.store(i_ptr + r * K + ks, chosen.to(tl.int64), mask=kin)
+
+    @triton.jit
+    def _score(s, live, SCORE: tl.constexpr):
+        """The gate's scoring function over a row's raw scores (SCORE 0: sqrt(softplus), 1: sigmoid,
+        2: softmax)."""
+        if SCORE == 2:
+            m = tl.max(tl.where(live, s, float("-inf")), axis=0)
+            p = tl.where(live, tl.exp(s - m), 0.0)
+            return p / tl.sum(p, axis=0)
+        elif SCORE == 1:
+            return tl.sigmoid(s)
+        else:  # torch's softplus: x itself above 20, else log1p(exp(x))
+            return tl.sqrt(tl.where(s > 20.0, s, tl.extra.cuda.libdevice.log1p(tl.exp(s))))
+
+    @triton.jit
+    def _quant_tile(x, BM: tl.constexpr, BK: tl.constexpr):
+        """x [BM, BK] fp32 through the fork's act_quant and back (per 32 along K: a power-of-two
+        scale putting the block's amax at most at 448, the values rounded to fp8 e4m3), the
+        arithmetic of _act_quant_dequant_kernel: the same values."""
+        xb = tl.reshape(x, (BM, BK // 32, 32))
+        amax = tl.maximum(tl.max(tl.abs(xb), axis=2), 1e-4)
+        v = amax / 448.0
+        bits = v.to(tl.int32, bitcast=True)
+        exponent = (bits >> 23) & 0xFF
+        exponent = tl.where((bits & 0x7FFFFF) == 0, exponent, exponent + 1)
+        scale = (exponent << 23).to(tl.float32, bitcast=True)
+        q = tl.minimum(tl.maximum(xb / scale[:, :, None], -448.0), 448.0)
+        y = _round_e4m3(q) * scale[:, :, None]
+        return tl.reshape(y.to(tl.bfloat16).to(tl.float32), (BM, BK))
+
+
+FFN_FRONT_EB = 8  # experts per program of the first kernel: E / EB programs a row (measured on an L4:
+FFN_FRONT_BD = 1024  # 36 us a row against 60 at 16 x 256), and the elements of the row per pass
+
+
+def ffn_front(stream, pre_mix, hc_fn, hc_scale, hc_base, hc_mult, sinkhorn_iters, hc_eps, norm_weight, norm_eps,
+              gate_weight, gate_bias, topk, score_func, gate_temp, norm_topk_prob, route_scale, traced=False,
+              eb=None, bd=None):
+    """ops.ffn_front's outputs from the two kernels above."""
+    eb = eb or FFN_FRONT_EB
+    bd = bd or FFN_FRONT_BD
+    while bd > 32 and stream.shape[-1] % bd:  # a narrow model (the tiny fixture): the widest chunk that divides
+        bd //= 2
+    b, s_, hc, d = stream.shape
+    rows = b * s_
+    E = gate_weight.shape[0]
+    nmix = (2 + hc) * hc
+    if d % bd:
+        raise ValueError(f"ffn_front: dim {d} is not a multiple of {bd}")
+    P = max(triton.cdiv(E, eb), nmix)  # at least a program per mix dot: a model with few experts
+                                      # (the fixtures) must not serialize them on two programs
+    dev = stream.device
+    mixes = torch.empty(rows, nmix, dtype=torch.float32, device=dev)
+    xn = torch.empty(rows, d, dtype=stream.dtype, device=dev)
+    x_in = torch.empty(rows, d, dtype=torch.bfloat16, device=dev)
+    scores = torch.empty(rows, E, dtype=torch.float32, device=dev)
+    pre = torch.empty(rows, hc, dtype=torch.float32, device=dev)
+    post = torch.empty(rows, hc, dtype=torch.float32, device=dev)
+    comb = torch.empty(rows, hc, hc, dtype=torch.float32, device=dev)
+    weights = torch.empty(rows, topk, dtype=torch.float32, device=dev)
+    indices = torch.empty(rows, topk, dtype=torch.int64, device=dev)
+    be = kp = 1
+    while be < E:
+        be *= 2
+    while kp < topk:
+        kp *= 2
+    if rows:
+        ka, ctx = _launcher(_ffn_front_a_kernel, dev, traced)
+        with ctx:
+            ka[(rows, P)](stream.contiguous(), pre_mix.contiguous().float(), hc_fn.contiguous().float(),
+                          norm_weight.contiguous(), gate_weight.contiguous(), mixes, xn, x_in, scores, d, E,
+                          float(norm_eps), HC=hc, NMIX=nmix, P=P, EB=eb, BD=bd)
+        kb, ctx = _launcher(_ffn_front_b_kernel, dev, traced)
+        with ctx:
+            kb[(rows,)](mixes, hc_scale.contiguous().float(), hc_base.contiguous().float(), scores,
+                        gate_bias.contiguous(), pre, post, comb, weights, indices, E, float(hc_eps),
+                        float(gate_temp), float(route_scale), int(sinkhorn_iters), HC=hc, NMIX=nmix, K=topk, KP=kp,
+                        BE=be, SCORE={"softmax": 2, "sigmoid": 1}.get(score_func, 0),
+                        NORM=bool(norm_topk_prob and topk > 1), num_warps=1)
+    return (pre.view(b, s_, hc), post.view(b, s_, hc), comb.view(b, s_, hc, hc), xn.view(b, s_, d), x_in,
+            weights, indices)
+
+
 def _gemv_blocks(K):
     """Block shape for fp8_gemv: 8 rows per program and the widest K step
     that divides K, measured best or within 3% of best for every
@@ -454,6 +653,17 @@ if triton is not None:
                      out_dtype: torch.dtype) -> torch.Tensor:
         return fp8_gemv(x, weight, scale, group_rows or None, out_dtype, traced=True)
 
+    @torch.library.triton_op("vxpu_triton::ffn_front", mutates_args=())
+    def _ffn_front_op(stream: torch.Tensor, pre_mix: torch.Tensor, hc_fn: torch.Tensor, hc_scale: torch.Tensor,
+                      hc_base: torch.Tensor, hc_mult: int, sinkhorn_iters: int, hc_eps: float,
+                      norm_weight: torch.Tensor, norm_eps: float, gate_weight: torch.Tensor, gate_bias: torch.Tensor,
+                      topk: int, score_func: str, gate_temp: float, norm_topk_prob: bool, route_scale: float
+                      ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor,
+                                 torch.Tensor]:
+        return ffn_front(stream, pre_mix, hc_fn, hc_scale, hc_base, hc_mult, sinkhorn_iters, hc_eps, norm_weight,
+                         norm_eps, gate_weight, gate_bias, topk, score_func, gate_temp, norm_topk_prob, route_scale,
+                         traced=True)
+
     @torch.library.triton_op("vxpu_triton::rotary", mutates_args=())
     def _rotary_op(x: torch.Tensor, cos: torch.Tensor, sin: torch.Tensor) -> torch.Tensor:
         return rotary(x, cos, sin, traced=True)
@@ -472,6 +682,7 @@ lowered = types.SimpleNamespace(
     linear_f32=lambda x, weight: torch.ops.vxpu_triton.linear_f32(x, weight),
     fp8_gemv=_lowered_fp8_gemv,
     rotary=lambda x, cos, sin: torch.ops.vxpu_triton.rotary(x, cos, sin),
+    ffn_front=lambda *a: torch.ops.vxpu_triton.ffn_front(*a),
 )
 
 
