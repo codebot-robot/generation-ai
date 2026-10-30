@@ -146,7 +146,7 @@ region.
 **Region ops from two kernel templates.** The dense half's gap is launches, not
 bytes: a plain layer ran about 40 kernels, 134 µs over its 118 µs floor
 on the hero machine, most of them small kernels around the GEMVs (norms,
-rotary, quantization, index arithmetic). Four regions of the attention
+rotary, quantization, index arithmetic). Five regions of the attention
 block and the MoE are now ops, each the fork's computation as a
 bit-identical reference, a fused tensor body the lowering may choose, and
 Triton kernels built from two templates:
@@ -154,13 +154,14 @@ Triton kernels built from two templates:
   norm, rotary, quantization to the fp8 grid per 32) and epilogue (rotary,
   or a SwiGLU over two weights' products with the quantization of the
   result), `_gemv_pe_kernel` and `_dual_gemv_swiglu_kernel`;
-- a per-row finishing kernel (norm, rotary, quantization), `_row_post_kernel`.
+- a per-row finishing kernel (norm, rotary, quantization to fp8 or fp4), `_row_post_kernel`.
 
 | op | replaces | kernels before | after | on an L4, one row |
 |---|---|---|---|---|
 | `vxpu::shared_ffn` | the shared expert: three fp8 linears and the SwiGLU | 9 | 3 | 152 µs against 154 |
 | `vxpu::attn_q` | q down-projection, q_norm, up-projection, rotary | about 9 | 4 | 208 µs against 206 |
 | `vxpu::window_kv` | kv projection, kv_norm, rotary, act_quant | about 6 | 3 | 21 µs against 25, bit-identical |
+| `vxpu::compress_post` | compressed KV and index key: rotary, fp4 quantize-dequantize | about 6 | 1 | bit-identical |
 | `vxpu::attn_out` | inverse rotary, act_quant, grouped and output projections | 5 | 4 | 310 µs against 312 |
 
 (Measured against the fork's reference at the released model's shapes,

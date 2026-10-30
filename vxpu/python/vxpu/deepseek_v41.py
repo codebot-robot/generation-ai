@@ -228,6 +228,7 @@ def set_external(model, on):
     ds.attn_q_fn = torch.ops.vxpu.attn_q if on else None  # the attention's query path
     ds.window_kv_fn = torch.ops.vxpu.window_kv if on else None  # and its window key
     ds.attn_out_fn = torch.ops.vxpu.attn_out if on else None  # and its output path
+    ds.compress_post_fn = torch.ops.vxpu.compress_post if on else None  # compressed KV and index key finishing
     # the hyper-connection mixing: the fork calls it through a module-level
     # name, so it is swapped for the op while tracing and restored after
     if not hasattr(ds, "_vxpu_hc_split_sinkhorn"):

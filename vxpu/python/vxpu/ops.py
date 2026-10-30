@@ -889,6 +889,69 @@ def _window_kv_reference(x, wkv, scale, norm_weight, norm_eps, freqs_cis, rope_d
     return ka.act_quant(kv, ds.fp8_block_size, ds.scale_fmt, ds.scale_dtype, True)
 
 
+@custom_op("vxpu::compress_post", mutates_args=())  # pure tensor work: capturable
+def compress_post(x: torch.Tensor, freqs_cis: torch.Tensor, rope_dim: int, quant_kind: str) -> torch.Tensor:
+    """The compressed KV or index key finishing (the fork's _compress_kv and Indexer.forward up to
+    the cache write): the rotary of the last rope_dim elements by freqs_cis (complex [s, rope_dim / 2]
+    shared by the rows, or [b, s, rope_dim / 2] per row) and fp4 quantization (quant_kind: 'e4m3' with
+    e4m3 scales per 16 elements, or 'e8m0' with ue8m0 scales per 32 elements). Returns [b, s, D] bf16."""
+    impl = select("vxpu::compress_post", x, freqs_cis, rope_dim, quant_kind)
+    return impl.fn(x, freqs_cis, rope_dim, quant_kind)
+
+
+@compress_post.register_fake
+def _(x, freqs_cis, rope_dim, quant_kind):
+    return torch.empty_like(x)
+
+
+def _compress_post_context(x, freqs_cis, rope_dim, quant_kind):
+    rows = x.numel() // x.shape[-1]
+    return x.device.type, f"rows={rows} dim={x.shape[-1]} quant={quant_kind}", {
+        "rows": rows, "dim": x.shape[-1], "rope_dim": rope_dim, "quant_kind": quant_kind}
+
+
+@implementation("vxpu::compress_post", "gpu-fused", ("cuda",), "rounding",
+                "the rotary and fp4 quantization as plain tensor operations for the compiler to fuse",
+                applies=lambda plan, lowering=False, rows=0, **_: _fusing(plan, lowering, "compress_post"),
+                lowerable=True, fused=True)
+def _compress_post_fused(x, freqs_cis, rope_dim, quant_kind, tk=triton_ops):
+    ds, ka = _fork_kernels()
+    D = x.shape[-1]
+    c, s = freqs_cis.real, freqs_cis.imag
+    rows = x.size(0) if freqs_cis.dim() == 3 else 1
+    shape = (rows, x.size(1), 1, rope_dim // 2) if x.ndim == 4 else (rows, x.size(1), rope_dim // 2)
+    c, s = c.reshape(shape), s.reshape(shape)
+    tail = x[..., D - rope_dim:].float()
+    pairs = tail.unflatten(-1, (-1, 2))
+    xe, xo = pairs[..., 0], pairs[..., 1]
+    rot_tail = torch.stack((xe * c - xo * s, xe * s + xo * c), dim=-1).flatten(-2).to(x.dtype)
+    rotated = torch.cat([x[..., :D - rope_dim], rot_tail], dim=-1)
+    if quant_kind in ("e4m3", "16_e4m3", torch.float8_e4m3fn):
+        return ka.fp4_quant_dequant(rotated, 16, scale_dtype=torch.float8_e4m3fn)
+    return ka.fp4_quant_dequant(rotated, ds.fp4_block_size, scale_dtype=torch.float8_e8m0fnu)
+
+
+@implementation("vxpu::compress_post", "gpu-triton", ("cuda",), "rounding",
+                "one program per row: rotary of the rope tail, then fp4 quantization",
+                applies=lambda plan, rows=0, dim=0, rope_dim=0, **_: plan["triton"]
+                and rows <= 64 and dim % 32 == 0 and rope_dim % 2 == 0, lowerable=True)
+def _compress_post_triton(x, freqs_cis, rope_dim, quant_kind, tk=triton_ops):
+    return tk.compress_post(x, _freqs_rows(freqs_cis, x.shape[0], rope_dim), rope_dim, quant_kind)
+
+
+@implementation("vxpu::compress_post", "reference", ("cpu", "cuda"), "bit-identical",
+                "the fork's: apply_rotary_emb on the rope tail and fp4_quant_dequant",
+                reference=True)
+def _compress_post_reference(x, freqs_cis, rope_dim, quant_kind):
+    ds, ka = _fork_kernels()
+    D = x.shape[-1]
+    tail = _rotary_reference(x[..., D - rope_dim:], freqs_cis).to(x.dtype)
+    rotated = torch.cat([x[..., :D - rope_dim], tail], dim=-1).contiguous()
+    if quant_kind in ("e4m3", "16_e4m3", torch.float8_e4m3fn):
+        return ka.fp4_quant_dequant(rotated, 16, scale_dtype=torch.float8_e4m3fn)
+    return ka.fp4_quant_dequant(rotated, ds.fp4_block_size, scale_dtype=torch.float8_e8m0fnu)
+
+
 @custom_op("vxpu::attn_out", mutates_args=())  # pure tensor work: capturable
 def attn_out(o: torch.Tensor, freqs_cis: torch.Tensor, wo_a: torch.Tensor, sa: torch.Tensor, groups: int, rank: int,
              wo_b: torch.Tensor, sb: torch.Tensor, rope_dim: int) -> torch.Tensor:
@@ -1352,6 +1415,7 @@ SELECTION = {
     "vxpu::shared_ffn": _shared_ffn_context,
     "vxpu::attn_q": _attn_q_context,
     "vxpu::window_kv": _window_kv_context,
+    "vxpu::compress_post": _compress_post_context,
     "vxpu::attn_out": _attn_out_context,
 }
 CALL = {"vxpu::head_linear": _call_head}

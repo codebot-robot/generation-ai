@@ -100,6 +100,19 @@ if triton is not None:
         return tl.where(tl.abs(q) < 0.015625, sub, normal)
 
     @triton.jit
+    def _round_e2m1(x):
+        """x (fp32, within [-6, 6]) rounded to the nearest fp4 e2m1 value, ties to even index."""
+        a = tl.abs(x)
+        v = tl.where(a <= 5.0, 4.0, 6.0)
+        v = tl.where(a < 3.5, 3.0, v)
+        v = tl.where(a <= 2.5, 2.0, v)
+        v = tl.where(a < 1.75, 1.5, v)
+        v = tl.where(a <= 1.25, 1.0, v)
+        v = tl.where(a < 0.75, 0.5, v)
+        v = tl.where(a <= 0.25, 0.0, v)
+        return tl.where(x.to(tl.int32, bitcast=True) < 0, -v, v)
+
+    @triton.jit
     def _act_quant_dequant_kernel(x_ptr, y_ptr, n_groups, G: tl.constexpr):
         pid = tl.program_id(0)
         g = pid.to(tl.int64) * G + tl.arange(0, G)  # int64: offsets of activations past 2^31 elements
@@ -571,16 +584,18 @@ if triton is not None:
     @triton.jit
     def _row_post_kernel(x_ptr, nw_ptr, freqs_ptr, sign, y_ptr, pre_ptr, M, D, HPR, eps,
                          NORM: tl.constexpr, RD: tl.constexpr, QUANT: tl.constexpr, STORE_PRE: tl.constexpr,
-                         BD: tl.constexpr):
+                         BD: tl.constexpr, FP4: tl.constexpr = False, FP4_E4M3: tl.constexpr = False):
         """A row's finishing after a projection, one program per row of x [M, D] (bf16): RMSNorm
         with nw_ptr's weight (NORM; fp32, rounded to bf16), the rotary of the last RD elements in
         adjacent pairs (freqs_ptr: the complex frequencies' real view [M, RD / 2, 2], cos and sin
         interleaved, read in place; sign -1 for the inverse rotation; RD = 0 for none),
-        quantization to the fp8 grid per 32 elements (QUANT, act_quant with ue8m0 scales), stored
-        as bf16. The fork's kv_norm, apply_rotary_emb and act_quant, each a kernel or more, as
-        one. BD is D rounded up to a power of two; RD divides D and is even. HPR consecutive rows
-        share a frequency row (the heads of one token). STORE_PRE also stores the row before the
-        quantization (pre_ptr), for a reader that wants it unquantized."""
+        quantization to the fp8 grid per 32 elements (QUANT, act_quant with ue8m0 scales), or
+        fp4 quantization to e2m1 values (FP4, with e4m3 scales per 16 elements if FP4_E4M3 else
+        e8m0 scales per 32 elements), stored as bf16. The fork's kv_norm, apply_rotary_emb and
+        act_quant / fp4_quant_dequant, each a kernel or more, as one. BD is D rounded up to a power
+        of two; RD divides D and is even. HPR consecutive rows share a frequency row (the heads of
+        one token). STORE_PRE also stores the row before the quantization (pre_ptr), for a reader
+        that wants it unquantized."""
         eps = eps.to(tl.float32)
         sign = sign.to(tl.float32)
         m = tl.program_id(0)
@@ -613,6 +628,23 @@ if triton is not None:
             scale = (exponent << 23).to(tl.float32, bitcast=True)
             q = tl.minimum(tl.maximum(xg / scale[:, None], -448.0), 448.0)
             x = tl.reshape(_round_e4m3(q) * scale[:, None], (BD,))
+        elif FP4:
+            if FP4_E4M3:
+                xg = tl.reshape(x, (BD // 16, 16))
+                amax = tl.maximum(tl.max(tl.abs(xg), axis=1), 0.01171875)
+                scale = _round_e4m3(tl.minimum(amax / 6.0, 448.0))
+                q = tl.minimum(tl.maximum(xg / scale[:, None], -6.0), 6.0)
+                x = tl.reshape(_round_e2m1(q) * scale[:, None], (BD,))
+            else:
+                xg = tl.reshape(x, (BD // 32, 32))
+                amax = tl.maximum(tl.max(tl.abs(xg), axis=1), 7.052966100933725e-38)
+                v = amax / 6.0
+                bits = v.to(tl.int32, bitcast=True)
+                exponent = (bits >> 23) & 0xFF
+                exponent = tl.where((bits & 0x7FFFFF) == 0, exponent, exponent + 1)
+                scale = (exponent << 23).to(tl.float32, bitcast=True)
+                q = tl.minimum(tl.maximum(xg / scale[:, None], -6.0), 6.0)
+                x = tl.reshape(_round_e2m1(q) * scale[:, None], (BD,))
         tl.store(y_ptr + m * D + d, x.to(tl.bfloat16), mask=live)
 
 
@@ -667,6 +699,28 @@ def attn_out(o, freqs, wo_a, sa, groups, rank, wo_b, sb, head_dim, rope_dim, tra
     mid = gemv_rows(oq.view(M, heads * hd), wo_a, sa, group_rows=rank, traced=traced)
     y = gemv_rows(act_quant_dequant(mid, traced=traced), wo_b, sb, traced=traced)
     return y.reshape(tuple(lead) + (dim,))
+
+
+def compress_post(x, freqs, rope_dim, quant_kind, traced=False):
+    """The compressed KV or index key finishing for a decode step's rows, in one kernel: the
+    rotary of the last rope_dim elements (freqs [rows, rope_dim / 2, 2] fp32: the complex
+    frequencies' real view, per row) and fp4 quantization (quant_kind: 'e4m3' per 16 elements,
+    or 'e8m0' per 32 elements). Returns [.., D] bf16."""
+    D = x.shape[-1]
+    lead = tuple(x.shape[:-1])
+    M = x.numel() // D
+    BD = triton.next_power_of_2(D)
+    e4m3 = quant_kind in ("e4m3", "16_e4m3", torch.float8_e4m3fn)
+    if M > GEMV_ROWS_MAX or D % 32 != 0 or rope_dim % 2 != 0 or tuple(freqs.shape) != (M, rope_dim // 2, 2):
+        raise ValueError(f"compress_post: x {tuple(x.shape)}, rope {rope_dim}, freqs {tuple(freqs.shape)}, quant_kind {quant_kind}")
+    y = torch.empty(M, D, dtype=torch.bfloat16, device=x.device)
+    if M:
+        kernel, ctx = _launcher(_row_post_kernel, x.device, traced)
+        with ctx:
+            kernel[(M,)](x.contiguous(), x, freqs.contiguous(), 1.0, y, y, M, D, 1,
+                         0.0, NORM=False, RD=rope_dim, QUANT=False, STORE_PRE=False, BD=BD,
+                         FP4=True, FP4_E4M3=e4m3)
+    return y.reshape(lead + (D,))
 
 
 # ---------------------------------------------------------------------------
@@ -1138,6 +1192,10 @@ if triton is not None:
                       norm_eps: float, freqs: torch.Tensor, rope_dim: int) -> torch.Tensor:
         return window_kv(x, wkv, scale, norm_weight, norm_eps, freqs, rope_dim, traced=True)
 
+    @torch.library.triton_op("vxpu_triton::compress_post", mutates_args=())
+    def _compress_post_op(x: torch.Tensor, freqs: torch.Tensor, rope_dim: int, quant_kind: str) -> torch.Tensor:
+        return compress_post(x, freqs, rope_dim, quant_kind, traced=True)
+
     @torch.library.triton_op("vxpu_triton::attn_out", mutates_args=())
     def _attn_out_op(o: torch.Tensor, freqs: torch.Tensor, wo_a: torch.Tensor, sa: torch.Tensor, groups: int,
                      rank: int, wo_b: torch.Tensor, sb: torch.Tensor, head_dim: int, rope_dim: int) -> torch.Tensor:
@@ -1169,6 +1227,7 @@ lowered = types.SimpleNamespace(
     shared_ffn=lambda *a: torch.ops.vxpu_triton.shared_ffn(*a),
     attn_q=lambda *a: torch.ops.vxpu_triton.attn_q(*a),
     window_kv=lambda *a: torch.ops.vxpu_triton.window_kv(*a),
+    compress_post=lambda *a: torch.ops.vxpu_triton.compress_post(*a),
     attn_out=lambda *a: torch.ops.vxpu_triton.attn_out(*a),
     ffn_front=lambda *a: torch.ops.vxpu_triton.ffn_front(*a),
     hc_front=lambda *a: torch.ops.vxpu_triton.hc_front(*a),
