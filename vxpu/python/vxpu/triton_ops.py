@@ -260,11 +260,15 @@ if triton is not None:
 if triton is not None:
     @triton.jit
     def _gemv_rows_kernel(x_ptr, w_ptr, s_ptr, y_ptr, M, N, K, XS, R, KS,
-                          HAS_SCALE: tl.constexpr, BM: tl.constexpr, BN: tl.constexpr, BK: tl.constexpr):
+                          HAS_SCALE: tl.constexpr, BM: tl.constexpr, BN: tl.constexpr, BK: tl.constexpr,
+                          EPI_QUANT: tl.constexpr = False):
         """x [M, K] (bf16) times weight [N, K] transposed, every row of x by one pass over the
         weight: a program owns BN weight rows, streams them once, and multiplies each tile by all
         M rows of x on the tensor cores (tl.dot, bf16 in, fp32 accumulation; an fp8 weight times
-        its e8m0 block scale is exact in bf16, so the products are exact). Up to BM rows."""
+        its e8m0 block scale is exact in bf16, so the products are exact). Up to BM rows. With
+        EPI_QUANT the bf16 outputs are quantized to the fp8 grid per 32 consecutive outputs of a
+        row (the fork's act_quant before the next linear) before the store; BN is then a multiple
+        of 32, so a program holds whole blocks."""
         pid = tl.program_id(0)
         rows = pid.to(tl.int64) * BN + tl.arange(0, BN)  # int64: weights past 2^31 elements
         live = rows < N
@@ -286,6 +290,16 @@ if triton is not None:
             x = tl.load(x_ptr + ms[:, None] * XS + g * K + ks[None, :],
                         mask=mlive[:, None] & kin[None, :], other=0.0)
             acc += tl.dot(w.to(tl.bfloat16), tl.trans(x.to(tl.bfloat16)))
+        if EPI_QUANT:
+            hg = tl.reshape(acc.to(tl.bfloat16).to(tl.float32), (BN // 32, 32, BM))  # the linear's bf16 output
+            amax = tl.maximum(tl.max(tl.abs(hg), axis=1), 1e-4)
+            v = amax / 448.0
+            bits = v.to(tl.int32, bitcast=True)
+            exponent = (bits >> 23) & 0xFF
+            exponent = tl.where((bits & 0x7FFFFF) == 0, exponent, exponent + 1)
+            scale = (exponent << 23).to(tl.float32, bitcast=True)
+            q = tl.minimum(tl.maximum(hg / scale[:, None, :], -448.0), 448.0)
+            acc = tl.reshape(_round_e4m3(q) * scale[:, None, :], (BN, BM))
         tl.store(y_ptr + ms[None, :] * N + rows[:, None], acc.to(y_ptr.dtype.element_ty),
                  mask=live[:, None] & mlive[None, :])
 
@@ -322,14 +336,19 @@ def _pe_blocks(M, K, tiles=3, device=None):
     return bm, bn, bk
 
 
-def gemv_rows(x, weight, scale=None, group_rows=None, out_dtype=torch.bfloat16, blocks=None, traced=False):
+def gemv_rows(x, weight, scale=None, group_rows=None, out_dtype=torch.bfloat16, blocks=None, traced=False,
+              quant_out=False):
     """x [M, G*K] bf16 times weight [N, K] (bf16, or fp8 e4m3 with [N/32, K/32] e8m0 block
     scales) transposed -> [M, N] in out_dtype, the weight read once for all M <= GEMV_ROWS_MAX
-    rows. group_rows as fp8_gemv."""
+    rows. group_rows as fp8_gemv. quant_out quantizes the bf16 result to the fp8 grid per 32
+    outputs in the kernel's epilogue (the fork's act_quant before the next linear) instead of in
+    a kernel of its own; the programs then own 32 rows of the weight."""
     M = x.shape[0]
     N, K = weight.shape
     R = group_rows or N
     bm, bn, bk = blocks or _rows_blocks(M, K)
+    if quant_out:
+        bn = max(bn, 32)
     if M > bm or N % R or R % bn or x.shape[1] != (N // R) * K or K % 32 or N % 32 or bk % 32:
         raise ValueError(f"gemv_rows: x {tuple(x.shape)}, weight {tuple(weight.shape)}, group_rows {group_rows}")
     if scale is not None and (weight.dtype != torch.float8_e4m3fn or scale.dtype != torch.float8_e8m0fnu
@@ -344,7 +363,7 @@ def gemv_rows(x, weight, scale=None, group_rows=None, out_dtype=torch.bfloat16, 
         with ctx:
             kernel[(triton.cdiv(N, bn),)](x.contiguous(), w, s, y, M, N, K, x.shape[1], R,
                                          scale.shape[1] if scale is not None else 0,
-                                         HAS_SCALE=scale is not None, BM=bm, BN=bn, BK=bk)
+                                         HAS_SCALE=scale is not None, BM=bm, BN=bn, BK=bk, EPI_QUANT=quant_out)
     return y
 
 
@@ -638,12 +657,11 @@ def window_kv(x, wkv, scale, norm_weight, norm_eps, freqs, rope_dim, traced=Fals
 
 
 def attn_out(o, freqs, wo_a, sa, groups, rank, wo_b, sb, head_dim, rope_dim, traced=False):
-    """The attention's output path for a decode step's rows, in four kernels: one program per
+    """The attention's output path for a decode step's rows, in three kernels: one program per
     (row, head) for the inverse rotary of the head's last rope_dim dims (freqs [rows, rope_dim /
     2, 2] fp32: the complex frequencies' real view, per row) and the fp8-grid quantization; the
-    grouped
-    projection wo_a [groups * rank, heads_per_group * head_dim] (fp8, e8m0 block scales,
-    block-diagonal over the groups); its result quantized; wo_b [dim, groups * rank]. Returns
+    grouped projection wo_a [groups * rank, heads_per_group * head_dim] (fp8, e8m0 block scales,
+    block-diagonal over the groups) quantizing its result in its epilogue; wo_b [dim, groups * rank]. Returns
     [.., dim] bf16. The fork launches about five kernels; the fold of the rotary into the grouped
     GEMV's prologue recomputed it per program and was dropped."""
     *lead, heads, hd = o.shape
@@ -662,8 +680,8 @@ def attn_out(o, freqs, wo_a, sa, groups, rank, wo_b, sb, head_dim, rope_dim, tra
         with ctx:
             post[(M * heads,)](x, x, freqs.contiguous(), -1.0, oq, oq, M * heads, hd, heads, 0.0,
                                NORM=False, RD=rope_dim, QUANT=True, STORE_PRE=False, BD=hd)
-    mid = gemv_rows(oq.view(M, heads * hd), wo_a, sa, group_rows=rank, traced=traced)
-    y = gemv_rows(act_quant_dequant(mid, traced=traced), wo_b, sb, traced=traced)
+    mid = gemv_rows(oq.view(M, heads * hd), wo_a, sa, group_rows=rank, traced=traced, quant_out=True)
+    y = gemv_rows(mid, wo_b, sb, traced=traced)
     return y.reshape(tuple(lead) + (dim,))
 
 
