@@ -181,7 +181,14 @@ lowering times the fused body against the kernels per call shape and
 GPU. The ops are instances of templates on purpose: the next step is
 for the planner to instantiate the templates (which norm, rotary or
 quantization to fold where) rather than for a person to write each op.
-[TODO hero 7: the step with the ops, kernels per layer and ms.]
+On the shaped fixture (five layers) at one row on an L4, with the ops'
+kernels forced, the decode step launches 265 kernels where the plain
+graph launched 310, nine fewer a layer; the step time is unchanged
+there (14.7 against 14.3 ms), since the L4 is bandwidth-bound at that
+size. With the lowering's measured choices on the L4 it keeps the fused
+bodies for `attn_q` and `shared_ffn`, and the count stays at 310; the
+hero machine measures for itself. [TODO hero 7: the step with the ops
+on the real model, kernels per layer and ms.]
 
 **The roofline, and the production stacks.** A decode step at one row
 reads every dense weight once and the selected experts once, so its floor

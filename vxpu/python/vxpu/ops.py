@@ -776,6 +776,16 @@ def _rms_norm(x, weight, eps):
     return (weight * xf).to(x.dtype)
 
 
+def _freqs_rows(freqs_cis, b, rope_dim):
+    """The complex frequencies ([s, D] shared by the rows, or [b, s, D] per row) as their real view
+    [b * s, D, 2] (cos and sin interleaved): a view when per row, one copy when shared."""
+    f = torch.view_as_real(freqs_cis)
+    if f.dim() == 3:  # [s, D, 2] shared by the rows
+        f = f.unsqueeze(0).expand(b, -1, -1, -1)
+    return f.reshape(-1, rope_dim // 2, 2)
+
+
+
 @implementation("vxpu::attn_q", "gpu-fused", ("cuda",), "rounding",
                 "the fp8 GEMVs with the norm, quantization and rotary between them as tensor operations for the "
                 "compiler to fuse (lowering, VXPU_FUSE; where it measures cheaper than the kernels)",
@@ -800,13 +810,8 @@ def _attn_q_fused(x, wq_a, sa, norm_weight, norm_eps, wq_b, sb, freqs_cis, heads
                 and rows <= FP8_GEMV_MAX_ROWS and dim % 32 == 0 and rank % 256 == 0 and head_dim % 32 == 0
                 and (head_dim - rope_dim) % 32 == 0 and rope_dim % 2 == 0 and _fp8_native(), lowerable=True)
 def _attn_q_triton(x, wq_a, sa, norm_weight, norm_eps, wq_b, sb, freqs_cis, heads, head_dim, rope_dim, tk=triton_ops):
-    b = x.shape[0]
-    c, s = freqs_cis.real, freqs_cis.imag
-    if c.dim() == 2:  # [s, D] shared by the rows
-        c, s = c.unsqueeze(0).expand(b, -1, -1), s.unsqueeze(0).expand(b, -1, -1)
-    D = rope_dim // 2
-    return tk.attn_q(x, wq_a, sa, norm_weight, norm_eps, wq_b, sb, c.reshape(-1, D).float().contiguous(),
-                     s.reshape(-1, D).float().contiguous(), heads, head_dim, rope_dim)
+    return tk.attn_q(x, wq_a, sa, norm_weight, norm_eps, wq_b, sb, _freqs_rows(freqs_cis, x.shape[0], rope_dim),
+                     heads, head_dim, rope_dim)
 
 
 @implementation("vxpu::attn_q", "reference", ("cpu", "cuda"), "bit-identical",
@@ -869,13 +874,7 @@ def _window_kv_fused(x, wkv, scale, norm_weight, norm_eps, freqs_cis, rope_dim, 
                 and rows <= FP8_GEMV_MAX_ROWS and dim % 32 == 0 and kv_dim % 32 == 0
                 and rope_dim % 2 == 0 and _fp8_native(), lowerable=True)
 def _window_kv_triton(x, wkv, scale, norm_weight, norm_eps, freqs_cis, rope_dim, tk=triton_ops):
-    b = x.shape[0]
-    c, s = freqs_cis.real, freqs_cis.imag
-    if c.dim() == 2:  # [s, D] shared by the rows
-        c, s = c.unsqueeze(0).expand(b, -1, -1), s.unsqueeze(0).expand(b, -1, -1)
-    D = rope_dim // 2
-    return tk.window_kv(x, wkv, scale, norm_weight, norm_eps, c.reshape(-1, D).float().contiguous(),
-                        s.reshape(-1, D).float().contiguous(), rope_dim)
+    return tk.window_kv(x, wkv, scale, norm_weight, norm_eps, _freqs_rows(freqs_cis, x.shape[0], rope_dim), rope_dim)
 
 
 @implementation("vxpu::window_kv", "reference", ("cpu", "cuda"), "bit-identical",
@@ -941,13 +940,8 @@ def _attn_out_fused(o, freqs_cis, wo_a, sa, groups, rank, wo_b, sb, rope_dim, tk
                 and rows <= FP8_GEMV_MAX_ROWS and head_dim % 32 == 0 and (head_dim - rope_dim) % 2 == 0
                 and rank % 32 == 0 and groups and heads % groups == 0 and _fp8_native(), lowerable=True)
 def _attn_out_triton(o, freqs_cis, wo_a, sa, groups, rank, wo_b, sb, rope_dim, tk=triton_ops):
-    b = o.shape[0]
-    c, s = freqs_cis.real, -freqs_cis.imag  # the inverse rotation
-    if c.dim() == 2:  # [s, D] shared by the rows
-        c, s = c.unsqueeze(0).expand(b, -1, -1), s.unsqueeze(0).expand(b, -1, -1)
-    D = rope_dim // 2
-    return tk.attn_out(o, c.reshape(-1, D).float().contiguous(), s.reshape(-1, D).float().contiguous(), wo_a, sa,
-                       groups, rank, wo_b, sb, o.shape[-1], rope_dim)
+    return tk.attn_out(o, _freqs_rows(freqs_cis, o.shape[0], rope_dim), wo_a, sa, groups, rank, wo_b, sb,
+                       o.shape[-1], rope_dim)
 
 
 @implementation("vxpu::attn_out", "reference", ("cpu", "cuda"), "bit-identical",
