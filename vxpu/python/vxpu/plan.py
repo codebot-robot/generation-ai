@@ -77,7 +77,7 @@ COORDINATOR_SWITCHES = frozenset({
     "VXPU_LOWER_DECODE", "VXPU_SEGMENT_RUNTIME", "VXPU_EXPERT_MAILBOXES", "VXPU_REMOTE_NODES", "VXPU_DATAFLOW",
     "VXPU_STEP_GRAPH", "VXPU_LAYER_RANGE", "VXPU_REMOTE_RANGES", "VXPU_FUSE", "VXPU_LAYER_DEVICES",
     "VXPU_DATAFLOW_PLACE", "VXPU_GPU_EXPERTS", "VXPU_GPU_EXPERTS_MOVES", "VXPU_GPU_EXPERTS_REQUEST_WEIGHT",
-    "VXPU_EXPERTS_IN_RAM", "VXPU_BF16_WEIGHT_CACHE", "VXPU_BF16_CACHE_HEADROOM_GB",
+    "VXPU_EXPERTS_IN_RAM", "VXPU_BF16_WEIGHT_CACHE", "VXPU_BF16_CACHE_HEADROOM_GB", "VXPU_PLAN_TABLE",
 })
 
 
@@ -249,6 +249,133 @@ class Choice:
 
 
 # ---------------------------------------------------------------------------
+# the kernel table and the record: the planner's choices as data (hero run 8)
+#
+# The table is what the planner (pkg/kernelplan, Go) hands an engine: per
+# call site (an op, the module that calls it, its input shapes) the
+# implementation body to run, and the kernels' knobs (the numbers
+# triton_ops sets by hand today). The record is what the engine writes
+# back: per site the candidates, what was measured, what was chosen and
+# why, and the kernels inlined for it, plus the step's statistics. The
+# planner reads records and emits tables; an engine given a table applies
+# it exactly and measures nothing.
+
+TABLE_FORMAT = "vxpu-kernel-table/1"
+RECORD_FORMAT = "vxpu-kernel-record/1"
+
+# triton_ops' hand-set numbers a table may set (module attributes read at
+# each call): name -> type. The bool ones are triton_ops' "1"/"0" A/B
+# overrides; None (the default) leaves the kernel to decide from the card.
+KNOBS = {
+    "GEMV_ROWS_MAX": int, "FP4_DIRECT_MAX": int, "FFN_FRONT_EB": int, "FFN_FRONT_BD": int,
+    "FRONT_SPLIT_BD": int, "FRONT_SPLIT_EB": int, "FP4_KSPLIT": int, "FP4_NATIVE": bool, "FP4_DIRECT": bool,
+}
+
+
+def load_table(text):
+    """A kernel table from its JSON (inline, or a path to a file), checked:
+    the format, every op and implementation registered, every knob known
+    and of its type. Returns the table dict with an "index" the matching
+    uses."""
+    source = text
+    if not text.lstrip().startswith("{"):
+        try:
+            with open(os.path.expanduser(text)) as f:
+                text = f.read()
+        except OSError as e:
+            raise ConfigError(f"VXPU_PLAN_TABLE={source!r}: cannot read it: {e}") from None
+    try:
+        table = json.loads(text)
+    except ValueError as e:
+        raise ConfigError(f"VXPU_PLAN_TABLE: not JSON: {e}") from None
+    if not isinstance(table, dict) or table.get("format") != TABLE_FORMAT:
+        raise ConfigError(f"VXPU_PLAN_TABLE: expected a JSON object with format {TABLE_FORMAT!r}")
+    knobs = table.get("knobs") or {}
+    if not isinstance(knobs, dict):
+        raise ConfigError("VXPU_PLAN_TABLE: knobs must be an object")
+    for name, value in knobs.items():
+        kind = KNOBS.get(name)
+        if kind is None:
+            raise ConfigError(f"VXPU_PLAN_TABLE: unknown knob {name!r} (known: {', '.join(sorted(KNOBS))})")
+        if kind is bool and not isinstance(value, bool) or kind is int and (isinstance(value, bool) or not isinstance(value, int)):
+            raise ConfigError(f"VXPU_PLAN_TABLE: knob {name} must be {'true/false' if kind is bool else 'an integer'}, got {value!r}")
+    index = {"site": {}, "shapes": {}, "op": {}}
+    for i, entry in enumerate(table.get("sites") or []):
+        if not isinstance(entry, dict) or "op" not in entry or "impl" not in entry:
+            raise ConfigError(f"VXPU_PLAN_TABLE: sites[{i}] needs op and impl")
+        op, impl = entry["op"], entry["impl"]
+        if op not in REGISTRY:
+            raise ConfigError(f"VXPU_PLAN_TABLE: sites[{i}]: unknown op {op!r}")
+        if impl not in {im.name for im in REGISTRY[op]}:
+            raise ConfigError(f"VXPU_PLAN_TABLE: sites[{i}]: {op} has no implementation {impl!r} "
+                              f"(it has {', '.join(im.name for im in REGISTRY[op])})")
+        if entry.get("site"):
+            key, where = (op, entry["site"]), index["site"]
+        elif entry.get("shapes"):
+            key, where = (op, entry["shapes"]), index["shapes"]
+        else:
+            key, where = op, index["op"]
+        if key in where and where[key]["impl"] != impl:
+            raise ConfigError(f"VXPU_PLAN_TABLE: sites[{i}] names {impl} where an earlier entry named "
+                              f"{where[key]['impl']} for the same {key}")
+        where[key] = entry
+    table["index"] = index
+    return table
+
+
+def table_entry(table, op, site=None, shapes=None):
+    """The table's entry for a call: the one naming this site, else the one
+    naming the op at these shapes, else the one for the op alone; None when
+    the table says nothing about it."""
+    if not table:
+        return None
+    index = table["index"]
+    if site is not None and (op, site) in index["site"]:
+        return index["site"][(op, site)]
+    if shapes is not None and (op, shapes) in index["shapes"]:
+        return index["shapes"][(op, shapes)]
+    return index["op"].get(op)
+
+
+def apply_knobs(knobs):
+    """Set triton_ops' knobs from the table. The kernels read them at each
+    call, so this takes effect for everything launched afterwards (and
+    before any graph is captured, since the plan is built first)."""
+    if not knobs:
+        return
+    from . import triton_ops
+    for name, value in knobs.items():
+        if KNOBS[name] is bool:
+            setattr(triton_ops, name, "1" if value else "0")
+        elif name == "FP4_KSPLIT":
+            setattr(triton_ops, name, str(int(value)))
+        else:
+            setattr(triton_ops, name, int(value))
+    cached = getattr(triton_ops, "_fp4_native", None)  # memoized per device from FP4_NATIVE
+    if cached is not None and hasattr(cached, "cache_clear"):
+        cached.cache_clear()
+
+
+def effective_knobs():
+    """The knobs' values in effect, typed as the table would give them
+    (None: the kernel decides from the card)."""
+    try:
+        from . import triton_ops
+    except ImportError:
+        return {}
+    out = {}
+    for name, kind in KNOBS.items():
+        value = getattr(triton_ops, name, None)
+        if value is None:
+            out[name] = None
+        elif kind is bool:
+            out[name] = value in (True, "1")
+        else:
+            out[name] = int(value)
+    return out
+
+
+# ---------------------------------------------------------------------------
 # the plan
 
 # input shapes recorded per implementation; later shapes are counted
@@ -407,6 +534,26 @@ class Plan:
         self._set("dataflow_placement", place, src, (),
                   "where the dataflow graph's nodes run, by kind (e.g. experts=cpu,engram=cpu); unnamed kinds run "
                   "where their resident tensors are")
+        # the kernel table: the planner's choice of body per call site and the kernels' knobs
+        text, src = env_text("VXPU_PLAN_TABLE", None)
+        self.table = load_table(text) if text else None
+        if self.table is not None:
+            wanted = self.table.get("gpu")
+            if wanted and self.hardware.get("gpu") and wanted != self.hardware["gpu"]:
+                raise ConfigError(f"VXPU_PLAN_TABLE: the table is for {wanted!r}, this engine runs on "
+                                  f"{self.hardware['gpu']!r}")
+            apply_knobs(self.table.get("knobs"))
+        sites = len(self.table.get("sites") or []) if self.table else 0
+        self._set("plan_table", (f"{sites} entries, {len(self.table.get('knobs') or {})} knobs" if self.table else None),
+                  src, (), "the kernel table (inline JSON or a file): which implementation body each call site runs "
+                  "and the kernels' knobs; an engine given one applies it exactly and measures nothing "
+                  "(plan.py: load_table; the planner writes it, pkg/kernelplan)")
+        path, src = env_text("VXPU_PLAN_RECORD", None)
+        self._record_path = path
+        self._set("plan_record", path, src, (), "where the engine writes the kernel record: per call site the "
+                  "candidates, the measured costs, the choice and its source, the kernels inlined; the planner's input")
+        self.sites = []  # the record's site entries (lower.py appends)
+        self.stats = {}  # per-step statistics (whoever measures them: Plan.stat)
         home = os.path.expanduser("~")
         base = os.path.join(home, ".cache") if home != "~" else tempfile.gettempdir()  # no HOME: not a relative "~"
         cache, src = env_text("VXPU_AOTI_CACHE_DIR", os.path.join(base, "vxpu", "aoti"))
@@ -483,23 +630,109 @@ class Plan:
     def candidates(self, op, device_type):
         return [impl for impl in REGISTRY[op] if _available(impl, device_type)]
 
+    def table_choice(self, op, device_type, key=None, site=None, **ctx):
+        """The implementation the kernel table names for this call, or None
+        when the table says nothing about it. A named body that cannot run
+        here is an error when the lowering asks (the table is the planner's
+        word and must be applied exactly); an eager call falls back to the
+        registry's choice and the plan notes it once, since eager dispatch
+        sees shapes the planner never measured (prefill, warm-up)."""
+        entry = table_entry(self.table, op, site, key)
+        if entry is None:
+            return None
+        impl = next(i for i in REGISTRY[op] if i.name == entry["impl"])
+        runs = impl.reference or (device_type in impl.devices and (impl.applies is None or impl.applies(self, **ctx)))
+        if runs:
+            return impl
+        where = f"{op} at {site or key or 'every site'}"
+        if ctx.get("lowering"):
+            raise ConfigError(f"VXPU_PLAN_TABLE names {impl.name} for {where}, which cannot run here "
+                              f"(device {device_type}, {impl.when})")
+        self.note(f"the kernel table names {impl.name} for {where}; an eager call could not run it and took the "
+                  f"registry's choice")
+        return None
+
     def select(self, op, device_type, key=None, **ctx):
-        """The implementation of op to run for this call: the first
-        registered one that runs on device_type and applies under this plan
-        and ctx. key (input shapes, say) is recorded with the selection."""
-        for impl in REGISTRY[op]:
-            # the reference computation runs anywhere torch does
-            if impl.reference or (device_type in impl.devices and (impl.applies is None or impl.applies(self, **ctx))):
-                with self._lock:
-                    record = (op, impl.name, key)
-                    if record not in self._selections:
-                        if self._shapes[(op, impl.name)] >= MAX_SHAPES_RECORDED:
-                            record = (op, impl.name, "(other shapes)")
-                        else:
-                            self._shapes[(op, impl.name)] += 1
-                    self._selections[record] += 1
-                return impl
-        raise RuntimeError(f"no implementation of {op} for {device_type} ({ctx})")
+        """The implementation of op to run for this call: the kernel table's
+        when it names one, else the first registered one that runs on
+        device_type and applies under this plan and ctx. key (input shapes,
+        say) is recorded with the selection; ctx may carry site (the module
+        calling the op) when the lowering asks."""
+        impl = self.table_choice(op, device_type, key, **ctx)
+        if impl is None:
+            for candidate in REGISTRY[op]:
+                # the reference computation runs anywhere torch does
+                if candidate.reference or (device_type in candidate.devices
+                                           and (candidate.applies is None or candidate.applies(self, **ctx))):
+                    impl = candidate
+                    break
+            else:
+                raise RuntimeError(f"no implementation of {op} for {device_type} ({ctx})")
+        with self._lock:
+            record = (op, impl.name, key)
+            if record not in self._selections:
+                if self._shapes[(op, impl.name)] >= MAX_SHAPES_RECORDED:
+                    record = (op, impl.name, "(other shapes)")
+                else:
+                    self._shapes[(op, impl.name)] += 1
+            self._selections[record] += 1
+        return impl
+
+    # ---- the record
+
+    def record_site(self, **entry):
+        """One call site's row of the kernel record (lower.py: op, site, node,
+        shapes, layer, chosen, source, candidates, measured_us, kernels)."""
+        with self._lock:
+            self.sites.append(entry)
+
+    def stat(self, name, value):
+        """A per-step statistic for the record (kernels a step, crossings,
+        distinct experts a layer, ...), from whoever measures it."""
+        with self._lock:
+            self.stats[name] = value
+        self.write_record()
+
+    def kernel_record(self):
+        """The kernel record as JSON-able data: the hardware, the choices,
+        the knobs in effect, every call site the lowering saw, the step's
+        statistics."""
+        import torch
+        hw = dict(self.hardware)
+        hw["torch"] = torch.__version__
+        if hw.get("gpu"):
+            hw["cuda"] = torch.version.cuda
+        try:
+            import triton
+            hw["triton"] = triton.__version__
+        except ImportError:
+            pass
+        with self._lock:
+            sites = [dict(e) for e in self.sites]
+            stats = dict(self.stats)
+        return {
+            "format": RECORD_FORMAT,
+            "hardware": hw,
+            "choices": {k: (c.value is not None) if k in LOCAL_PATHS else c.value for k, c in self.choices.items()},
+            "knobs": effective_knobs(),
+            "sites": sites,
+            "stats": stats,
+        }
+
+    def write_record(self):
+        """Write the kernel record where VXPU_PLAN_RECORD says, if it does
+        (rewritten whole each time: after the lowering, and as statistics
+        arrive)."""
+        path = getattr(self, "_record_path", None)
+        if not path:
+            return None
+        record = self.kernel_record()
+        tmp = f"{path}.{os.getpid()}"
+        os.makedirs(os.path.dirname(os.path.abspath(path)), exist_ok=True)
+        with open(tmp, "w") as f:
+            json.dump(record, f, indent=1, sort_keys=True)
+        os.replace(tmp, path)
+        return path
 
     # ---- explain
 
@@ -573,6 +806,24 @@ def record(explained):
             "notes": list(explained["notes"])}
 
 
+def check_record(table, record):
+    """The sites of a record that did not run what the table names for
+    them: [(site entry, expected impl)]. A table applied exactly gives
+    none; anything else is the failure the planner cannot tolerate (a
+    choice measured, recorded and not applied: #490)."""
+    bad = []
+    for entry in record.get("sites", []):
+        want = table_entry(table, entry["op"], entry.get("site"), entry.get("shapes"))
+        if want is not None and want["impl"] != entry.get("chosen"):
+            bad.append((entry, want["impl"]))
+    return bad
+
+
+def describe_mismatches(bad):
+    return "; ".join(f"{e['op']} at {e.get('site') or e.get('shapes') or 'a site'}: ran {e.get('chosen')}, "
+                     f"the table names {want}" for e, want in bad)
+
+
 _default = {}
 
 
@@ -605,17 +856,87 @@ def artifact_ops(artifact_dir):
     return found
 
 
+def profile_step(artifact, table=None, steps=4, heavy_us=50.0):
+    """On a GPU: load the engine for artifact (the environment's plan, the
+    table given or VXPU_PLAN_TABLE's), run decode steps under the CUDA
+    profiler and report what launched: every kernel name with its count and
+    time in one step, next to the table's choices. Two checks: the record's
+    sites against the table (check_record), and the compiler-fused kernels
+    (inductor's, named triton_*_fused_*) heavier than heavy_us, which no
+    chosen body accounts for when every site of their op chose a kernel
+    body: that is how a body the table did not choose shows itself (#490).
+    Returns (report dict, problems list)."""
+    import torch
+    from .engine import Engine, SamplingParams
+    if table is not None:
+        os.environ["VXPU_PLAN_TABLE"] = table
+    engine = Engine(artifact, device="cuda", compile_decode=True)
+    greedy = SamplingParams(do_sample=False)
+    prompt = [(11 * j + 5) % 30000 + 100 for j in range(24)]
+    engine.generate_rows([prompt], 4, greedy)  # warm-up: the step captured
+    from torch.profiler import ProfilerActivity, profile
+    with profile(activities=[ProfilerActivity.CUDA, ProfilerActivity.CPU]) as prof:
+        engine.generate_rows([prompt], steps, greedy)
+    events = sorted((e for e in prof.events() if e.device_type == torch.autograd.DeviceType.CUDA),
+                    key=lambda e: e.time_range.start)
+    nk = (getattr(engine._decode_split, "node_counts", None) or {}).get("kernels")
+    last = events[-nk:] if nk and nk <= len(events) else events
+    counts = collections.Counter(e.name for e in last)
+    times = collections.defaultdict(float)
+    for e in last:
+        times[e.name] += e.time_range.elapsed_us()
+    record = engine.plan.kernel_record()
+    problems = []
+    if engine.plan.table is not None:
+        bad = check_record(engine.plan.table, record)
+        if bad:
+            problems.append("sites that did not run the table's body: " + describe_mismatches(bad))
+    fused_ops = {e["op"] for e in record["sites"] if e.get("source") != "kept" and e.get("kernels") == []}
+    heavy = [(name, counts[name], times[name] / counts[name]) for name in counts
+             if "_fused_" in name and name.startswith("triton_") and times[name] / counts[name] > heavy_us]
+    if heavy and not fused_ops:
+        problems.append("compiler-fused kernels heavier than %.0f us with no site choosing a fused body: " % heavy_us
+                        + ", ".join(f"{n} x{c} {us:.0f} us" for n, c, us in heavy))
+    report = {"kernels_in_step": len(last), "by_kernel": [{"name": n, "count": counts[n], "us": round(times[n], 1)}
+                                                          for n in sorted(counts, key=lambda n: -times[n])],
+              "record": record, "problems": problems}
+    return report, problems
+
+
 def main(argv=None):
-    p = argparse.ArgumentParser(description="Explain the physical plan for an artifact, without loading weights.")
-    p.add_argument("--artifact", required=True)
+    p = argparse.ArgumentParser(description="Explain the physical plan for an artifact, without loading weights; "
+                                "check a kernel record against a kernel table; or profile a step on a GPU.")
+    p.add_argument("--artifact", help="the artifact to explain (or to run, with --profile-step)")
     p.add_argument("--device", default="cpu")
     p.add_argument("--compile", action="store_true", help="the plan for a compiled decode (the executor's GPU default)")
     p.add_argument("--json", action="store_true", help="print the full explain() JSON")
+    p.add_argument("--table", help="a kernel table (file or inline JSON) for --check-record or --profile-step")
+    p.add_argument("--check-record", metavar="RECORD", help="check a kernel record file against --table (no GPU)")
+    p.add_argument("--profile-step", action="store_true",
+                   help="on a GPU: load the engine for --artifact, profile a decode step and report what launched")
     args = p.parse_args(argv)
     # run as `python -m vxpu.plan` this file is __main__, a second copy of
     # the module: the ops register into vxpu.plan's registry, so use that one
     from . import ops as _ops  # noqa: F401  (registers the implementations)
     from . import plan as registered
+    if args.check_record:
+        if not args.table:
+            p.error("--check-record needs --table")
+        table = registered.load_table(args.table)
+        with open(args.check_record) as f:
+            record = json.load(f)
+        bad = registered.check_record(table, record)
+        print(f"{len(record.get('sites', []))} sites, {len(bad)} did not run the table's body"
+              + (": " + registered.describe_mismatches(bad) if bad else ""))
+        raise SystemExit(1 if bad else 0)
+    if not args.artifact:
+        p.error("--artifact is required")
+    if args.profile_step:
+        report, problems = registered.profile_step(args.artifact, args.table)
+        print(json.dumps(report if args.json else {k: v for k, v in report.items() if k != "record"}, indent=1))
+        for problem in problems:
+            print("PROBLEM: " + problem)
+        raise SystemExit(1 if problems else 0)
     plan = registered.Plan(args.device, compile_decode=args.compile)
     used = registered.artifact_ops(args.artifact)
     print(json.dumps(plan.explain(used), indent=1) if args.json else plan.summary(used))
