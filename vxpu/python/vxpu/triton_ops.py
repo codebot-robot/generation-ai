@@ -447,29 +447,8 @@ def _narrow_ksplit(N, bn, K, bk, device=None):
 
 if triton is not None:
     @triton.jit
-    def _swiglu_quant_cols(acc1, acc3, limit, BN: tl.constexpr, BM: tl.constexpr):
-        """The dual GEMV's epilogue over a [BN outputs, BM rows] tile of fp32 sums: the two linears'
-        outputs rounded to bf16, the clamps, silu(gate) * up rounded to bf16, quantized to the fp8
-        grid per 32 consecutive outputs of a row (act_quant, the w2 linear's input), as bf16."""
-        gate = acc1.to(tl.bfloat16).to(tl.float32)  # the linears' bf16 outputs, as the fork sees them
-        up = acc3.to(tl.bfloat16).to(tl.float32)
-        up = tl.minimum(tl.maximum(up, -limit), limit)
-        gate = tl.minimum(gate, limit)
-        h = (gate * tl.sigmoid(gate) * up).to(tl.bfloat16).to(tl.float32)
-        hg = tl.reshape(h, (BN // 32, 32, BM))
-        amax = tl.maximum(tl.max(tl.abs(hg), axis=1), 1e-4)
-        v = amax / 448.0
-        bits = v.to(tl.int32, bitcast=True)
-        exponent = (bits >> 23) & 0xFF
-        exponent = tl.where((bits & 0x7FFFFF) == 0, exponent, exponent + 1)
-        scale = (exponent << 23).to(tl.float32, bitcast=True)
-        q = tl.minimum(tl.maximum(hg / scale[:, None, :], -448.0), 448.0)
-        return tl.reshape(_round_e4m3(q) * scale[:, None, :], (BN, BM)).to(tl.bfloat16)
-
-    @triton.jit
-    def _dual_gemv_swiglu_kernel(x_ptr, w1_ptr, s1_ptr, w3_ptr, s3_ptr, h_ptr, cnt_ptr, M, N, K, KS, limit,
-                                 BM: tl.constexpr, BN: tl.constexpr, BK: tl.constexpr, KSPLIT: tl.constexpr = 1,
-                                 LAST: tl.constexpr = False):
+    def _dual_gemv_swiglu_kernel(x_ptr, w1_ptr, s1_ptr, w3_ptr, s3_ptr, h_ptr, M, N, K, KS, limit,
+                                 BM: tl.constexpr, BN: tl.constexpr, BK: tl.constexpr, KSPLIT: tl.constexpr = 1):
         """The SwiGLU front of an FFN for up to BM rows in one pass over both weights: a program
         owns BN rows of w1 and of w3 (fp8, e8m0 block scales), streams them once against all M rows
         of x (bf16 on the fp8 grid), and in its epilogue rounds the two products to bf16 as the
@@ -479,12 +458,7 @@ if triton is not None:
         program holds whole quantization blocks. With KSPLIT > 1, that many programs share a row
         tile, each reducing a K slice and storing its two fp32 partial sums in h_ptr as [KSPLIT, 2,
         M, N] (gate then up); _swiglu_rows_kernel adds them and does the epilogue (a shared expert
-        of 2,304 rows gives 72 programs otherwise), or with LAST the last of the row tile's KSPLIT
-        programs to arrive (cnt_ptr: a counter per row tile, zero between launches, reset by that
-        program) adds them in k order and does the epilogue itself, so no second launch runs; the
-        partials then live in h_ptr's fp32 scratch and the result goes to h_ptr's bf16 output
-        (h_ptr points at [KSPLIT, 2, M, N] fp32 followed, in the same allocation, by [M, N] bf16;
-        see shared_ffn)."""
+        of 2,304 rows gives 72 programs otherwise)."""
         limit = limit.to(tl.float32)
         pid = tl.program_id(0)
         rows = pid.to(tl.int64) * BN + tl.arange(0, BN)
@@ -515,27 +489,28 @@ if triton is not None:
             sc = tl.where(e == 255, float("nan"), sc)
             w = tl.reshape(tl.reshape(w.to(tl.float32), (BN, BK // 32, 32)) * sc[:, :, None], (BN, BK))
             acc3 += tl.dot(w.to(tl.bfloat16), xt)
-        omask = live[:, None] & mlive[None, :]
         if KSPLIT > 1:
             part = h_ptr + tl.program_id(1).to(tl.int64) * 2 * M * N
+            omask = live[:, None] & mlive[None, :]
             tl.store(part + ms[None, :] * N + rows[:, None], acc1, mask=omask)
             tl.store(part + M * N + ms[None, :] * N + rows[:, None], acc3, mask=omask)
-            if LAST:
-                tl.debug_barrier()
-                old = tl.atomic_add(cnt_ptr + pid, 1, sem="acq_rel")
-                if old == KSPLIT - 1:  # every partial of this row tile is stored: sum them in k order
-                    g = tl.zeros((BN, BM), dtype=tl.float32)
-                    u = tl.zeros((BN, BM), dtype=tl.float32)
-                    for k in range(KSPLIT):
-                        pk = h_ptr + k.to(tl.int64) * 2 * M * N
-                        g += tl.load(pk + ms[None, :] * N + rows[:, None], mask=omask, other=0.0, cache_modifier=".cg")
-                        u += tl.load(pk + M * N + ms[None, :] * N + rows[:, None], mask=omask, other=0.0,
-                                     cache_modifier=".cg")
-                    out = (h_ptr + KSPLIT * 2 * M * N).to(tl.pointer_type(tl.bfloat16), bitcast=True)
-                    tl.store(out + ms[None, :] * N + rows[:, None], _swiglu_quant_cols(g, u, limit, BN, BM), mask=omask)
-                    tl.atomic_xchg(cnt_ptr + pid, 0)
             return
-        tl.store(h_ptr + ms[None, :] * N + rows[:, None], _swiglu_quant_cols(acc1, acc3, limit, BN, BM), mask=omask)
+        gate = acc1.to(tl.bfloat16).to(tl.float32)  # the linears' bf16 outputs, as the fork sees them
+        up = acc3.to(tl.bfloat16).to(tl.float32)
+        up = tl.minimum(tl.maximum(up, -limit), limit)
+        gate = tl.minimum(gate, limit)
+        h = (gate * tl.sigmoid(gate) * up).to(tl.bfloat16).to(tl.float32)
+        # act_quant of the bf16 result per 32 consecutive outputs of a row (the w2 linear's input)
+        hg = tl.reshape(h, (BN // 32, 32, BM))
+        amax = tl.maximum(tl.max(tl.abs(hg), axis=1), 1e-4)
+        v = amax / 448.0
+        bits = v.to(tl.int32, bitcast=True)
+        exponent = (bits >> 23) & 0xFF
+        exponent = tl.where((bits & 0x7FFFFF) == 0, exponent, exponent + 1)
+        scale = (exponent << 23).to(tl.float32, bitcast=True)
+        q = tl.minimum(tl.maximum(hg / scale[:, None, :], -448.0), 448.0)
+        hq = tl.reshape(_round_e4m3(q) * scale[:, None, :], (BN, BM))
+        tl.store(h_ptr + ms[None, :] * N + rows[:, None], hq.to(tl.bfloat16), mask=live[:, None] & mlive[None, :])
 
 
 if triton is not None:
@@ -590,24 +565,19 @@ def shared_ffn(x, w1, s1, w3, s3, w2, s2, swiglu_limit, quantized=False, y_exper
     bm, _, bk = _pe_blocks(M, K, tiles=3, device=x.device)
     bn = 32  # whole quantization blocks per program
     ks = _narrow_ksplit(I, bn, K, bk, x.device)
+    h = torch.empty(M, I, dtype=torch.bfloat16, device=x.device)
     limit = float(swiglu_limit) if swiglu_limit > 0 else float("inf")
-    tiles = triton.cdiv(I, bn)
-    if ks > 1:
-        # one allocation: the fp32 partials [ks, 2, M, I] followed by the bf16 result [M, I]; the last program of
-        # each row tile to arrive sums the partials and writes the result (no second launch)
-        scratch = torch.empty(ks * 2 * M * I * 4 + M * I * 2, dtype=torch.uint8, device=x.device)
-        parts = scratch[:ks * 2 * M * I * 4].view(torch.float32).view(ks, 2, M, I)
-        h = scratch[ks * 2 * M * I * 4:].view(torch.bfloat16).view(M, I)
-        counters = _fp4_counters(x.device, tiles)
-    else:
-        h = torch.empty(M, I, dtype=torch.bfloat16, device=x.device)
-        parts, counters = h, h
     if M:
         kernel, ctx = _launcher(_dual_gemv_swiglu_kernel, x.device, traced)
+        parts = torch.empty(ks, 2, M, I, dtype=torch.float32, device=x.device) if ks > 1 else h
         with ctx:
-            kernel[(tiles, ks)](xq, w1.contiguous(), s1.contiguous().view(torch.uint8), w3.contiguous(),
-                                s3.contiguous().view(torch.uint8), parts, counters, M, I, K, s1.shape[1], limit,
-                                BM=bm, BN=bn, BK=bk, KSPLIT=ks, LAST=ks > 1)
+            kernel[(triton.cdiv(I, bn), ks)](xq, w1.contiguous(), s1.contiguous().view(torch.uint8), w3.contiguous(),
+                                            s3.contiguous().view(torch.uint8), parts, M, I, K, s1.shape[1], limit,
+                                            BM=bm, BN=bn, BK=bk, KSPLIT=ks)
+        if ks > 1:  # the epilogue over the partial sums
+            epi, ctx = _launcher(_swiglu_rows_kernel, x.device, traced)
+            with ctx:
+                epi[(M, triton.cdiv(I, 256))](parts, h, M, I, limit, KSUM=ks, BN=256)
     if residual is not None:
         HC = residual.shape[-2]
         out = gemv_rows(h, w2, s2, traced=traced, hc=(residual.reshape(M, HC, K), post.reshape(M, HC),
