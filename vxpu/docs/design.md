@@ -472,7 +472,7 @@ pod at a time; measured):**
 
 | rows | one prompt | same prompt per row | different prompts |
 |---|---|---|---|
-| 1 | 14.0 ms, 67 tok/s | | |
+| 1 | 14.0 ms, 67 tok/s (13.7 with the second round's parallel branch) | | |
 | 1 + drafter, 4 drafts verified | 27.0 ms, 2.67 tokens a step, 92 tok/s | | |
 | 9 | 23.2 ms | 19.0 ms, 447 tok/s | 36.9 ms, 246 tok/s |
 | 8 + drafter, 4 drafts | 59.9 ms | 44.7 ms, 505 tok/s | 101 ms, 172 tok/s |
@@ -492,9 +492,32 @@ tok/s) / 99.6, the drafter 28.9 to 29.9 ms at one row and 45.2 ms at
 eight; the drafter's step varies by 2 to 3 ms between runs, its host
 work.
 
+A second round added two things to that table. The lowering traces each
+fused body on the GPU of the segment it lands in (it traced on whichever
+GPU was current and baked that index into the body's factories, which
+killed sharded steps whenever a fused body was picked for a segment on
+another GPU), and the compiled packages' key names the kernel source,
+which closes the engram projection's stale-package symptom (#490). And
+the attention's two projections are cut into their own nodes and run on
+a parallel branch of the step graph: one row 14.0 to 13.7 ms (on/off
+back to back: 14.0 / 13.7; 9 rows 23.2 / 22.9, 19.0 / 18.7, 36.9 /
+36.7), the first overlap the step has had, at the cost of 160 more
+compiled segments and about two minutes more load. The shared expert
+cannot join the branch yet: its op takes the routed experts' sum for
+its epilogue, so it must split into the gate/up projections (beside the
+experts) and the down projection with the epilogue (after), an op and
+fork change. Hero 8's one-row number is therefore 13.7 ms, 1.54 times
+the floor.
+
 The acceptance asked for 11.5 ms and a layer of about a dozen kernels.
-Hero 8 reached 14.0 ms and 21 kernels a layer, so it did not meet it,
-and the gap has names. What landed: four op boundaries in the fork (the
+Hero 8 reached 13.7 ms and 21 kernels a layer, so it did not meet it,
+and the gap has names. One more thing the night established: on these
+pods, step times of a fresh process sometimes read flat 30 or 60 ms for
+one prompt's run (14 ms of GPU work; the next prompt clean), on either
+pod, with islands on or off, with no other process on the GPUs; the page
+cache was one cause and is handled, and the rest is not understood. A
+serving process would see it too, so it is a bug to find, not only a
+measurement hazard. What landed: four op boundaries in the fork (the
 attention input quantized once, the rotary table indexed inside the
 kernels, the hyper-connection post-mix as the last GEMV's epilogue, the
 sparse attention forming its selection and finishing the output path
