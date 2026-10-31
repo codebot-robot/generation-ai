@@ -434,6 +434,59 @@ and it is untestable without a GPU. The change:
   enumerable choice the planner makes from measurements, not an op a
   person writes.
 
+**The planner's contract (hero run 8, first cut).** What is data, what
+is code, and what runs where:
+- *The kernel table* (`vxpu-kernel-table/1`) is what the planner hands
+  an engine: the GPU it is for, the kernels' knobs, and per call site the
+  implementation body to run. A site is the module that calls the op in
+  the exported graph (`model.layers.14.engram.wkv`), which is the same
+  across exports of one model; an entry may instead name the op at a
+  shape key (the engine's own, `1x6144->25600` for an fp8 linear) or the
+  op alone, and the engine takes the most specific entry that matches.
+  The knobs are the numbers `triton_ops` set by hand (`GEMV_ROWS_MAX`,
+  `FP4_DIRECT_MAX`, the fronts' chunk and group sizes, the fp4 bodies'
+  overrides), typed and checked. `VXPU_PLAN_TABLE` (a file, or inline
+  from the coordinator with the load) makes the engine apply the table
+  exactly: the dispatch and the lowering return the named body, nothing
+  is measured, and a body that cannot run at a site the lowering reaches
+  is an error, not a fallback.
+- *The kernel record* (`vxpu-kernel-record/1`) is what the engine writes
+  (`VXPU_PLAN_RECORD`): the hardware, the choices, the knobs in effect,
+  and per call site the candidates, which of them the compiler fuses,
+  the microseconds measured, the body chosen and why (the table, a
+  measurement, the registry's order, or kept and what kept it), and the
+  kernels inlined for it as the traced graph names them (empty for a
+  fused body: the compiler's kernels). Per-step statistics go in the same
+  file by name (`Plan.stat`): kernels a step, crossings, the distinct
+  experts a layer, and `sweeps` of a knob where a run swept one.
+- *The planner* (`pkg/kernelplan`, Go; `vxpu kernels plan`) reads
+  records of one GPU and writes the table: per (op, shapes) the
+  measured-fastest body, a launch credited to a fused one as the engine's
+  own costing does, named per site where the record ran different bodies
+  at one shape; the native-format knobs from the card's compute
+  capability (fp4 on the tensor cores from Blackwell on); the other knobs
+  from the record's sweeps, else as the record ran. It is a function of
+  the record, unit-tested on fixture records with no GPU, so a costlier
+  policy (regions costed whole, the graph cut here) replaces the function
+  behind the same table.
+- *The check*: `vxpu kernels check` and `python -m vxpu.plan
+  --check-record` compare a run's record against its table, and every
+  site that ran another body is listed; `python -m vxpu.plan
+  --profile-step` runs a step under the CUDA profiler on the engine's GPU
+  and reports what launched next to the table, flagging compiler-fused
+  kernels heavier than 50 µs where no site chose a fused body. Issue
+  #490 is the live case for the first check: the engram layers'
+  `fp8_linear` sites measured and chose the GEMV and the step ran the
+  fused body. The graph these artifacts export calls `vxpu.fp8_linear`
+  at both sites and the lowering records the GEMV for all ten; where the
+  fused body enters is still open, so the check runs with the table on
+  the hero machine as the acceptance for that bug.
+Of hero 8's acceptance items, the table and record drive the per-site
+body choices, the knobs, and the report that the choices were applied;
+the op boundaries, the step graph's branches and the crossings are the
+other workstreams' and the planner takes their measurements through the
+same record.
+
 **The roofline, and the production stacks.** A decode step at one row
 reads every dense weight once and the selected experts once, so its floor
 on one GPU is those bytes over the GPU's copy bandwidth. On an RTX PRO
