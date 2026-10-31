@@ -411,6 +411,33 @@ Python side and deferred the fork's boundaries each time, and estimated
 small kernels at zero when they cost about 2 µs each. Hero 8 does not
 get to do that again.
 
+**Hero 8, first measurements (Oct 31, night).** The planner's round trip
+works on the real model: `vxpu kernels plan` read the record of a one-row
+step (307 sites) and wrote a table of 13 entries plus the knobs; a step
+run with that table applied measured 14.5 ms (p10/p90 14/16), its record
+checked against the table reports 0 sites that ran another body, and the
+profiling check found no heavy compiler-fused kernel: the engram
+projection's 154 µs reductions (#490) are gone when the choice is given
+explicitly, so the default path loses a choice the table path honours.
+The step graph's crossings went from 23 flags to 3 and one row from
+15.3 to 14.5 ms; the step is a chain at the node level (85 of 85 nodes
+on the critical path), so parallel branches need the planner to cut the
+shared expert and the attention's narrow projections into their own
+nodes before they buy anything. The distinct experts a step are now
+measured (one row 6.0 a layer; 33 different prompts 90 to 113 a layer,
+depending on the prompts and steps): the 33-different-prompt step reads
+about 70 to 85 GB of experts, and its per-kernel profile shows the
+grouped expert kernels at their bytes (1,024 + 459 µs a layer for about
+2.1 GB), the dense multiplications at 33 rows at about 60% of bandwidth
+(33 µs a launch against 21 at one row: the software MXFP8 conversion,
+hero 9's item), and 3.4 ms of GPU-to-GPU copies carrying 33 rows' state
+across the range boundaries. The drafter at shorter verify blocks does
+not shorten the step: 3 tokens a step 29.9 ms at 2.21 tokens, 4 tokens
+30.0 ms at 2.37, 6 tokens 29.2 ms at 2.46 (so 6 stays); 5 tokens a step
+is broken at 210 ms flat, a bug to find. The engine now releases the
+checkpoint files' page cache after loading on the pods too, which ends
+the mid-step faults that contaminated three matrices.
+
 **Direction: the planner chooses the kernels, in Go (hero run 8).** Today
 two planners exist and the split is the wrong one. The coordinator's
 planner (Go) decides placement, which machines and GPUs run which layers
