@@ -197,6 +197,15 @@ def _slot_maps(entry):
 
 
 TOP_CANDIDATES = 1024  # the tokens top-k and top-p choose among
+_seeds = {}  # device -> the sampler's seed counter (ops.choose_argmax), stepped by every choose
+
+
+def _seed(device):
+    if device.type == "cuda" and device.index is None:  # "cuda" and "cuda:0" are one key
+        device = torch.device("cuda", torch.cuda.current_device())
+    if device not in _seeds:
+        _seeds[device] = torch.randint(0, 2 ** 31, (1,), dtype=torch.int64, device=device)
+    return _seeds[device]
 
 
 def choose(logits, temperature, top_k, top_p):
@@ -206,13 +215,16 @@ def choose(logits, temperature, top_k, top_p):
     vocabulary, or with top_k > 0 or top_p < 1 over the TOP_CANDIDATES most likely tokens kept by
     top-k (the k most likely) and then top-p (the most likely, until their mass reaches top_p), as
     transformers' processors keep them. Returns [rows, tokens] int64."""
-    greedy = logits.argmax(-1)
-    scaled = logits / temperature.clamp_min(1e-5).view(-1, 1, 1)
-
+    from . import ops
+    seed = _seed(logits.device)
+    seed.add_(1)  # in the graph: every replay draws fresh noise
+    greedy, full = ops.choose_argmax(logits, temperature, seed)  # argmax, and Gumbel-max over the whole vocabulary
     def gumbel(like):
         return -torch.log(-torch.log(torch.rand_like(like).clamp_(min=1e-20)))
-    full = (scaled + gumbel(scaled)).argmax(-1)
-    vals, idx = scaled.topk(min(TOP_CANDIDATES, scaled.shape[-1]), dim=-1)  # most likely first
+    # the candidates from the logits as stored (bf16: half the radix passes of the fp32 scaled
+    # values), scaled after: a positive temperature keeps their order, and the values are the same
+    vals, idx = logits.topk(min(TOP_CANDIDATES, logits.shape[-1]), dim=-1)  # most likely first
+    vals = vals / temperature.clamp_min(1e-5).view(-1, 1, 1)
     ranks = torch.arange(vals.shape[-1], device=vals.device)
     k = top_k.view(-1, 1, 1)
     vals = vals.masked_fill((k > 0) & (ranks >= k), float("-inf"))
@@ -344,6 +356,7 @@ class StepGraph(torch.nn.Module):
         logits = out[0] if isinstance(out, (tuple, list)) and len(out) == 1 else out
         if not (isinstance(logits, torch.Tensor) and logits.dim() == 3 and logits.is_cuda):
             return
+        _seed(logits.device)  # made before the compile: a first call that makes it guards on its absence
         self._choose = torch.compile(choose, dynamic=False)
         rows = logits.shape[0]
         self._choose(logits, torch.zeros(rows, device=logits.device),

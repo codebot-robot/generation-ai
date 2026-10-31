@@ -1107,6 +1107,46 @@ def _sparse_attn_reference(q, kv, attn_sink, topk_idxs, softmax_scale):
     return ka.sparse_attn(q, kv, attn_sink, topk_idxs, softmax_scale)
 
 
+@custom_op("vxpu::choose_argmax", mutates_args=())  # pure tensor work: capturable
+def choose_argmax(logits: torch.Tensor, temperature: torch.Tensor, seed: torch.Tensor
+                  ) -> tuple[torch.Tensor, torch.Tensor]:
+    """The sampler's two argmaxes over logits [rows, tokens, vocab] (stepgraph.choose): the greedy
+    choice (the first largest logit) and the Gumbel-max sample of softmax(logits / temperature
+    [rows]), with fresh noise each call from seed (a one-element int64 tensor the caller steps).
+    Both [rows, tokens] int64. One kernel on a GPU where the compiler's version was a 100 us
+    reduction over the vocabulary with the random draw; plain tensor operations elsewhere."""
+    impl = select("vxpu::choose_argmax", logits, temperature, seed)
+    return impl.fn(logits, temperature, seed)
+
+
+@choose_argmax.register_fake
+def _(logits, temperature, seed):
+    rows, toks, _ = logits.shape
+    return logits.new_empty((rows, toks), dtype=torch.int64), logits.new_empty((rows, toks), dtype=torch.int64)
+
+
+def _choose_argmax_context(logits, temperature, seed):
+    rows, toks, vocab = logits.shape
+    return logits.device.type, f"positions={rows * toks} vocab={vocab}", {"positions": rows * toks}
+
+
+@implementation("vxpu::choose_argmax", "gpu-triton", ("cuda",), "rounding",
+                "Triton: a program per position streams its logits once for both argmaxes, the noise drawn in the "
+                "kernel (Philox from the step's seed)",
+                applies=lambda plan, **_: plan["triton"], lowerable=True)
+def _choose_argmax_triton(logits, temperature, seed, tk=triton_ops):
+    return tk.choose_argmax(logits, temperature, seed)
+
+
+@implementation("vxpu::choose_argmax", "reference", ("cpu", "cuda"), "bit-identical",
+                "torch: argmax, and argmax of the scaled logits plus Gumbel noise from rand_like", reference=True)
+def _choose_argmax_reference(logits, temperature, seed):
+    greedy = logits.argmax(-1)
+    scaled = logits.float() / temperature.clamp_min(1e-5).view(-1, 1, 1)
+    noise = -torch.log(-torch.log(torch.rand_like(scaled).clamp_(min=1e-20)))
+    return greedy, (scaled + noise).argmax(-1)
+
+
 @custom_op("vxpu::hc_front", mutates_args=())  # pure tensor work: capturable
 def hc_front(stream: torch.Tensor, pre_mix: torch.Tensor, hc_fn: torch.Tensor, hc_scale: torch.Tensor,
              hc_base: torch.Tensor, hc_mult: int, sinkhorn_iters: int, hc_eps: float, norm_weight: torch.Tensor,
@@ -1374,6 +1414,7 @@ SELECTION = {
     "vxpu::hc_sinkhorn": _sinkhorn_context,
     "vxpu::ffn_front": _ffn_front_context,
     "vxpu::sparse_attn": _sparse_attn_context,
+    "vxpu::choose_argmax": _choose_argmax_context,
     "vxpu::hc_front": _hc_front_context,
     "vxpu::head_linear": _head_context,
     "vxpu::rotary": _rotary_context,
