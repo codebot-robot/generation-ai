@@ -797,8 +797,13 @@ def _hc_post_reference(x, residual, post, comb):
 
 def _freqs_at(freqs_table, start, seqlen):
     """The complex frequencies of every token of the step, [b, seqlen, D]: token t of row b at
-    position start[b] + t (the fork's freqs_cis[_positions(...)], per row)."""
-    positions = start.reshape(-1, 1) + torch.arange(seqlen, device=start.device)
+    position start[b] + t (the fork's freqs_cis[_positions(...)], per row). The arange names
+    "cuda" without an index on a GPU: the fused bodies are traced into a segment's graph by the
+    lowering on whatever GPU is current, and a segment runs with its own GPU current (dataflow),
+    so an indexed device baked here put the positions on cuda:0 for a segment on cuda:1 (the
+    9-row step died there; one row had taken the Triton body)."""
+    device = "cuda" if start.is_cuda else start.device
+    positions = start.reshape(-1, 1) + torch.arange(seqlen, device=device)
     return freqs_table[positions]
 
 
@@ -1221,6 +1226,64 @@ def _attn_core_reference(q, kv, attn_sink, topk_idxs, softmax_scale, freqs_table
     return ka.act_quant(o, ds.fp8_block_size, ds.scale_fmt, ds.scale_dtype, True)
 
 
+@custom_op("vxpu::attn_select", mutates_args=())  # pure tensor work: capturable
+def attn_select(q: torch.Tensor, kv_window: torch.Tensor, kv_compress: torch.Tensor, attn_sink: torch.Tensor,
+                compress_idxs: torch.Tensor, softmax_scale: float, freqs_table: torch.Tensor, start: torch.Tensor,
+                seqlen: int, rope_dim: int, window: int, prefill: bool) -> torch.Tensor:
+    """vxpu::attn_core over the attention's two caches, the selection formed inside: the window
+    ring kv_window [b, slots, d] (every slot a candidate: the fork's get_window_topk_idxs decides
+    which hold positions the query sees, from the rows' positions start [b] + t and the window
+    size; a prefill sees its causal window) and the compressed cache kv_compress [b, n2, d] at
+    compress_idxs [b, s, t2] (indices into kv_compress, -1 for none; n2 and t2 may be 0 for a layer
+    without compression).
+    The model then builds neither the window's ids nor the concatenated KV and ids before the
+    attention: two launches fewer a layer on a GPU. The output comes finished as attn_core's."""
+    impl = select("vxpu::attn_select", q, kv_window, kv_compress, attn_sink, compress_idxs, softmax_scale, freqs_table,
+                  start, seqlen, rope_dim, window, prefill)
+    return impl.fn(q, kv_window, kv_compress, attn_sink, compress_idxs, softmax_scale, freqs_table, start, seqlen,
+                   rope_dim, window, prefill)
+
+
+@attn_select.register_fake
+def _(q, kv_window, kv_compress, attn_sink, compress_idxs, softmax_scale, freqs_table, start, seqlen, rope_dim, window,
+      prefill):
+    return q.new_empty(q.shape)
+
+
+def _attn_select_context(q, kv_window, kv_compress, attn_sink, compress_idxs, softmax_scale, freqs_table, start,
+                         seqlen, rope_dim, window, prefill):
+    b, m, h, d = q.shape
+    t = kv_window.shape[1] + compress_idxs.shape[-1]
+    return q.device.type, f"queries={b * m} heads={h} d={d} t={t}", {
+        "queries": b * m, "heads": h, "d": d, "t": t, "prefill": prefill}
+
+
+@implementation("vxpu::attn_select", "gpu-triton", ("cuda",), "rounding",
+                "attn_core's two kernels reading the window ring and the compressed cache, the window's selection "
+                "formed in the first from the rows' positions (a decode step's form)",
+                applies=lambda plan, d=0, heads=0, prefill=False, **_: plan["triton"] and d in (64, 128, 256, 512)
+                and heads % 16 == 0 and not prefill, lowerable=True)
+def _attn_select_triton(q, kv_window, kv_compress, attn_sink, compress_idxs, softmax_scale, freqs_table, start, seqlen,
+                        rope_dim, window, prefill, tk=triton_ops):
+    return tk.attn_select(q, kv_window, kv_compress, attn_sink, compress_idxs, softmax_scale, _freqs_real(freqs_table),
+                          start, seqlen, rope_dim, window)
+
+
+@implementation("vxpu::attn_select", "reference", ("cpu", "cuda"), "bit-identical",
+                "the fork's get_window_topk_idxs, the concatenations, aten sparse_attn, apply_rotary_emb inverse and "
+                "act_quant", reference=True)
+def _attn_select_reference(q, kv_window, kv_compress, attn_sink, compress_idxs, softmax_scale, freqs_table, start,
+                           seqlen, rope_dim, window, prefill):
+    ds, ka = _fork_kernels()
+    b, s_ = q.shape[:2]
+    slots = kv_window.shape[1]
+    window_idxs = ds.get_window_topk_idxs(window, slots, b, s_, 0 if prefill else start, q.device)
+    kv = torch.cat([kv_window, kv_compress], dim=1)
+    # the compressed selection indexes the compressed cache; in the concatenation it sits after the slots
+    idxs = torch.cat([window_idxs, torch.where(compress_idxs >= 0, compress_idxs + slots, compress_idxs)], dim=-1)
+    return _attn_core_reference(q, kv, attn_sink, idxs, softmax_scale, freqs_table, start, seqlen, rope_dim)
+
+
 @custom_op("vxpu::choose_argmax", mutates_args=())  # pure tensor work: capturable
 def choose_argmax(logits: torch.Tensor, temperature: torch.Tensor, seed: torch.Tensor
                   ) -> tuple[torch.Tensor, torch.Tensor]:
@@ -1544,6 +1607,7 @@ SELECTION = {
     "vxpu::window_kv": _window_kv_context,
     "vxpu::attn_out": _attn_out_context,
     "vxpu::attn_core": _attn_core_context,
+    "vxpu::attn_select": _attn_select_context,
 }
 CALL = {"vxpu::head_linear": _call_head}
 
