@@ -286,15 +286,26 @@ compiler-fused reductions at 154 µs each, the greedy sampler at 100 µs
 with a random draw it does not need, and nine top-k gathers of 11.5 µs
 (the indexer's, #484).
 
-Batched rows, sharded, with the native expert body (the same session;
-measured; "same" is one prompt in every row, "different" a prompt per
-row):
+Batched rows and the drafter, sharded, the merged 7(b) code, the
+drafter's stages on the last GPU (Oct 31; measured; "same" is one
+prompt in every row, "different" a prompt per row; the native-experts
+numbers before the merge in parentheses):
 
 | rows | one prompt | same prompt per row | different prompts |
 |---|---|---|---|
-| 1 | 18.2 ms | | |
-| 9 | 26.1 ms | 23.1 ms, 366 tok/s | 41.4 ms, 216 tok/s |
-| 33 | 42.6 ms | 44.4 ms, 722 tok/s | 120 ms, 282 tok/s |
+| 1 | 15.4 ms (18.2) | | |
+| 1 + drafter | 29.9 ms, 37 of 130 drafts accepted, 2.46 tokens a step, 82 tok/s (31.0) | | |
+| 9 | 34.1 ms (26.1) | 33.9 ms, 258 tok/s (23.1 ms, 366) | 40.4 ms, 216 tok/s (41.4) |
+| 33 | 40.5 ms (42.6) | 39.8 ms, 828 tok/s (44.4 ms, 722) | 120 ms, 284 tok/s (120) |
+| 8 + drafter | 91.8 ms, 2.78 tokens a step | 107 ms, 73 of 2,155 accepted, rows differ | 152 ms |
+
+Two of these are open. Nine rows got slower in the merge, from 26 to 34
+ms with one prompt, while one row and 33 rows got faster: the per-kernel
+profile at nine rows will say which of the merged bodies it is. And eight
+rows with the drafter and the same prompt in every row still collapse
+(73 of 2,155 drafts, the rows' tokens differ) where eight rows with one
+prompt accept 2.78 tokens a step and nine plain rows are token-identical:
+a row-mixing bug in the batched draft path, under investigation.
 
 The floor with different prompts depends on how many distinct experts
 the rows select a layer, which is not measured yet: at most 198 for 33
