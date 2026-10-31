@@ -177,6 +177,13 @@ class Packages:
         self.expected = expected  # segments that will ask: the summary is printed when all have
         self.built = self.loaded = 0
         self.build_s = 0.0
+        # the key names the kernel source too: a lowered segment's canonical code renders a
+        # vxpu_triton.* node the same whatever the kernel behind it became, and a package built
+        # from an older kernel source (or an older lowering choice at the same graph) was served
+        # for the engram layers' projections (#490: the compiler-fused reduction ran where the
+        # GEMV had been chosen)
+        from . import lower
+        self.extra = f" kernels={lower.kernel_digest()}"
 
     def get(self, sub, args, extra="", code=None):
         """The segment's package, loaded (built first if not cached)."""
@@ -193,7 +200,7 @@ class Packages:
         """The segment's package file, built first if not cached."""
         import torch._inductor.config as inductor_config
         with inductor_config.patch(deterministic=True):
-            return self._path(sub, args, extra + repr(dynamic_shapes), code, dynamic_shapes)
+            return self._path(sub, args, extra + getattr(self, "extra", "") + repr(dynamic_shapes), code, dynamic_shapes)
 
     def _path(self, sub, args, extra, code, dynamic_shapes=None):
         path = os.path.join(self.cache_dir, cache_key(sub, args, extra, code) + ".pt2")

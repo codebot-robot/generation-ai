@@ -253,6 +253,12 @@ def _segment_devices(gm, layer_device):
 _keyed_cache_dir = None
 
 
+def kernel_digest():
+    """A digest of the Triton kernels' source: what the compiled packages and inductor's caches
+    are keyed by, so a changed kernel is never served from an older compilation."""
+    return hashlib.sha256(inspect.getsource(triton_ops).encode()).hexdigest()[:16]
+
+
 def key_cache_dir():
     """Point inductor's on-disk caches at a directory keyed by the Triton
     kernels' source. A lowered graph embeds the kernels, and inductor's
@@ -263,7 +269,7 @@ def key_cache_dir():
     global _keyed_cache_dir
     if _keyed_cache_dir is None:
         from torch._inductor.runtime.cache_dir_utils import default_cache_dir
-        digest = hashlib.sha256(inspect.getsource(triton_ops).encode()).hexdigest()[:16]
+        digest = kernel_digest()
         base = os.environ.get("TORCHINDUCTOR_CACHE_DIR") or default_cache_dir()
         _keyed_cache_dir = os.path.join(os.path.abspath(base), f"vxpu-kernels-{digest}")
         os.environ["TORCHINDUCTOR_CACHE_DIR"] = _keyed_cache_dir
