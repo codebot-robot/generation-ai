@@ -643,6 +643,12 @@ class Engine:
                     weight, scale = item
                     self.external.engram[int(layer)] = ds.host_engram(
                         int(layer), spec["num_embeddings"], spec["dim"], weight, scale)
+                    # the tables are read every step: their pages come in now, not lookup by lookup
+                    took = [rehydrate.populate(t) for t in (weight, scale)]
+                    if all(x is not None for x in took):
+                        print(f"[vxpu] n-gram table of layer {layer} resident: "
+                              f"{(weight.numel() * weight.element_size() + scale.numel() * scale.element_size()) / 1e9:.1f} GB "
+                              f"in {sum(took):.1f} s", flush=True)
                 ops.ENGRAM_DIM[int(layer)] = spec["dim"]
             if has_file_tables:
                 k = kernels.load()

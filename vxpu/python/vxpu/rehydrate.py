@@ -515,3 +515,32 @@ def share_state(src_module, dst_module, state_fqns):
                 dst_parent._buffers[name] = src[fqn]
                 shared += 1
     return shared
+
+
+def populate(tensor):
+    """Fault every page of a tensor's storage in now (madvise MADV_POPULATE_READ, Linux 5.14
+    and later), so a table the engine reads every step does not page itself in from disk one
+    lookup at a time. A file-backed n-gram table on a network disk (two 92 GB tables on a
+    Hyperdisk) cost a decode step tens to hundreds of milliseconds while its rows faulted in,
+    in random reads of about a millisecond each, and runs whose prompts touched cold rows read
+    flat 30 or 60 ms medians where warm ones read 25. Returns the seconds it took, or None where
+    the call is unavailable (macOS, an older kernel: the pages then arrive on demand as before)."""
+    import ctypes
+    import mmap
+    import sys
+    import time
+    if not sys.platform.startswith("linux"):
+        return None
+    storage = tensor.untyped_storage()
+    addr, nbytes = storage.data_ptr(), storage.nbytes()
+    if nbytes == 0:
+        return 0.0
+    page = mmap.PAGESIZE
+    start = addr - addr % page
+    length = nbytes + (addr - start)
+    libc = ctypes.CDLL("libc.so.6", use_errno=True)
+    libc.madvise.argtypes = (ctypes.c_void_p, ctypes.c_size_t, ctypes.c_int)
+    t0 = time.time()
+    if libc.madvise(start, length, 22) != 0:  # MADV_POPULATE_READ
+        return None
+    return time.time() - t0
