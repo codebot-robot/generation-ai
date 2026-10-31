@@ -284,7 +284,16 @@ ms, not 10.3. Hero 7 to here: 20.3 to 15.4 ms, 1.7 times the one-GPU
 floor; the dense GEMVs run at 86% of theirs. Still visible in the profile: two
 compiler-fused reductions at 154 µs each, the greedy sampler at 100 µs
 with a random draw it does not need, and nine top-k gathers of 11.5 µs
-(the indexer's, #484).
+(the indexer's, #484). The sampler became its own op (171 to 55 µs for
+the choice). The two reductions are the engram layers' fp8 projection
+([25600, 6144], 157 MB) running the compiler-fused body although the
+lowering measured and chose the GEMV kernel for that site (112 against
+150 µs): with `fp8_linear` taken out of the fusion list the two kernels
+vanish and the step's GPU time drops by 0.17 ms (14.17 to 14.00; the
+median step is unchanged within noise). So the per-site choice is lost
+for sites inside those segments, most likely a package cache key that
+does not carry the choice: a lowering bug to fix, since a planner whose
+choices are not applied is no planner.
 
 Batched rows and the drafter, sharded, the merged 7(b) code, the
 drafter's stages on the last GPU (Oct 31; measured; "same" is one
