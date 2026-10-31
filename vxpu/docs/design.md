@@ -267,7 +267,17 @@ prologue costs 7 to 10 µs at one row (every program redoes it on the
 padded tile); quantization belongs in the producer's epilogue. The
 expert kernels' tail stays: the loads alone reach 1,400 GB/s, the dot
 with one live row in a 16-row tile adds 18 µs, and no tile shape moves
-it. [combined step: pending]
+it. The merged step, one row, sharded, the drafter's stages on the last
+GPU (measured): 15.4 ms median (p10/p90 15/25), 1,422 kernels a step
+(hero 7: 1,742), 14.2 ms of GPU time in 15.2 ms of wall; by part: dense
+GEMVs 6.8 ms, experts 4.5 (floor 3.1), fronts 0.8 (floor 0.2), the rest
+2.1. The dense GEMVs came in under the 7.2 ms written above as their
+floor, so that number was an overestimate of the dense bytes and is to
+be recomputed from the weights the step reads. Hero 7 to here: 20.3 to
+15.4 ms, 1.5 times the one-GPU floor. Still visible in the profile: two
+compiler-fused reductions at 154 µs each, the greedy sampler at 100 µs
+with a random draw it does not need, and nine top-k gathers of 11.5 µs
+(the indexer's, #484).
 
 Batched rows, sharded, with the native expert body (the same session;
 measured; "same" is one prompt in every row, "different" a prompt per
