@@ -1065,7 +1065,7 @@ class Engine:
         self._decode_split = runner
         if self.plan["step_graph"]:
             from .stepgraph import StepGraph
-            self._decode_split = StepGraph(runner)
+            self._decode_split = StepGraph(runner, plan=self.plan)
             draft = self._draft_run
             if draft is not None and hasattr(draft, "split") and not self.plan["layer_range"]:
                 # the drafter's step too, so the native loop runs a speculative step with no Python
@@ -1076,7 +1076,7 @@ class Engine:
                     draft_runner.place(self._host_placement(draft_runner.graph, "draft"))
                     ddevices = collections.Counter(str(d) for d in draft_runner._devices.values())
                     print(f"[vxpu] layer sharding: draft nodes by GPU {dict(ddevices)}", flush=True)
-                self._draft_run = StepGraph(draft_runner)
+                self._draft_run = StepGraph(draft_runner, plan=self.plan, role="draft")
         self._segment_info = segment_info(self._decode_split.split)
         self._decode_run = self._decode_split
         msg = runner.graph.describe() + (", the step one CUDA graph" if self.plan["step_graph"] else "")

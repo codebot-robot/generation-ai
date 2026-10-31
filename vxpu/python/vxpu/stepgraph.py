@@ -68,6 +68,7 @@ node-by-node run can take, are left out.
 """
 
 import collections
+import os
 import ctypes
 import gc
 import weakref
@@ -78,6 +79,10 @@ from . import dataflow, kernels, nodes, triton_ops
 
 CU_STREAM_WAIT_VALUE_EQ = 0x1
 CU_STREAM_WRITE_VALUE_DEFAULT = 0x0  # with a system-wide memory fence before the write
+
+
+EXPERT_STATS = os.environ.get("VXPU_EXPERT_STATS", "") == "1"  # count the distinct experts a step (measurement)
+EXPERT_STATS_LAYERS, EXPERT_STATS_EXPERTS = 64, 1024  # slots for layers and expert ids
 
 
 class _Driver:
@@ -260,9 +265,11 @@ def _check_flat(inputs, out, what):
 class StepGraph(torch.nn.Module):
     """A dataflow runner's step as one CUDA graph (module docstring)."""
 
-    def __init__(self, runner):
+    def __init__(self, runner, plan=None, role="decode"):
         super().__init__()
         self.runner = runner  # dataflow.Runner over a split whose dense segments are aoti.GraphedSegment
+        self.plan = plan  # the engine's plan: the step's statistics go into its record (plan.stat)
+        self.role = role  # "decode" or "draft": the draft's statistics are prefixed
         self.split = runner.split
         self.vxpu_segments = runner.vxpu_segments
         self.graph = None
@@ -273,6 +280,7 @@ class StepGraph(torch.nn.Module):
         self.steps = 0
         self.recorder = None
         self._host = None
+        self._expert_counts = {}  # per GPU: distinct experts selected, summed per layer (VXPU_EXPERT_STATS)
 
     def set_recorder(self, recorder):
         self.recorder = recorder
@@ -353,8 +361,24 @@ class StepGraph(torch.nn.Module):
         loop.set_sampling(*self._sampling)
         if draft is not None:
             d_inputs, d_out, d_execs, d_streams, d_devices, d_host, d_flags = draft.native_parts()
+            # the drafter's tokens into this step's input ids on the GPU: a graph of one copy per
+            # row (ids[i, 1:S] <- out[i, :S-1], contiguous slices, across GPUs if the drafter
+            # lives on another), run by the loop on the verify's stream after an event on the
+            # drafter's; the drafts reach the host only after the verify, for the acceptance.
+            # Before this the loop synchronized after the drafter's graphs, copied the drafts to
+            # the host, wrote the verify's ids and synchronized again: about 3 ms of a 30 ms
+            # speculative step at one row sat in those two round trips.
+            ids = inputs["input_ids"]
+            S = ids.shape[1]
+            driver = _Driver()
+            compose = torch.cuda.CUDAGraph()
+            with torch.cuda.device(ids.device), torch.cuda.graph(compose, stream=torch.cuda.Stream(device=ids.device)):
+                stream = torch.cuda.current_stream()
+                for i in range(ids.shape[0]):
+                    driver.memcpy(stream, ids[i, 1:S], d_out[i, :S - 1])
+            self._compose = compose  # the loop holds the exec's handle, not the graph
             loop.set_draft(d_inputs["input_ids"], d_inputs["cache_position"], d_out, d_execs, d_streams, d_devices,
-                           d_host, d_flags)
+                           d_host, d_flags, compose=compose.raw_cuda_graph_exec())
         loop.start()
         return loop
 
@@ -472,6 +496,8 @@ class StepGraph(torch.nn.Module):
 
         mailboxes = []  # per host node: (node, pinned inputs, kwargs, outbox, flag offset, pooled)
         sides = {d: torch.cuda.Stream(device=d) for d in devs}  # a GPU's pools' kernels, forked and joined back
+        if EXPERT_STATS:  # the distinct-expert counters, allocated before any capture (see _count_experts)
+            self._expert_counts = {d: torch.zeros(EXPERT_STATS_LAYERS, dtype=torch.int64, device=d) for d in devs}
         answers = self._answers(host_nodes, boxes, pooled, external)  # before any capture: builds packages
         self._warm(pooled, runner, inputs, node_dev)
         torch.cuda.synchronize()
@@ -586,16 +612,57 @@ class StepGraph(torch.nn.Module):
         from . import aoti
         events = []  # per host node: (sent, back), timing events recorded in the graph
         self._gpu_only = 0  # experts nodes answered by GPU pools alone, with no host crossing
-        # a flag per value crossing GPUs, in the reader's memory; one per GPU for the step's inputs;
-        # one on the engine's GPU for the chosen tokens coming back
-        xflags = {}
+
+        def reader_dev(node, d2):
+            return node_dev.get(node.name) if d2.type != "cuda" else (torch.device("cuda", dev.index) if d2.index is None else d2)
+
+        # The values crossing GPUs, grouped into waves: one flag per (producer GPU, reader GPU,
+        # wave), in the reader's memory, written after the wave's last value is copied and
+        # waited on once by the reader's first node that needs any of them. A wave ends when
+        # the producer GPU itself waits on a flag (whatever it produces after that could depend
+        # on the reader's progress, so it gets a flag of its own). The layer-sharded step is a
+        # chain, so a boundary between two ranges is one flag, however many values cross it
+        # (seven to eight), and the step's inputs ride the same ordering: a GPU's first wait is
+        # on a flag written after the engine's GPU copied them out.
+        xvalue_wave = {}  # (producer, index, reader GPU) -> wave key (producer GPU, reader GPU, wave)
+        need = collections.defaultdict(list)  # node -> wave keys it waits on (in order)
+        last_producer = {}  # wave key -> the node whose copies end the wave
+        waits = collections.Counter()  # GPU -> flags waited on so far, in step order
+        waited_keys = set()
         for node in graph.nodes:
+            g = node_dev[node.name]
+            for r in dataflow._flat(node.refs()):
+                if isinstance(r, dataflow.Ref) and r.kind == "edge" and node_dev[r.node] != g:
+                    key = xvalue_wave[(r.node, r.index, g)]
+                    if key not in waited_keys:
+                        waited_keys.add(key)
+                        need[node.name].append(key)
+            if need[node.name]:
+                waits[g] += 1
             for index, devices, _ in self.runner._fanout[node.name]:
                 for d2 in devices:
-                    d2 = node_dev.get(node.name) if d2.type != "cuda" else (torch.device("cuda", dev.index) if d2.index is None else d2)
-                    if d2 != node_dev[node.name]:
-                        xflags[(node.name, index, d2)] = torch.zeros(1, dtype=torch.int32, device=d2)
-        in_flags = {d: torch.zeros(1, dtype=torch.int32, device=d) for d in devs[1:]}
+                    d2 = reader_dev(node, d2)
+                    if d2 != g:
+                        key = (g, d2, waits[g])
+                        xvalue_wave[(node.name, index, d2)] = key
+                        last_producer[key] = node.name
+        wflags = {key: torch.zeros(1, dtype=torch.int32, device=key[1]) for key in last_producer}
+        # the step's inputs: a GPU whose first flag comes (transitively) after the engine's GPU
+        # copied them out needs no flag of its own for them
+        first_wait = {}
+        for node in graph.nodes:
+            g = node_dev[node.name]
+            if g not in first_wait:
+                first_wait[g] = need[node.name][0][0] if need[node.name] else None  # the GPU it first waits on
+        covered = {dev: True}
+        for d in devs[1:]:
+            seen, s_ = set(), first_wait.get(d)
+            while s_ is not None and s_ != dev and s_ not in seen:
+                seen.add(s_)
+                s_ = first_wait.get(s_)
+            covered[d] = s_ == dev
+        in_flags = {d: torch.zeros(1, dtype=torch.int32, device=d) for d in devs[1:] if not covered[d]}
+        xflags = wflags  # what _keep holds alive
         out_node = next((r.node for r in dataflow._flat([graph.output]) if isinstance(r, dataflow.Ref) and r.kind == "edge"), None)
         out_dev = node_dev[out_node] if out_node is not None else dev
         if self._sampling is not None and out_dev != dev:  # the choice runs where the logits are
@@ -605,8 +672,10 @@ class StepGraph(torch.nn.Module):
         counts = collections.Counter()
         if len(devs) > 1:  # the step spans GPUs (layer sharding): what crosses, and where the tokens come out
             per = collections.Counter(str(node_dev[n.name]) for n in graph.nodes)
-            print(f"[vxpu] step graph: one CUDA graph per GPU, nodes {dict(per)}, {len(xflags)} crossings "
-                  f"({len(in_copies)} step inputs copied), the chosen tokens read from {out_dev}", flush=True)
+            print(f"[vxpu] step graph: one CUDA graph per GPU, nodes {dict(per)}, {len(xvalue_wave)} values cross "
+                  f"GPUs in {len(wflags)} flags ({len(in_copies)} step inputs copied, {len(in_flags)} input flags), "
+                  f"the chosen tokens read from {out_dev}", flush=True)
+        self.crossings = (len(xvalue_wave), len(wflags), len(in_flags))
         for d in devs:
             g = torch.cuda.CUDAGraph(keep_graph=True)  # kept, to count its nodes (node_counts)
             with torch.cuda.device(d), torch.cuda.graph(g, stream=torch.cuda.Stream(device=d)):
@@ -617,21 +686,18 @@ class StepGraph(torch.nn.Module):
                         for (name, d3), copy in in_copies.items():
                             if d3 == d2:
                                 driver.memcpy(stream, copy, dict(zip(graph.inputs, self._inputs))[name])
-                        driver.write_value(stream, in_flags[d2].data_ptr(), 1)
-                else:
+                        if d2 in in_flags:
+                            driver.write_value(stream, in_flags[d2].data_ptr(), 1)
+                elif d in in_flags:
                     driver.wait_value(stream, in_flags[d].data_ptr(), 1)
                     driver.write_value(stream, in_flags[d].data_ptr(), 0)
-                waited = set()
                 for node in graph.nodes:
                     if node_dev[node.name] != d:
                         continue
-                    for r in dataflow._flat(node.refs()):  # what another GPU makes for this node: wait for it
-                        if isinstance(r, dataflow.Ref) and r.kind == "edge" and node_dev[r.node] != d \
-                                and (r.node, r.index) not in waited:
-                            f = xflags[(r.node, r.index, d)]
-                            driver.wait_value(stream, f.data_ptr(), 1)
-                            driver.write_value(stream, f.data_ptr(), 0)
-                            waited.add((r.node, r.index))
+                    for key in need[node.name]:  # the waves of values other GPUs made for this node
+                        f = wflags[key]
+                        driver.wait_value(stream, f.data_ptr(), 1)
+                        driver.write_value(stream, f.data_ptr(), 0)
                     args_ = [resolve(r, d) for r in node.args]
                     kwargs_ = {k: resolve(r, d) for k, r in node.kwargs.items()}
                     if node.kind == "dense":
@@ -640,16 +706,23 @@ class StepGraph(torch.nn.Module):
                             raise RuntimeError(f"step graph: {node.name} is not a loaded AOTInductor segment")
                         out = module.runner(*args_)
                     else:
+                        if node.kind == "experts" and EXPERT_STATS:
+                            self._count_experts(node, args_, d)
                         out = self._capture_host_node(node, args_, kwargs_, d, stream, side, boxes, pooled, driver,
                                                       flags, flag, F, mailboxes, events)
                     produced[node.name] = out
+                    ended = []
                     for index, devices, _ in self.runner._fanout[node.name]:  # out to readers on other GPUs
                         value = out if index is None else out[index]
                         for d2 in devices:
-                            d2 = node_dev.get(node.name) if d2.type != "cuda" else (torch.device("cuda", dev.index) if d2.index is None else d2)
+                            d2 = reader_dev(node, d2)
                             if d2 != d and isinstance(value, torch.Tensor):
                                 driver.memcpy(stream, self.runner.inboxes[(node.name, index, d2)], value)
-                                driver.write_value(stream, xflags[(node.name, index, d2)].data_ptr(), 1)
+                                key = xvalue_wave[(node.name, index, d2)]
+                                if last_producer[key] == node.name and key not in ended:
+                                    ended.append(key)
+                    for key in ended:  # the wave's last value copied: its flag, after the copies
+                        driver.write_value(stream, wflags[key].data_ptr(), 1)
                 if d == out_dev:
                     output = resolve(graph.output, d)
                     # the native loop reads the output with one flat copy: a strided view (the
@@ -674,6 +747,11 @@ class StepGraph(torch.nn.Module):
             g.instantiate()
             graphs[d] = g
         self.node_counts = dict(counts)
+        # with the expert counters captured, the count includes their kernels (five a layer):
+        # that run's number goes in under its own name, so "kernels" always means the plain step
+        self._stat("kernels_with_expert_stats" if EXPERT_STATS else "kernels", self.node_counts.get("kernels"))
+        self._stat("crossings", {"values": len(xvalue_wave), "flags": len(wflags), "input_flags": len(in_flags),
+                                 "step_inputs_copied": len(in_copies)})
         g = graphs[dev]
         peer_graphs = [(d2, graphs[d2]) for d2 in devs[1:]]
         peer_graphs += [self._capture_peer(pdev, peers.index(pdev), driver, flags, F, host_nodes, boxes, pooled)
@@ -700,6 +778,37 @@ class StepGraph(torch.nn.Module):
         # be reused under the graphs. The Python worker held it through its mailboxes.
         self._keep = (boxes, pooled, mailboxes, xflags, in_flags, in_copies, graphs)
         weakref.finalize(self, host.stop)  # the engine dropped: the thread lets go of the model
+
+    def _count_experts(self, node, args_, d):
+        """The distinct experts a layer's node selects this step, added into this GPU's
+        counter at the layer's slot (captured: three small kernels a layer, so only for
+        measurement runs, VXPU_EXPERT_STATS=1). The bytes a batched step reads are the
+        distinct experts times the expert's size; with 33 different prompts the count is
+        between the rows' pairs and the model's experts, and only this number says where."""
+        layer, where = _experts_call(getattr(self.split, node.name))
+        if layer is None:
+            return
+        # the counters live outside the graph's memory: a tensor made inside the capture is re-zeroed
+        # by the graph on every replay (its zeros become a memset node), and the count never adds up
+        counters = self._expert_counts[d]
+        ids = args_[where[2]].reshape(-1).to(torch.long)
+        present = torch.zeros(EXPERT_STATS_EXPERTS, dtype=torch.int32, device=d)
+        present.index_fill_(0, ids, 1)
+        counters[layer] += present.sum().to(torch.int64)
+
+    def expert_stats(self):
+        """{layer: distinct experts selected, summed over every replay since the capture} (None
+        without VXPU_EXPERT_STATS). The caller knows how many steps it ran (the native loop
+        replays the graphs without this object), divides, and reports the mean through
+        plan.stat("distinct_experts", ...); hero-spec-stats.py does that per run."""
+        if not self._expert_counts:
+            return None
+        total = sum(c.cpu() for c in self._expert_counts.values())
+        return {layer: int(total[layer]) for layer in range(EXPERT_STATS_LAYERS) if total[layer] > 0}
+
+    def _stat(self, name, value):
+        if self.plan is not None and hasattr(self.plan, "stat"):
+            self.plan.stat(name if self.role == "decode" else f"{self.role}_{name}", value)
 
     def _capture_host_node(self, node, args_, kwargs_, dev, stream, side, boxes, pooled, driver, flags, flag, F,
                            mailboxes, events):

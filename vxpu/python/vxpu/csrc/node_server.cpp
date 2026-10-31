@@ -630,6 +630,9 @@ struct Driver {
   int (*stream_sync)(void*) = nullptr;
   int (*primary_ctx_retain)(void**, int) = nullptr;
   int (*ctx_set_current)(void*) = nullptr;
+  int (*event_create)(void**, unsigned) = nullptr;
+  int (*event_record)(void*, void*) = nullptr;
+  int (*stream_wait_event)(void*, void*, unsigned) = nullptr;
 
   static Driver& get() {
     static Driver d = [] {
@@ -646,6 +649,9 @@ struct Driver {
       d.stream_sync = reinterpret_cast<int (*)(void*)>(sym("cuStreamSynchronize"));
       d.primary_ctx_retain = reinterpret_cast<int (*)(void**, int)>(sym("cuDevicePrimaryCtxRetain"));
       d.ctx_set_current = reinterpret_cast<int (*)(void*)>(sym("cuCtxSetCurrent"));
+      d.event_create = reinterpret_cast<int (*)(void**, unsigned)>(sym("cuEventCreate"));
+      d.event_record = reinterpret_cast<int (*)(void*, void*)>(sym("cuEventRecord"));
+      d.stream_wait_event = reinterpret_cast<int (*)(void*, void*, unsigned)>(sym("cuStreamWaitEvent"));
       return d;
     }();
     return d;
@@ -911,9 +917,13 @@ class DecodeLoop {
 
   // The drafter's captured step: input_ids [B, 1] and positions [B] int64
   // on the GPU, its tokens out [B, K] int64 (K >= S - 1), its graphs.
+  // `compose` is a graph exec on the verify's first stream's GPU that copies the drafter's
+  // tokens out[:, :S-1] into the verify's input_ids[:, 1:] on the GPU (captured by
+  // StepGraph.native_loop); with it the step never brings the drafts to the host before
+  // the verify. 0 keeps the host path.
   void set_draft(at::Tensor input_ids, at::Tensor positions, at::Tensor out, const std::vector<int64_t>& execs,
                  const std::vector<int64_t>& streams, const std::vector<int64_t>& devices, pybind11::object host,
-                 at::Tensor flags) {
+                 at::Tensor flags, int64_t compose = 0) {
     TORCH_CHECK(!thread_.joinable(), "decode loop: set_draft before start");
     TORCH_CHECK(S_ > 1, "decode loop: a drafter needs steps of several tokens");
     TORCH_CHECK(input_ids.scalar_type() == at::kLong && input_ids.numel() == rows_n_ && positions.numel() == rows_n_,
@@ -923,8 +933,16 @@ class DecodeLoop {
     draft_ = std::make_unique<Graphs>(Graphs{std::move(input_ids), std::move(positions), std::move(out), execs, streams,
                                              devices, std::move(host), std::move(flags)});
     draft_->retain();
+    draft_->out_graph = static_cast<int64_t>(std::find(devices.begin(), devices.end(), static_cast<int64_t>(draft_->out.get_device())) - devices.begin());
+    TORCH_CHECK(draft_->out_graph < static_cast<int64_t>(devices.size()), "decode loop: the drafter's tokens live on none of its graphs' GPUs");
     auto pinned = at::TensorOptions().dtype(at::kLong).pinned_memory(true);
     draft_out_host_ = at::zeros({rows_n_ * draft_->out.size(1)}, pinned);
+    compose_ = compose;
+    if (compose_ != 0) {  // the event the verify's stream waits on: recorded after the drafter's graphs
+      auto& cu = Driver::get();
+      Driver::check(cu.ctx_set_current(draft_->ctxs[draft_->out_graph]), "cuCtxSetCurrent");
+      Driver::check(cu.event_create(&drafted_event_, 0x2 /* CU_EVENT_DISABLE_TIMING */), "cuEventCreate");
+    }
   }
 
   // The graph's sampling settings, one per row on the GPU: temperature
@@ -1074,8 +1092,12 @@ class DecodeLoop {
         ctxs.push_back(c);
       }
     }
-    // One replay: the inputs (pinned host arrays) in, the output back into `out_host`.
-    void run(const int64_t* ids_host, size_t ids_bytes, const int64_t* pos_host, size_t pos_bytes, int64_t* out_host) {
+    // The inputs (pinned host arrays) in and the graphs launched, nothing waited for. With
+    // `after` (an event on another stream) and `compose` (a graph exec), the first stream
+    // waits on the event and runs compose before the step: the speculative step writes the
+    // drafter's tokens into this step's input ids on the GPU that way, with no host between.
+    void launch(const int64_t* ids_host, size_t ids_bytes, const int64_t* pos_host, size_t pos_bytes,
+                void* after = nullptr, int64_t compose = 0) {
       auto& cu = Driver::get();
       void* stream = reinterpret_cast<void*>(streams[0]);
       Driver::check(cu.ctx_set_current(ctxs[0]), "cuCtxSetCurrent");
@@ -1083,17 +1105,25 @@ class DecodeLoop {
                                     ids_bytes, stream), "cuMemcpyAsync");
       Driver::check(cu.memcpy_async(reinterpret_cast<uint64_t>(pos.data_ptr()), reinterpret_cast<uint64_t>(pos_host),
                                     pos_bytes, stream), "cuMemcpyAsync");
+      if (after != nullptr) Driver::check(cu.stream_wait_event(stream, after, 0), "cuStreamWaitEvent");
+      if (compose != 0) Driver::check(cu.graph_launch(reinterpret_cast<void*>(compose), stream), "cuGraphLaunch");
       host->go();
       for (size_t g = 0; g < execs.size(); ++g) {  // the engine's GPU's graph first: the others wait on its flags
         Driver::check(cu.ctx_set_current(ctxs[g]), "cuCtxSetCurrent");
         Driver::check(cu.graph_launch(reinterpret_cast<void*>(execs[g]), reinterpret_cast<void*>(streams[g])),
                       "cuGraphLaunch");
       }
-      // the output read on its own GPU's stream, after that GPU's graph (the last, with layers sharded)
+    }
+    void* out_stream() const { return reinterpret_cast<void*>(streams[out_graph]); }
+    // The output read on its own GPU's stream, after that GPU's graph (the last, with layers sharded).
+    void collect(int64_t* out_host) {
+      auto& cu = Driver::get();
       Driver::check(cu.ctx_set_current(ctxs[out_graph]), "cuCtxSetCurrent");
       Driver::check(cu.memcpy_async(reinterpret_cast<uint64_t>(out_host), reinterpret_cast<uint64_t>(out.data_ptr()),
-                                    static_cast<size_t>(out.numel()) * sizeof(int64_t),
-                                    reinterpret_cast<void*>(streams[out_graph])), "cuMemcpyAsync");
+                                    static_cast<size_t>(out.numel()) * sizeof(int64_t), out_stream()), "cuMemcpyAsync");
+    }
+    void sync() {
+      auto& cu = Driver::get();
       for (size_t g = 0; g < execs.size(); ++g) {
         Driver::check(cu.ctx_set_current(ctxs[g]), "cuCtxSetCurrent");
         Driver::check(cu.stream_sync(reinterpret_cast<void*>(streams[g])), "cuStreamSynchronize");
@@ -1104,6 +1134,12 @@ class DecodeLoop {
         flags.zero_();  // the host released every flag; the next step starts clean
         throw std::runtime_error(error);
       }
+    }
+    // One replay: the inputs in, the output back into `out_host`, waited for.
+    void run(const int64_t* ids_host, size_t ids_bytes, const int64_t* pos_host, size_t pos_bytes, int64_t* out_host) {
+      launch(ids_host, ids_bytes, pos_host, pos_bytes);
+      collect(out_host);
+      sync();
     }
   };
 
@@ -1170,12 +1206,21 @@ class DecodeLoop {
       const int64_t t0 = now_ns();
       std::string error;
       try {
-        if (draft_) {  // the drafter on each row's next token: its K tokens after it
-          draft_->run(first.data(), rows_n_ * sizeof(int64_t), pos, rows_n_ * sizeof(int64_t), drafted);
-        }
-        for (int64_t i = 0; i < rows_n_; ++i) {
-          ids[i * S_] = first[i];
-          for (int64_t j = 1; j < S_; ++j) ids[i * S_ + j] = drafted[i * K + j - 1];
+        void* after = nullptr;
+        if (draft_ && compose_ != 0) {  // the drafter's graphs, then its tokens copied out and an event for the verify
+          draft_->launch(first.data(), rows_n_ * sizeof(int64_t), pos, rows_n_ * sizeof(int64_t));
+          draft_->collect(drafted);  // read by the host after the verify, for the acceptance
+          Driver::check(Driver::get().event_record(drafted_event_, draft_->out_stream()), "cuEventRecord");
+          after = drafted_event_;
+          for (int64_t i = 0; i < rows_n_; ++i) ids[i * S_] = first[i];  // the rest come from the GPU (compose)
+        } else {
+          if (draft_) {  // the drafter on each row's next token: its K tokens after it, through the host
+            draft_->run(first.data(), rows_n_ * sizeof(int64_t), pos, rows_n_ * sizeof(int64_t), drafted);
+          }
+          for (int64_t i = 0; i < rows_n_; ++i) {
+            ids[i * S_] = first[i];
+            for (int64_t j = 1; j < S_; ++j) ids[i * S_ + j] = drafted[i * K + j - 1];
+          }
         }
         if (temperature_.defined()) {  // the rows' sampling settings, ahead of the step on its stream
           auto& cu = Driver::get();
@@ -1187,7 +1232,14 @@ class DecodeLoop {
                                           static_cast<size_t>(host.numel() * host.element_size()), stream), "cuMemcpyAsync");
           }
         }
-        verify_.run(ids, rows_n_ * S_ * sizeof(int64_t), pos, rows_n_ * sizeof(int64_t), chosen);
+        verify_.launch(ids, rows_n_ * S_ * sizeof(int64_t), pos, rows_n_ * sizeof(int64_t), after, compose_);
+        verify_.collect(chosen);
+        if (after != nullptr) draft_->sync();
+        verify_.sync();
+        if (after != nullptr) {  // the host's view of the step's ids: the drafts the GPU verified
+          for (int64_t i = 0; i < rows_n_; ++i)
+            for (int64_t j = 1; j < S_; ++j) ids[i * S_ + j] = drafted[i * K + j - 1];
+        }
       } catch (const std::exception& e) {
         error = e.what();
       }
@@ -1223,6 +1275,8 @@ class DecodeLoop {
 
   Graphs verify_;
   std::unique_ptr<Graphs> draft_;
+  int64_t compose_ = 0;  // the graph that writes the drafts into the verify's ids on the GPU (0: via the host)
+  void* drafted_event_ = nullptr;
   int64_t rows_n_ = 0, S_ = 1;
   at::Tensor ids_host_, pos_host_, chosen_host_, draft_out_host_;
   at::Tensor temperature_, top_k_, top_p_, temperature_host_, top_k_host_, top_p_host_;
@@ -1264,7 +1318,9 @@ void register_node_server(pybind11::module& m) {
                           const std::vector<int64_t>&, pybind11::object, at::Tensor>())
       .def(pybind11::init<at::Tensor, at::Tensor, at::Tensor, const std::vector<int64_t>&, const std::vector<int64_t>&,
                           const std::vector<int64_t>&, pybind11::object, at::Tensor, int64_t>())  // + out_graph
-      .def("set_draft", &DecodeLoop::set_draft)
+      .def("set_draft", &DecodeLoop::set_draft, pybind11::arg("input_ids"), pybind11::arg("positions"),
+           pybind11::arg("out"), pybind11::arg("execs"), pybind11::arg("streams"), pybind11::arg("devices"),
+           pybind11::arg("host"), pybind11::arg("flags"), pybind11::arg("compose") = 0)
       .def("set_sampling", &DecodeLoop::set_sampling)
       .def("start", &DecodeLoop::start)
       .def("pause", &DecodeLoop::pause, pybind11::call_guard<pybind11::gil_scoped_release>())
