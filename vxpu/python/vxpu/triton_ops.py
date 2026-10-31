@@ -1306,14 +1306,22 @@ def choose_argmax(logits, temperature, seed, traced=False):
 
 if triton is not None:
     @triton.jit
-    def _sparse_attn_kernel(q_ptr, kv_ptr, idx_ptr, m_ptr, l_ptr, acc_ptr, M, H, T, N, S, scale,
-                            D: tl.constexpr, HB: tl.constexpr, TB: tl.constexpr):
+    def _sparse_attn_kernel(q_ptr, kv_ptr, idx_ptr, m_ptr, l_ptr, acc_ptr, kv2_ptr, start_ptr, M, H, T, N, S, scale,
+                            T1, N2, WIN,
+                            D: tl.constexpr, HB: tl.constexpr, TB: tl.constexpr, TWO: tl.constexpr):
         """Query row r (of b * M: row b's token m), heads hg * HB ..., and split sp of its T selected
         KV rows (idx, -1 for an absent slot; TB rows per split): scores = q . kv * scale, and the
         split's softmax partials: the max, the sum of exp, and sum exp * kv. On the tensor cores:
         the scores from bf16 inputs (exact products, fp32 sums), the output from the
         probabilities split into a bf16 high and low part (about 16 bits each), so the result
-        differs from the fork's fp32 computation by summation order and that split."""
+        differs from the fork's fp32 computation by summation order and that split. With TWO the
+        KV comes from two caches and the selection is formed here, so neither the window's ids
+        nor the concatenated KV is built before the kernel: entries 0 .. T1 - 1 are the window's
+        T1 slots of kv_ptr [b, N = T1, D], entry k holding position newest - T1 + 1 + k with
+        newest = start[b] + M - 1 the row's last position of the step (the fork's
+        get_window_topk_idxs for a decode step: seen when at most the query's position, within
+        WIN of it and not before the sequence), and entries T1 .. T - 1 the compressed cache
+        kv2_ptr [b, N2, D] at idx[r, entry - T1] (-1 for none)."""
         scale = scale.to(tl.float32)  # inductor passes a Python float as fp64 (lower.py: Numerics)
         r = tl.program_id(0).to(tl.int64)
         hg = tl.program_id(1)
@@ -1324,10 +1332,26 @@ if triton is not None:
         hl = hs < H
         q = tl.load(q_ptr + (r * H + hs)[:, None] * D + ds[None, :], mask=hl[:, None], other=0.0).to(tl.bfloat16)
         ts = sp * TB + tl.arange(0, TB)
-        ids = tl.load(idx_ptr + r * T + ts, mask=ts < T, other=-1)
-        valid = ids >= 0
-        rows = tl.load(kv_ptr + (b * N + tl.maximum(ids, 0).to(tl.int64))[:, None] * D + ds[None, :],
-                       mask=valid[:, None], other=0.0).to(tl.bfloat16)  # [TB, D]
+        if TWO:
+            st = tl.load(start_ptr + b)
+            p = st + r % M  # the query's position
+            newest = st + M - 1
+            held = newest - T1 + 1 + ts  # the window slot's position, oldest first
+            win = ts < T1
+            seen = win & (held <= p) & (held > p - WIN) & (held >= 0)
+            ids1 = tl.where(seen, held % T1, -1)
+            ids2 = tl.load(idx_ptr + r * (T - T1) + (ts - T1), mask=(ts >= T1) & (ts < T), other=-1)
+            valid = tl.where(win, ids1 >= 0, ids2 >= 0)
+            rows1 = tl.load(kv_ptr + (b * N + tl.maximum(ids1, 0).to(tl.int64))[:, None] * D + ds[None, :],
+                            mask=seen[:, None], other=0.0)
+            rows2 = tl.load(kv2_ptr + (b * N2 + tl.maximum(ids2, 0).to(tl.int64))[:, None] * D + ds[None, :],
+                            mask=((~win) & (ids2 >= 0))[:, None], other=0.0)
+            rows = tl.where(win[:, None], rows1, rows2).to(tl.bfloat16)  # [TB, D]
+        else:
+            ids = tl.load(idx_ptr + r * T + ts, mask=ts < T, other=-1)
+            valid = ids >= 0
+            rows = tl.load(kv_ptr + (b * N + tl.maximum(ids, 0).to(tl.int64))[:, None] * D + ds[None, :],
+                           mask=valid[:, None], other=0.0).to(tl.bfloat16)  # [TB, D]
         sc = tl.dot(q, tl.trans(rows)) * scale  # [HB, TB] fp32
         sc = tl.where(valid[None, :], sc, float("-inf"))
         m_i = tl.max(sc, axis=1)
@@ -1393,14 +1417,18 @@ if triton is not None:
 
 
 def sparse_attn(q, kv, attn_sink, topk_idxs, softmax_scale, freqs=None, start=None, seqlen=1, rope_dim=0,
-                finish=False, traced=False):
+                finish=False, kv2=None, window=0, traced=False):
     """The fork's sparse_attn: q [b, m, h, d], kv [b, n, d] (K and V the same rows), attn_sink [h],
     topk_idxs [b, m, t] int32 with -1 for an absent slot -> o [b, m, h, d] in q's dtype. With
     finish, the output path's first step runs in the combine kernel: each head's last rope_dim
     elements rotated back by the frequencies at the token's position (freqs the table's real
     view [positions, rope_dim / 2, 2], start [b] int64, seqlen the step's length: query token t
     of row b at start[b] + t) and the head quantized to the fp8 grid per 32, so attn_out takes
-    the result as prepared (one launch fewer a layer)."""
+    the result as prepared (one launch fewer a layer). With kv2 [b, n2, d] (the compressed KV)
+    and window (the attention's window size), kv is the window ring [b, slots, d] and
+    topk_idxs the compressed selection only: the kernel forms the window's selection from the
+    positions and reads both caches, so the model builds neither the window's ids nor the
+    concatenated KV (two launches fewer a layer); a decode step's form (start, seqlen as above)."""
     b, m, h, d = q.shape
     if finish and (freqs is None or start is None or rope_dim % 2 or tuple(freqs.shape[1:]) != (rope_dim // 2, 2)
                    or start.numel() * seqlen != b * m or d % 32):
@@ -1408,9 +1436,15 @@ def sparse_attn(q, kv, attn_sink, topk_idxs, softmax_scale, freqs=None, start=No
                          f"{None if freqs is None else tuple(freqs.shape)}, start {None if start is None else tuple(start.shape)} "
                          f"x {seqlen} for {b} x {m} queries, rope {rope_dim}, d {d}")
     n = kv.shape[1]
-    t = topk_idxs.shape[-1]
-    if kv.shape[-1] != d or (d & (d - 1)):
-        raise ValueError(f"sparse_attn: q {tuple(q.shape)} against kv {tuple(kv.shape)}; d must be a power of two")
+    two = kv2 is not None
+    t1 = n if two else 0  # the window's slots come first
+    n2 = kv2.shape[1] if two else 0
+    t = t1 + topk_idxs.shape[-1]
+    if kv.shape[-1] != d or (d & (d - 1)) or (two and (kv2.shape[-1] != d or start is None or seqlen != m
+                                                        or start.numel() != b)):
+        raise ValueError(f"sparse_attn: q {tuple(q.shape)} against kv {tuple(kv.shape)}"
+                         f"{'' if not two else f' and kv2 {tuple(kv2.shape)}, start {tuple(start.shape)} x {seqlen}'}; "
+                         f"d must be a power of two")
     o = torch.empty_like(q)
     if q.numel():
         HB, TB = (16 if h >= 16 else h), 32  # 64-row tiles overflow shared memory at d = 512
@@ -1425,8 +1459,10 @@ def sparse_attn(q, kv, attn_sink, topk_idxs, softmax_scale, freqs=None, start=No
         kernel, ctx = _launcher(_sparse_attn_kernel, dev, traced)
         with ctx:
             kernel[(b * m, triton.cdiv(h, HB), S)](q.contiguous(), kv.contiguous(), topk_idxs.contiguous(), m_part,
-                                                  l_part, acc_part, m, h, t, n, S, float(softmax_scale),
-                                                  D=d, HB=HB, TB=TB, num_warps=4)
+                                                  l_part, acc_part, kv2.contiguous() if two else kv,
+                                                  start.contiguous() if two else topk_idxs, m, h, t, n, S,
+                                                  float(softmax_scale), t1, n2, int(window),
+                                                  D=d, HB=HB, TB=TB, TWO=two, num_warps=4)
         combine, ctx = _launcher(_sparse_attn_combine_kernel, dev, traced)
         fr = freqs.contiguous() if finish else o
         st = start.contiguous() if finish else topk_idxs
@@ -1439,6 +1475,14 @@ def sparse_attn(q, kv, attn_sink, topk_idxs, softmax_scale, freqs=None, start=No
 def sparse_attn_finish(q, kv, attn_sink, topk_idxs, softmax_scale, freqs, start, seqlen, rope_dim, traced=False):
     """sparse_attn with finish (ops.attn_core): the output rotated back and quantized per head."""
     return sparse_attn(q, kv, attn_sink, topk_idxs, softmax_scale, freqs, start, seqlen, rope_dim, True, traced=traced)
+
+
+def attn_select(q, kv_window, kv_compress, attn_sink, compress_idxs, softmax_scale, freqs, start, seqlen, rope_dim,
+                window, traced=False):
+    """ops.attn_select's Triton body: sparse_attn over the window ring and the compressed cache with
+    the window's selection formed in the kernel, finishing the output (see sparse_attn)."""
+    return sparse_attn(q, kv_window, attn_sink, compress_idxs, softmax_scale, freqs, start, seqlen, rope_dim, True,
+                       kv2=kv_compress, window=window, traced=traced)
 
 
 def _gemv_blocks(K):
@@ -1634,6 +1678,13 @@ if triton is not None:
                         softmax_scale: float) -> torch.Tensor:
         return sparse_attn(q, kv, attn_sink, topk_idxs, softmax_scale, traced=True)
 
+    @torch.library.triton_op("vxpu_triton::attn_select", mutates_args=())
+    def _attn_select_op(q: torch.Tensor, kv_window: torch.Tensor, kv_compress: torch.Tensor, attn_sink: torch.Tensor,
+                        compress_idxs: torch.Tensor, softmax_scale: float, freqs: torch.Tensor, start: torch.Tensor,
+                        seqlen: int, rope_dim: int, window: int) -> torch.Tensor:
+        return attn_select(q, kv_window, kv_compress, attn_sink, compress_idxs, softmax_scale, freqs, start, seqlen,
+                           rope_dim, window, traced=True)
+
     @torch.library.triton_op("vxpu_triton::sparse_attn_finish", mutates_args=())
     def _sparse_attn_finish_op(q: torch.Tensor, kv: torch.Tensor, attn_sink: torch.Tensor, topk_idxs: torch.Tensor,
                                softmax_scale: float, freqs: torch.Tensor, start: torch.Tensor, seqlen: int,
@@ -1664,6 +1715,7 @@ lowered = types.SimpleNamespace(
     window_kv=lambda *a: torch.ops.vxpu_triton.window_kv(*a),
     attn_out=lambda *a: torch.ops.vxpu_triton.attn_out(*a),
     sparse_attn_finish=lambda *a: torch.ops.vxpu_triton.sparse_attn_finish(*a),
+    attn_select=lambda *a: torch.ops.vxpu_triton.attn_select(*a),
     ffn_front=lambda *a: torch.ops.vxpu_triton.ffn_front(*a),
     hc_front=lambda *a: torch.ops.vxpu_triton.hc_front(*a),
     ffn_front_split=lambda *a: torch.ops.vxpu_triton.ffn_front_split(*a),
