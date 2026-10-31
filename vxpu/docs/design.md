@@ -564,6 +564,27 @@ multiplications run at 60% at 33 rows (the software MXFP8 conversion),
 3.4 ms go to the copies that carry 33 rows' state across the three
 boundaries, and the compiler glue is 4 ms; that is hero 9's table.
 
+**Hero run 8, final table (Oct 31, 13:00 UTC; four RTX PRO 6000, layer
+ranges 0:8, 8:20, 20:32, 32:43 with the drafter's stages on the last GPU,
+everything above merged, one process on the pod at a time, a four-second
+warm-up; measured):**
+
+| rows | one prompt | same prompt per row | different prompts |
+|---|---|---|---|
+| 1 | 13.6 ms, 75 tok/s (p10/p90 14/14) | | |
+| 1 + drafter, 4 drafts verified | 25.8 ms, 2.67 tokens a step, 103 tok/s (25/27) | | |
+| 9 | 22.6 ms | 18.5 ms, 495 tok/s | 35.6 ms, 262 tok/s |
+| 8 + drafter, 4 drafts | 58.8 ms | 42.9 ms, 444 tok/s | 97.1 ms, 202 tok/s |
+| 33 | 35.0 ms | 32.8 ms, 1,021 tok/s | 99.2 ms, 339 tok/s |
+
+Against hero 7 at one row: 20.3 to 13.6 ms (the floor is 8.9; 1.53
+times), 1,742 to 1,026 kernels, 23 to 3 crossings, GPU time 13.4 ms in
+13.3 ms of wall; the drafter from 86 to 103 tok/s; 33 same-prompt rows
+from 802 to 1,021 tok/s. Every same-prompt run has identical rows and
+accepts rows times what one row accepts. One stall survives: the first
+prompt of this fresh process read 30 ms flat for its 63 steps before the
+second read 13.6 steady; the step trace is the instrument for it.
+
 **Direction: the planner chooses the kernels, in Go (hero run 8).** Today
 two planners exist and the split is the wrong one. The coordinator's
 planner (Go) decides placement, which machines and GPUs run which layers
