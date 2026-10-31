@@ -875,7 +875,8 @@ class Engine:
                 # unit (a CUDA graph on CUDA: the plan's mode defaults to
                 # reduce-overhead there), the host ops eager between
                 if self.plan["lower_decode"]:
-                    report = lower.lower(self._decode, self.plan)
+                    report = lower.lower(self._decode, self.plan,
+                                         layer_device=self._layer_device if self.plan["layer_devices"] else None)
                     for msg in (lower.describe(report), lower.describe_measured(report)):
                         if msg:
                             print(f"[vxpu] {msg}", flush=True)

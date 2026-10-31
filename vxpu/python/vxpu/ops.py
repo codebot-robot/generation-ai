@@ -797,13 +797,10 @@ def _hc_post_reference(x, residual, post, comb):
 
 def _freqs_at(freqs_table, start, seqlen):
     """The complex frequencies of every token of the step, [b, seqlen, D]: token t of row b at
-    position start[b] + t (the fork's freqs_cis[_positions(...)], per row). The arange names
-    "cuda" without an index on a GPU: the fused bodies are traced into a segment's graph by the
-    lowering on whatever GPU is current, and a segment runs with its own GPU current (dataflow),
-    so an indexed device baked here put the positions on cuda:0 for a segment on cuda:1 (the
-    9-row step died there; one row had taken the Triton body)."""
-    device = "cuda" if start.is_cuda else start.device
-    positions = start.reshape(-1, 1) + torch.arange(seqlen, device=device)
+    position start[b] + t (the fork's freqs_cis[_positions(...)], per row). The arange takes
+    start's device: the lowering traces a fused body on the GPU its segment will run on
+    (lower._segment_devices), so the device it bakes in is the right one."""
+    positions = start.reshape(-1, 1) + torch.arange(seqlen, device=start.device)
     return freqs_table[positions]
 
 

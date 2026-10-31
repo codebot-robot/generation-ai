@@ -145,13 +145,20 @@ def _site(node):
     return path, layer
 
 
-def _inline(gm, node, fn, values):
+def _inline(gm, node, fn, values, device=None):
     """Replace node with fn traced to torch ops on the node's values
     (shapes, dtypes and devices: fake tensors, nothing is computed).
     Non-tensor arguments are constants of the traced graph. Returns the
     kernels the body launches, as the traced graph names them (the
     vxpu_triton ops): empty for a body of plain tensor operations, which
-    the compiler fuses into kernels of its own."""
+    the compiler fuses into kernels of its own.
+
+    device: the GPU the node's segment will run on under layer sharding
+    (_segment_devices). The body is traced on it, so what it derives from
+    its inputs' device (an arange on start.device, a cast's copy) names
+    that GPU and not the one the lowering happens to run on; and any
+    device literal the trace still carries for another GPU is rewritten
+    before the copy into gm. Without it the values' own devices stand."""
     leaves, spec = pytree.tree_flatten(values)
     arg_leaves, _ = pytree.tree_flatten(node.args)
     at = [i for i, v in enumerate(leaves) if isinstance(v, torch.Tensor)]
@@ -164,8 +171,11 @@ def _inline(gm, node, fn, values):
 
     with FakeTensorMode():
         examples = [torch.empty_strided(leaves[i].shape, leaves[i].stride(), dtype=leaves[i].dtype,
-                                        device=leaves[i].device) for i in at]
+                                        device=device if device is not None and leaves[i].is_cuda else leaves[i].device)
+                    for i in at]
     traced = make_fx(flat, tracing_mode="fake")(*examples)
+    if device is not None:
+        _retarget(traced.graph, device)
     kernels = [str(n.target).removesuffix(".default") for n in traced.graph.nodes
                if n.op == "call_function" and str(n.target).startswith("vxpu_triton.")]
     placeholders = [n for n in traced.graph.nodes if n.op == "placeholder"]
@@ -181,6 +191,63 @@ def _inline(gm, node, fn, values):
     if not node.users:
         gm.graph.erase_node(node)
     return kernels
+
+
+def _retarget(graph, device):
+    """Point every device literal of graph that names a CUDA device other
+    than `device` at device: the kwargs of factories and copies (arange,
+    zeros, _to_copy) and positional torch.device arguments. Returns how
+    many nodes changed."""
+    changed = 0
+    for n in graph.nodes:
+        def fix(v):
+            if isinstance(v, (str, torch.device)):
+                try:
+                    d = torch.device(v)
+                except (RuntimeError, TypeError):
+                    return v
+                if d.type == "cuda" and d != device:
+                    return device
+            return v
+        kwargs = {k: fix(v) for k, v in n.kwargs.items()}
+        args = tuple(fix(v) if isinstance(v, torch.device) else v for v in n.args)
+        if kwargs != dict(n.kwargs) or args != tuple(n.args):
+            n.kwargs, n.args = kwargs, args
+            changed += 1
+    return changed
+
+
+def _segment_devices(gm, layer_device):
+    """The GPU each node's segment runs on under layer sharding, by the
+    same rule the sharding applies after the split (engine._shard_layers):
+    the host ops cut the graph into segments, a segment goes to the GPU of
+    the highest layer its nodes come from (a layer's tail and the next
+    layer's head share one segment and go with the later layer), and a
+    segment with no layer (the head) goes where the one before it went.
+    layer_device: layer -> torch.device or None. {} without sharding."""
+    if layer_device is None:
+        return {}
+    devices, segment, layers, prev = {}, [], set(), None
+
+    def flush():
+        nonlocal prev
+        dev = layer_device(max(layers)) if layers else prev
+        for n in segment:
+            devices[n] = dev
+        if dev is not None:
+            prev = dev
+
+    for n in gm.graph.nodes:
+        if n.op == "call_function" and str(n.target) in HOST_OPS:
+            flush()
+            segment, layers = [], set()
+            continue
+        segment.append(n)
+        _, layer = _site(n)
+        if layer is not None:
+            layers.add(layer)
+    flush()
+    return devices
 
 
 _keyed_cache_dir = None
@@ -203,18 +270,30 @@ def key_cache_dir():
     return _keyed_cache_dir
 
 
-def lower(gm, plan):
+def lower(gm, plan, layer_device=None):
     """Rewrite gm's vxpu op calls into their selected implementations,
     where lowerable. The engine lowers the whole decode graph before
     splitting it (segments.py): the host ops are left where they are, so
     the cut is the same. Each call site's choice goes into the plan's
     kernel record (Plan.record_site): the site, its shapes, the candidates,
     what was measured, what was chosen and why (the table, a measurement,
-    the registry's order), and the kernels inlined for it. With a kernel
-    table (VXPU_PLAN_TABLE) the table's body is inlined and nothing is
-    measured. Returns {op: {"lowered": {impl: n}, "kept": {impl: n}}}
-    for the calls seen; gm is recompiled if anything changed."""
+    the registry's order), the kernels inlined for it, and the device it
+    was traced for. With a kernel table (VXPU_PLAN_TABLE) the table's body
+    is inlined and nothing is measured.
+
+    layer_device (layer -> torch.device, the engine's layer sharding):
+    each site's body is traced on the GPU its segment will run on
+    (_segment_devices), not on the GPU the lowering runs on. A body traced
+    on the wrong GPU bakes that GPU's index into what it derives from its
+    inputs' device (an arange on start.device, type_as's copy), and the
+    segment then dies on another GPU with "Expected all tensors to be on
+    the same device": the 9- and 33-row steps did, in the segment spanning
+    a range boundary, whenever the lowering picked a fused body there.
+
+    Returns {op: {"lowered": {impl: n}, "kept": {impl: n}}} for the calls
+    seen; gm is recompiled if anything changed."""
     key_cache_dir()
+    devices = _segment_devices(gm, layer_device)
     report = collections.defaultdict(lambda: {"lowered": collections.Counter(), "kept": collections.Counter(),
                                               "measured": {}})
     for node in list(gm.graph.nodes):
@@ -250,17 +329,19 @@ def lower(gm, plan):
                 impl, times = _cheaper(op, impl, ops.select(op, *args, plan=plan, site=site), args, report)
                 if times:
                     source = "measured"
+        target = devices.get(node)
         entry = dict(op=op, site=site, node=node.name, shapes=key, layer=layer, chosen=impl.name, source=source,
-                     candidates=candidates, fused=fused, measured_us=times or None)
+                     candidates=candidates, fused=fused, measured_us=times or None,
+                     device=str(target) if target is not None else None)
         if not impl.lowerable:
             report[op]["kept"][impl.name] += 1
             plan.record_site(kernels=None, **entry)
             continue
-        kernels = _inline(gm, node, _implementation(op, impl), args)
+        kernels = _inline(gm, node, _implementation(op, impl), args, device=target)
         report[op]["lowered"][impl.name] += 1
         plan.record_site(kernels=kernels, **entry)
     if "matmul" in plan["fuse"]:
-        _fuse_matmuls(gm, report)
+        _fuse_matmuls(gm, report, devices)
     if any(r["lowered"] for r in report.values()):
         gm.graph.lint()
         gm.recompile()
@@ -357,7 +438,7 @@ def _matmul_rows(node, gm):
     return None
 
 
-def _fuse_matmuls(gm, report):
+def _fuse_matmuls(gm, report, devices=None):
     """Rewrite small contractions into reductions the compiler fuses with
     their neighbours (plan fuse "matmul"), where that measures cheaper. To
     inductor a matmul is a library call (cuBLAS), one kernel launch with its
@@ -390,7 +471,7 @@ def _fuse_matmuls(gm, report):
         if chosen == "aten":
             report[op]["kept"]["aten"] += 1
             continue
-        _inline(gm, node, body, values)
+        _inline(gm, node, body, values, device=(devices or {}).get(node))
         report[op]["lowered"]["reduction"] += 1
 
 
