@@ -730,6 +730,128 @@ def _check_compare():
     assert ok
 
 
+def _check_plan_table():
+    """The kernel table (hero run 8): a table names the implementation body per
+    call site and the kernels' knobs; the plan validates it, applies it
+    exactly (dispatch and the lowering), records every site with its choice
+    and source, writes the record, and a record is checked against a table."""
+    import json
+    import tempfile
+    import torch
+    from . import lower, plan, triton_ops
+    from .plan import ConfigError, Plan, check_record, load_table, table_entry
+    good = {"format": plan.TABLE_FORMAT, "knobs": {"GEMV_ROWS_MAX": 16, "FP4_NATIVE": False},
+            "sites": [{"op": "vxpu::fp8_linear", "site": "model.layers.1.engram.wkv", "impl": "reference"},
+                      {"op": "vxpu::fp8_linear", "shapes": "1x8->16", "impl": "reference"},
+                      {"op": "vxpu::rotary", "impl": "reference"}]}
+    # refusals: the format, an unknown op or body, an unknown or mistyped knob, two entries disagreeing
+    for bad in ({"format": "nope"}, {**good, "sites": [{"op": "vxpu::no_such", "impl": "x"}]},
+                {**good, "sites": [{"op": "vxpu::fp8_linear", "impl": "no-such-body"}]},
+                {**good, "knobs": {"NO_SUCH_KNOB": 1}}, {**good, "knobs": {"GEMV_ROWS_MAX": "16"}},
+                {**good, "knobs": {"FP4_NATIVE": 1}},
+                {**good, "sites": [{"op": "vxpu::rotary", "impl": "reference"}, {"op": "vxpu::rotary", "impl": "gpu-triton"}]}):
+        try:
+            load_table(json.dumps(bad))
+        except ConfigError:
+            continue
+        raise SystemExit(f"plan table: {bad} should be refused")
+    table = load_table(json.dumps(good))
+    # matching: the site's entry first, then the op at these shapes, then the op alone
+    if table_entry(table, "vxpu::fp8_linear", "model.layers.1.engram.wkv", "1x6144->25600")["site"] != "model.layers.1.engram.wkv":
+        raise SystemExit("plan table: a site's own entry should win")
+    if table_entry(table, "vxpu::fp8_linear", "model.layers.3.attn.wo", "1x8->16")["shapes"] != "1x8->16":
+        raise SystemExit("plan table: the op's entry at these shapes should apply to an unnamed site")
+    if table_entry(table, "vxpu::fp8_linear", "model.layers.3.attn.wo", "1x9->16") is not None:
+        raise SystemExit("plan table: an op with neither the site nor the shapes should match nothing")
+    if table_entry(table, "vxpu::rotary", "anywhere", "any")["impl"] != "reference":
+        raise SystemExit("plan table: an entry for the op alone should apply everywhere")
+    # the plan applies it: the dispatch returns the table's body, the knobs are set, the choice is recorded
+    before = (triton_ops.GEMV_ROWS_MAX, triton_ops.FP4_NATIVE)
+    try:
+        with tempfile.TemporaryDirectory() as tmp:
+            path = os.path.join(tmp, "table.json")
+            with open(path, "w") as f:
+                json.dump(good, f)
+            record_path = os.path.join(tmp, "record.json")
+            p = _with_env({"VXPU_PLAN_TABLE": path, "VXPU_PLAN_RECORD": record_path, "VXPU_KERNELS": "0"}, Plan, "cpu",
+                          triton_available=False)
+            if p.choices["plan_table"].source != "env" or "3 entries" not in str(p["plan_table"]):
+                raise SystemExit(f"plan table: not read from the environment: {p.choices['plan_table']}")
+            if triton_ops.GEMV_ROWS_MAX != 16 or triton_ops.FP4_NATIVE != "0":
+                raise SystemExit("plan table: the knobs should be set on triton_ops")
+            if p.select("vxpu::fp8_linear", "cpu", key="1x8->16").name != "reference":
+                raise SystemExit("plan table: the dispatch should take the table's body at these shapes")
+            if p.select("vxpu::rotary", "cpu", key="whatever").name != "reference":
+                raise SystemExit("plan table: the dispatch should take the table's body for the op")
+            # an inline table from the coordinator, and a table for another GPU refused
+            given = Plan("cpu", triton_available=False, given={"VXPU_PLAN_TABLE": json.dumps(good)})
+            if given.choices["plan_table"].source != "coordinator":
+                raise SystemExit("plan table: the coordinator's inline table should be taken")
+            try:
+                Plan("cpu", triton_available=False, given={"VXPU_PLAN_TABLE": json.dumps({**good, "gpu": "Some Other GPU"})})
+            except ConfigError:
+                pass
+            else:
+                # no GPU probed on a CPU plan: the table's gpu is not checked there; on a GPU it is
+                pass
+            # the lowering: a graph calling fp8_linear from an engram module; on the CPU the table's
+            # reference body is not lowerable, so the call is kept, and the record says so and why
+            from torch.fx.experimental.proxy_tensor import make_fx
+            x = torch.randn(1, 8, dtype=torch.bfloat16)
+            w = torch.randn(16, 8).to(torch.float8_e4m3fn)
+            sc = torch.ones(1, 1, dtype=torch.float8_e8m0fnu)
+
+            def f(x, w, sc):
+                return torch.ops.vxpu.fp8_linear(x, w, sc)
+            gm = make_fx(f, tracing_mode="fake")(x, w, sc)
+            node = next(n for n in gm.graph.nodes if str(n.target).startswith("vxpu.fp8_linear"))
+            node.meta["nn_module_stack"] = {"L__self___model": ("model", "Model"),
+                                            "L__self___model_layers_1": ("model.layers.1", "Block"),
+                                            "wkv": ("model.layers.1.engram.wkv", "Linear")}
+            p.choices["fuse"].value = ()
+            report = lower.lower(gm, p)
+            if report.get("vxpu::fp8_linear", {}).get("kept", {}).get("reference") != 1:
+                raise SystemExit(f"plan table: the lowering should keep the table's reference body: {report}")
+            if lower._site(node) != ("model.layers.1.engram.wkv", 1):
+                raise SystemExit(f"plan table: the site should be the calling module and its layer: {lower._site(node)}")
+            sites = p.kernel_record()["sites"]
+            if len(sites) != 1 or sites[0]["source"] != "table" or sites[0]["chosen"] != "reference" \
+                    or sites[0]["site"] != "model.layers.1.engram.wkv" or sites[0]["shapes"] != "1x8->16" \
+                    or sites[0]["layer"] != 1 or sites[0]["kernels"] is not None:
+                raise SystemExit(f"plan table: the record's site row is wrong: {sites}")
+            with open(record_path) as f:
+                written = json.load(f)
+            if written["format"] != plan.RECORD_FORMAT or written["knobs"]["GEMV_ROWS_MAX"] != 16 \
+                    or written["sites"][0]["chosen"] != "reference" or "gpu_capability" in written["hardware"]:
+                raise SystemExit(f"plan table: the record file is wrong: {list(written)}")
+            p.stat("kernels", 7)
+            with open(record_path) as f:
+                if json.load(f)["stats"] != {"kernels": 7}:
+                    raise SystemExit("plan table: a statistic should be written into the record")
+            # a record checked against a table: a site that ran another body is the mismatch to report
+            if check_record(table, written):
+                raise SystemExit("plan table: a record of the table's own choices should check clean")
+            written["sites"][0]["chosen"] = "cpu-kernel"
+            bad = check_record(table, written)
+            if len(bad) != 1 or bad[0][1] != "reference" or "ran cpu-kernel" not in plan.describe_mismatches(bad):
+                raise SystemExit(f"plan table: the mismatch should be reported: {bad}")
+            # a table naming a body the lowering cannot run here is refused at the lowering, not worked around
+            strict = load_table(json.dumps({"format": plan.TABLE_FORMAT,
+                                            "sites": [{"op": "vxpu::fp8_linear", "impl": "gpu-fp8-gemv"}]}))
+            p.table = strict
+            try:
+                p.table_choice("vxpu::fp8_linear", "cpu", key="1x8->16", site="s", lowering=True, rows=1)
+            except ConfigError:
+                pass
+            else:
+                raise SystemExit("plan table: a body that cannot run here should be refused when lowering")
+            if p.table_choice("vxpu::fp8_linear", "cpu", key="1x8->16", rows=1) is not None \
+                    or not any("kernel table names gpu-fp8-gemv" in n for n in p.notes):
+                raise SystemExit("plan table: an eager call should fall back and the plan should note it")
+    finally:
+        triton_ops.GEMV_ROWS_MAX, triton_ops.FP4_NATIVE = before
+
+
 def _check_compile_plan():
     """Verify configure_inductor and Plan's compiler choices for prologue_fusion."""
     from . import engine, plan
@@ -2721,6 +2843,7 @@ def selftest(workdir, settings):
     _check_mover_lifetime()
     _check_compile_plan()
     _check_plan_given()
+    _check_plan_table()
     _check_compile_names()
     if not _check_admin_telemetry():
         raise SystemExit("admin telemetry check failed")

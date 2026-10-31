@@ -125,10 +125,33 @@ def _implementation(op, impl):
     return fn
 
 
+def _site(node):
+    """The call site's name and layer: the module that called the op (the
+    export's nn_module_stack, e.g. model.layers.14.engram.wkv), which is
+    the same across exports of one model, and the layer index parsed from
+    it (None for the head, the embedding). The kernel table names sites
+    this way."""
+    stack = node.meta.get("nn_module_stack") or {}
+    path = None
+    for value in stack.values():
+        path = value[0] if isinstance(value, (tuple, list)) else str(value)
+    layer = None
+    if path:
+        parts = path.split(".")
+        for i, part in enumerate(parts[:-1]):
+            if part in ("layers", "mtp") and parts[i + 1].isdigit():
+                layer = int(parts[i + 1])
+                break
+    return path, layer
+
+
 def _inline(gm, node, fn, values):
     """Replace node with fn traced to torch ops on the node's values
     (shapes, dtypes and devices: fake tensors, nothing is computed).
-    Non-tensor arguments are constants of the traced graph."""
+    Non-tensor arguments are constants of the traced graph. Returns the
+    kernels the body launches, as the traced graph names them (the
+    vxpu_triton ops): empty for a body of plain tensor operations, which
+    the compiler fuses into kernels of its own."""
     leaves, spec = pytree.tree_flatten(values)
     arg_leaves, _ = pytree.tree_flatten(node.args)
     at = [i for i, v in enumerate(leaves) if isinstance(v, torch.Tensor)]
@@ -143,6 +166,8 @@ def _inline(gm, node, fn, values):
         examples = [torch.empty_strided(leaves[i].shape, leaves[i].stride(), dtype=leaves[i].dtype,
                                         device=leaves[i].device) for i in at]
     traced = make_fx(flat, tracing_mode="fake")(*examples)
+    kernels = [str(n.target).removesuffix(".default") for n in traced.graph.nodes
+               if n.op == "call_function" and str(n.target).startswith("vxpu_triton.")]
     placeholders = [n for n in traced.graph.nodes if n.op == "placeholder"]
     with gm.graph.inserting_before(node):
         out = gm.graph.graph_copy(traced.graph, {ph: arg_leaves[i] for ph, i in zip(placeholders, at)})
@@ -155,6 +180,7 @@ def _inline(gm, node, fn, values):
         node.replace_all_uses_with(out)
     if not node.users:
         gm.graph.erase_node(node)
+    return kernels
 
 
 _keyed_cache_dir = None
@@ -181,7 +207,12 @@ def lower(gm, plan):
     """Rewrite gm's vxpu op calls into their selected implementations,
     where lowerable. The engine lowers the whole decode graph before
     splitting it (segments.py): the host ops are left where they are, so
-    the cut is the same. Returns {op: {"lowered": {impl: n}, "kept": {impl: n}}}
+    the cut is the same. Each call site's choice goes into the plan's
+    kernel record (Plan.record_site): the site, its shapes, the candidates,
+    what was measured, what was chosen and why (the table, a measurement,
+    the registry's order), and the kernels inlined for it. With a kernel
+    table (VXPU_PLAN_TABLE) the table's body is inlined and nothing is
+    measured. Returns {op: {"lowered": {impl: n}, "kept": {impl: n}}}
     for the calls seen; gm is recompiled if anything changed."""
     key_cache_dir()
     report = collections.defaultdict(lambda: {"lowered": collections.Counter(), "kept": collections.Counter(),
@@ -191,27 +222,49 @@ def lower(gm, plan):
         if node.op != "call_function" or not target.startswith("vxpu.") or target in HOST_OPS:
             continue
         op = "vxpu::" + target.split(".")[1]
+        site, layer = _site(node)
         if op not in ops.SELECTION or node.kwargs:
             report[op]["kept"]["(not lowerable)"] += 1
+            plan.record_site(op=op, site=site, node=node.name, layer=layer, chosen=None, source="kept",
+                             why="not lowerable")
             continue
         try:
             args = _value(gm, node.args)
         except _NoShapes:
             report[op]["kept"]["(no shapes)"] += 1
+            plan.record_site(op=op, site=site, node=node.name, layer=layer, chosen=None, source="kept",
+                             why="no shapes")
             continue
-        impl = ops.select(op, *args, plan=plan, lowering=True)
-        if impl.fused:
-            impl = _cheaper(op, impl, ops.select(op, *args, plan=plan), args, report)
+        device_type, key, ctx = ops.SELECTION[op](*args)
+        available = plan.candidates(op, device_type)
+        candidates = [i.name for i in available]
+        fused = [i.name for i in available if i.fused]  # bodies the compiler fuses: credited a launch (costs.py)
+        times = None
+        impl = plan.table_choice(op, device_type, key, site=site, lowering=True, **ctx)
+        if impl is not None:
+            source = "table"
+        else:
+            impl = ops.select(op, *args, plan=plan, lowering=True, site=site)
+            source = "registry"
+            if impl.fused:
+                impl, times = _cheaper(op, impl, ops.select(op, *args, plan=plan, site=site), args, report)
+                if times:
+                    source = "measured"
+        entry = dict(op=op, site=site, node=node.name, shapes=key, layer=layer, chosen=impl.name, source=source,
+                     candidates=candidates, fused=fused, measured_us=times or None)
         if not impl.lowerable:
             report[op]["kept"][impl.name] += 1
+            plan.record_site(kernels=None, **entry)
             continue
-        _inline(gm, node, _implementation(op, impl), args)
+        kernels = _inline(gm, node, _implementation(op, impl), args)
         report[op]["lowered"][impl.name] += 1
+        plan.record_site(kernels=kernels, **entry)
     if "matmul" in plan["fuse"]:
         _fuse_matmuls(gm, report)
     if any(r["lowered"] for r in report.values()):
         gm.graph.lint()
         gm.recompile()
+    plan.write_record()
     return {op: {k: dict(v) for k, v in r.items() if v} for op, r in report.items()}
 
 
@@ -221,20 +274,21 @@ def _device(values):
 
 def _cheaper(op, fused, other, args, report):
     """fused (a decomposed body) or other (the implementation selected without it), by
-    their measured cost at these shapes (costs.py). Only a lowerable other competes: one
-    that is not runs through its op, as the plan chose it (a bf16 weight copy kept in the
-    engine's cache, say), which a measurement on its own could not reproduce."""
+    their measured cost at these shapes (costs.py), with the times measured ({} when a
+    cached decision answered, None when nothing was measured). Only a lowerable other
+    competes: one that is not runs through its op, as the plan chose it (a bf16 weight copy
+    kept in the engine's cache, say), which a measurement on its own could not reproduce."""
     if other.name == fused.name:
-        return other
+        return other, None
     if not other.lowerable:
         # the reference computation (plain tensor operations) is better inlined as the body
         # than kept as a call the compiler cannot take; any other unlowerable choice stays
-        return fused if other.reference else other
+        return (fused if other.reference else other), None
     chosen, times = costs.choose(op, {fused.name: (_implementation(op, fused), True),
                                       other.name: (_implementation(op, other), False)}, args, _device(args))
     if times:
         report[op]["measured"][" ".join(costs.shapes(args))] = times
-    return fused if chosen == fused.name else other
+    return (fused if chosen == fused.name else other), times
 
 
 def _linear_reduction(x, w, b=None):
