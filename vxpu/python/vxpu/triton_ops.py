@@ -1608,6 +1608,14 @@ if triton is not None:
         return b, e
 
     @triton.jit
+    def _fp4_scales(s_ptr, rows, live, k0, KS, BN: tl.constexpr, BK: tl.constexpr):
+        """The e8m0 scales [BN, BK/32] of _fp4_raw alone, for a kernel whose packed bytes arrive
+        through a tensor descriptor (TMA): a scale tile of 8 bytes a row is below the descriptor's
+        16-byte minimum at BK 256, and plain loads of it cost nothing measurable."""
+        ks = k0 // 32 + tl.arange(0, BK // 32)
+        return tl.load(s_ptr + rows[:, None] * KS + ks[None, :], mask=live[:, None], other=127)
+
+    @triton.jit
     def _grouped_block(order_ptr, blk_slot_ptr, blk_first_ptr, blk_count_ptr, b, BM: tl.constexpr):
         """Block b of the schedule: its expert's slot, its pairs (up to BM, in the sorted order) and
         which of them are real."""
@@ -1695,14 +1703,27 @@ if triton is not None:
 
 if triton is not None:
     @triton.jit
-    def _fp4_direct_one(x_ptr, w_ptr, s_ptr, o_ptr, p, tok, bank_rows, rows, live_n, I, K,
-                        BM: tl.constexpr, BN: tl.constexpr, BK: tl.constexpr, NATIVE: tl.constexpr):
-        """One pair's product with BN rows of one fp4 matrix (gate or up), stored as bf16."""
+    def _fp4_direct_one(x_ptr, w_ptr, s_ptr, o_ptr, p, tok, bank_rows, rows, live_n, I, K, NROWS,
+                        BM: tl.constexpr, BN: tl.constexpr, BK: tl.constexpr, NATIVE: tl.constexpr,
+                        TMA: tl.constexpr):
+        """One pair's product with BN rows of one fp4 matrix (gate or up), stored as bf16. With TMA
+        the packed bytes stream through a tensor descriptor over the bank's rows ([NROWS, K/2]),
+        num_stages tiles in flight in shared memory, and the scales come by plain loads: measured
+        cold at one token on an RTX PRO 6000, 60.2 us for 75 MB against 75.6 with plain loads of
+        both (the loads alone reach 1,400 GB/s either way; the descriptor's pipeline keeps the
+        one-live-row dot from stalling them)."""
         live_m = tl.arange(0, BM) == 0
         acc = tl.zeros((BM, BN), dtype=tl.float32)
+        if TMA:
+            wd = tl.make_tensor_descriptor(w_ptr, shape=[NROWS, K // 2], strides=[K // 2, 1], block_shape=[BN, BK // 2])
+            base = tl.min(bank_rows, axis=0).to(tl.int32)
         for k0 in range(0, K, BK):
             x = tl.load(x_ptr + tok * K + k0 + tl.arange(0, BK)[None, :], mask=live_m[:, None], other=0.0)
-            if NATIVE:
+            if TMA:
+                b = wd.load([base, k0 // 2])
+                e = _fp4_scales(s_ptr, bank_rows, live_n, k0, K // 32, BN, BK)
+                acc = tl.dot_scaled(x, None, "bf16", tl.trans(b), e, "e2m1", acc)
+            elif NATIVE:
                 b, e = _fp4_raw(w_ptr, s_ptr, bank_rows, live_n, k0, K // 2, K // 32, BN, BK)
                 acc = tl.dot_scaled(x, None, "bf16", tl.trans(b), e, "e2m1", acc)
             else:
@@ -1712,8 +1733,8 @@ if triton is not None:
 
     @triton.jit
     def _fp4_direct_gate_up_kernel(x_ptr, idx_ptr, map_ptr, start, w1_ptr, s1_ptr, w3_ptr, s3_ptr, g_ptr, u_ptr,
-                                   I, K, TOPK, BM: tl.constexpr, BN: tl.constexpr, BK: tl.constexpr,
-                                   NATIVE: tl.constexpr):
+                                   I, K, TOPK, NROWS, BM: tl.constexpr, BN: tl.constexpr, BK: tl.constexpr,
+                                   NATIVE: tl.constexpr, TMA: tl.constexpr):
         """Gate or up (the third grid axis) for one pair (a token and one of its chosen experts), BN
         of the expert's rows: the decode step's path, with no schedule. The program finds its
         expert's slot itself from the pair's expert id and the pool's slot map (a pair whose expert
@@ -1731,15 +1752,15 @@ if triton is not None:
         live_n = rows < I
         bank_rows = slot * I + rows
         if tl.program_id(2) == 0:
-            _fp4_direct_one(x_ptr, w1_ptr, s1_ptr, g_ptr, p, tok, bank_rows, rows, live_n, I, K, BM, BN, BK, NATIVE)
+            _fp4_direct_one(x_ptr, w1_ptr, s1_ptr, g_ptr, p, tok, bank_rows, rows, live_n, I, K, NROWS, BM, BN, BK, NATIVE, TMA)
         else:
-            _fp4_direct_one(x_ptr, w3_ptr, s3_ptr, u_ptr, p, tok, bank_rows, rows, live_n, I, K, BM, BN, BK, NATIVE)
+            _fp4_direct_one(x_ptr, w3_ptr, s3_ptr, u_ptr, p, tok, bank_rows, rows, live_n, I, K, NROWS, BM, BN, BK, NATIVE, TMA)
 
     @triton.jit
     def _fp4_direct_down_kernel(g_ptr, u_ptr, wt_ptr, idx_ptr, map_ptr, start, w2_ptr, s2_ptr, part_ptr, cnt_ptr,
-                                y_ptr, D, I, limit, TOPK, NT,
+                                y_ptr, D, I, limit, TOPK, NT, NROWS,
                                 BM: tl.constexpr, BN: tl.constexpr, BK: tl.constexpr, NATIVE: tl.constexpr,
-                                SUM: tl.constexpr):
+                                SUM: tl.constexpr, TMA: tl.constexpr):
         """The down projection for one pair, BN of its expert's rows, with the SwiGLU folded into the
         loads: each BK tile of the pair's input is w * silu(g) * u from the gate/up outputs, rounded
         and quantized per 32 exactly as _swiglu_quant_kernel does (the tile is a multiple of 32, the
@@ -1759,6 +1780,9 @@ if triton is not None:
             bank_rows = slot * D + rows
             w = tl.load(wt_ptr + p).to(tl.float32)
             live_m = tl.arange(0, BM) == 0
+            if TMA:  # the bytes through a descriptor over the bank's rows, as in _fp4_direct_one
+                wd = tl.make_tensor_descriptor(w2_ptr, shape=[NROWS, I // 2], strides=[I // 2, 1], block_shape=[BN, BK // 2])
+                base = (slot * D + tile * BN).to(tl.int32)
             for i0 in range(0, I, BK):
                 offs = p.to(tl.int64) * I + i0 + tl.arange(0, BK)
                 g = tl.load(g_ptr + offs).to(tl.bfloat16).to(tl.float32)
@@ -1769,7 +1793,11 @@ if triton is not None:
                 h = (w * ((g * tl.sigmoid(g)) * u)).to(tl.bfloat16).to(tl.float32)
                 h = tl.reshape(_quant_tile(tl.reshape(h, (1, BK)), 1, BK), (BK,))
                 hx = tl.where(live_m[:, None], h[None, :], 0.0).to(tl.bfloat16)
-                if NATIVE:
+                if TMA:
+                    b2 = wd.load([base, i0 // 2])
+                    e2 = _fp4_scales(s2_ptr, bank_rows, live_n, i0, I // 32, BN, BK)
+                    acc = tl.dot_scaled(hx, None, "bf16", tl.trans(b2), e2, "e2m1", acc)
+                elif NATIVE:
                     b2, e2 = _fp4_raw(w2_ptr, s2_ptr, bank_rows, live_n, i0, I // 2, I // 32, BN, BK)
                     acc = tl.dot_scaled(hx, None, "bf16", tl.trans(b2), e2, "e2m1", acc)
                 else:
@@ -1870,6 +1898,28 @@ def _block_k(dim, want):
 FP4_KSPLIT = os.environ.get("VXPU_FP4_KSPLIT")  # override: the K split of the fp4 expert kernels (measurement)
 FP4_NATIVE = os.environ.get("VXPU_FP4_NATIVE")  # override: force the native (1) or software-decode (0) body (A/B)
 FP4_DIRECT = os.environ.get("VXPU_FP4_DIRECT")  # override: force the direct (1) or grouped (0) decode path (A/B)
+FP4_TMA = os.environ.get("VXPU_FP4_TMA")  # override: force the descriptor (1) or plain (0) loads in the direct kernels (A/B)
+# the direct kernels' shapes with descriptor loads (rows a program, the K tile, warps, stages), measured cold at one
+# token on an RTX PRO 6000, bit-identical to the plain loads: gate/up 60.2 us for 75 MB (plain loads 75.6; floor 52),
+# down 30.6 us for 38 MB (plain 32.6; floor 26); the best of 36 and 36 shapes, each timed twice
+FP4_TMA_GATE_UP = (32, 256, 2, 2)
+FP4_TMA_DOWN = (32, 256, 2, 2)
+
+
+@functools.lru_cache(maxsize=None)
+def _fp4_tma(device_index):
+    """Whether the direct expert kernels stream their bytes through tensor descriptors (TMA) on
+    this GPU: Hopper and later, with a Triton that has them; the descriptors' scratch comes from
+    Triton's allocator, set here once. VXPU_FP4_TMA only overrides it for an A/B."""
+    if FP4_TMA is not None and FP4_TMA != "1":
+        return False
+    if triton is None or not hasattr(tl, "make_tensor_descriptor"):
+        return False
+    major, _ = torch.cuda.get_device_capability(device_index)
+    if major < 9 and FP4_TMA is None:
+        return False
+    triton.set_allocator(lambda size, align, stream: torch.empty(size, dtype=torch.int8, device="cuda"))
+    return True
 FP4_DIRECT_MAX = 8  # pairs up to which the direct kernels run (no schedule; each pair reads its expert whole).
 # One row's pairs (top-6) and no more: the direct path streams an expert once per pair, so rows that share experts
 # multiply its bytes (one prompt in 9 rows: 54 pairs over 6 experts read each nine times, 19.1 ms of experts a step
@@ -2002,7 +2052,14 @@ def _fp4_experts_direct(x_in, weights, slot_map, indices, start, w1, s1, w3, s3,
     S, I, _ = w1.shape
     pairs = n * topk
     dev = x_in.device
-    BM, BN, BK = 16, 64, 256
+    BM = 16
+    tma = native and _fp4_tma(dev.index) and (K // 2) % 16 == 0 and (I // 2) % 16 == 0  # descriptor strides: 16 bytes
+    if tma:
+        bn1, bk1, warps1, stages1 = FP4_TMA_GATE_UP
+        bn2, bk2, warps2, stages2 = FP4_TMA_DOWN
+    else:
+        bn1, bk1, warps1, stages1 = 64, 256, 4, 3
+        bn2, bk2, warps2, stages2 = 64, 256, 4, 3
     g = torch.empty(pairs, I, dtype=torch.bfloat16, device=dev)
     u = torch.empty(pairs, I, dtype=torch.bfloat16, device=dev)
     part = torch.empty(pairs, K, dtype=torch.float32, device=dev)
@@ -2011,21 +2068,23 @@ def _fp4_experts_direct(x_in, weights, slot_map, indices, start, w1, s1, w3, s3,
     idx = indices.contiguous().view(-1)
     smap = slot_map.contiguous()
     with torch.cuda.device(dev):
-        bk1, bk2 = _block_k(K, BK), _block_k(I, BK)
-        nt = triton.cdiv(K, BN)
-        _fp4_direct_gate_up_kernel[(pairs, triton.cdiv(I, BN), 2)](
-            x, idx, smap, start, w1, s1.view(torch.uint8), w3, s3.view(torch.uint8), g, u, I, K, topk,
-            BM=BM, BN=BN, BK=bk1, NATIVE=native)
+        bk1, bk2 = _block_k(K, bk1), _block_k(I, bk2)
+        nt = triton.cdiv(K, bn2)
+        _fp4_direct_gate_up_kernel[(pairs, triton.cdiv(I, bn1), 2)](
+            x, idx, smap, start, w1, s1.view(torch.uint8), w3, s3.view(torch.uint8), g, u, I, K, topk, S * I,
+            BM=BM, BN=bn1, BK=bk1, NATIVE=native, TMA=tma, num_warps=warps1, num_stages=stages1)
         if per_pair:
             _fp4_direct_down_kernel[(pairs, nt)](
                 g, u, wt, idx, smap, start, w2, s2.view(torch.uint8), part, part, part, K, I, float(swiglu_limit),
-                topk, nt, BM=BM, BN=BN, BK=bk2, NATIVE=native, SUM=False)
+                topk, nt, S * K, BM=BM, BN=bn2, BK=bk2, NATIVE=native, SUM=False, TMA=tma, num_warps=warps2,
+                num_stages=stages2)
             return part.view(n, topk, K)
         y = torch.empty(n, K, dtype=torch.float32, device=dev)
         counters = _fp4_counters(dev, n * nt)
         _fp4_direct_down_kernel[(pairs, nt)](
             g, u, wt, idx, smap, start, w2, s2.view(torch.uint8), part, counters, y, K, I, float(swiglu_limit),
-            topk, nt, BM=BM, BN=BN, BK=bk2, NATIVE=native, SUM=True)
+            topk, nt, S * K, BM=BM, BN=bn2, BK=bk2, NATIVE=native, SUM=True, TMA=tma, num_warps=warps2,
+            num_stages=stages2)
     return y
 
 
