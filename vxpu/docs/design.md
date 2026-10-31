@@ -524,7 +524,10 @@ them on this 384-vCPU machine costs a quantized 10 ms (a microbenchmark:
 p90 9.9 ms at a 500 ms cadence, 46 µs at a 14 ms one). Not disk, not
 memory, not another process. Host node packages now build with their
 loops serial: six fresh processes all at 13.6 ms with p10 equal to p90,
-the host node 0.012 ms. The page cache at the pod's memory limit was a
+the host node 0.012 ms. That closed it for one row and for 33 rows (32.8
+ms with p10 equal to p90, 1,021 tok/s same prompt), not yet for nine
+rows (flat 60 ms) or the drafter's steps (flat 30 and 60 ms): the same
+mechanism at another shape, being traced. The page cache at the pod's memory limit was a
 second, earlier cause and is handled by the engine. The exposure stays
 for any OpenMP region issued at a long cadence from the host path (the
 CPU expert path when experts are served from RAM); the trace is the
