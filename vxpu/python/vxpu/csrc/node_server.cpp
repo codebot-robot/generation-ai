@@ -1258,20 +1258,15 @@ class DecodeLoop {
         verify_.launch(ids, rows_n_ * S_ * sizeof(int64_t), pos, rows_n_ * sizeof(int64_t), after, compose_);
         if (trace_ != nullptr) tr_launch1_ = now_ns();
         verify_.collect(chosen);
-<<<<<<< HEAD
         t_launched = now_ns();
-        verify_.sync();  // the drafter's graphs ran on these same streams, ahead of the verify's
-        if (after != nullptr) draft_->check();
-        t_synced = now_ns();
-=======
-        if (after != nullptr) draft_->sync();
-        if (trace_ != nullptr) {
+        if (trace_ != nullptr) {  // the drafter's graphs ran on these same streams, ahead of the verify's
           tr_synced_.assign(verify_.execs.size(), 0);
           verify_.sync(tr_synced_.data());
         } else {
           verify_.sync();
         }
->>>>>>> h8b-stall
+        if (after != nullptr) draft_->check();
+        t_synced = now_ns();
         if (after != nullptr) {  // the host's view of the step's ids: the drafts the GPU verified
           for (int64_t i = 0; i < rows_n_; ++i)
             for (int64_t j = 1; j < S_; ++j) ids[i * S_ + j] = drafted[i * K + j - 1];
@@ -1281,13 +1276,10 @@ class DecodeLoop {
       }
       const int64_t t_end = now_ns();
       const double ms = (t_end - t0) / 1e6;
-<<<<<<< HEAD
       if (timing_ && t_launched && t_synced)
         phases_.push_back({(t_drafted ? t_drafted - t0 : 0) / 1e6, (t_launched - (t_drafted ? t_drafted : t0)) / 1e6,
                            (t_synced - t_launched) / 1e6, (t_end - t_synced) / 1e6});
-=======
       if (trace_ != nullptr && error.empty()) trace_step(t0, t_end, decoding);
->>>>>>> h8b-stall
       std::lock_guard<std::mutex> lk(mu_);
       stepping_ = false;
       steps_++;
