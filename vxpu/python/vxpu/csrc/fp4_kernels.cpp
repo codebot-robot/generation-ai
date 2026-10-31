@@ -976,7 +976,12 @@ torch::Tensor gather_rows(const torch::Tensor& table, const torch::Tensor& indic
   auto out = torch::empty({n, table.size(1)}, table.options());
   const char* src = static_cast<const char*>(table.data_ptr());
   char* dst = static_cast<char*>(out.data_ptr());
-  parallel_range(n, 1, [&](int64_t i0, int64_t i1) {
+  // A decode step's lookup is a few dozen rows, about 150 KB: on one thread it is 10 us, spread
+  // over 16 threads it is the slowest of 16 wakes, which on the virtual machine was 5 to 10 ms
+  // one call in ten and 50 to 100 ms for whole runs. The grain keeps at least 2 MB per thread, so
+  // the small lookups stay on the calling thread and a prefill's thousands of rows still spread.
+  const int64_t grain = std::max<int64_t>(1, (int64_t(2) << 20) / std::max<int64_t>(row_bytes, 1));
+  parallel_range(n, grain, [&](int64_t i0, int64_t i1) {
     for (int64_t i = i0; i < i1; ++i) {
       std::memcpy(dst + i * row_bytes, src + ix[i] * row_bytes, row_bytes);
     }
