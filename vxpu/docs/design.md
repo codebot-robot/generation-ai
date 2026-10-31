@@ -525,9 +525,14 @@ p90 9.9 ms at a 500 ms cadence, 46 µs at a 14 ms one). Not disk, not
 memory, not another process. Host node packages now build with their
 loops serial: six fresh processes all at 13.6 ms with p10 equal to p90,
 the host node 0.012 ms. That closed it for one row and for 33 rows (32.8
-ms with p10 equal to p90, 1,021 tok/s same prompt), not yet for nine
-rows (flat 60 ms) or the drafter's steps (flat 30 and 60 ms): the same
-mechanism at another shape, being traced. The page cache at the pod's memory limit was a
+ms with p10 equal to p90, 1,021 tok/s same prompt) but not for nine rows
+or the drafter's steps, where the trace found the one parallel operation
+left in the host node: torch runs a copy of more than 32k elements on
+OpenMP's workers, and a nine-row reply is 55k elements (one row's is 6k).
+The reply is a plain memcpy now: nine rows 22.6 / 18.5 / 35.6 ms over
+three fresh processes with p10 equal to p90, the drafter 25.8 to 26.0 ms
+(p10/p90 25/27), host nodes 0.02 ms. Any other torch op over 32k elements
+on the host path has the same exposure; the trace is the instrument. The page cache at the pod's memory limit was a
 second, earlier cause and is handled by the engine. The exposure stays
 for any OpenMP region issued at a long cadence from the host path (the
 CPU expert path when experts are served from RAM); the trace is the
