@@ -431,10 +431,14 @@ grouped expert kernels at their bytes (1,024 + 459 µs a layer for about
 2.1 GB), the dense multiplications at 33 rows at about 60% of bandwidth
 (33 µs a launch against 21 at one row: the software MXFP8 conversion,
 hero 9's item), and 3.4 ms of GPU-to-GPU copies carrying 33 rows' state
-across the range boundaries. The drafter at shorter verify blocks does
-not shorten the step: 3 tokens a step 29.9 ms at 2.21 tokens, 4 tokens
-30.0 ms at 2.37, 6 tokens 29.2 ms at 2.46 (so 6 stays); 5 tokens a step
-is broken at 210 ms flat, a bug to find. The engine now releases the
+across the range boundaries. The drafter at shorter verify blocks: 5 tokens
+a step (four drafts verified) measured 26.8 ms at 2.67 tokens a step, 99.5
+tok/s at one row, against 29.8 ms at 2.46 and 83 tok/s with 6 (the
+model's own block of five drafts; the fifth draft is rarely accepted and
+its verification costs bytes). The first run at 5 tokens read 210 ms
+flat with a 346 s load: the page-cache thrash, not a kernel; the 3- and
+4-token runs (29.9 ms at 2.21, 30.0 at 2.37) predate the fix and are
+being rerun. The draft length is the planner's knob, measured as such. The engine now releases the
 checkpoint files' page cache after loading on the pods too, which ends
 the mid-step faults that contaminated three matrices.
 
