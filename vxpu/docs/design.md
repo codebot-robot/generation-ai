@@ -507,7 +507,8 @@ cannot join the branch yet: its op takes the routed experts' sum for
 its epilogue, so it must split into the gate/up projections (beside the
 experts) and the down projection with the epilogue (after), an op and
 fork change. Hero 8's one-row number is therefore 13.7 ms, 1.54 times
-the floor.
+the floor (the second pod, with everything merged: 13.7 ms, 13.4 ms of
+GPU time in 13.4 ms of wall, 1,026 kernels).
 
 The acceptance asked for 11.5 ms and a layer of about a dozen kernels.
 Hero 8 reached 13.7 ms and 21 kernels a layer, so it did not meet it,
