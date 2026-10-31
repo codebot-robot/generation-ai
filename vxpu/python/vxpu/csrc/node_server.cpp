@@ -590,7 +590,18 @@ class StepHost {
             t[5 * i + 3] = now_ns();  // a local node: when its package returned (the reply's copy follows)
           }
           TORCH_CHECK(!out.empty(), "host node ", i, ": no reply");
-          box.outbox.copy_(out[0].view(box.outbox.sizes()));
+          {
+            // a memcpy, not copy_: torch runs a copy of more than 32k elements on OpenMP's workers,
+            // whose wake from the host thread costs 5 to 10 ms on the virtual machine; a decode
+            // step's reply is 6k elements a row (serial under 6 rows, parallel above)
+            at::Tensor reply = out[0].view(box.outbox.sizes());
+            if (reply.is_contiguous() && box.outbox.is_contiguous() && reply.scalar_type() == box.outbox.scalar_type() &&
+                reply.device().is_cpu() && box.outbox.device().is_cpu()) {
+              std::memcpy(box.outbox.data_ptr(), reply.data_ptr(), static_cast<size_t>(reply.numel() * reply.element_size()));
+            } else {
+              box.outbox.copy_(reply);
+            }
+          }
           t[5 * i + 1] = now_ns();
           t[5 * i + 2] = now_ns();  // as the flag goes up: before it, so the step's reader never sees it unwritten
           std::atomic_thread_fence(std::memory_order_seq_cst);  // the reply (and the times) before the flag
@@ -1229,7 +1240,9 @@ class DecodeLoop {
       try {
         void* after = nullptr;
         if (draft_ && compose_ != 0) {  // the drafter's graphs, then its tokens copied out and an event for the verify
+          if (trace_ != nullptr) tr_draft0_ = now_ns();
           draft_->launch(first.data(), rows_n_ * sizeof(int64_t), pos, rows_n_ * sizeof(int64_t));
+          if (trace_ != nullptr) tr_draft1_ = now_ns();
           draft_->collect(drafted);  // read by the host after the verify, for the acceptance
           Driver::check(Driver::get().event_record(drafted_event_, draft_->out_stream()), "cuEventRecord");
           after = drafted_event_;
@@ -1237,7 +1250,9 @@ class DecodeLoop {
           t_drafted = now_ns();
         } else {
           if (draft_) {  // the drafter on each row's next token: its K tokens after it, through the host
+            if (trace_ != nullptr) tr_draft0_ = now_ns();
             draft_->run(first.data(), rows_n_ * sizeof(int64_t), pos, rows_n_ * sizeof(int64_t), drafted);
+            if (trace_ != nullptr) tr_draft1_ = now_ns();
           }
           for (int64_t i = 0; i < rows_n_; ++i) {
             ids[i * S_] = first[i];
@@ -1266,6 +1281,7 @@ class DecodeLoop {
           verify_.sync();
         }
         if (after != nullptr) draft_->check();
+        if (trace_ != nullptr) tr_draft_synced_ = now_ns();
         t_synced = now_ns();
         if (after != nullptr) {  // the host's view of the step's ids: the drafts the GPU verified
           for (int64_t i = 0; i < rows_n_; ++i)
@@ -1336,7 +1352,7 @@ class DecodeLoop {
   std::map<int64_t, Event> pending_;
   std::vector<std::pair<double, int64_t>> step_log_;
   std::FILE* trace_ = nullptr;
-  int64_t tr_launch0_ = 0, tr_launch1_ = 0;
+  int64_t tr_launch0_ = 0, tr_launch1_ = 0, tr_draft0_ = 0, tr_draft1_ = 0, tr_draft_synced_ = 0;
   std::vector<int64_t> tr_synced_;
 
   // One JSON line per step: milliseconds from the step's start to each phase's end, the GPUs'
@@ -1349,7 +1365,23 @@ class DecodeLoop {
                        ",\"launched_ms\":" + std::to_string((tr_launch1_ - t0) / 1e6) + ",\"synced_ms\":[";
     for (size_t g = 0; g < tr_synced_.size(); ++g)
       line += (g ? "," : "") + std::to_string((tr_synced_[g] - t0) / 1e6);
-    line += "],\"host\":[";
+    line += "]";
+    if (draft_) {
+      line += ",\"draft_launch0_ms\":" + std::to_string((tr_draft0_ - t0) / 1e6) +
+              ",\"draft_launched_ms\":" + std::to_string((tr_draft1_ - t0) / 1e6) +
+              ",\"draft_checked_ms\":" + std::to_string((tr_draft_synced_ - t0) / 1e6) + ",\"draft_host\":[";
+      if (draft_->host != nullptr) {
+        at::Tensor dtimes = draft_->host->times();
+        const int64_t* dt = dtimes.data_ptr<int64_t>();
+        for (int64_t i = 0; i < dtimes.size(0); ++i) {
+          if (dt[5 * i] == 0) continue;
+          line += (i ? "," : "") + std::string("{\"start_ms\":") + std::to_string((dt[5 * i] - t0) / 1e6) +
+                  ",\"end_ms\":" + std::to_string((dt[5 * i + 1] - t0) / 1e6) + "}";
+        }
+      }
+      line += "]";
+    }
+    line += ",\"host\":[";
     if (verify_.host != nullptr) {
       at::Tensor times = verify_.host->times();
       const int64_t* t = times.data_ptr<int64_t>();
