@@ -373,6 +373,36 @@ hero 6's placement accepted 49 of 2,285 drafts at eight rows with the
 same prompt in every row: the exchange path's rows differ, and that is
 the suspect for it.
 
+**Hero run 8's acceptance, agreed Oct 31.** Hero 8 is the planner in
+Go, and it is judged on the real model at one row, not on the fixture:
+the step from 15.3 ms to 11.5 ms or better (floor 8.9), with the
+drafter line, 9 and 33 rows reported in the same table as always. The
+remainder of the one-row gap is structure, not bytes, and the planner
+owns structure, so hero 8 must deliver these rather than hand them to
+hero 9:
+- op boundaries in the fork so that a layer runs about a dozen kernels
+  (35 today): the attention input quantized once and passed to both
+  consumers, the rotary table indexed inside the kernels, the post-mix
+  and the sparse attention's index preparation folded into their
+  neighbours; the planner instantiates the templates at those
+  boundaries;
+- independent kernels on parallel branches of the step graph (the
+  narrow projections and the small kernels run alone on one stream per
+  GPU today);
+- three crossings a step, one per range boundary, with the replica
+  refreshes and step inputs staged ahead;
+- the per-site choice applied and reported (#490): the step says which
+  body each site ran, checked against the record;
+- the statistics the floors need: distinct experts a step, and a cost
+  record with two kernel bodies per op measured per site.
+The fronts' finishing fold and the expert kernel's last 20 µs a layer
+are kernel items that may land alongside but are not the test. This is
+the fourth time "fewer kernels, fold the glue, fewer crossings" has been
+written as the plan; the first three delivered part of it from the
+Python side and deferred the fork's boundaries each time, and estimated
+small kernels at zero when they cost about 2 µs each. Hero 8 does not
+get to do that again.
+
 **Direction: the planner chooses the kernels, in Go (hero run 8).** Today
 two planners exist and the split is the wrong one. The coordinator's
 planner (Go) decides placement, which machines and GPUs run which layers
