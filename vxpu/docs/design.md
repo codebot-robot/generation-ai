@@ -465,6 +465,58 @@ the one-row record picks the kernel, which is the per-shape choice the
 design asks for. The fork's op boundaries are the remaining workstream
 and the one that moves the one-row number.
 
+**Hero run 8, result (Oct 31, morning; four RTX PRO 6000, layer ranges
+0:8, 8:20, 20:32, 32:43 with the drafter's stages on the last GPU, the
+merged hero 8 code and the re-exported artifacts, one process on the
+pod at a time; measured):**
+
+| rows | one prompt | same prompt per row | different prompts |
+|---|---|---|---|
+| 1 | 14.0 ms, 67 tok/s | | |
+| 1 + drafter, 4 drafts verified | 27.0 ms, 2.67 tokens a step, 92 tok/s | | |
+| 9 | 23.2 ms | 19.0 ms, 447 tok/s | 36.9 ms, 246 tok/s |
+| 8 + drafter, 4 drafts | 59.9 ms | 44.7 ms, 505 tok/s | 101 ms, 172 tok/s |
+| 33 | 35.9 ms | 35.0 ms, 915 tok/s | 103 ms, 332 tok/s |
+
+Against the floors and the production stacks: one row is 1.57 times the
+8.9 ms floor (hero 7: 20.3 ms, 2.3 times; 7(b): 15.3, 1.7 times); the
+six-card vLLM recipe reports 9.6 ms with two GPUs streaming each layer,
+and 285 tok/s with its drafter against our 92 on one GPU's bandwidth.
+The step launches 1,026 kernels (hero 7: 1,742; 7(b): 1,422) and crosses
+GPUs on 3 flags (23); its GPU time is 12.9 ms in a 13.6 ms wall under
+the profiler. Every same-prompt run has identical rows and accepts rows
+times what one row accepts.
+
+The acceptance asked for 11.5 ms and a layer of about a dozen kernels.
+Hero 8 reached 14.0 ms and 21 kernels a layer, so it did not meet it,
+and the gap has names. What landed: four op boundaries in the fork (the
+attention input quantized once, the rotary table indexed inside the
+kernels, the hyper-connection post-mix as the last GEMV's epilogue, the
+sparse attention forming its selection and finishing the output path
+itself), 400 launches fewer; crossings 23 to 3; the verify's input ids
+built on the GPU; the expert kernels' bytes through the copy engine
+(TMA); the drafter at four drafts; the planner's table and record, with
+the round trip on the real model (307 sites, none off the table, the
+engram bug gone when the choice is given); the distinct-expert count;
+the engine keeping the n-gram tables resident and the checkpoint and
+bank pages out of the cache (three matrices were contaminated by page
+faults before that). What did not: parallel branches, because the step
+is a chain at the node level and the planner must cut the shared expert
+and the attention's narrow projections into their own nodes first;
+folding the fronts' finishing kernel and the shared expert's epilogue
+by a last-arriving program (both slower); the persistent expert kernel.
+The 21 kernels a layer are 2 experts, 7 dense multiplications, 6 front
+kernels, 2 per-row kernels, 2 attention kernels, the ring write (needs
+a mutating op) and the shared expert's epilogue. The next 2.5 ms at one
+row are: the dense multiplications' latency at narrow shapes (1.1 ms;
+needs the node cut and parallel branches, or a native MXFP8 body), the
+expert kernels' one-row dot (1.2 ms over their bytes), and about 400
+launches of 2 µs. At 33 different prompts the step is 103 ms against
+about 63 ms of bytes: the expert kernels are at their bytes, the dense
+multiplications run at 60% at 33 rows (the software MXFP8 conversion),
+3.4 ms go to the copies that carry 33 rows' state across the three
+boundaries, and the compiler glue is 4 ms; that is hero 9's table.
+
 **Direction: the planner chooses the kernels, in Go (hero run 8).** Today
 two planners exist and the split is the wrong one. The coordinator's
 planner (Go) decides placement, which machines and GPUs run which layers
