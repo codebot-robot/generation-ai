@@ -2,7 +2,7 @@
  "format": "vxpu-kernel-record/1",
  "hardware": {"device": "cuda", "gpu": "NVIDIA RTX PRO 6000 Blackwell Server Edition", "gpu_capability": "12.0", "torch": "2.14.1", "cuda": "13.0", "triton": "3.6.0"},
  "choices": {"fuse": ["attn_out", "attn_q", "ffn_front", "fp8_linear", "hc_front", "hc_sinkhorn", "matmul", "rotary", "shared_ffn", "window_kv"]},
- "knobs": {"GEMV_ROWS_MAX": 64, "FP4_DIRECT_MAX": 8, "FFN_FRONT_EB": 8, "FFN_FRONT_BD": 1024, "FRONT_SPLIT_BD": 512, "FRONT_SPLIT_EB": 8, "FP4_KSPLIT": null, "FP4_NATIVE": null, "FP4_DIRECT": null},
+ "knobs": {"GEMV_ROWS_MAX": 64, "FP4_DIRECT_MAX": 8, "FFN_FRONT_EB": 8, "FFN_FRONT_BD": 1024, "FRONT_SPLIT_BD": 512, "FRONT_SPLIT_EB": 8, "FRONT_SPLIT_WARPS": 8, "FP4_KSPLIT": null, "FP4_NATIVE": null, "FP4_DIRECT": null},
  "sites": [
   {"op": "vxpu::attn_q", "site": "model.layers.0.attn", "node": "attn_q", "shapes": "rows=1 dim=5120 rank=1280 heads=64x512", "layer": 0, "chosen": "gpu-triton", "source": "measured", "candidates": ["gpu-fused", "gpu-triton", "reference"], "fused": ["gpu-fused"], "measured_us": {"gpu-fused": 56.36, "gpu-triton": 48.15}, "kernels": ["vxpu_triton.gemv_rows", "vxpu_triton.row_post", "vxpu_triton.gemv_pe"]},
   {"op": "vxpu::attn_q", "site": "model.layers.1.attn", "node": "attn_q_1", "shapes": "rows=1 dim=5120 rank=1280 heads=64x512", "layer": 1, "chosen": "gpu-triton", "source": "measured", "candidates": ["gpu-fused", "gpu-triton", "reference"], "fused": ["gpu-fused"], "measured_us": {"gpu-fused": 56.36, "gpu-triton": 48.15}, "kernels": ["vxpu_triton.gemv_rows", "vxpu_triton.row_post", "vxpu_triton.gemv_pe"]},

@@ -15,6 +15,7 @@
 package kernelplan
 
 import (
+	"encoding/json"
 	"os"
 	"path/filepath"
 	"strings"
@@ -74,6 +75,9 @@ func TestPlanChoosesTheMeasuredFastestBody(t *testing.T) {
 	// the knobs: native fp4 from the card (12.0 is Blackwell), GEMV_ROWS_MAX from the sweep, the rest as run
 	if table.Knobs["FP4_NATIVE"] != true {
 		t.Errorf("FP4_NATIVE = %v, want true for capability 12.0", table.Knobs["FP4_NATIVE"])
+	}
+	if table.Knobs["FRONT_SPLIT_WARPS"] != 8 {
+		t.Errorf("FRONT_SPLIT_WARPS = %v, want 8 for capability 12.0", table.Knobs["FRONT_SPLIT_WARPS"])
 	}
 	if table.Knobs["GEMV_ROWS_MAX"] != 64 {
 		t.Errorf("GEMV_ROWS_MAX = %v, want 64 (the sweep's fastest)", table.Knobs["GEMV_ROWS_MAX"])
@@ -169,17 +173,22 @@ func TestReadTableRefusesWhatTheEngineRefuses(t *testing.T) {
 		`{"format": "vxpu-kernel-table/1", "knobs": {"NO_SUCH": 1}, "sites": []}`,
 		`{"format": "vxpu-kernel-table/1", "knobs": {"GEMV_ROWS_MAX": "16"}, "sites": []}`,
 		`{"format": "vxpu-kernel-table/1", "knobs": {"FP4_NATIVE": 1}, "sites": []}`,
+		`{"format": "vxpu-kernel-table/1", "knobs": {"FRONT_SPLIT_WARPS": 7}, "sites": []}`,
+		`{"format": "vxpu-kernel-table/1", "knobs": {"FRONT_SPLIT_WARPS": "8"}, "sites": []}`,
 		`{"format": "vxpu-kernel-table/1", "sites": [{"op": "vxpu::rotary", "impl": "a"}, {"op": "vxpu::rotary", "impl": "b"}]}`,
 	} {
 		if _, err := ReadTable([]byte(bad)); err == nil {
 			t.Errorf("should be refused: %s", bad)
 		}
 	}
-	good := `{"format": "vxpu-kernel-table/1", "knobs": {"GEMV_ROWS_MAX": 16, "FP4_NATIVE": false},
+	good := `{"format": "vxpu-kernel-table/1", "knobs": {"GEMV_ROWS_MAX": 16, "FP4_NATIVE": false, "FRONT_SPLIT_WARPS": 8},
 	          "sites": [{"op": "vxpu::rotary", "impl": "reference"}, {"op": "vxpu::rotary", "site": "model.layers.1.attn", "impl": "gpu-triton"}]}`
 	table, err := ReadTable([]byte(good))
 	if err != nil {
 		t.Fatal(err)
+	}
+	if table.Knobs["FRONT_SPLIT_WARPS"] != float64(8) {
+		t.Errorf("FRONT_SPLIT_WARPS = %v (%T), want 8", table.Knobs["FRONT_SPLIT_WARPS"], table.Knobs["FRONT_SPLIT_WARPS"])
 	}
 	if e := table.Entry("vxpu::rotary", "model.layers.1.attn", "x"); e.Impl != "gpu-triton" {
 		t.Errorf("the site's entry should win: %+v", e)
@@ -195,5 +204,52 @@ func TestReadTableRefusesWhatTheEngineRefuses(t *testing.T) {
 	}
 	if _, err := ReadTableFile(path); err != nil {
 		t.Fatal(err)
+	}
+}
+
+func TestPlanFrontSplitWarps(t *testing.T) {
+	// capability 8.9 (L4): defaults to 4 warps
+	recL4 := Record{
+		Format:   RecordFormat,
+		Hardware: Hardware{GPU: "NVIDIA L4", GPUCapability: "8.9"},
+		Knobs:    map[string]any{"FRONT_SPLIT_WARPS": 4},
+		Stats:    map[string]json.RawMessage{},
+	}
+	tableL4, err := Plan(t.Context(), []*Record{&recL4}, Options{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if tableL4.Knobs["FRONT_SPLIT_WARPS"] != 4 {
+		t.Errorf("L4 FRONT_SPLIT_WARPS = %v, want 4", tableL4.Knobs["FRONT_SPLIT_WARPS"])
+	}
+
+	// swept FRONT_SPLIT_WARPS overrides the capability default
+	recSweep := Record{
+		Format:   RecordFormat,
+		Hardware: Hardware{GPU: "NVIDIA L4", GPUCapability: "8.9"},
+		Knobs:    map[string]any{"FRONT_SPLIT_WARPS": 4},
+		Stats: map[string]json.RawMessage{
+			"sweeps": json.RawMessage(`{"FRONT_SPLIT_WARPS": {"4": 20.8, "8": 19.9}}`),
+		},
+	}
+	tableSweep, err := Plan(t.Context(), []*Record{&recSweep}, Options{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if tableSweep.Knobs["FRONT_SPLIT_WARPS"] != 8 {
+		t.Errorf("swept FRONT_SPLIT_WARPS = %v, want 8 (fastest)", tableSweep.Knobs["FRONT_SPLIT_WARPS"])
+	}
+
+	// invalid swept value is refused
+	recBadSweep := Record{
+		Format:   RecordFormat,
+		Hardware: Hardware{GPU: "NVIDIA L4", GPUCapability: "8.9"},
+		Knobs:    map[string]any{"FRONT_SPLIT_WARPS": 4},
+		Stats: map[string]json.RawMessage{
+			"sweeps": json.RawMessage(`{"FRONT_SPLIT_WARPS": {"7": 10.0}}`),
+		},
+	}
+	if _, err := Plan(t.Context(), []*Record{&recBadSweep}, Options{}); err == nil {
+		t.Errorf("unsupported swept warp count should be refused")
 	}
 }

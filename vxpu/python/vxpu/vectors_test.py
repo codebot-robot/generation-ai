@@ -740,7 +740,7 @@ def _check_plan_table():
     import torch
     from . import lower, plan, triton_ops
     from .plan import ConfigError, Plan, check_record, load_table, table_entry
-    good = {"format": plan.TABLE_FORMAT, "knobs": {"GEMV_ROWS_MAX": 16, "FP4_NATIVE": False},
+    good = {"format": plan.TABLE_FORMAT, "knobs": {"GEMV_ROWS_MAX": 16, "FP4_NATIVE": False, "FRONT_SPLIT_WARPS": 8},
             "sites": [{"op": "vxpu::fp8_linear", "site": "model.layers.1.engram.wkv", "impl": "reference"},
                       {"op": "vxpu::fp8_linear", "shapes": "1x8->16", "impl": "reference"},
                       {"op": "vxpu::rotary", "impl": "reference"}]}
@@ -749,10 +749,14 @@ def _check_plan_table():
                 {**good, "sites": [{"op": "vxpu::fp8_linear", "impl": "no-such-body"}]},
                 {**good, "knobs": {"NO_SUCH_KNOB": 1}}, {**good, "knobs": {"GEMV_ROWS_MAX": "16"}},
                 {**good, "knobs": {"FP4_NATIVE": 1}},
+                {**good, "knobs": {"FRONT_SPLIT_WARPS": 7}},
+                {**good, "knobs": {"FRONT_SPLIT_WARPS": "8"}},
                 {**good, "sites": [{"op": "vxpu::rotary", "impl": "reference"}, {"op": "vxpu::rotary", "impl": "gpu-triton"}]}):
         try:
             load_table(json.dumps(bad))
-        except ConfigError:
+        except ConfigError as e:
+            if bad.get("knobs", {}).get("FRONT_SPLIT_WARPS") == 7 and "supported warp count" not in str(e):
+                raise SystemExit(f"plan table: refusal message should explain supported warp counts: {e}")
             continue
         raise SystemExit(f"plan table: {bad} should be refused")
     table = load_table(json.dumps(good))
@@ -766,7 +770,7 @@ def _check_plan_table():
     if table_entry(table, "vxpu::rotary", "anywhere", "any")["impl"] != "reference":
         raise SystemExit("plan table: an entry for the op alone should apply everywhere")
     # the plan applies it: the dispatch returns the table's body, the knobs are set, the choice is recorded
-    before = (triton_ops.GEMV_ROWS_MAX, triton_ops.FP4_NATIVE)
+    before = (triton_ops.GEMV_ROWS_MAX, triton_ops.FP4_NATIVE, triton_ops.FRONT_SPLIT_WARPS)
     try:
         with tempfile.TemporaryDirectory() as tmp:
             path = os.path.join(tmp, "table.json")
@@ -777,7 +781,7 @@ def _check_plan_table():
                           triton_available=False)
             if p.choices["plan_table"].source != "env" or "3 entries" not in str(p["plan_table"]):
                 raise SystemExit(f"plan table: not read from the environment: {p.choices['plan_table']}")
-            if triton_ops.GEMV_ROWS_MAX != 16 or triton_ops.FP4_NATIVE != "0":
+            if triton_ops.GEMV_ROWS_MAX != 16 or triton_ops.FP4_NATIVE != "0" or triton_ops.FRONT_SPLIT_WARPS != 8:
                 raise SystemExit("plan table: the knobs should be set on triton_ops")
             if p.select("vxpu::fp8_linear", "cpu", key="1x8->16").name != "reference":
                 raise SystemExit("plan table: the dispatch should take the table's body at these shapes")
@@ -822,6 +826,7 @@ def _check_plan_table():
             with open(record_path) as f:
                 written = json.load(f)
             if written["format"] != plan.RECORD_FORMAT or written["knobs"]["GEMV_ROWS_MAX"] != 16 \
+                    or written["knobs"]["FRONT_SPLIT_WARPS"] != 8 \
                     or written["sites"][0]["chosen"] != "reference" or "gpu_capability" in written["hardware"]:
                 raise SystemExit(f"plan table: the record file is wrong: {list(written)}")
             p.stat("kernels", 7)
@@ -849,7 +854,7 @@ def _check_plan_table():
                     or not any("kernel table names gpu-fp8-gemv" in n for n in p.notes):
                 raise SystemExit("plan table: an eager call should fall back and the plan should note it")
     finally:
-        triton_ops.GEMV_ROWS_MAX, triton_ops.FP4_NATIVE = before
+        triton_ops.GEMV_ROWS_MAX, triton_ops.FP4_NATIVE, triton_ops.FRONT_SPLIT_WARPS = before
 
 
 def _check_compile_plan():

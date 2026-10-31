@@ -77,6 +77,16 @@ def available():
     return triton is not None and torch.cuda.is_available()
 
 
+@functools.lru_cache(maxsize=None)
+def _blackwell(device=None):
+    """Whether the GPU (the current one by default) is Blackwell or later (compute capability 10+)."""
+    if not torch.cuda.is_available():
+        return False
+    index = device.index if isinstance(device, torch.device) else device
+    major, _ = torch.cuda.get_device_capability(torch.cuda.current_device() if index is None else index)
+    return major >= 10
+
+
 def _launcher(kernel, device, traced):
     """The kernel to launch and the context to launch it in. Eager, Triton
     launches on the current device, so that is made the tensors' device (an
@@ -1153,20 +1163,21 @@ def ffn_front(stream, pre_mix, hc_fn, hc_scale, hc_base, hc_mult, sinkhorn_iters
 
 FRONT_SPLIT_BD = 512  # the chunk of the row per program of the split front's kernels
 FRONT_SPLIT_EB = 8  # experts per program of its second kernel
+FRONT_SPLIT_WARPS = 8 if _blackwell() else 4  # warps for the dots kernel (8 measured faster on Blackwell)
 
 
 def hc_front_split(stream, pre_mix, hc_fn, hc_scale, hc_base, hc_mult, sinkhorn_iters, hc_eps, norm_weight, norm_eps,
-                   traced=False):
+                   traced=False, bd=None, eb=None, warps=None):
     """ops.hc_front's outputs: ffn_front_split's kernels without the gate."""
     pre, post, comb, xn, x_in, _, _ = ffn_front_split(stream, pre_mix, hc_fn, hc_scale, hc_base, hc_mult,
                                                       sinkhorn_iters, hc_eps, norm_weight, norm_eps, None, None, 1, "",
-                                                      1.0, False, 1.0, traced=traced)
+                                                      1.0, False, 1.0, traced=traced, bd=bd, eb=eb, warps=warps)
     return pre, post, comb, xn, x_in
 
 
 def ffn_front_split(stream, pre_mix, hc_fn, hc_scale, hc_base, hc_mult, sinkhorn_iters, hc_eps, norm_weight, norm_eps,
                     gate_weight, gate_bias, topk, score_func, gate_temp, norm_topk_prob, route_scale, traced=False,
-                    bd=None, eb=None):
+                    bd=None, eb=None, warps=None):
     """ops.ffn_front's outputs from three kernels, the row split into chunks: the norms'
     statistics and x per chunk (_front_stats_kernel), then per chunk and group of experts the
     normalized row, the mix dots and the gate scores as partial sums (_front_dots_kernel), then
@@ -1175,6 +1186,7 @@ def ffn_front_split(stream, pre_mix, hc_fn, hc_scale, hc_base, hc_mult, sinkhorn
     dependent chain; here a program reads one chunk and the card runs hundreds of them at once."""
     bd = bd or FRONT_SPLIT_BD
     eb = eb or FRONT_SPLIT_EB
+    warps = warps or FRONT_SPLIT_WARPS
     b, s_, hc, d = stream.shape
     while bd > 32 and d % bd:  # a narrow model (the tiny fixture): the widest chunk that divides
         bd //= 2
@@ -1213,7 +1225,7 @@ def ffn_front_split(stream, pre_mix, hc_fn, hc_scale, hc_base, hc_mult, sinkhorn
         with ctx:
             k2[(rows, nc, G)](st, xpre, part, hc_fn.contiguous().float(), norm_weight.contiguous(),
                               gate_weight.contiguous() if gate else xn, mixp, xn, x_in, scorep, d, E, float(norm_eps),
-                              HC=hc, NMIX=nmix, NC=nc, NCP=ncp, BD=bd, G=G, EB=eb, GATE=gate)
+                              HC=hc, NMIX=nmix, NC=nc, NCP=ncp, BD=bd, G=G, EB=eb, GATE=gate, num_warps=warps)
         kb, ctx = _launcher(_ffn_front_b_kernel, dev, traced)
         with ctx:
             kb[(rows,)](mixp, hc_scale.contiguous().float(), hc_base.contiguous().float(), scorep,
@@ -2114,16 +2126,6 @@ FP4_DIRECT_MAX = 8  # pairs up to which the direct kernels run (no schedule; eac
 # One row's pairs (top-6) and no more: the direct path streams an expert once per pair, so rows that share experts
 # multiply its bytes (one prompt in 9 rows: 54 pairs over 6 experts read each nine times, 19.1 ms of experts a step
 # against 4.5 at one row and 7.9 grouped); the grouped path reads each expert once for all its pairs.
-
-
-@functools.lru_cache(maxsize=None)
-def _blackwell(device=None):
-    """Whether the GPU (the current one by default) is Blackwell or later (compute capability 10+)."""
-    if not torch.cuda.is_available():
-        return False
-    index = device.index if isinstance(device, torch.device) else device
-    major, _ = torch.cuda.get_device_capability(torch.cuda.current_device() if index is None else index)
-    return major >= 10
 
 
 @functools.lru_cache(maxsize=None)

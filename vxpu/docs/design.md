@@ -626,8 +626,8 @@ is code, and what runs where:
   shape key (the engine's own, `1x6144->25600` for an fp8 linear) or the
   op alone, and the engine takes the most specific entry that matches.
   The knobs are the numbers `triton_ops` set by hand (`GEMV_ROWS_MAX`,
-  `FP4_DIRECT_MAX`, the fronts' chunk and group sizes, the fp4 bodies'
-  overrides), typed and checked. `VXPU_PLAN_TABLE` (a file, or inline
+  `FP4_DIRECT_MAX`, the front kernels' chunk size, group size, and dots warp count
+  `FRONT_SPLIT_WARPS`, the fp4 bodies' overrides), typed and checked. `VXPU_PLAN_TABLE` (a file, or inline
   from the coordinator with the load) makes the engine apply the table
   exactly: the dispatch and the lowering return the named body, nothing
   is measured, and a body that cannot run at a site the lowering reaches
@@ -645,12 +645,12 @@ is code, and what runs where:
   records of one GPU and writes the table: per (op, shapes) the
   measured-fastest body, a launch credited to a fused one as the engine's
   own costing does, named per site where the record ran different bodies
-  at one shape; the native-format knobs from the card's compute
-  capability (fp4 on the tensor cores from Blackwell on); the other knobs
-  from the record's sweeps, else as the record ran. It is a function of
-  the record, unit-tested on fixture records with no GPU, so a costlier
-  policy (regions costed whole, the graph cut here) replaces the function
-  behind the same table.
+  at one shape; the native-format and warp knobs from the card's compute
+  capability (fp4 on the tensor cores and 8 warps for the front dots kernel
+  from Blackwell on); the other knobs from the record's sweeps, else as
+  the record ran. It is a function of the record, unit-tested on fixture
+  records with no GPU, so a costlier policy (regions costed whole, the
+  graph cut here) replaces the function behind the same table.
 - *The check*: `vxpu kernels check` and `python -m vxpu.plan
   --check-record` compare a run's record against its table, and every
   site that ran another body is listed; `python -m vxpu.plan

@@ -252,7 +252,12 @@ func (e Entry) key() string {
 // KNOBS). A table with another knob, or a wrong type, is refused there.
 var knobTypes = map[string]string{
 	"GEMV_ROWS_MAX": "int", "FP4_DIRECT_MAX": "int", "FFN_FRONT_EB": "int", "FFN_FRONT_BD": "int",
-	"FRONT_SPLIT_BD": "int", "FRONT_SPLIT_EB": "int", "FP4_KSPLIT": "int", "FP4_NATIVE": "bool", "FP4_DIRECT": "bool",
+	"FRONT_SPLIT_BD": "int", "FRONT_SPLIT_EB": "int", "FRONT_SPLIT_WARPS": "int", "FP4_KSPLIT": "int",
+	"FP4_NATIVE": "bool", "FP4_DIRECT": "bool",
+}
+
+func isSupportedWarps(w int) bool {
+	return w == 1 || w == 2 || w == 4 || w == 8 || w == 16
 }
 
 func checkKnob(name string, value any) error {
@@ -266,11 +271,17 @@ func checkKnob(name string, value any) error {
 			return fmt.Errorf("kernel table: knob %s must be true or false, got %v", name, value)
 		}
 	case "int":
+		var iv int
 		f, ok := value.(float64) // encoding/json's number
-		if !ok || f != float64(int64(f)) {
-			if _, isInt := value.(int); !isInt {
-				return fmt.Errorf("kernel table: knob %s must be an integer, got %v", name, value)
-			}
+		if ok && f == float64(int64(f)) {
+			iv = int(f)
+		} else if v, isInt := value.(int); isInt {
+			iv = v
+		} else {
+			return fmt.Errorf("kernel table: knob %s must be an integer, got %v", name, value)
+		}
+		if name == "FRONT_SPLIT_WARPS" && !isSupportedWarps(iv) {
+			return fmt.Errorf("kernel table: knob FRONT_SPLIT_WARPS must be a supported warp count (1, 2, 4, 8, 16), got %v", value)
 		}
 	}
 	return nil

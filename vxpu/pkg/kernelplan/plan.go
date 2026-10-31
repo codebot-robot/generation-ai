@@ -111,6 +111,13 @@ func Plan(ctx context.Context, records []*Record, opts Options) (*Table, error) 
 		native := major >= 10 // Blackwell and later take MXFP4 on the tensor cores
 		t.Knobs["FP4_NATIVE"] = native
 		t.Explain = append(t.Explain, fmt.Sprintf("FP4_NATIVE=%v: compute capability %s", native, records[0].Hardware.GPUCapability))
+
+		warps := 4
+		if major >= 10 {
+			warps = 8
+		}
+		t.Knobs["FRONT_SPLIT_WARPS"] = warps
+		t.Explain = append(t.Explain, fmt.Sprintf("FRONT_SPLIT_WARPS=%d: compute capability %s", warps, records[0].Hardware.GPUCapability))
 	}
 	sweeps := map[string]map[string]float64{}
 	for _, r := range records {
@@ -263,6 +270,9 @@ func knobValue(knob, text string) (any, error) {
 		n, err := strconv.Atoi(text)
 		if err != nil {
 			return nil, fmt.Errorf("knob %s: %w", knob, err)
+		}
+		if knob == "FRONT_SPLIT_WARPS" && !isSupportedWarps(n) {
+			return nil, fmt.Errorf("knob FRONT_SPLIT_WARPS: unsupported warp count %d", n)
 		}
 		return n, nil
 	}

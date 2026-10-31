@@ -266,9 +266,12 @@ RECORD_FORMAT = "vxpu-kernel-record/1"
 # triton_ops' hand-set numbers a table may set (module attributes read at
 # each call): name -> type. The bool ones are triton_ops' "1"/"0" A/B
 # overrides; None (the default) leaves the kernel to decide from the card.
+SUPPORTED_FRONT_SPLIT_WARPS = (1, 2, 4, 8, 16)
+
 KNOBS = {
     "GEMV_ROWS_MAX": int, "FP4_DIRECT_MAX": int, "FFN_FRONT_EB": int, "FFN_FRONT_BD": int,
-    "FRONT_SPLIT_BD": int, "FRONT_SPLIT_EB": int, "FP4_KSPLIT": int, "FP4_NATIVE": bool, "FP4_DIRECT": bool,
+    "FRONT_SPLIT_BD": int, "FRONT_SPLIT_EB": int, "FRONT_SPLIT_WARPS": int, "FP4_KSPLIT": int,
+    "FP4_NATIVE": bool, "FP4_DIRECT": bool,
 }
 
 
@@ -299,6 +302,9 @@ def load_table(text):
             raise ConfigError(f"VXPU_PLAN_TABLE: unknown knob {name!r} (known: {', '.join(sorted(KNOBS))})")
         if kind is bool and not isinstance(value, bool) or kind is int and (isinstance(value, bool) or not isinstance(value, int)):
             raise ConfigError(f"VXPU_PLAN_TABLE: knob {name} must be {'true/false' if kind is bool else 'an integer'}, got {value!r}")
+        if name == "FRONT_SPLIT_WARPS" and value not in SUPPORTED_FRONT_SPLIT_WARPS:
+            raise ConfigError(f"VXPU_PLAN_TABLE: knob FRONT_SPLIT_WARPS must be a supported warp count "
+                              f"({', '.join(str(w) for w in SUPPORTED_FRONT_SPLIT_WARPS)}), got {value!r}")
     index = {"site": {}, "shapes": {}, "op": {}}
     for i, entry in enumerate(table.get("sites") or []):
         if not isinstance(entry, dict) or "op" not in entry or "impl" not in entry:
