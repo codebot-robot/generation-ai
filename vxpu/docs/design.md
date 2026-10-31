@@ -195,7 +195,9 @@ layers whole, dense weights and experts (`VXPU_LAYER_DEVICES`, ranges
 0:8, 8:20, 20:32, 32:40 and the drafter's 40:43 back on the first; 65,
 87, 87 and 58 GB of experts), and the step crosses GPUs once per range
 instead of fanning every layer's experts out to four GPUs and back. The
-aim was the one-GPU floor at one row, 10.3 ms. It was not reached:
+aim was the one-GPU floor at one row, then written as 10.3 ms (8.9 ms
+once the dense bytes were counted from the artifact, below). It was not
+reached:
 
 | one row, no drafter | step | kernels a step |
 |---|---|---|
@@ -203,7 +205,8 @@ aim was the one-GPU floor at one row, 10.3 ms. It was not reached:
 | the same placement, the region ops in the graph | 21.3 ms | |
 | sharded, the region ops | 20.3 ms | 1,742 |
 | sharded, the ops' Triton kernels forced | 20.2 ms | |
-| floor (10.5 GB dense + 4.5 GB of experts at 1,460 GB/s) | 10.3 ms | |
+| floor as then estimated (10.5 GB dense + 4.5 GB of experts at 1,460 GB/s) | 10.3 ms | |
+| floor from the artifact's bytes (8.5 GB dense + 4.5 GB of experts) | 8.9 ms | |
 
 The region ops took 350 kernels out of the step and no time: on this
 card the small kernels they fold away were already cheap, and the GEMVs
@@ -272,9 +275,13 @@ GPU (measured): 15.4 ms median (p10/p90 15/25), 1,422 kernels a step
 (hero 7: 1,742), 14.2 ms of GPU time in 15.2 ms of wall; by part: dense
 GEMVs 6.8 ms, experts 4.5 (floor 3.1), fronts 0.8 (floor 0.2), the rest
 2.1. The dense GEMVs came in under the 7.2 ms written above as their
-floor, so that number was an overestimate of the dense bytes and is to
-be recomputed from the weights the step reads. Hero 7 to here: 20.3 to
-15.4 ms, 1.5 times the one-GPU floor. Still visible in the profile: two
+floor, so that floor was wrong. Recomputed from the artifact's binding
+(rows-b1, the bound tensors that are not state): the 40 layers' dense
+weights are 6.9 GB, the two engram layers 0.3 GB, and the head 1.3 GB in
+bf16 (the embedding is read one row at a time), 8.5 GB a step, 5.8 ms at
+1,460 GB/s; with the 4.5 GB of selected experts the one-row floor is 8.9
+ms, not 10.3. Hero 7 to here: 20.3 to 15.4 ms, 1.7 times the one-GPU
+floor; the dense GEMVs run at 86% of theirs. Still visible in the profile: two
 compiler-fused reductions at 154 µs each, the greedy sampler at 100 µs
 with a random draw it does not need, and nine top-k gathers of 11.5 µs
 (the indexer's, #484).
@@ -348,9 +355,12 @@ and it is untestable without a GPU. The change:
 **The roofline, and the production stacks.** A decode step at one row
 reads every dense weight once and the selected experts once, so its floor
 on one GPU is those bytes over the GPU's copy bandwidth. On an RTX PRO
-6000 (copy measured at 1,460 GB/s) DeepSeek-V4.1-Flash reads 10.5 GB of
-dense weights and about 4.5 GB of selected experts a step: a floor of
-10.3 ms, 97 tokens/s. We measure against that floor and against the
+6000 (copy measured at 1,460 GB/s) DeepSeek-V4.1-Flash reads 8.5 GB of
+dense weights (6.9 GB in the 40 layers, 0.3 GB in the two engram layers,
+the 1.3 GB bf16 head; counted from the artifact's binding) and about 4.5
+GB of selected experts a step: a floor of 8.9 ms, 112 tokens/s (hero
+runs 6 and 7 were written against an estimate of 10.5 GB dense, 10.3
+ms). We measure against that floor and against the
 production stacks on the same cards, not against our previous run. Hero
 run 6 (Oct 30, four RTX PRO 6000, every expert on the GPUs) took 20.6 ms
 a step at one row:
