@@ -385,14 +385,15 @@ class Engine:
             raise
         pool.shutdown(wait=True)
 
-        if self.plan["blob_dir"]:
-            # the weights are loaded: the blob files' cached pages would only
-            # crowd out what the engine reads every token (tables read every
-            # token keep their pages)
-            from . import localblobs
-            keep_shas = {t.file_backed.sha for t in getattr(self.external, "engram", {}).values()
-                         if getattr(t, "file_backed", None) is not None} if hasattr(self, "external") else set()
-            released = localblobs.release(self.manifest["files"], self.plan["blob_dir"], exclude_shas=keep_shas)
+        # the weights are loaded: the blob files' cached pages would only
+        # crowd out what the engine reads every token (tables read every
+        # token keep their pages); local files are those in blob_dir or
+        # named by a file:// source in the manifest
+        from . import localblobs
+        keep_shas = {t.file_backed.sha for t in getattr(self.external, "engram", {}).values()
+                     if getattr(t, "file_backed", None) is not None} if hasattr(self, "external") else set()
+        released = localblobs.release(self.manifest["files"], self.plan["blob_dir"], exclude_shas=keep_shas)
+        if released:
             print(f"[vxpu] released the page cache of {released} local blob files", flush=True)
         if str(self.device).startswith("cuda") and self._resident is not None:
             self._warm_up()

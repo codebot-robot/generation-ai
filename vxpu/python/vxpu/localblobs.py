@@ -96,18 +96,30 @@ def localize(files, blob_dir, bucket=None, log=lambda msg: print(msg, flush=True
     return out, summary
 
 
-def release(files, blob_dir, exclude_shas=None):
+def release(files, blob_dir=None, exclude_shas=None):
     """Ask the kernel to drop the page cache of the local blob files once
     the engine has loaded from them: their bytes now live in RAM (the
     expert banks), on the GPU or in the external tables' own files, so
     cached blob pages only push out what the engine reads every token
     (the memory-mapped or file-backed n-gram tables). Tables read directly
-    from checkpoint files via io_uring are excluded (#452)."""
+    from checkpoint files via io_uring are excluded (#452). A file is
+    local when it sits in blob_dir or when the manifest names it by a
+    file:// source (a checkpoint copied next to the engine): both are
+    released. On a pod whose memory limit bounds the page cache, 510 GB
+    of cached blobs crowded out the n-gram tables, which then faulted in
+    the middle of steps (44.8 ms in one profiled step, medians at flat 20,
+    30 or 60 ms)."""
     released = 0
-    for sha in files:
+    for sha, info in files.items():
         if exclude_shas and sha in exclude_shas:
             continue
-        path = os.path.join(blob_dir, sha)
+        if blob_dir:
+            path = os.path.join(blob_dir, sha)
+        else:
+            source = info.get("source", "") if isinstance(info, dict) else ""
+            if not source.startswith("file://"):
+                continue
+            path = source[len("file://"):]
         try:
             fd = os.open(path, os.O_RDONLY)
         except OSError:
