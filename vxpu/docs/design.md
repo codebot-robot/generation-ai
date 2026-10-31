@@ -640,7 +640,8 @@ is code, and what runs where:
   kernels inlined for it as the traced graph names them (empty for a
   fused body: the compiler's kernels). Per-step statistics go in the same
   file by name (`Plan.stat`): kernels a step, crossings, the distinct
-  experts a layer, and `sweeps` of a knob where a run swept one.
+  experts a layer (`distinct_experts`, reported by the engine at the end of a run
+  when measured), and `sweeps` of a knob where a run swept one.
 - *The planner* (`pkg/kernelplan`, Go; `vxpu kernels plan`) reads
   records of one GPU and writes the table: per (op, shapes) the
   measured-fastest body, a launch credited to a fused one as the engine's

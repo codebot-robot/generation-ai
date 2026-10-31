@@ -1178,6 +1178,8 @@ class Engine:
             torch.cuda.synchronize(self.device)
             for tensor in (self._resident or {}).values():
                 tensor.zero_()
+            if hasattr(self._decode_split, "reset_expert_stats"):
+                self._decode_split.reset_expert_stats()
         msg = f"warm-up: decode steps in {time.time() - started:.1f}s (weight copies made, segments built or loaded, graphs captured)"
         print(f"[vxpu] {msg}", flush=True)
         self.plan.note(msg)
@@ -1515,46 +1517,49 @@ class Engine:
         for request in requests:
             self._check_prompt(request.prompt)
         waiting = sorted(range(len(prompts)), key=lambda i: arrivals[i])
-        if not telemetry and all(self._native_rows(r.sampler) for r in requests):
-            return self._generate_rows_native(requests, waiting, arrivals)
-        step_ms, rows_active = [], []
-        recorder = None
-        with self._lock:
-            rows = _Rows(self)
-            if telemetry:
-                recorder = Recorder(self.device, getattr(self, "_segment_info", None)
-                                    if self._decode_split is not None else None)
-                self.external.telemetry = recorder
-                if self._decode_split is not None:
-                    self._decode_split.set_recorder(recorder)
-            try:
-                with self.external_scope():
-                    rows.bind()
-                    step = 0
-                    while waiting or rows.active():
-                        row = rows.free_row()
-                        while row is not None and waiting and arrivals[waiting[0]] <= step:
-                            rows.admit(requests[waiting.pop(0)], row)
-                            row = rows.free_row()
-                        rows.emit()
-                        if rows.active():
-                            rows_active.append(len(rows.active()))
-                            step_ms.append(rows.step())
-                            if recorder is not None:
-                                recorder.step_ms.append(step_ms[-1])
-                        step += 1
-            finally:
-                if recorder is not None:
-                    self.external.telemetry = None
+        try:
+            if not telemetry and all(self._native_rows(r.sampler) for r in requests):
+                return self._generate_rows_native(requests, waiting, arrivals)
+            step_ms, rows_active = [], []
+            recorder = None
+            with self._lock:
+                rows = _Rows(self)
+                if telemetry:
+                    recorder = Recorder(self.device, getattr(self, "_segment_info", None)
+                                        if self._decode_split is not None else None)
+                    self.external.telemetry = recorder
                     if self._decode_split is not None:
-                        self._decode_split.set_recorder(None)
-        out = {"token_ids": [r.token_ids for r in requests], "prefill_ms": [r.prefill_ms for r in requests],
-               "step_ms": step_ms, "rows_active": rows_active,
-               "drafted": rows.drafted, "accepted": rows.accepted}
-        if recorder is not None:
-            recorder.phase = "decode"
-            out["telemetry"] = recorder.result(plan_record(self.explain()))
-        return out
+                        self._decode_split.set_recorder(recorder)
+                try:
+                    with self.external_scope():
+                        rows.bind()
+                        step = 0
+                        while waiting or rows.active():
+                            row = rows.free_row()
+                            while row is not None and waiting and arrivals[waiting[0]] <= step:
+                                rows.admit(requests[waiting.pop(0)], row)
+                                row = rows.free_row()
+                            rows.emit()
+                            if rows.active():
+                                rows_active.append(len(rows.active()))
+                                step_ms.append(rows.step())
+                                if recorder is not None:
+                                    recorder.step_ms.append(step_ms[-1])
+                            step += 1
+                finally:
+                    if recorder is not None:
+                        self.external.telemetry = None
+                        if self._decode_split is not None:
+                            self._decode_split.set_recorder(None)
+            out = {"token_ids": [r.token_ids for r in requests], "prefill_ms": [r.prefill_ms for r in requests],
+                   "step_ms": step_ms, "rows_active": rows_active,
+                   "drafted": rows.drafted, "accepted": rows.accepted}
+            if recorder is not None:
+                recorder.phase = "decode"
+                out["telemetry"] = recorder.result(plan_record(self.explain()))
+            return out
+        finally:
+            self._report_expert_stats()
 
     def _generate_rows_native(self, requests, waiting, arrivals):
         """generate_rows on the native loop (_NativeRows): the loop steps by itself, and a prompt
@@ -1626,6 +1631,7 @@ class Engine:
                 self.external.telemetry = None
                 if self._decode_split is not None:
                     self._decode_split.set_recorder(None)
+            self._report_expert_stats()
 
     def _generate_scoped(self, session, ids, max_new_tokens, params,
                          extra_eos_ids, logits_sink, recorder=None):
@@ -1742,6 +1748,32 @@ class Engine:
         if recorder is not None:
             done["telemetry"] = recorder.result(plan_record(self.explain()))
         yield done
+
+    def expert_stats(self):
+        """The distinct experts a decode step selects per layer (None without VXPU_EXPERT_STATS)."""
+        if self._decode_split is not None and hasattr(self._decode_split, "expert_stats"):
+            return self._decode_split.expert_stats()
+        return None
+
+    def _report_expert_stats(self):
+        """Report distinct experts selected per layer into the planner's cost record."""
+        stats = self.expert_stats()
+        if stats and self.plan is not None and hasattr(self.plan, "stat"):
+            self.plan.stat("distinct_experts", stats)
+        return stats
+
+    def close(self):
+        """Release engine resources and report final statistics into the plan record."""
+        self._report_expert_stats()
+        if hasattr(self, "_decode_split") and self._decode_split is not None:
+            if hasattr(self._decode_split, "close"):
+                self._decode_split.close()
+
+    def __del__(self):
+        try:
+            self.close()
+        except Exception:
+            pass
 
 
 class _Request:
@@ -2016,6 +2048,7 @@ class _NativeRows:
     def close(self):
         if self.loop is not None:
             self.loop.stop()
+        self.engine._report_expert_stats()
 
 
 class _ModelDrafter:

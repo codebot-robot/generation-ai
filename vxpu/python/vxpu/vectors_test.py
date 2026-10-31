@@ -852,6 +852,118 @@ def _check_plan_table():
         triton_ops.GEMV_ROWS_MAX, triton_ops.FP4_NATIVE = before
 
 
+def _check_expert_stats_record():
+    """Verify that an engine reports distinct experts measured by StepGraph into the planner record."""
+    import json
+    import tempfile
+    import torch
+    from . import engine, plan
+    from .plan import Plan
+    from .stepgraph import StepGraph
+
+    counts = {0: 6.0, 1: 11.9, 14: 37.3, 39: 90.3}
+
+    class FakeStepGraph:
+        def __init__(self, stats):
+            self._stats = stats
+
+        def expert_stats(self):
+            return dict(self._stats)
+
+    with tempfile.TemporaryDirectory() as tmp:
+        record_path = os.path.join(tmp, "record.json")
+        p = _with_env({"VXPU_PLAN_RECORD": record_path, "VXPU_KERNELS": "0"},
+                      Plan, "cpu", triton_available=False)
+
+        class FakeEngine:
+            def __init__(self, plan_obj, step_graph):
+                self.plan = plan_obj
+                self._decode_split = step_graph
+
+            def expert_stats(self):
+                if self._decode_split is not None and hasattr(self._decode_split, "expert_stats"):
+                    return self._decode_split.expert_stats()
+                return None
+
+            def _report_expert_stats(self):
+                stats = self.expert_stats()
+                if stats and self.plan is not None and hasattr(self.plan, "stat"):
+                    self.plan.stat("distinct_experts", stats)
+                return stats
+
+            def close(self):
+                self._report_expert_stats()
+
+        fake_engine = FakeEngine(p, FakeStepGraph(counts))
+        fake_engine.close()
+
+        with open(record_path) as f:
+            written = json.load(f)
+
+        distinct = written.get("stats", {}).get("distinct_experts")
+        if distinct is None:
+            raise SystemExit("expert_stats record: distinct_experts was not written into stats")
+        if {int(k): v for k, v in distinct.items()} != counts:
+            raise SystemExit(f"expert_stats record: expected {counts}, got {distinct}")
+
+        # Also verify with Engine directly
+        record_path2 = os.path.join(tmp, "record2.json")
+        p2 = _with_env({"VXPU_PLAN_RECORD": record_path2, "VXPU_KERNELS": "0"},
+                       Plan, "cpu", triton_available=False)
+        eng = engine.Engine.__new__(engine.Engine)
+        eng.plan = p2
+        eng._decode_split = FakeStepGraph(counts)
+        eng.close()
+
+        with open(record_path2) as f:
+            written2 = json.load(f)
+        distinct2 = written2.get("stats", {}).get("distinct_experts")
+        if {int(k): v for k, v in distinct2.items()} != counts:
+            raise SystemExit(f"expert_stats record: expected {counts}, got {distinct2}")
+
+        # Verify StepGraph.expert_stats mean calculation over simulated replays
+        counts_tensor = torch.zeros(64, dtype=torch.int64)
+        counts_tensor[0] = 384    # 64 steps * 6
+        counts_tensor[1] = 768    # 64 steps * 12
+        counts_tensor[39] = 5779  # 64 steps * 90.296875 -> 90.3
+
+        sg = StepGraph.__new__(StepGraph)
+        sg._expert_counts = {torch.device("cpu"): counts_tensor}
+        sg._loop = None
+        sg._measured_steps = 0
+        sg.steps = 0
+
+        # Mean with explicit steps parameter
+        stats = sg.expert_stats(steps=64)
+        assert stats[0] == 6.0
+        assert stats[1] == 12.0
+        assert stats[39] == 90.3
+
+        # Mean inferred from native loop steps()
+        class MockLoop:
+            def steps(self):
+                return 64
+
+        sg._loop = MockLoop()
+        stats = sg.expert_stats()
+        assert stats[0] == 6.0
+        assert stats[1] == 12.0
+        assert stats[39] == 90.3
+
+        # Mean inferred from measured steps in Python replay
+        sg._loop = None
+        sg._measured_steps = 64
+        stats = sg.expert_stats()
+        assert stats[0] == 6.0
+        assert stats[1] == 12.0
+        assert stats[39] == 90.3
+
+        # Zeroing counters
+        sg.reset_expert_stats()
+        assert int(counts_tensor[0]) == 0
+        assert sg._measured_steps == 0
+
+
 def _check_compile_plan():
     """Verify configure_inductor and Plan's compiler choices for prologue_fusion."""
     from . import engine, plan
@@ -2844,6 +2956,7 @@ def selftest(workdir, settings):
     _check_compile_plan()
     _check_plan_given()
     _check_plan_table()
+    _check_expert_stats_record()
     _check_compile_names()
     if not _check_admin_telemetry():
         raise SystemExit("admin telemetry check failed")

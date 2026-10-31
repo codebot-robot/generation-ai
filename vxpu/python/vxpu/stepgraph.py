@@ -279,6 +279,8 @@ class StepGraph(torch.nn.Module):
         self.node_counts = {}
         self._peer_graphs = []
         self.steps = 0
+        self._measured_steps = 0
+        self._loop = None
         self.recorder = None
         self._host = None
         self._expert_counts = {}  # per GPU: distinct experts selected, summed per layer (VXPU_EXPERT_STATS)
@@ -303,6 +305,8 @@ class StepGraph(torch.nn.Module):
             buf.copy_(a)
         self._host.go()
         self.graph.replay()
+        if self._expert_counts:
+            self._measured_steps += 1
         # the other GPUs' graphs after this one's: launched first, a graph
         # that opens by waiting on a flag held the launching thread ~5 ms
         for pdev, g in self._peer_graphs:
@@ -359,6 +363,7 @@ class StepGraph(torch.nn.Module):
             _check_flat(*draft.native_parts()[:2], "draft")
         loop = kernels.load().DecodeLoop(inputs["input_ids"], inputs["cache_position"], chosen, execs, streams, devices,
                                          host, flags, out_graph)
+        self._loop = loop
         loop.set_sampling(*self._sampling)
         if draft is not None:
             d_inputs, d_out, d_execs, d_streams, d_devices, d_host, d_flags = draft.native_parts()
@@ -833,15 +838,35 @@ class StepGraph(torch.nn.Module):
         present.index_fill_(0, ids, 1)
         counters[layer] += present.sum().to(torch.int64)
 
-    def expert_stats(self):
-        """{layer: distinct experts selected, summed over every replay since the capture} (None
-        without VXPU_EXPERT_STATS). The caller knows how many steps it ran (the native loop
-        replays the graphs without this object), divides, and reports the mean through
-        plan.stat("distinct_experts", ...); hero-spec-stats.py does that per run."""
+    def reset_expert_stats(self):
+        """Zero the distinct-expert counters and measured steps."""
+        self._measured_steps = 0
+        if self._expert_counts:
+            for c in self._expert_counts.values():
+                c.zero_()
+
+    def expert_stats(self, steps=None):
+        """{layer: mean distinct experts selected per step} (None without VXPU_EXPERT_STATS).
+        The engine reports it through plan.stat("distinct_experts", ...) at the end of a run."""
         if not self._expert_counts:
             return None
         total = sum(c.cpu() for c in self._expert_counts.values())
-        return {layer: int(total[layer]) for layer in range(EXPERT_STATS_LAYERS) if total[layer] > 0}
+        if steps is None:
+            if getattr(self, "_loop", None) is not None and self._loop.steps() > 0:
+                steps = self._loop.steps()
+            elif getattr(self, "_measured_steps", 0) > 0:
+                steps = self._measured_steps
+            elif self.steps > 1:
+                steps = self.steps - 1
+            else:
+                steps = 1
+        return {layer: round(float(total[layer]) / steps, 1)
+                for layer in range(min(len(total), EXPERT_STATS_LAYERS)) if total[layer] > 0}
+
+    def close(self):
+        """Stop the step host thread if running."""
+        if self._host is not None:
+            self._host.stop()
 
     def _stat(self, name, value):
         if self.plan is not None and hasattr(self.plan, "stat"):
