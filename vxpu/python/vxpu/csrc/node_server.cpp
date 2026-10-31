@@ -64,6 +64,7 @@
 #include <dlfcn.h>
 
 #include <atomic>
+#include <array>
 #include <chrono>
 #include <condition_variable>
 #include <cstring>
@@ -513,8 +514,8 @@ class StepHost {
 
   // [nodes, 5] int64: per host node of the last step, when the GPU's flag
   // was seen, when the reply was ready, when the flag was raised back
-  // (steady-clock ns), and for a remote node the server's read and run
-  // times (ns; 0 for a local node).
+  // (steady-clock ns), then for a remote node the server's read and run
+  // times (ns), for a local node when its package returned (and 0).
   at::Tensor times() const { return times_; }
 
   bool running() const { return thread_.joinable(); }
@@ -584,6 +585,7 @@ class StepHost {
             std::vector<at::Tensor> args(box.inputs);
             args.insert(args.end(), box.residents.begin(), box.residents.end());
             out = box.loader->run(args);
+            t[5 * i + 3] = now_ns();  // a local node: when its package returned (the reply's copy follows)
           }
           TORCH_CHECK(!out.empty(), "host node ", i, ": no reply");
           box.outbox.copy_(out[0].view(box.outbox.sizes()));
@@ -1058,6 +1060,7 @@ class DecodeLoop {
     wake_.notify_all();
     events_cv_.notify_all();
     if (thread_.joinable()) thread_.join();
+    print_phases();
   }
 
  private:
@@ -1129,6 +1132,11 @@ class DecodeLoop {
         Driver::check(cu.stream_sync(reinterpret_cast<void*>(streams[g])), "cuStreamSynchronize");
       }
       Driver::check(cu.ctx_set_current(ctxs[0]), "cuCtxSetCurrent");
+      check();
+    }
+    // The step host's verdict alone: for graphs whose streams another Graphs' sync already drained
+    // (the drafter's run on the verify's streams, ahead of it).
+    void check() {
       std::string error = host->take_error();
       if (!error.empty()) {
         flags.zero_();  // the host released every flag; the next step starts clean
@@ -1204,6 +1212,7 @@ class DecodeLoop {
         }
       }
       const int64_t t0 = now_ns();
+      int64_t t_drafted = 0, t_launched = 0, t_synced = 0;
       std::string error;
       try {
         void* after = nullptr;
@@ -1213,6 +1222,7 @@ class DecodeLoop {
           Driver::check(Driver::get().event_record(drafted_event_, draft_->out_stream()), "cuEventRecord");
           after = drafted_event_;
           for (int64_t i = 0; i < rows_n_; ++i) ids[i * S_] = first[i];  // the rest come from the GPU (compose)
+          t_drafted = now_ns();
         } else {
           if (draft_) {  // the drafter on each row's next token: its K tokens after it, through the host
             draft_->run(first.data(), rows_n_ * sizeof(int64_t), pos, rows_n_ * sizeof(int64_t), drafted);
@@ -1234,8 +1244,10 @@ class DecodeLoop {
         }
         verify_.launch(ids, rows_n_ * S_ * sizeof(int64_t), pos, rows_n_ * sizeof(int64_t), after, compose_);
         verify_.collect(chosen);
-        if (after != nullptr) draft_->sync();
-        verify_.sync();
+        t_launched = now_ns();
+        verify_.sync();  // the drafter's graphs ran on these same streams, ahead of the verify's
+        if (after != nullptr) draft_->check();
+        t_synced = now_ns();
         if (after != nullptr) {  // the host's view of the step's ids: the drafts the GPU verified
           for (int64_t i = 0; i < rows_n_; ++i)
             for (int64_t j = 1; j < S_; ++j) ids[i * S_ + j] = drafted[i * K + j - 1];
@@ -1243,7 +1255,11 @@ class DecodeLoop {
       } catch (const std::exception& e) {
         error = e.what();
       }
-      const double ms = (now_ns() - t0) / 1e6;
+      const int64_t t_end = now_ns();
+      const double ms = (t_end - t0) / 1e6;
+      if (timing_ && t_launched && t_synced)
+        phases_.push_back({(t_drafted ? t_drafted - t0 : 0) / 1e6, (t_launched - (t_drafted ? t_drafted : t0)) / 1e6,
+                           (t_synced - t_launched) / 1e6, (t_end - t_synced) / 1e6});
       std::lock_guard<std::mutex> lk(mu_);
       stepping_ = false;
       steps_++;
@@ -1275,6 +1291,22 @@ class DecodeLoop {
 
   Graphs verify_;
   std::unique_ptr<Graphs> draft_;
+  // VXPU_LOOP_TIMING=1: each step's host phases in ms (the drafter launched, the verify launched, the GPUs
+  // waited for, the acceptance), their medians printed when the loop stops
+  const bool timing_ = std::getenv("VXPU_LOOP_TIMING") != nullptr;
+  std::vector<std::array<double, 4>> phases_;
+  void print_phases() {
+    if (!timing_ || phases_.empty()) return;
+    const char* names[4] = {"drafter launched", "verify launched", "GPUs waited for", "acceptance"};
+    fprintf(stderr, "[vxpu] decode loop phases over %zu steps (median ms):", phases_.size());
+    for (int k = 0; k < 4; ++k) {
+      std::vector<double> v;
+      for (const auto& p : phases_) v.push_back(p[k]);
+      std::sort(v.begin(), v.end());
+      fprintf(stderr, " %s %.3f;", names[k], v[v.size() / 2]);
+    }
+    fprintf(stderr, "\n");
+  }
   int64_t compose_ = 0;  // the graph that writes the drafts into the verify's ids on the GPU (0: via the host)
   void* drafted_event_ = nullptr;
   int64_t rows_n_ = 0, S_ = 1;
