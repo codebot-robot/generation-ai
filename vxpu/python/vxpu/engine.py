@@ -50,7 +50,7 @@ import torch
 
 from typing import NamedTuple
 
-from . import kernels, lower, ops, segments, vxpu_pb2  # noqa: F401  (registers vxpu::* before a graph that calls them is loaded)
+from . import kernels, lower, ops, rehydrate, segments, vxpu_pb2  # noqa: F401  (registers vxpu::* before a graph that calls them is loaded)
 from .plan import Plan
 from .plan import record as plan_record
 from .telemetry import Recorder, segment_info
