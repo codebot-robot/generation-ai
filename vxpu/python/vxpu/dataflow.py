@@ -68,10 +68,11 @@ class Ref:
 class Node:
     """One segment of the step."""
 
-    def __init__(self, name, kind, layers, args, kwargs, host=None):
+    def __init__(self, name, kind, layers, args, kwargs, host=None, writes=()):
         self.name = name
         self.kind = kind  # "dense", "experts" or "engram"
         self.layers = layers
+        self.writes = tuple(writes)  # positions of the arguments the segment writes in place (its caches)
         self.args = args  # [Ref]
         self.kwargs = kwargs  # {name: Ref}
         self.host = host  # a host node's (collection, index): ("experts", 3) for layer 3's experts
@@ -96,13 +97,14 @@ class Graph:
         self.output_names = output_names
 
     @classmethod
-    def from_split(cls, split):
+    def from_split(cls, split, mtp_base=None):
         """The graph of a module split at its host ops (split_module's
         output: placeholders, get_attr, call_module per segment, getitem
-        to unpack a segment's outputs, output)."""
+        to unpack a segment's outputs, output). mtp_base: the layer id of
+        the drafter's first stage (telemetry.segment_info)."""
         from . import nodes as native_nodes
         from .telemetry import segment_info
-        info = {seg["name"]: seg for seg in segment_info(split)}
+        info = {seg["name"]: seg for seg in segment_info(split, mtp_base)}
         refs, nodes, inputs, output = {}, [], [], None
 
         def ref(arg):
@@ -124,7 +126,8 @@ class Graph:
                 sub = getattr(sub, "_orig_mod", sub)
                 host = native_nodes.host_call(sub) if seg["kind"] != "dense" and native_nodes.is_native(sub) else None
                 nodes.append(Node(fx.target, seg["kind"], seg["layers"],
-                                  [ref(a) for a in fx.args], {k: ref(v) for k, v in fx.kwargs.items()}, host))
+                                  [ref(a) for a in fx.args], {k: ref(v) for k, v in fx.kwargs.items()}, host,
+                                  writes=seg.get("writes", ())))
                 refs[fx] = Ref("edge", node=fx.target)
             elif fx.op == "call_function" and fx.target is operator.getitem:
                 base = refs[fx.args[0]]
@@ -176,7 +179,7 @@ class Graph:
             return r
 
         nodes = [Node(n.name, n.kind, n.layers, [rewrite(a) for a in n.args],
-                      {k: rewrite(v) for k, v in n.kwargs.items()}, n.host) for n in self.nodes[start:end]]
+                      {k: rewrite(v) for k, v in n.kwargs.items()}, n.host, n.writes) for n in self.nodes[start:end]]
         if end >= len(self.nodes):
             output, names = rewrite(self.output), None
         else:
