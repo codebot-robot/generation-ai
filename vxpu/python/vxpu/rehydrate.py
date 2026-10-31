@@ -164,6 +164,40 @@ def _preallocate(fd, length, chunk=64 << 20):
         done += os.pwrite(fd, view[:n], done)
 
 
+_FILES = {}  # storage address -> the file behind a file-backed tensor (file_backed)
+
+
+def file_of(tensor):
+    """The file behind a file-backed tensor (or a parameter wrapping one), else None."""
+    try:
+        return _FILES.get(tensor.untyped_storage().data_ptr())
+    except (RuntimeError, AttributeError):
+        return None
+
+
+def release_files(paths):
+    """Ask the kernel to drop the page cache of these files (posix_fadvise DONTNEED): for a
+    file-backed tensor the engine has finished reading, such as a layer's expert banks once every
+    expert of the layer sits on a GPU. On a pod whose memory limit bounds the page cache, the
+    banks (289 GB mapped) and the checkpoint blobs together pushed out the n-gram tables the
+    engram host op reads every step (memory.events max 2,128 times, 96 GB refaulted), and the
+    steps paid random disk reads. Returns how many files were released."""
+    released = 0
+    for path in paths:
+        try:
+            fd = os.open(path, os.O_RDONLY)
+        except OSError:
+            continue
+        try:
+            os.posix_fadvise(fd, 0, 0, os.POSIX_FADV_DONTNEED)
+            released += 1
+        except (OSError, AttributeError):
+            pass
+        finally:
+            os.close(fd)
+    return released
+
+
 def file_backed(path, length):
     """A uint8 tensor of `length` bytes whose storage is the file at
     `path`, memory-mapped shared: writes land in the page cache and reach
@@ -185,7 +219,9 @@ def file_backed(path, length):
     fresh = not (os.path.exists(path) and os.path.getsize(path) == length)
     if not fresh:
         _clean_strays(dirname, basename)
-        return torch.from_file(path, shared=True, size=length, dtype=torch.uint8), False, lambda: None
+        tensor = torch.from_file(path, shared=True, size=length, dtype=torch.uint8)
+        _FILES[tensor.untyped_storage().data_ptr()] = path
+        return tensor, False, lambda: None
 
     _clean_strays(dirname, basename)
     fd, tmp = tempfile.mkstemp(dir=dirname, prefix=basename + ".partial.")
@@ -193,6 +229,7 @@ def file_backed(path, length):
     os.ftruncate(fd, length)
     _preallocate(fd, length)
     tensor = torch.from_file(tmp, shared=True, size=length, dtype=torch.uint8)
+    _FILES[tensor.untyped_storage().data_ptr()] = path  # the name it will have once committed
     fin = weakref.finalize(tensor, os.close, fd)
 
     def commit():

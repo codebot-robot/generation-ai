@@ -627,6 +627,22 @@ class Engine:
             self.external.experts[layer] = ds.host_experts(layer, args, {})
         if self.plan["gpu_experts"] and self.external.experts:
             self._place_hot_experts(self.plan["gpu_experts"])
+            # a layer whose every expert now sits on a GPU reads its host banks no more: their pages
+            # leave the cache, so the n-gram tables read every step keep theirs
+            paths, nbytes = [], 0
+            for moe in self.external.experts.values():
+                hot = getattr(moe, "_vxpu_hot", None)
+                if hot is None or hot.count < moe.n_local_experts:
+                    continue
+                for _, param in moe.named_parameters(recurse=False):
+                    path = rehydrate.file_of(param)
+                    if path is not None:
+                        paths.append(path)
+                        nbytes += param.numel() * param.element_size()
+            if paths:
+                released = rehydrate.release_files(paths)
+                print(f"[vxpu] released the page cache of {released} expert bank files ({nbytes / 1e9:.0f} GB): "
+                      f"every expert of those layers is on a GPU", flush=True)
         if self.plan["expert_mailboxes"] and self.external.experts:
             self._attach_mailboxes()
         if fetched_engram:
