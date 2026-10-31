@@ -485,7 +485,12 @@ and 285 tok/s with its drafter against our 92 on one GPU's bandwidth.
 The step launches 1,026 kernels (hero 7: 1,742; 7(b): 1,422) and crosses
 GPUs on 3 flags (23); its GPU time is 12.9 ms in a 13.6 ms wall under
 the profiler. Every same-prompt run has identical rows and accepts rows
-times what one row accepts.
+times what one row accepts. The same matrix on the other pod, with a
+two-second warm-up before the timed runs, agrees: one row 14.0 ms
+(p10/p90 14/14), 9 rows 23.2 / 24.0 / 37.3, 33 rows 35.7 / 33.5 (1,000
+tok/s) / 99.6, the drafter 28.9 to 29.9 ms at one row and 45.2 ms at
+eight; the drafter's step varies by 2 to 3 ms between runs, its host
+work.
 
 The acceptance asked for 11.5 ms and a layer of about a dozen kernels.
 Hero 8 reached 14.0 ms and 21 kernels a layer, so it did not meet it,
