@@ -341,7 +341,7 @@ def lower(gm, plan, layer_device=None):
         report[op]["lowered"][impl.name] += 1
         plan.record_site(kernels=kernels, **entry)
     if "matmul" in plan["fuse"]:
-        _fuse_matmuls(gm, report)
+        _fuse_matmuls(gm, report, devices)
     if any(r["lowered"] for r in report.values()):
         gm.graph.lint()
         gm.recompile()
@@ -438,7 +438,7 @@ def _matmul_rows(node, gm):
     return None
 
 
-def _fuse_matmuls(gm, report):
+def _fuse_matmuls(gm, report, devices=None):
     """Rewrite small contractions into reductions the compiler fuses with
     their neighbours (plan fuse "matmul"), where that measures cheaper. To
     inductor a matmul is a library call (cuBLAS), one kernel launch with its
@@ -471,7 +471,7 @@ def _fuse_matmuls(gm, report):
         if chosen == "aten":
             report[op]["kept"]["aten"] += 1
             continue
-        _inline(gm, node, body, values)
+        _inline(gm, node, body, values, device=(devices or {}).get(node))
         report[op]["lowered"]["reduction"] += 1
 
 
