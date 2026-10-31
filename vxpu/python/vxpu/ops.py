@@ -680,29 +680,34 @@ def _may_cache_bf16(ext, w):
 
 @custom_op("vxpu::shared_ffn", mutates_args=())  # pure tensor work: capturable
 def shared_ffn(x: torch.Tensor, w1: torch.Tensor, s1: torch.Tensor, w3: torch.Tensor, s3: torch.Tensor,
-               w2: torch.Tensor, s2: torch.Tensor, swiglu_limit: float, quantized: bool) -> torch.Tensor:
-    """An fp8 SwiGLU FFN over x [.., K]: the fork's Expert.forward (the MoE's shared expert), w1 and
-    w3 [I, K] and w2 [K, I] fp8 with e8m0 block scales, the SwiGLU's clamps at swiglu_limit (0 for
-    none). `quantized` says x is already on the fp8 grid (the FFN front's x_in, the experts'
-    input), so the implementations skip the quantization launch; act_quant is idempotent, so
-    the result is the same either way. One region of the decode step: about nine kernels as
-    aten, two or three as Triton."""
-    impl = select("vxpu::shared_ffn", x, w1, s1, w3, s3, w2, s2, swiglu_limit, quantized)
-    return impl.fn(x, w1, s1, w3, s3, w2, s2, swiglu_limit, quantized)
+               w2: torch.Tensor, s2: torch.Tensor, swiglu_limit: float, quantized: bool, y_experts: torch.Tensor,
+               residual: torch.Tensor, post: torch.Tensor, comb: torch.Tensor) -> torch.Tensor:
+    """The MoE's tail: the shared expert over x [b, s, K] (the fork's Expert.forward: w1 and w3
+    [I, K] and w2 [K, I] fp8 with e8m0 block scales, the SwiGLU's clamps at swiglu_limit, 0 for
+    none), added to the routed experts' sum y_experts [b, s, K] fp32 and rounded to bf16 as
+    forward_routed does, then mixed back into the hyper-connection stream (the fork's hc_post:
+    residual [b, s, hc, K], post [b, s, hc], comb [b, s, hc, hc]). Returns the new stream
+    [b, s, hc, K] bf16. `quantized` says x is already on the fp8 grid (the FFN front's x_in),
+    so the implementations skip the quantization launch; act_quant is idempotent, so the result
+    is the same either way. One region of the decode step: about eleven kernels as aten, two or
+    three as Triton (the mix is the last GEMV's epilogue)."""
+    impl = select("vxpu::shared_ffn", x, w1, s1, w3, s3, w2, s2, swiglu_limit, quantized, y_experts, residual, post,
+                  comb)
+    return impl.fn(x, w1, s1, w3, s3, w2, s2, swiglu_limit, quantized, y_experts, residual, post, comb)
 
 
 @shared_ffn.register_fake
-def _(x, w1, s1, w3, s3, w2, s2, swiglu_limit, quantized):
-    return x.new_empty(x.shape)
+def _(x, w1, s1, w3, s3, w2, s2, swiglu_limit, quantized, y_experts, residual, post, comb):
+    return x.new_empty(residual.shape)
 
 
-def _shared_ffn_context(x, w1, s1, w3, s3, w2, s2, swiglu_limit, quantized):
+def _shared_ffn_context(x, w1, s1, w3, s3, w2, s2, swiglu_limit, quantized, y_experts, residual, post, comb):
     rows = x.numel() // x.shape[-1]
     return x.device.type, f"rows={rows} dim={x.shape[-1]} inter={w1.shape[0]}", {
         "rows": rows, "dim": x.shape[-1], "inter": w1.shape[0]}
 
 
-def _shared_ffn_body(x, w1, s1, w3, s3, w2, s2, swiglu_limit, quantized, tk):
+def _shared_ffn_body(x, w1, s1, w3, s3, w2, s2, swiglu_limit, quantized, y_experts, residual, post, comb, tk):
     K = x.shape[-1]
     xf = (x if quantized else tk.act_quant_dequant(x)).reshape(-1, K)
     gate = tk.fp8_gemv(xf, w1, s1).float()
@@ -711,8 +716,8 @@ def _shared_ffn_body(x, w1, s1, w3, s3, w2, s2, swiglu_limit, quantized, tk):
         up = up.clamp(-swiglu_limit, swiglu_limit)
         gate = gate.clamp(max=swiglu_limit)
     h = (torch.nn.functional.silu(gate) * up).to(x.dtype)
-    y = tk.fp8_gemv(tk.act_quant_dequant(h), w2, s2)
-    return y.reshape(x.shape).to(x.dtype)
+    y = tk.fp8_gemv(tk.act_quant_dequant(h), w2, s2).reshape(x.shape).to(x.dtype)
+    return _hc_post_reference((y_experts + y).type_as(x), residual, post, comb)
 
 
 @implementation("vxpu::shared_ffn", "gpu-fused", ("cuda",), "rounding",
@@ -720,30 +725,34 @@ def _shared_ffn_body(x, w1, s1, w3, s3, w2, s2, swiglu_limit, quantized, tk):
                 "VXPU_FUSE; where it measures cheaper than the kernels)",
                 applies=lambda plan, lowering=False, rows=0, **_: _fusing(plan, lowering, "shared_ffn")
                 and rows <= FP8_GEMV_MAX_ROWS and _fp8_native(), lowerable=True, fused=True)
-def _shared_ffn_fused(x, w1, s1, w3, s3, w2, s2, swiglu_limit, quantized, tk=triton_ops):
-    return _shared_ffn_body(x, w1, s1, w3, s3, w2, s2, swiglu_limit, quantized, tk)
+def _shared_ffn_fused(x, w1, s1, w3, s3, w2, s2, swiglu_limit, quantized, y_experts, residual, post, comb,
+                      tk=triton_ops):
+    return _shared_ffn_body(x, w1, s1, w3, s3, w2, s2, swiglu_limit, quantized, y_experts, residual, post, comb, tk)
 
 
 @implementation("vxpu::shared_ffn", "gpu-triton", ("cuda",), "rounding",
                 "two or three Triton kernels: the input quantized unless it comes so, the dual GEMV over w1 and w3 "
-                "with the SwiGLU and the w2 input's quantization in its epilogue, the w2 GEMV",
+                "with the SwiGLU and the w2 input's quantization in its epilogue, the w2 GEMV with the experts' sum "
+                "and the hyper-connection mix in its epilogue",
                 applies=lambda plan, rows=0, dim=0, inter=0, **_: plan["triton"] and rows <= FP8_GEMV_MAX_ROWS
                 and dim % 32 == 0 and inter % 32 == 0 and _fp8_native(), lowerable=True)
-def _shared_ffn_triton(x, w1, s1, w3, s3, w2, s2, swiglu_limit, quantized, tk=triton_ops):
-    return tk.shared_ffn(x, w1, s1, w3, s3, w2, s2, swiglu_limit, quantized=quantized)
+def _shared_ffn_triton(x, w1, s1, w3, s3, w2, s2, swiglu_limit, quantized, y_experts, residual, post, comb,
+                       tk=triton_ops):
+    return tk.shared_ffn(x, w1, s1, w3, s3, w2, s2, swiglu_limit, quantized, y_experts, residual, post, comb)
 
 
 @implementation("vxpu::shared_ffn", "reference", ("cpu", "cuda"), "bit-identical",
                 "the fork's Expert.forward: three fp8 linears (act_quant and fp8_gemm, aten) and the SwiGLU",
                 reference=True)
-def _shared_ffn_reference(x, w1, s1, w3, s3, w2, s2, swiglu_limit, quantized):
+def _shared_ffn_reference(x, w1, s1, w3, s3, w2, s2, swiglu_limit, quantized, y_experts, residual, post, comb):
     gate = _fp8_linear_reference(x, w1, s1).float()  # the fork's linear quantizes x itself (idempotent)
     up = _fp8_linear_reference(x, w3, s3).float()
     if swiglu_limit > 0:
         up = up.clamp(-swiglu_limit, swiglu_limit)
         gate = gate.clamp(max=swiglu_limit)
     h = (torch.nn.functional.silu(gate) * up).to(x.dtype)
-    return _fp8_linear_reference(h, w2, s2)
+    y = y_experts + _fp8_linear_reference(h, w2, s2)  # forward_routed: y += shared, in fp32
+    return _hc_post_reference(y.type_as(x), residual, post, comb)
 
 
 @custom_op("vxpu::attn_q", mutates_args=())  # pure tensor work: capturable
@@ -776,6 +785,14 @@ def _attn_q_context(x, wq_a, sa, norm_weight, norm_eps, wq_b, sb, freqs_table, s
     rows = x.numel() // x.shape[-1]
     return x.device.type, f"rows={rows} dim={x.shape[-1]} rank={wq_a.shape[0]} heads={heads}x{head_dim}", {
         "rows": rows, "dim": x.shape[-1], "rank": wq_a.shape[0], "head_dim": head_dim, "rope_dim": rope_dim}
+
+
+def _hc_post_reference(x, residual, post, comb):
+    """The fork's Block.hc_post: the sublayer's output x [b, s, d] expanded back to the hc copies
+    of the stream and the residual [b, s, hc, d] mixed in through comb [b, s, hc, hc] (summed
+    over its first index) with post [b, s, hc]: [b, s, hc, d] in x's dtype."""
+    y = post.unsqueeze(-1) * x.unsqueeze(-2) + torch.sum(comb.unsqueeze(-1) * residual.unsqueeze(-2), dim=2)
+    return y.type_as(x)
 
 
 def _freqs_at(freqs_table, start, seqlen):
@@ -828,7 +845,7 @@ def _attn_q_fused(x, wq_a, sa, norm_weight, norm_eps, wq_b, sb, freqs_table, sta
 def _attn_q_triton(x, wq_a, sa, norm_weight, norm_eps, wq_b, sb, freqs_table, start, seqlen, heads, head_dim,
                    rope_dim, quantized, tk=triton_ops):
     return tk.attn_q(x, wq_a, sa, norm_weight, norm_eps, wq_b, sb, _freqs_real(freqs_table), start, seqlen, heads,
-                     head_dim, rope_dim, quantized=quantized)
+                     head_dim, rope_dim, quantized)
 
 
 @implementation("vxpu::attn_q", "reference", ("cpu", "cuda"), "bit-identical",
@@ -901,7 +918,7 @@ def _window_kv_fused(x, wkv, scale, norm_weight, norm_eps, freqs_table, start, s
 def _window_kv_triton(x, wkv, scale, norm_weight, norm_eps, freqs_table, start, seqlen, rope_dim, quantized,
                       tk=triton_ops):
     return tk.window_kv(x, wkv, scale, norm_weight, norm_eps, _freqs_real(freqs_table), start, seqlen, rope_dim,
-                        quantized=quantized)
+                        quantized)
 
 
 @implementation("vxpu::window_kv", "reference", ("cpu", "cuda"), "bit-identical",
@@ -919,24 +936,28 @@ def _window_kv_reference(x, wkv, scale, norm_weight, norm_eps, freqs_table, star
 
 @custom_op("vxpu::attn_out", mutates_args=())  # pure tensor work: capturable
 def attn_out(o: torch.Tensor, freqs_table: torch.Tensor, start: torch.Tensor, seqlen: int, wo_a: torch.Tensor,
-             sa: torch.Tensor, groups: int, rank: int, wo_b: torch.Tensor, sb: torch.Tensor, rope_dim: int
-             ) -> torch.Tensor:
-    """The attention's output path (the fork's Attention.forward after the attention): the inverse
-    rotary of each head's last rope_dim dims of o [b, s, heads, head_dim] by the frequencies of
-    the token's position (freqs_table the whole complex table, token t of row b at start[b] + t;
-    see attn_q), act_quant, the grouped fp8 projection wo_a [groups * rank, heads_per_group *
-    head_dim] and the fp8 projection wo_b [dim, groups * rank]. Returns [b, s, dim]. About five
-    kernels as aten, three as Triton."""
-    impl = select("vxpu::attn_out", o, freqs_table, start, seqlen, wo_a, sa, groups, rank, wo_b, sb, rope_dim)
-    return impl.fn(o, freqs_table, start, seqlen, wo_a, sa, groups, rank, wo_b, sb, rope_dim)
+             sa: torch.Tensor, groups: int, rank: int, wo_b: torch.Tensor, sb: torch.Tensor, rope_dim: int,
+             residual: torch.Tensor, post: torch.Tensor, comb: torch.Tensor) -> torch.Tensor:
+    """The attention's output path (the fork's Attention.forward after the attention, and the
+    block's hc_post after it): the inverse rotary of each head's last rope_dim dims of o [b, s,
+    heads, head_dim] by the frequencies of the token's position (freqs_table the whole complex
+    table, token t of row b at start[b] + t; see attn_q), act_quant, the grouped fp8 projection
+    wo_a [groups * rank, heads_per_group * head_dim], the fp8 projection wo_b [dim, groups *
+    rank], and the result mixed back into the hyper-connection stream (residual [b, s, hc, dim],
+    post [b, s, hc], comb [b, s, hc, hc]). Returns the new stream [b, s, hc, dim]. About seven
+    kernels as aten, three as Triton (the mix is the last GEMV's epilogue)."""
+    impl = select("vxpu::attn_out", o, freqs_table, start, seqlen, wo_a, sa, groups, rank, wo_b, sb, rope_dim,
+                  residual, post, comb)
+    return impl.fn(o, freqs_table, start, seqlen, wo_a, sa, groups, rank, wo_b, sb, rope_dim, residual, post, comb)
 
 
 @attn_out.register_fake
-def _(o, freqs_table, start, seqlen, wo_a, sa, groups, rank, wo_b, sb, rope_dim):
-    return o.new_empty(tuple(o.shape[:-2]) + (wo_b.shape[0],))
+def _(o, freqs_table, start, seqlen, wo_a, sa, groups, rank, wo_b, sb, rope_dim, residual, post, comb):
+    return o.new_empty(residual.shape)
 
 
-def _attn_out_context(o, freqs_table, start, seqlen, wo_a, sa, groups, rank, wo_b, sb, rope_dim):
+def _attn_out_context(o, freqs_table, start, seqlen, wo_a, sa, groups, rank, wo_b, sb, rope_dim, residual, post,
+                      comb):
     rows = o.numel() // (o.shape[-1] * o.shape[-2])
     return o.device.type, f"rows={rows} heads={o.shape[-2]}x{o.shape[-1]} groups={groups} rank={rank}", {
         "rows": rows, "heads": o.shape[-2], "head_dim": o.shape[-1], "groups": groups, "rank": rank,
@@ -958,26 +979,31 @@ def _attn_out_body(o, freqs_cis, wo_a, sa, groups, rank, wo_b, sb, rope_dim, tk,
                 "fuse (lowering, VXPU_FUSE; where it measures cheaper than the kernels)",
                 applies=lambda plan, lowering=False, rows=0, **_: _fusing(plan, lowering, "attn_out")
                 and rows <= FP8_GEMV_MAX_ROWS and _fp8_native(), lowerable=True, fused=True)
-def _attn_out_fused(o, freqs_table, start, seqlen, wo_a, sa, groups, rank, wo_b, sb, rope_dim, tk=triton_ops):
-    return _attn_out_body(o, _freqs_at(freqs_table, start, seqlen), wo_a, sa, groups, rank, wo_b, sb, rope_dim, tk,
-                          tk.act_quant_dequant, lambda o_, w, s_: _grouped_gemv(o_, w, s_, tk=tk))
+def _attn_out_fused(o, freqs_table, start, seqlen, wo_a, sa, groups, rank, wo_b, sb, rope_dim, residual, post, comb,
+                    tk=triton_ops):
+    x = _attn_out_body(o, _freqs_at(freqs_table, start, seqlen), wo_a, sa, groups, rank, wo_b, sb, rope_dim, tk,
+                       tk.act_quant_dequant, lambda o_, w, s_: _grouped_gemv(o_, w, s_, tk=tk))
+    return _hc_post_reference(x, residual, post, comb)
 
 
 @implementation("vxpu::attn_out", "gpu-triton", ("cuda",), "rounding",
                 "three Triton kernels: one program per row and head for the inverse rotary and the quantization, the "
-                "grouped projection quantizing its result in its epilogue, the output projection",
+                "grouped projection quantizing its result in its epilogue, the output projection with the "
+                "hyper-connection mix in its epilogue",
                 applies=lambda plan, rows=0, head_dim=0, rope_dim=0, rank=0, heads=0, groups=0, **_: plan["triton"]
                 and rows <= FP8_GEMV_MAX_ROWS and head_dim % 32 == 0 and (head_dim - rope_dim) % 2 == 0
                 and rank % 32 == 0 and groups and heads % groups == 0 and _fp8_native(), lowerable=True)
-def _attn_out_triton(o, freqs_table, start, seqlen, wo_a, sa, groups, rank, wo_b, sb, rope_dim, tk=triton_ops):
+def _attn_out_triton(o, freqs_table, start, seqlen, wo_a, sa, groups, rank, wo_b, sb, rope_dim, residual, post, comb,
+                     tk=triton_ops):
     return tk.attn_out(o, _freqs_real(freqs_table), start, seqlen, wo_a, sa, groups, rank, wo_b, sb, o.shape[-1],
-                       rope_dim)
+                       rope_dim, residual, post, comb)
 
 
 @implementation("vxpu::attn_out", "reference", ("cpu", "cuda"), "bit-identical",
                 "the fork's: apply_rotary_emb inverse, act_quant, the dequantized grouped einsum and an fp8 linear "
                 "(aten)", reference=True)
-def _attn_out_reference(o, freqs_table, start, seqlen, wo_a, sa, groups, rank, wo_b, sb, rope_dim):
+def _attn_out_reference(o, freqs_table, start, seqlen, wo_a, sa, groups, rank, wo_b, sb, rope_dim, residual, post,
+                        comb):
     ds, ka = _fork_kernels()
     freqs_cis = _freqs_at(freqs_table, start, seqlen)
     hd = o.shape[-1]
@@ -985,7 +1011,7 @@ def _attn_out_reference(o, freqs_table, start, seqlen, wo_a, sa, groups, rank, w
     o = torch.cat([o[..., :hd - rope_dim], tail], dim=-1).flatten(-2).unflatten(-1, (groups, -1)).contiguous()
     o = ka.act_quant(o, ds.fp8_block_size, ds.scale_fmt, ds.scale_dtype, True)
     mid = _grouped_reference(o, wo_a, sa).flatten(-2)
-    return _fp8_linear_reference(mid, wo_b, sb)
+    return _hc_post_reference(_fp8_linear_reference(mid, wo_b, sb), residual, post, comb)
 
 
 @custom_op("vxpu::ffn_front", mutates_args=())  # pure tensor work: capturable
