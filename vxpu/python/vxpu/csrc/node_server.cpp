@@ -66,6 +66,8 @@
 #include <atomic>
 #include <array>
 #include <chrono>
+#include <cstdio>
+#include <cstdlib>
 #include <condition_variable>
 #include <cstring>
 #include <functional>
@@ -913,9 +915,18 @@ class DecodeLoop {
     ids_host_ = at::zeros({rows_n_ * S_}, pinned);
     pos_host_ = at::zeros({rows_n_}, pinned);
     chosen_host_ = at::zeros({rows_n_ * S_}, pinned);
+    // VXPU_STEP_TRACE=path: the host side of every step, a JSON line each (the launch, the
+    // collect, each GPU's stream drain, each host node's start and end), for the steps that
+    // read 30 or 60 ms of wall around 14 ms of GPU work
+    if (const char* path = std::getenv("VXPU_STEP_TRACE"); path != nullptr && *path != 0) {
+      trace_ = std::fopen(path, "a");
+    }
   }
 
-  ~DecodeLoop() { stop(); }
+  ~DecodeLoop() {
+    stop();
+    if (trace_ != nullptr) std::fclose(trace_);
+  }
 
   // The drafter's captured step: input_ids [B, 1] and positions [B] int64
   // on the GPU, its tokens out [B, K] int64 (K >= S - 1), its graphs.
@@ -1125,11 +1136,12 @@ class DecodeLoop {
       Driver::check(cu.memcpy_async(reinterpret_cast<uint64_t>(out_host), reinterpret_cast<uint64_t>(out.data_ptr()),
                                     static_cast<size_t>(out.numel()) * sizeof(int64_t), out_stream()), "cuMemcpyAsync");
     }
-    void sync() {
+    void sync(int64_t* synced_ns = nullptr) {  // synced_ns: a timestamp per GPU as its stream drains (the step trace)
       auto& cu = Driver::get();
       for (size_t g = 0; g < execs.size(); ++g) {
         Driver::check(cu.ctx_set_current(ctxs[g]), "cuCtxSetCurrent");
         Driver::check(cu.stream_sync(reinterpret_cast<void*>(streams[g])), "cuStreamSynchronize");
+        if (synced_ns != nullptr) synced_ns[g] = now_ns();
       }
       Driver::check(cu.ctx_set_current(ctxs[0]), "cuCtxSetCurrent");
       check();
@@ -1242,12 +1254,24 @@ class DecodeLoop {
                                           static_cast<size_t>(host.numel() * host.element_size()), stream), "cuMemcpyAsync");
           }
         }
+        if (trace_ != nullptr) tr_launch0_ = now_ns();
         verify_.launch(ids, rows_n_ * S_ * sizeof(int64_t), pos, rows_n_ * sizeof(int64_t), after, compose_);
+        if (trace_ != nullptr) tr_launch1_ = now_ns();
         verify_.collect(chosen);
+<<<<<<< HEAD
         t_launched = now_ns();
         verify_.sync();  // the drafter's graphs ran on these same streams, ahead of the verify's
         if (after != nullptr) draft_->check();
         t_synced = now_ns();
+=======
+        if (after != nullptr) draft_->sync();
+        if (trace_ != nullptr) {
+          tr_synced_.assign(verify_.execs.size(), 0);
+          verify_.sync(tr_synced_.data());
+        } else {
+          verify_.sync();
+        }
+>>>>>>> h8b-stall
         if (after != nullptr) {  // the host's view of the step's ids: the drafts the GPU verified
           for (int64_t i = 0; i < rows_n_; ++i)
             for (int64_t j = 1; j < S_; ++j) ids[i * S_ + j] = drafted[i * K + j - 1];
@@ -1257,9 +1281,13 @@ class DecodeLoop {
       }
       const int64_t t_end = now_ns();
       const double ms = (t_end - t0) / 1e6;
+<<<<<<< HEAD
       if (timing_ && t_launched && t_synced)
         phases_.push_back({(t_drafted ? t_drafted - t0 : 0) / 1e6, (t_launched - (t_drafted ? t_drafted : t0)) / 1e6,
                            (t_synced - t_launched) / 1e6, (t_end - t_synced) / 1e6});
+=======
+      if (trace_ != nullptr && error.empty()) trace_step(t0, t_end, decoding);
+>>>>>>> h8b-stall
       std::lock_guard<std::mutex> lk(mu_);
       stepping_ = false;
       steps_++;
@@ -1315,6 +1343,34 @@ class DecodeLoop {
   std::vector<Row> rows_;
   std::map<int64_t, Event> pending_;
   std::vector<std::pair<double, int64_t>> step_log_;
+  std::FILE* trace_ = nullptr;
+  int64_t tr_launch0_ = 0, tr_launch1_ = 0;
+  std::vector<int64_t> tr_synced_;
+
+  // One JSON line per step: milliseconds from the step's start to each phase's end, the GPUs'
+  // stream drains in launch order, and each host node's start and end (StepHost::times: the
+  // host thread's clock, the same steady clock).
+  void trace_step(int64_t t0, int64_t t_end, int64_t decoding) {
+    std::string line = "{\"step\":" + std::to_string(steps_.load()) + ",\"decoding\":" + std::to_string(decoding) +
+                       ",\"ms\":" + std::to_string((t_end - t0) / 1e6) +
+                       ",\"launch0_ms\":" + std::to_string((tr_launch0_ - t0) / 1e6) +
+                       ",\"launched_ms\":" + std::to_string((tr_launch1_ - t0) / 1e6) + ",\"synced_ms\":[";
+    for (size_t g = 0; g < tr_synced_.size(); ++g)
+      line += (g ? "," : "") + std::to_string((tr_synced_[g] - t0) / 1e6);
+    line += "],\"host\":[";
+    if (verify_.host != nullptr) {
+      at::Tensor times = verify_.host->times();
+      const int64_t* t = times.data_ptr<int64_t>();
+      for (int64_t i = 0; i < times.size(0); ++i) {
+        if (t[5 * i] == 0) continue;
+        line += (i ? "," : "") + std::string("{\"start_ms\":") + std::to_string((t[5 * i] - t0) / 1e6) +
+                ",\"end_ms\":" + std::to_string((t[5 * i + 1] - t0) / 1e6) + "}";
+      }
+    }
+    line += "]}\n";
+    std::fputs(line.c_str(), trace_);
+    std::fflush(trace_);
+  }
   std::atomic<int64_t> steps_{0};
   int64_t drafted_ = 0, accepted_ = 0;
   std::mutex mu_;

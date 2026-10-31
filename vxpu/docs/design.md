@@ -512,13 +512,23 @@ GPU time in 13.4 ms of wall, 1,026 kernels).
 
 The acceptance asked for 11.5 ms and a layer of about a dozen kernels.
 Hero 8 reached 13.7 ms and 21 kernels a layer, so it did not meet it,
-and the gap has names. One more thing the night established: on these
-pods, step times of a fresh process sometimes read flat 30 or 60 ms for
-one prompt's run (14 ms of GPU work; the next prompt clean), on either
-pod, with islands on or off, with no other process on the GPUs; the page
-cache was one cause and is handled, and the rest is not understood. A
-serving process would see it too, so it is a bug to find, not only a
-measurement hazard. What landed: four op boundaries in the fork (the
+and the gap has names. One more thing the night established and fixed:
+on these pods, step times of a fresh process sometimes read flat 30 or
+60 ms for a whole run (14 ms of GPU work), on either pod, with no other
+process on the GPUs. A per-step host trace (`VXPU_STEP_TRACE=path`,
+one JSON line per step with each phase) put all of it inside the first
+n-gram lookup's host node: inductor compiles that node's dequantization
+loops as OpenMP parallel regions, issued once a step from the step
+host's thread, whose OpenMP workers sleep between steps, and waking
+them on this 384-vCPU machine costs a quantized 10 ms (a microbenchmark:
+p90 9.9 ms at a 500 ms cadence, 46 µs at a 14 ms one). Not disk, not
+memory, not another process. Host node packages now build with their
+loops serial: six fresh processes all at 13.6 ms with p10 equal to p90,
+the host node 0.012 ms. The page cache at the pod's memory limit was a
+second, earlier cause and is handled by the engine. The exposure stays
+for any OpenMP region issued at a long cadence from the host path (the
+CPU expert path when experts are served from RAM); the trace is the
+instrument. What landed: four op boundaries in the fork (the
 attention input quantized once, the rotary table indexed inside the
 kernels, the hyper-connection post-mix as the last GEMV's epilogue, the
 sparse attention forming its selection and finishing the output path

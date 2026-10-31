@@ -252,8 +252,19 @@ def native_package(packages, sub, external, inputs, slot_maps=None):
         spec.append({dim: tokens})
     args = examples + list(node.residents)
     dynamic = {"args": tuple(spec) + (None,) * len(node.residents)}
-    return packages.path(node, args, extra=node.cache_extra() + "tokens", code=node.code,
-                         dynamic_shapes=dynamic), node.residents
+    # The host package's loops run on one thread. Inductor's C++ parallelizes
+    # every elementwise loop over OpenMP's workers; a decode step's n-gram
+    # lookup is a few rows (about 150 KB of dequantization, 50 us serial),
+    # and each OpenMP region from the step host's thread woke sleeping
+    # workers, which on the virtual machine took 5 to 10 ms one call in ten
+    # and tens of milliseconds for whole runs (the step trace put the stall
+    # inside this node: 46 ms median against 0.07 ms hot, no page faults).
+    # A prefill's many rows run serially too, a few milliseconds once.
+    import torch._inductor.config as inductor_config
+    with inductor_config.patch({"cpp.threads": 1}):
+        path = packages.path(node, args, extra=node.cache_extra() + "tokens", code=node.code,
+                             dynamic_shapes=dynamic)
+    return path, node.residents
 
 
 def decode_split(artifact_dir):
