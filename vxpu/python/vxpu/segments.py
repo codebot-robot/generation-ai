@@ -37,10 +37,24 @@ rather than re-pointing the graph.
 """
 
 
+import operator
+import os
+
 import torch
 from torch.fx.passes.split_module import split_module
 
 HOST_OPS = ("vxpu.moe_experts.default", "vxpu.engram_rows.default")
+
+# Ops cut into segments of their own, so that the step graph can run them beside the work they
+# are independent of (stepgraph: a node that does not read the node before it goes on a parallel
+# branch). The attention's query projection and its key/value projection read the same input and
+# neither reads the other: the query path is 49 us at one row and the key/value one 9 us, and in
+# one compiled segment they ran one after the other. VXPU_ISLANDS overrides the list for an A/B
+# (empty: none).
+ISLAND_OPS = ("vxpu.attn_q.default", "vxpu.window_kv.default")
+_islands_env = os.environ.get("VXPU_ISLANDS")
+if _islands_env is not None:
+    ISLAND_OPS = tuple(f"vxpu.{name}.default" for name in _islands_env.split(",") if name)
 
 
 
@@ -97,18 +111,73 @@ def _aliases(node):
     return schema is not None and any(r.alias_info is not None for r in schema.returns)
 
 
+def mark_islands(gm):
+    """Fence every island op (ISLAND_OPS) between two alias nodes tagged in their meta, before
+    the lowering runs: the lowering replaces the op's node with its kernels' nodes, spliced in
+    right before it, so after it nothing names the op, but the fences still stand around what
+    it became and split_at_host_ops cuts at them. An alias launches nothing. Returns how many
+    ops were fenced."""
+    fenced = 0
+    for node in list(gm.graph.nodes):
+        if not (node.op == "call_function" and str(node.target) in ISLAND_OPS):
+            continue
+        name = f"{str(node.target).split('.')[1]}_{fenced}"
+        first = next((a for a in node.args if isinstance(a, torch.fx.Node)), None)
+        if first is None:
+            continue
+        with gm.graph.inserting_before(node):
+            start = gm.graph.call_function(torch.ops.aten.alias.default, (first,))
+        start.meta = dict(first.meta)
+        start.meta["vxpu_island"] = ("start", name)
+        node.replace_input_with(first, start)
+        outs = [u for u in node.users if u.op == "call_function" and u.target is operator.getitem] or [node]
+        for out in outs:
+            with gm.graph.inserting_after(out):
+                end = gm.graph.call_function(torch.ops.aten.alias.default, (out,))
+            end.meta = dict(out.meta)
+            end.meta["vxpu_island"] = ("end", name)
+            for user in list(out.users):
+                if user is not end:
+                    user.replace_input_with(out, end)
+        fenced += 1
+    if fenced:
+        gm.graph.lint()
+        gm.recompile()
+    return fenced
+
+
 def split_at_host_ops(gm):
-    """Cut gm at every host-op node. Returns (split GraphModule, names of
-    the submodules that hold a host op and must stay eager)."""
+    """Cut gm at every host-op node, and at the fences around island ops
+    (mark_islands; an unlowered island op counts as well). Returns (split
+    GraphModule, names of the submodules that hold a host op and must
+    stay eager)."""
     functionalize_host_outputs(gm)
-    segment = 0
-    part = {}
+    # an island spans its start fence to its last end fence (the op's nodes and its outputs'
+    # getitems between them), one partition; what follows is a new dense partition
+    order = {n: i for i, n in enumerate(gm.graph.nodes)}
+    span = {}  # island name -> (first index, last index)
     for node in gm.graph.nodes:
-        if node.op == "call_function" and str(node.target) in HOST_OPS:
-            part[node] = 2 * segment + 1  # a segment of its own
-            segment += 1
+        tag = node.meta.get("vxpu_island") if node.op == "call_function" else None
+        if tag is not None:
+            first, last = span.get(tag[1], (order[node], order[node]))
+            span[tag[1]] = (min(first, order[node]), max(last, order[node]))
+    island_of = {}
+    for name, (first, last) in span.items():
+        for i in range(first, last + 1):
+            island_of[i] = name
+    current = 0  # the dense segment being filled; a host op or an island takes the next number alone
+    part = {}
+    inside = None
+    for node in gm.graph.nodes:
+        here = island_of.get(order[node])
+        if here != inside:  # entering or leaving an island: a new number either way
+            current += 1
+            inside = here
+        if node.op == "call_function" and str(node.target) in HOST_OPS + (ISLAND_OPS if here is None else ()):
+            part[node] = current + 1  # a segment of its own
+            current += 2
         elif node.op in ("call_function", "call_method", "call_module"):
-            part[node] = 2 * segment
+            part[node] = current
     # a lifted parameter or buffer goes with its first user
     for node in gm.graph.nodes:
         if node.op == "get_attr":

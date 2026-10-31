@@ -82,6 +82,7 @@ CU_STREAM_WRITE_VALUE_DEFAULT = 0x0  # with a system-wide memory fence before th
 
 
 EXPERT_STATS = os.environ.get("VXPU_EXPERT_STATS", "") == "1"  # count the distinct experts a step (measurement)
+PARALLEL_BRANCHES = os.environ.get("VXPU_PARALLEL_BRANCHES", "1") != "0"  # A/B: 0 keeps every node on one stream
 EXPERT_STATS_LAYERS, EXPERT_STATS_EXPERTS = 64, 1024  # slots for layers and expert ids
 
 
@@ -612,6 +613,7 @@ class StepGraph(torch.nn.Module):
         from . import aoti
         events = []  # per host node: (sent, back), timing events recorded in the graph
         self._gpu_only = 0  # experts nodes answered by GPU pools alone, with no host crossing
+        self._branched = 0  # dense nodes captured on a parallel branch
 
         def reader_dev(node, d2):
             return node_dev.get(node.name) if d2.type != "cuda" else (torch.device("cuda", dev.index) if d2.index is None else d2)
@@ -681,6 +683,17 @@ class StepGraph(torch.nn.Module):
             with torch.cuda.device(d), torch.cuda.graph(g, stream=torch.cuda.Stream(device=d)):
                 stream = torch.cuda.current_stream()
                 side = sides[d]
+                # The parallel branch: a dense node that does not read the node captured before it
+                # on this GPU runs on `par`; every node waits on the events of the nodes it reads
+                # (recorded in the graph), so the order is the dataflow's and not the step's.
+                # The step is a chain at the node level except where the cut made islands
+                # (segments.ISLAND_OPS: the attention's two projections), which is what the branch
+                # overlaps. Host nodes stay on the main stream (their own capture uses `side`).
+                par = torch.cuda.Stream(device=d)
+                par.wait_stream(stream)  # forked from the capture's stream before anything runs on it
+                done = {}  # node name -> (its stream, the event after it)
+                main_last = None  # the node captured last on the main stream
+                par_used = False
                 if d == dev:
                     for d2 in devs[1:]:  # the step's inputs out to the other GPUs
                         for (name, d3), copy in in_copies.items():
@@ -694,22 +707,32 @@ class StepGraph(torch.nn.Module):
                 for node in graph.nodes:
                     if node_dev[node.name] != d:
                         continue
+                    producers = {r.node for r in dataflow._flat(node.refs())
+                                 if isinstance(r, dataflow.Ref) and r.kind == "edge" and node_dev[r.node] == d}
+                    on_par = (PARALLEL_BRANCHES and node.kind == "dense" and main_last is not None
+                              and main_last not in producers and not need[node.name])
+                    s = par if on_par else stream
+                    for pname in producers:  # the nodes it reads, wherever they ran
+                        ps, pe = done[pname]
+                        if ps is not s:
+                            s.wait_event(pe)
                     for key in need[node.name]:  # the waves of values other GPUs made for this node
                         f = wflags[key]
-                        driver.wait_value(stream, f.data_ptr(), 1)
-                        driver.write_value(stream, f.data_ptr(), 0)
-                    args_ = [resolve(r, d) for r in node.args]
-                    kwargs_ = {k: resolve(r, d) for k, r in node.kwargs.items()}
-                    if node.kind == "dense":
-                        module = getattr(self.split, node.name)
-                        if not isinstance(module, aoti.GraphedSegment) or module.runner is None:
-                            raise RuntimeError(f"step graph: {node.name} is not a loaded AOTInductor segment")
-                        out = module.runner(*args_)
-                    else:
-                        if node.kind == "experts" and EXPERT_STATS:
-                            self._count_experts(node, args_, d)
-                        out = self._capture_host_node(node, args_, kwargs_, d, stream, side, boxes, pooled, driver,
-                                                      flags, flag, F, mailboxes, events)
+                        driver.wait_value(s, f.data_ptr(), 1)
+                        driver.write_value(s, f.data_ptr(), 0)
+                    with torch.cuda.stream(s):
+                        args_ = [resolve(r, d) for r in node.args]
+                        kwargs_ = {k: resolve(r, d) for k, r in node.kwargs.items()}
+                        if node.kind == "dense":
+                            module = getattr(self.split, node.name)
+                            if not isinstance(module, aoti.GraphedSegment) or module.runner is None:
+                                raise RuntimeError(f"step graph: {node.name} is not a loaded AOTInductor segment")
+                            out = module.runner(*args_)
+                        else:
+                            if node.kind == "experts" and EXPERT_STATS:
+                                self._count_experts(node, args_, d)
+                            out = self._capture_host_node(node, args_, kwargs_, d, stream, side, boxes, pooled, driver,
+                                                          flags, flag, F, mailboxes, events)
                     produced[node.name] = out
                     ended = []
                     for index, devices, _ in self.runner._fanout[node.name]:  # out to readers on other GPUs
@@ -717,12 +740,22 @@ class StepGraph(torch.nn.Module):
                         for d2 in devices:
                             d2 = reader_dev(node, d2)
                             if d2 != d and isinstance(value, torch.Tensor):
-                                driver.memcpy(stream, self.runner.inboxes[(node.name, index, d2)], value)
+                                driver.memcpy(s, self.runner.inboxes[(node.name, index, d2)], value)
                                 key = xvalue_wave[(node.name, index, d2)]
                                 if last_producer[key] == node.name and key not in ended:
                                     ended.append(key)
                     for key in ended:  # the wave's last value copied: its flag, after the copies
-                        driver.write_value(stream, wflags[key].data_ptr(), 1)
+                        driver.write_value(s, wflags[key].data_ptr(), 1)
+                    ev = torch.cuda.Event()
+                    ev.record(s)
+                    done[node.name] = (s, ev)
+                    if on_par:
+                        par_used = True
+                        self._branched += 1
+                    else:
+                        main_last = node.name
+                if par_used:
+                    stream.wait_stream(par)  # the branch joins the main stream before the step's end
                 if d == out_dev:
                     output = resolve(graph.output, d)
                     # the native loop reads the output with one flat copy: a strided view (the
@@ -752,6 +785,10 @@ class StepGraph(torch.nn.Module):
         self._stat("kernels_with_expert_stats" if EXPERT_STATS else "kernels", self.node_counts.get("kernels"))
         self._stat("crossings", {"values": len(xvalue_wave), "flags": len(wflags), "input_flags": len(in_flags),
                                  "step_inputs_copied": len(in_copies)})
+        self._stat("branched_nodes", self._branched)
+        if self._branched:
+            print(f"[vxpu] step graph: {self._branched} nodes captured on a parallel branch beside the node before them",
+                  flush=True)
         g = graphs[dev]
         peer_graphs = [(d2, graphs[d2]) for d2 in devs[1:]]
         peer_graphs += [self._capture_peer(pdev, peers.index(pdev), driver, flags, F, host_nodes, boxes, pooled)
