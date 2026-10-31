@@ -1862,7 +1862,10 @@ def _block_k(dim, want):
 FP4_KSPLIT = os.environ.get("VXPU_FP4_KSPLIT")  # override: the K split of the fp4 expert kernels (measurement)
 FP4_NATIVE = os.environ.get("VXPU_FP4_NATIVE")  # override: force the native (1) or software-decode (0) body (A/B)
 FP4_DIRECT = os.environ.get("VXPU_FP4_DIRECT")  # override: force the direct (1) or grouped (0) decode path (A/B)
-FP4_DIRECT_MAX = 64  # pairs up to which the direct kernels run (no schedule; each pair reads its expert whole)
+FP4_DIRECT_MAX = 8  # pairs up to which the direct kernels run (no schedule; each pair reads its expert whole).
+# One row's pairs (top-6) and no more: the direct path streams an expert once per pair, so rows that share experts
+# multiply its bytes (one prompt in 9 rows: 54 pairs over 6 experts read each nine times, 19.1 ms of experts a step
+# against 4.5 at one row and 7.9 grouped); the grouped path reads each expert once for all its pairs.
 
 
 @functools.lru_cache(maxsize=None)
