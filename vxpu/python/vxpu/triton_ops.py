@@ -1143,6 +1143,80 @@ def ffn_front_split(stream, pre_mix, hc_fn, hc_scale, hc_base, hc_mult, sinkhorn
 
 
 # ---------------------------------------------------------------------------
+# the sampler's two argmaxes (ops.choose_argmax): one pass over a row's logits
+
+if triton is not None:
+    @triton.jit
+    def _choose_blocks_kernel(logits_ptr, temp_ptr, seed_ptr, pmax_ptr, pidx_ptr, smax_ptr, sidx_ptr, V, T, NB,
+                              BLOCK: tl.constexpr):
+        """Program (p, b): block b of position p's logits (row p // T): the block's largest logit
+        and its index (the first on ties, as torch.argmax), and the largest of logit / temperature
+        + Gumbel noise, -log(-log(u)) with u uniform per element (fresh each call: the seed tensor
+        is stepped by the caller), and its index. The second kernel combines the blocks."""
+        p = tl.program_id(0).to(tl.int64)
+        b = tl.program_id(1)
+        temp = tl.maximum(tl.load(temp_ptr + p // T), 1e-5)
+        seed = tl.load(seed_ptr)
+        offs = b * BLOCK + tl.arange(0, BLOCK)
+        live = offs < V
+        x = tl.load(logits_ptr + p * V + offs, mask=live, other=float("-inf")).to(tl.float32)
+        m = tl.max(x, axis=0)
+        i = tl.min(tl.where(x == m, offs, V), axis=0)
+        u = tl.maximum(tl.rand(seed, offs + p * V), 1e-20)
+        y = tl.where(live, x / temp - tl.log(-tl.log(u)), float("-inf"))
+        sm = tl.max(y, axis=0)
+        si = tl.min(tl.where(y == sm, offs, V), axis=0)
+        tl.store(pmax_ptr + p * NB + b, m)
+        tl.store(pidx_ptr + p * NB + b, i)
+        tl.store(smax_ptr + p * NB + b, sm)
+        tl.store(sidx_ptr + p * NB + b, si)
+
+    @triton.jit
+    def _choose_reduce_kernel(pmax_ptr, pidx_ptr, smax_ptr, sidx_ptr, greedy_ptr, full_ptr, NB, V,
+                              NBP: tl.constexpr):
+        """Position p: the block maxima combined, the smallest index among equal maxima."""
+        p = tl.program_id(0).to(tl.int64)
+        bs = tl.arange(0, NBP)
+        live = bs < NB
+        m = tl.load(pmax_ptr + p * NB + bs, mask=live, other=float("-inf"))
+        i = tl.load(pidx_ptr + p * NB + bs, mask=live, other=V)
+        best = tl.max(m, axis=0)
+        tl.store(greedy_ptr + p, tl.min(tl.where(m == best, i, V), axis=0).to(tl.int64))
+        sm = tl.load(smax_ptr + p * NB + bs, mask=live, other=float("-inf"))
+        si = tl.load(sidx_ptr + p * NB + bs, mask=live, other=V)
+        sbest = tl.max(sm, axis=0)
+        tl.store(full_ptr + p, tl.min(tl.where(sm == sbest, si, V), axis=0).to(tl.int64))
+
+
+def choose_argmax(logits, temperature, seed, traced=False):
+    """ops.choose_argmax's outputs: greedy and full [rows, tokens] int64 for logits [rows, tokens,
+    vocab], temperature [rows] fp32, seed a one-element int64 tensor on the device. Two kernels: the
+    vocabulary in blocks of 2,048 across programs (a 129k vocabulary is 64 programs a position; one
+    program a position serialized the noise and took 120 us), then the blocks combined."""
+    rows, toks, V = logits.shape
+    dev = logits.device
+    greedy = torch.empty(rows, toks, dtype=torch.int64, device=dev)
+    full = torch.empty_like(greedy)
+    P = rows * toks
+    if P:
+        BLOCK = 2048
+        NB = triton.cdiv(V, BLOCK)
+        NBP = triton.next_power_of_2(NB)
+        pmax = torch.empty(P, NB, dtype=torch.float32, device=dev)
+        smax = torch.empty_like(pmax)
+        pidx = torch.empty(P, NB, dtype=torch.int32, device=dev)
+        sidx = torch.empty_like(pidx)
+        k1, ctx = _launcher(_choose_blocks_kernel, dev, traced)
+        with ctx:
+            k1[(P, NB)](logits.contiguous(), temperature.contiguous().float(), seed, pmax, pidx, smax, sidx, V, toks,
+                        NB, BLOCK=BLOCK, num_warps=4)
+        k2, ctx = _launcher(_choose_reduce_kernel, dev, traced)
+        with ctx:
+            k2[(P,)](pmax, pidx, smax, sidx, greedy, full, NB, V, NBP=NBP, num_warps=1)
+    return greedy, full
+
+
+# ---------------------------------------------------------------------------
 # sparse attention for decode (ops.sparse_attn): one kernel per (query, group
 # of heads) gathers the selected KV rows, forms the scores, the softmax with
 # the sink term and the output, in fp32 as the fork's aten version does
