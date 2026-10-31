@@ -48,6 +48,9 @@ DTYPES = {
     "F8_E8M0": torch.float8_e8m0fnu,
 }
 
+# Maps storage data_ptr to the file path backing it.
+_FILES = {}
+
 
 _local = threading.local()
 
@@ -165,13 +168,18 @@ def file_backed(path, length):
     fresh = not (os.path.exists(path) and os.path.getsize(path) == length)
     if not fresh:
         _clean_strays(dirname, basename)
-        return torch.from_file(path, shared=True, size=length, dtype=torch.uint8), False, lambda: None
+        tensor = torch.from_file(path, shared=True, size=length, dtype=torch.uint8)
+        _FILES[tensor.untyped_storage().data_ptr()] = path
+        tensor._file = path
+        return tensor, False, lambda: None
 
     _clean_strays(dirname, basename)
     fd, tmp = tempfile.mkstemp(dir=dirname, prefix=basename + ".partial.")
     fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
     os.ftruncate(fd, length)
     tensor = torch.from_file(tmp, shared=True, size=length, dtype=torch.uint8)
+    _FILES[tensor.untyped_storage().data_ptr()] = path
+    tensor._file = path
     fin = weakref.finalize(tensor, os.close, fd)
 
     def commit():
@@ -183,6 +191,73 @@ def file_backed(path, length):
         _clean_strays(dirname, basename)
 
     return tensor, True, commit
+
+
+def file_of(tensor):
+    """Return the path of the file that backs the tensor's storage, or None.
+
+    The lookup checks attributes on the tensor, follows views and parameters
+    along the base and data chains, and checks the storage data pointer in
+    _FILES.
+    """
+    if tensor is None:
+        return None
+    curr = tensor
+    while curr is not None:
+        if hasattr(curr, "_file"):
+            return curr._file
+        data = getattr(curr, "data", None)
+        if data is not None and data is not curr and hasattr(data, "_file"):
+            return data._file
+        base = getattr(curr, "_base", None)
+        if base is None and data is not None and data is not curr:
+            base = getattr(data, "_base", None)
+        curr = base
+
+    objects = [tensor]
+    data = getattr(tensor, "data", None)
+    if data is not None and data is not tensor:
+        objects.append(data)
+    curr = tensor
+    while getattr(curr, "_base", None) is not None:
+        curr = curr._base
+        objects.append(curr)
+
+    for obj in objects:
+        try:
+            storage = obj.untyped_storage()
+            if storage is not None:
+                ptr = storage.data_ptr()
+                if ptr in _FILES:
+                    return _FILES[ptr]
+        except (RuntimeError, NotImplementedError, AttributeError):
+            pass
+    return None
+
+
+def release_files(files):
+    """Ask the kernel to drop the page cache of the given files.
+
+    The function calls posix_fadvise with POSIX_FADV_DONTNEED on each file.
+    It returns the number of files released.
+    """
+    if isinstance(files, (str, bytes, os.PathLike)):
+        files = [files]
+    released = 0
+    for path in sorted(set(files)):
+        try:
+            fd = os.open(path, os.O_RDONLY)
+        except OSError:
+            continue
+        try:
+            if hasattr(os, "posix_fadvise") and hasattr(os, "POSIX_FADV_DONTNEED"):
+                os.posix_fadvise(fd, 0, 0, os.POSIX_FADV_DONTNEED)
+            released += 1
+        except OSError:
+            pass
+        finally:
+            os.close(fd)
+    return released
 
 
 def fetch_tensor(ref, files, cas_dir=None, mmap_dir=None):
@@ -203,10 +278,13 @@ def fetch_tensor(ref, files, cas_dir=None, mmap_dir=None):
     key = hashlib.sha256(f"{ref['file_sha256']}:{ref['offset']}:{length}".encode()).hexdigest()
     path = os.path.join(cas_dir, key) if cas_dir else None
     commit = lambda: None
-    if mmap_dir:
-        buf, fresh, commit = file_backed(os.path.join(mmap_dir, key), length)
+    mmap_path = os.path.join(mmap_dir, key) if mmap_dir else None
+    if mmap_path:
+        buf, fresh, commit = file_backed(mmap_path, length)
         if not fresh:
-            return buf.view(DTYPES[ref["dtype"]]).view(ref["shape"]), 0
+            tensor = buf.view(DTYPES[ref["dtype"]]).view(ref["shape"])
+            tensor._file = mmap_path
+            return tensor, 0
     else:
         buf = torch.empty(length, dtype=torch.uint8)
     view = memoryview(buf.numpy())
@@ -233,6 +311,8 @@ def fetch_tensor(ref, files, cas_dir=None, mmap_dir=None):
                 f.write(view)
     commit()
     tensor = buf.view(DTYPES[ref["dtype"]]).view(ref["shape"])
+    if mmap_path:
+        tensor._file = mmap_path
     return tensor, downloaded
 
 
@@ -268,6 +348,7 @@ def fetch_stacked(spec, manifest_tensors, files, cas_dir=None, workers=16, mmap_
             nbytes *= d
         buf, fresh, commit = file_backed(mmap_path, nbytes)
         out = buf.view(dtype).view(out_shape)
+        out._file = mmap_path
         if not fresh:
             return out, 0
     else:
@@ -295,6 +376,8 @@ def fetch_stacked(spec, manifest_tensors, files, cas_dir=None, workers=16, mmap_
             _place_part(out, slots[j], pending.pop(j).result(), cat_dim, stack)
             downloaded += _last_bytes
     commit()
+    if mmap_path:
+        out._file = mmap_path
     return out, downloaded
 
 

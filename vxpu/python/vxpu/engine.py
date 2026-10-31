@@ -55,7 +55,7 @@ from .plan import Plan
 from .plan import record as plan_record
 from .telemetry import Recorder, segment_info
 from .rehydrate import (DTYPES, advise_random, derived_tensor, fetch_stacked, fetch_tensor,
-                        load_program, share_state, strip_asserts)
+                        file_of, load_program, release_files, share_state, strip_asserts)
 
 
 class FileTable:
@@ -755,6 +755,24 @@ class Engine:
                                              if self.expert_mover else ""))
         print(f"[vxpu] {msg}", flush=True)
         self.plan.note(msg)
+
+        bank_files = set()
+        for layer, moe in self.external.experts.items():
+            if layer in self._remote_layers:
+                continue
+            hot = getattr(moe, "_vxpu_hot", None)
+            if hot is not None and moe.n_local_experts > 0 and hot.count == moe.n_local_experts:
+                for param in moe.parameters():
+                    f = file_of(param)
+                    if f:
+                        bank_files.add(f)
+        if bank_files:
+            total_bytes = sum(os.path.getsize(f) for f in bank_files if os.path.exists(f))
+            released = release_files(bank_files)
+            if released:
+                msg = f"released the page cache of {released} expert bank files ({total_bytes / 1e9:.0f} GB)"
+                print(f"[vxpu] {msg}", flush=True)
+                self.plan.note(msg)
 
     def external_scope(self):
         """The context in which this engine's graphs must run: the ops

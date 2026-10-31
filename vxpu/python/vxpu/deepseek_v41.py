@@ -252,9 +252,13 @@ def host_experts(layer_id, args, banks):
     with torch.device("meta"), bf16_default():
         moe = ds.MoE(layer_id, args)
     for name, tensor in banks.items():
+        f = getattr(tensor, "_file", None)
         if tensor.dtype == torch.int8:  # the checkpoint's packed fp4 bytes; the module keeps uint8
             tensor = tensor.view(torch.uint8)
-        setattr(moe, name, torch.nn.Parameter(tensor, requires_grad=False))
+        param = torch.nn.Parameter(tensor, requires_grad=False)
+        if f is not None:
+            param._file = f
+        setattr(moe, name, param)
     return moe
 
 

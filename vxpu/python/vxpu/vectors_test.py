@@ -1202,6 +1202,47 @@ def _check_host_reads(workdir):
     print("host reads: gather_rows matches index_select and refuses bad or device indices; MADV_RANDOM taken")
 
 
+def _check_page_cache_release(workdir):
+    """Confirm that file_of finds the file path through views and Parameter wrapping,
+    and that release_files drops the file's page cache."""
+    import torch
+    from .rehydrate import file_backed, file_of, release_files
+
+    path = os.path.join(workdir, "test-bank.bin")
+    if os.path.exists(path):
+        os.remove(path)
+
+    mapped, fresh, commit = file_backed(path, 1024)
+    commit()
+    wrapped = mapped.view(torch.uint8)
+    param = torch.nn.Parameter(wrapped, requires_grad=False)
+
+    got_path = file_of(param)
+    if got_path != path:
+        raise SystemExit(f"page cache release: file_of returned {got_path!r}, want {path!r}")
+
+    released = release_files(got_path)
+    if released != 1:
+        raise SystemExit(f"page cache release: release_files returned {released}, want 1")
+
+    plain = torch.nn.Parameter(torch.zeros(16, dtype=torch.uint8), requires_grad=False)
+    if file_of(plain) is not None:
+        raise SystemExit(f"page cache release: file_of returned {file_of(plain)!r} for plain parameter, want None")
+
+    # Also verify through deepseek_v41.host_experts
+    from . import deepseek_v41 as ds
+    try:
+        args = ds.model_args("", 1024)
+        moe = ds.host_experts(0, args, {"w1": mapped})
+        if file_of(moe.w1) != path:
+            raise SystemExit(f"page cache release: host_experts file_of returned {file_of(moe.w1)!r}, want {path!r}")
+    except Exception as e:
+        if "third_party" not in str(e):
+            raise
+
+    print("page cache release: file_of finds file through view/Parameter, release_files releases cache")
+
+
 def _check_local_blobs_copy(workdir):
     """Copying into the local weight tier (localblobs.py) through a fake
     gcloud that copies every file but one and then fails, as gcloud does:
@@ -2470,6 +2511,7 @@ def selftest(workdir, settings):
         raise SystemExit("admin telemetry check failed")
     os.makedirs(workdir, exist_ok=True)
     _check_host_reads(workdir)
+    _check_page_cache_release(workdir)
     _check_local_blobs_copy(workdir)
     _check_expert_sim()
     _check_rotary()
