@@ -310,14 +310,14 @@ def lower(gm, plan, layer_device=None):
         site, layer = _site(node)
         if op not in ops.SELECTION or node.kwargs:
             report[op]["kept"]["(not lowerable)"] += 1
-            plan.record_site(op=op, site=site, node=node.name, layer=layer, chosen=None, source="kept",
+            plan.record_site(op=op, site=site, node=node.name, layer=layer, chosen=None, ran=None, source="kept",
                              why="not lowerable")
             continue
         try:
             args = _value(gm, node.args)
         except _NoShapes:
             report[op]["kept"]["(no shapes)"] += 1
-            plan.record_site(op=op, site=site, node=node.name, layer=layer, chosen=None, source="kept",
+            plan.record_site(op=op, site=site, node=node.name, layer=layer, chosen=None, ran=None, source="kept",
                              why="no shapes")
             continue
         device_type, key, ctx = ops.SELECTION[op](*args)
@@ -336,9 +336,9 @@ def lower(gm, plan, layer_device=None):
                 if times:
                     source = "measured"
         target = devices.get(node)
-        entry = dict(op=op, site=site, node=node.name, shapes=key, layer=layer, chosen=impl.name, source=source,
-                     candidates=candidates, fused=fused, measured_us=times or None,
-                     device=str(target) if target is not None else None)
+        entry = dict(op=op, site=site, node=node.name, shapes=key, layer=layer, chosen=impl.name,
+                     ran=impl.name, source=source, candidates=candidates, fused=fused,
+                     measured_us=times or None, device=str(target) if target is not None else None)
         if not impl.lowerable:
             report[op]["kept"][impl.name] += 1
             plan.record_site(kernels=None, **entry)

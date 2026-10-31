@@ -806,22 +806,54 @@ def record(explained):
             "notes": list(explained["notes"])}
 
 
-def check_record(table, record):
-    """The sites of a record that did not run what the table names for
-    them: [(site entry, expected impl)]. A table applied exactly gives
-    none; anything else is the failure the planner cannot tolerate (a
-    choice measured, recorded and not applied: #490)."""
+def check_record(table, record, raise_on_mismatch=True):
+    """Compare what a record ran against the table (or without one, against the
+    lowering's own measured choice): [(site entry, expected impl)].
+
+    When a table is given, fail on any mismatch (a ConfigError naming the site,
+    the table's body and the one that ran, unless raise_on_mismatch=False), and
+    print a one-line summary when everything matches. Without a table, compare
+    against the lowering's measured choice (the record's chosen) and print any
+    mismatches as warnings (#495)."""
     bad = []
-    for entry in record.get("sites", []):
-        want = table_entry(table, entry["op"], entry.get("site"), entry.get("shapes"))
-        if want is not None and want["impl"] != entry.get("chosen"):
-            bad.append((entry, want["impl"]))
-    return bad
+    sites = record.get("sites", []) if isinstance(record, dict) else []
+    if table is not None:
+        for entry in sites:
+            ran = entry.get("ran") or entry.get("launched") or entry.get("chosen")
+            want = table_entry(table, entry["op"], entry.get("site"), entry.get("shapes"))
+            if want is not None and want["impl"] != ran:
+                bad.append((entry, want["impl"]))
+        if bad:
+            if raise_on_mismatch:
+                raise ConfigError(f"kernel table: {describe_mismatches(bad, table)}")
+            return bad
+        n = len(sites)
+        print(f"[vxpu] kernel table: all {n} sites matched the table", flush=True)
+        return []
+    else:
+        for entry in sites:
+            ran = entry.get("ran") or entry.get("launched")
+            chosen = entry.get("chosen")
+            if ran is not None and chosen is not None and ran != chosen:
+                bad.append((entry, chosen))
+        if bad:
+            import warnings
+            msg = describe_mismatches(bad, table=None)
+            warnings.warn(f"[vxpu] {msg}", stacklevel=2)
+            print(f"[vxpu] warning: {msg}", flush=True)
+        return bad
 
 
-def describe_mismatches(bad):
-    return "; ".join(f"{e['op']} at {e.get('site') or e.get('shapes') or 'a site'}: ran {e.get('chosen')}, "
-                     f"the table names {want}" for e, want in bad)
+def describe_mismatches(bad, table=None):
+    parts = []
+    for e, want in bad:
+        where = e.get("site") or e.get("shapes") or "a site"
+        ran = e.get("ran") or e.get("launched") or e.get("chosen")
+        if table is not None or any(want != e.get("chosen") for e, want in bad):
+            parts.append(f"{e['op']} at {where}: ran {ran}, the table names {want}")
+        else:
+            parts.append(f"{e['op']} at {where}: ran {e.get('ran') or e.get('launched')}, the lowering chose {want}")
+    return "; ".join(parts)
 
 
 _default = {}
@@ -888,9 +920,9 @@ def profile_step(artifact, table=None, steps=4, heavy_us=50.0):
     record = engine.plan.kernel_record()
     problems = []
     if engine.plan.table is not None:
-        bad = check_record(engine.plan.table, record)
+        bad = check_record(engine.plan.table, record, raise_on_mismatch=False)
         if bad:
-            problems.append("sites that did not run the table's body: " + describe_mismatches(bad))
+            problems.append("sites that did not run the table's body: " + describe_mismatches(bad, engine.plan.table))
     fused_ops = {e["op"] for e in record["sites"] if e.get("source") != "kept" and e.get("kernels") == []}
     heavy = [(name, counts[name], times[name] / counts[name]) for name in counts
              if "_fused_" in name and name.startswith("triton_") and times[name] / counts[name] > heavy_us]
@@ -911,7 +943,7 @@ def main(argv=None):
     p.add_argument("--compile", action="store_true", help="the plan for a compiled decode (the executor's GPU default)")
     p.add_argument("--json", action="store_true", help="print the full explain() JSON")
     p.add_argument("--table", help="a kernel table (file or inline JSON) for --check-record or --profile-step")
-    p.add_argument("--check-record", metavar="RECORD", help="check a kernel record file against --table (no GPU)")
+    p.add_argument("--check-record", metavar="RECORD", help="check a kernel record file against --table, or against chosen without one (no GPU)")
     p.add_argument("--profile-step", action="store_true",
                    help="on a GPU: load the engine for --artifact, profile a decode step and report what launched")
     args = p.parse_args(argv)
@@ -920,15 +952,15 @@ def main(argv=None):
     from . import ops as _ops  # noqa: F401  (registers the implementations)
     from . import plan as registered
     if args.check_record:
-        if not args.table:
-            p.error("--check-record needs --table")
-        table = registered.load_table(args.table)
+        table = registered.load_table(args.table) if args.table else None
         with open(args.check_record) as f:
             record = json.load(f)
-        bad = registered.check_record(table, record)
-        print(f"{len(record.get('sites', []))} sites, {len(bad)} did not run the table's body"
-              + (": " + registered.describe_mismatches(bad) if bad else ""))
-        raise SystemExit(1 if bad else 0)
+        try:
+            registered.check_record(table, record, raise_on_mismatch=True)
+        except registered.ConfigError as e:
+            print(f"error: {e}", file=sys.stderr)
+            raise SystemExit(1)
+        raise SystemExit(0)
     if not args.artifact:
         p.error("--artifact is required")
     if args.profile_step:

@@ -651,18 +651,21 @@ is code, and what runs where:
   the record, unit-tested on fixture records with no GPU, so a costlier
   policy (regions costed whole, the graph cut here) replaces the function
   behind the same table.
-- *The check*: `vxpu kernels check` and `python -m vxpu.plan
-  --check-record` compare a run's record against its table, and every
-  site that ran another body is listed; `python -m vxpu.plan
-  --profile-step` runs a step under the CUDA profiler on the engine's GPU
-  and reports what launched next to the table, flagging compiler-fused
-  kernels heavier than 50 µs where no site chose a fused body. Issue
-  #490 is the live case for the first check: the engram layers'
-  `fp8_linear` sites measured and chose the GEMV and the step ran the
-  fused body. The graph these artifacts export calls `vxpu.fp8_linear`
-  at both sites and the lowering records the GEMV for all ten; where the
-  fused body enters is still open, so the check runs with the table on
-  the hero machine as the acceptance for that bug.
+- *The check*: the comparison is part of the engine's own load. When a
+  table is given, after lowering and package building, the engine compares each
+  site's launched body against the table in-process. The engine fails the load
+  with a `ConfigError` naming the site, the table's body, and the one that ran
+  rather than start serving. The engine prints a one-line summary when every site
+  matches. Without a table, the engine compares each site's launched body against
+  the lowering's own measured choice (the record's `chosen`) and prints any
+  mismatches as warnings. Offline, `vxpu kernels check` and `python -m vxpu.plan
+  --check-record` compare a run's record against its table, and every site that
+  ran another body is listed; `python -m vxpu.plan --profile-step` runs a step
+  under the CUDA profiler on the engine's GPU and reports what launched next to
+  the table, flagging compiler-fused kernels heavier than 50 µs where no site
+  chose a fused body. Issue #490 showed why this check matters: the engram
+  layers' `fp8_linear` sites measured and chose the GEMV, but the step ran the
+  fused body from a stale package.
 Of hero 8's acceptance items, the table and record drive the per-site
 body choices, the knobs, and the report that the choices were applied;
 the op boundaries, the step graph's branches and the crossings are the

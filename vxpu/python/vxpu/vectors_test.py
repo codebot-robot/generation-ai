@@ -832,9 +832,33 @@ def _check_plan_table():
             if check_record(table, written):
                 raise SystemExit("plan table: a record of the table's own choices should check clean")
             written["sites"][0]["chosen"] = "cpu-kernel"
-            bad = check_record(table, written)
+            bad = check_record(table, written, raise_on_mismatch=False)
             if len(bad) != 1 or bad[0][1] != "reference" or "ran cpu-kernel" not in plan.describe_mismatches(bad):
                 raise SystemExit(f"plan table: the mismatch should be reported: {bad}")
+            try:
+                check_record(table, written)
+            except ConfigError as e:
+                msg = str(e)
+                if "model.layers.1.engram.wkv" not in msg or "ran cpu-kernel" not in msg or "the table names reference" not in msg:
+                    raise SystemExit(f"plan table: the mismatch should name site, body, table: {e}")
+            else:
+                raise SystemExit("plan table: mismatch against table should raise ConfigError")
+            # a record with no table: warns on a mismatch against chosen
+            import warnings
+            no_table_bad = dict(written)
+            no_table_bad["sites"] = [dict(written["sites"][0], chosen="reference", ran="cpu-kernel")]
+            with warnings.catch_warnings(record=True) as ws:
+                warnings.simplefilter("always")
+                check_record(None, no_table_bad)
+                if not ws or "model.layers.1.engram.wkv" not in str(ws[-1].message) or "cpu-kernel" not in str(ws[-1].message):
+                    raise SystemExit(f"plan table: record with no table should warn on mismatch: {ws}")
+            no_table_good = dict(written)
+            no_table_good["sites"] = [dict(written["sites"][0], chosen="reference", ran="reference")]
+            with warnings.catch_warnings(record=True) as ws:
+                warnings.simplefilter("always")
+                check_record(None, no_table_good)
+                if ws:
+                    raise SystemExit(f"plan table: matching record with no table should not warn: {ws}")
             # a table naming a body the lowering cannot run here is refused at the lowering, not worked around
             strict = load_table(json.dumps({"format": plan.TABLE_FORMAT,
                                             "sites": [{"op": "vxpu::fp8_linear", "impl": "gpu-fp8-gemv"}]}))
