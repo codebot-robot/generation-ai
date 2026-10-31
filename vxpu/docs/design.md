@@ -288,24 +288,27 @@ with a random draw it does not need, and nine top-k gathers of 11.5 µs
 
 Batched rows and the drafter, sharded, the merged 7(b) code, the
 drafter's stages on the last GPU (Oct 31; measured; "same" is one
-prompt in every row, "different" a prompt per row; the native-experts
-numbers before the merge in parentheses):
+prompt in every row, "different" a prompt per row; hero 7's numbers,
+where they existed, in parentheses):
 
 | rows | one prompt | same prompt per row | different prompts |
 |---|---|---|---|
-| 1 | 15.4 ms (18.2) | | |
-| 1 + drafter | 29.9 ms, 37 of 130 drafts accepted, 2.46 tokens a step, 82 tok/s (31.0) | | |
-| 9 | 34.1 ms (26.1) | 33.9 ms, 258 tok/s (23.1 ms, 366) | 40.4 ms, 216 tok/s (41.4) |
-| 33 | 40.5 ms (42.6) | 39.8 ms, 828 tok/s (44.4 ms, 722) | 120 ms, 284 tok/s (120) |
-| 8 + drafter | 91.8 ms, 2.78 tokens a step | 107 ms, 73 of 2,155 accepted, rows differ | 152 ms |
+| 1 | 15.3 ms (20.3) | | |
+| 1 + drafter | 29.9 ms, 37 of 130 drafts accepted, 2.46 tokens a step, 82 tok/s | | |
+| 9 | 25.3 ms | 21.1 ms, 433 tok/s | 38.3 ms, 243 tok/s |
+| 8 + drafter | 69.4 ms, 2.78 tokens a step | 48.7 ms, 320 of 920 accepted, 453 tok/s | 107 ms, 2.89 tokens a step, 173 tok/s |
+| 33 | 40.5 ms | 39.9 ms, 804 tok/s | 112 ms, 303 tok/s |
 
-Two of these are open. Nine rows got slower in the merge, from 26 to 34
-ms with one prompt, while one row and 33 rows got faster: the per-kernel
-profile at nine rows will say which of the merged bodies it is. And eight
-rows with the drafter and the same prompt in every row still collapse
-(73 of 2,155 drafts, the rows' tokens differ) where eight rows with one
-prompt accept 2.78 tokens a step and nine plain rows are token-identical:
-a row-mixing bug in the batched draft path, under investigation.
+Every same-prompt run has token-identical rows and accepts rows times
+what one row accepts. Two bugs came out on the way to this table. The
+batched drafter had collapsed (73 of 2,155 drafts at eight rows) because
+the drafter's step returns a strided view of its tokens and the native
+loop copied it to the host with one flat memcpy: only row 0 read its
+own drafts. The capture makes the output contiguous now, and the loop
+refuses a strided tensor. And the experts' direct path (two launches a
+layer) streamed an expert once per pair, so one prompt in nine rows read
+each of its six experts nine times (34 ms a step where the grouped path
+took 26); it now serves one row's pairs only.
 
 The floor with different prompts depends on how many distinct experts
 the rows select a layer, which is not measured yet: at most 198 for 33
