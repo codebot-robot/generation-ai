@@ -717,7 +717,7 @@ def _shared_ffn_body(x, w1, s1, w3, s3, w2, s2, swiglu_limit, quantized, y_exper
         gate = gate.clamp(max=swiglu_limit)
     h = (torch.nn.functional.silu(gate) * up).to(x.dtype)
     y = tk.fp8_gemv(tk.act_quant_dequant(h), w2, s2).reshape(x.shape).to(x.dtype)
-    return _hc_post_reference((y_experts + y).type_as(x), residual, post, comb)
+    return _hc_post_reference((y_experts + y).to(x.dtype), residual, post, comb)
 
 
 @implementation("vxpu::shared_ffn", "gpu-fused", ("cuda",), "rounding",
@@ -752,7 +752,7 @@ def _shared_ffn_reference(x, w1, s1, w3, s3, w2, s2, swiglu_limit, quantized, y_
         gate = gate.clamp(max=swiglu_limit)
     h = (torch.nn.functional.silu(gate) * up).to(x.dtype)
     y = y_experts + _fp8_linear_reference(h, w2, s2)  # forward_routed: y += shared, in fp32
-    return _hc_post_reference(y.type_as(x), residual, post, comb)
+    return _hc_post_reference(y.to(x.dtype), residual, post, comb)
 
 
 @custom_op("vxpu::attn_q", mutates_args=())  # pure tensor work: capturable
@@ -792,7 +792,7 @@ def _hc_post_reference(x, residual, post, comb):
     of the stream and the residual [b, s, hc, d] mixed in through comb [b, s, hc, hc] (summed
     over its first index) with post [b, s, hc]: [b, s, hc, d] in x's dtype."""
     y = post.unsqueeze(-1) * x.unsqueeze(-2) + torch.sum(comb.unsqueeze(-1) * residual.unsqueeze(-2), dim=2)
-    return y.type_as(x)
+    return y.to(x.dtype)  # not type_as: traced by the lowering, that bakes the tracing GPU's index into the copy
 
 
 def _freqs_at(freqs_table, start, seqlen):
