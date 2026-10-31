@@ -236,6 +236,15 @@ def _all_held(moe, here, peer_boxes):
     return bool(held.all())
 
 
+def _check_flat(inputs, out, what):
+    """The native loop copies a step's inputs and output as flat arrays (node_server.cpp's
+    Graphs::run): each must be contiguous, or rows read each other's values."""
+    for name, t in list(inputs.items()) + [("output", out)]:
+        if not t.is_contiguous():
+            raise RuntimeError(f"native loop: the {what} step's {name} is not contiguous "
+                               f"(shape {tuple(t.shape)}, stride {t.stride()}); the loop copies it flat")
+
+
 class StepGraph(torch.nn.Module):
     """A dataflow runner's step as one CUDA graph (module docstring)."""
 
@@ -324,6 +333,9 @@ class StepGraph(torch.nn.Module):
         if self._chosen is None or sorted(inputs) != ["cache_position", "input_ids"]:
             raise RuntimeError(f"native loop: a decode step of logits from input_ids and cache_position, not {sorted(inputs)}")
         out_graph = devices.index(chosen.device.index) if chosen.device.index in devices else 0
+        _check_flat(inputs, chosen, "decode")
+        if draft is not None:
+            _check_flat(*draft.native_parts()[:2], "draft")
         loop = kernels.load().DecodeLoop(inputs["input_ids"], inputs["cache_position"], chosen, execs, streams, devices,
                                          host, flags, out_graph)
         loop.set_sampling(*self._sampling)
@@ -627,6 +639,15 @@ class StepGraph(torch.nn.Module):
                                 driver.write_value(stream, xflags[(node.name, index, d2)].data_ptr(), 1)
                 if d == out_dev:
                     output = resolve(graph.output, d)
+                    # the native loop reads the output with one flat copy: a strided view (the
+                    # drafter's tokens are spec_draft(...)[0][:, 1:], stride 6 for 5 columns) is made
+                    # contiguous here, in the graph, or every row after the first reads its
+                    # neighbour's tokens
+                    if isinstance(output, torch.Tensor) and not output.is_contiguous():
+                        output = output.contiguous()
+                    elif (isinstance(output, (tuple, list)) and len(output) == 1 and isinstance(output[0], torch.Tensor)
+                          and not output[0].is_contiguous()):
+                        output = type(output)([output[0].contiguous()])
                     # the greedy choice, in the graph: a decode step's logits [rows, tokens, vocab] become each
                     # position's argmax, so a native loop (native_loop) reads token ids, not logits
                     logits = output[0] if isinstance(output, (tuple, list)) and len(output) == 1 else output
