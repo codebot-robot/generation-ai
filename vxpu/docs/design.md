@@ -442,6 +442,29 @@ being rerun. The draft length is the planner's knob, measured as such. The engin
 checkpoint files' page cache after loading on the pods too, which ends
 the mid-step faults that contaminated three matrices.
 
+**Hero 8, the step-graph and planner code measured clean (Oct 31, early
+morning; benchmark pod, one process at a time, the page-cache releases
+in the engine; measured):**
+
+| rows | one prompt | same prompt per row | different prompts |
+|---|---|---|---|
+| 1 | 14.5 ms, 69 tok/s | | |
+| 1 + drafter, 4 drafts verified | 26.8 to 30.0 ms, 2.67 tokens a step, 90 to 99 tok/s | | |
+| 9 | 24.7 ms | 20.4 ms, 440 tok/s | 37.5 ms, 240 tok/s |
+| 8 + drafter, 4 drafts | 64.5 ms | 45.4 ms, 467 tok/s | 99.3 ms, 202 tok/s |
+| 33 | 40.8 ms | 40.1 ms, 800 tok/s | 105 ms, 300 tok/s |
+
+The 33-different-prompt step reads 90 to 113 distinct experts a layer
+(measured), about 63 ms of bytes: its profile puts the grouped expert
+kernels at their bytes, the dense multiplications at 60% of bandwidth
+(33 µs a launch at 33 rows against 21 at one), 3.4 ms in the copies that
+carry 33 rows' state across the three range boundaries, and about 4 ms
+of compiler glue. The planner's records now exist for 1, 9 and 33 rows;
+on the 9-row record the planner picks the fused body for `attn_q` where
+the one-row record picks the kernel, which is the per-shape choice the
+design asks for. The fork's op boundaries are the remaining workstream
+and the one that moves the one-row number.
+
 **Direction: the planner chooses the kernels, in Go (hero run 8).** Today
 two planners exist and the split is the wrong one. The coordinator's
 planner (Go) decides placement, which machines and GPUs run which layers
