@@ -504,15 +504,16 @@ if triton is not None:
         tl.store(h_ptr + m * N + n, hq.to(tl.bfloat16), mask=live)
 
 
-def shared_ffn(x, w1, s1, w3, s3, w2, s2, swiglu_limit, traced=False):
-    """An fp8 SwiGLU FFN (the shared expert) for a decode step's rows, in three or four kernels:
-    x [.., K] bf16 quantized to the fp8 grid (act_quant_dequant), the dual GEMV over w1 and w3
+def shared_ffn(x, w1, s1, w3, s3, w2, s2, swiglu_limit, quantized=False, traced=False):
+    """An fp8 SwiGLU FFN (the shared expert) for a decode step's rows, in two to four kernels:
+    x [.., K] bf16 quantized to the fp8 grid (act_quant_dequant, unless `quantized` says the
+    caller already did: the FFN front's x_in), the dual GEMV over w1 and w3
     [I, K] with the SwiGLU and the w2 input's quantization in its epilogue (or, split over K for
     enough programs, in a small kernel after it), and the w2 [K, I] GEMV. Returns
     [.., K] in x's dtype. The fork's Expert.forward launches about nine kernels for the same."""
     K = x.shape[-1]
     I = w1.shape[0]
-    xq = act_quant_dequant(x, traced=traced).reshape(-1, K)
+    xq = (x.contiguous() if quantized else act_quant_dequant(x, traced=traced)).reshape(-1, K)
     M = xq.shape[0]
     if M > GEMV_ROWS_MAX or K % 32 or I % 32 or w3.shape != w1.shape or tuple(w2.shape) != (K, I):
         raise ValueError(f"shared_ffn: x {tuple(x.shape)}, w1 {tuple(w1.shape)}, w2 {tuple(w2.shape)}")
@@ -538,7 +539,7 @@ def shared_ffn(x, w1, s1, w3, s3, w2, s2, swiglu_limit, traced=False):
 
 if triton is not None:
     @triton.jit
-    def _gemv_pe_kernel(x_ptr, w_ptr, s_ptr, y_ptr, xn_ptr, nw_ptr, freqs_ptr, sign, M, N, K, KS, R, eps,
+    def _gemv_pe_kernel(x_ptr, w_ptr, s_ptr, y_ptr, xn_ptr, nw_ptr, freqs_ptr, start_ptr, sign, M, N, K, KS, R, S, eps,
                         PRO_NORM: tl.constexpr, PRO_ROTARY: tl.constexpr, PRO_QUANT: tl.constexpr,
                         STORE_XN: tl.constexpr, EPI_ROTARY: tl.constexpr, HD: tl.constexpr, RD: tl.constexpr,
                         BM: tl.constexpr, BN: tl.constexpr, BK: tl.constexpr):
@@ -547,8 +548,9 @@ if triton is not None:
         quantization to the fp8 grid per 32 elements (PRO_QUANT, act_quant with ue8m0 scales), the
         normalized row stored by program 0 (STORE_XN, for whoever else reads it). Epilogue: the
         bf16 outputs rotated in adjacent pairs over the last RD of every HD outputs (EPI_ROTARY,
-        freqs_ptr the complex frequencies' real view [M, RD / 2, 2] per row, sign -1 for the
-        inverse), as the fork's apply_rotary_emb. BN must divide
+        freqs_ptr the whole table of complex frequencies as its real view [positions, RD / 2, 2],
+        read at each row's position, start_ptr[row // S] + row % S; sign -1 for the inverse), as
+        the fork's apply_rotary_emb. BN must divide
         HD - RD and be even. PRO_ROTARY rotates the input the same way instead (the pairs along K,
         the last RD of every HD; sign picks the direction), for the
         attention's output. Weight rows come in groups of R, group g reading x[:, g * K:(g + 1)
@@ -563,6 +565,7 @@ if triton is not None:
         xb = x_ptr + g * K
         ms = tl.arange(0, BM)
         mlive = ms < M
+        pos = tl.load(start_ptr + ms // S, mask=mlive, other=0) + ms % S  # each row's position in the table
         rstd = tl.zeros((BM,), dtype=tl.float32)
         if PRO_NORM:
             for k0 in range(0, K, BK):
@@ -587,7 +590,7 @@ if triton is not None:
                 tail = (jk >= HD - RD) & (even_k < K)
                 pair = (jk - (HD - RD)) // 2
                 pm = mlive[:, None] & tail[None, :]
-                fb = freqs_ptr + ms[:, None] * RD + 2 * pair[None, :]
+                fb = freqs_ptr + pos[:, None] * RD + 2 * pair[None, :]
                 c = tl.load(fb, mask=pm, other=1.0)
                 sn = tl.load(fb + 1, mask=pm, other=0.0) * sign
                 x = tl.reshape(tl.join(ev * c - od * sn, ev * sn + od * c), (BM, BK))
@@ -622,7 +625,7 @@ if triton is not None:
             tail = j >= HD - RD
             pair = (j - (HD - RD)) // 2
             pm = tail[:, None] & mlive[None, :]
-            fb = freqs_ptr + ms[None, :] * RD + 2 * pair[:, None]
+            fb = freqs_ptr + pos[None, :] * RD + 2 * pair[:, None]
             c = tl.load(fb, mask=pm, other=1.0)
             sn = tl.load(fb + 1, mask=pm, other=0.0) * sign
             y3 = tl.join(ev * c - od * sn, ev * sn + od * c)
@@ -630,28 +633,33 @@ if triton is not None:
         tl.store(y_ptr + ms[None, :] * N + rows[:, None], y.to(tl.bfloat16), mask=live[:, None] & mlive[None, :])
 
 
-def attn_q(x, wq_a, sa, norm_weight, norm_eps, wq_b, sb, freqs, heads, head_dim, rope_dim, traced=False):
-    """The attention's query path for a decode step's rows, in four kernels: x [.., K] quantized
-    to the fp8 grid, the down-projection wq_a [R, K] (fp8, e8m0 block scales), one program per row
-    for q_norm and the fp8-grid quantization of its result (the normalized query also kept, for
-    the indexer), then the up-projection wq_b [N, R] with the rotary of every head's last
-    rope_dim dims in its epilogue (freqs [rows, rope_dim / 2, 2] fp32: the complex frequencies'
-    real view, per row). Returns (qn [.., R] bf16, the normalized query; q [.., N] bf16,
+def attn_q(x, wq_a, sa, norm_weight, norm_eps, wq_b, sb, freqs, start, seqlen, heads, head_dim, rope_dim,
+           quantized=False, traced=False):
+    """The attention's query path for a decode step's rows, in three or four kernels: x [.., K]
+    quantized to the fp8 grid (skipped when `quantized`: the front already did it), the
+    down-projection wq_a [R, K] (fp8, e8m0 block scales), one program per row for q_norm and the
+    fp8-grid quantization of its result (the normalized query also kept, for the indexer), then
+    the up-projection wq_b [N, R] with the rotary of every head's last rope_dim dims in its
+    epilogue (freqs [positions, rope_dim / 2, 2] fp32: the whole table of complex frequencies as
+    its real view, read at each row's position, start [b] int64 + the token's index of seqlen:
+    no gather before the kernels). Returns (qn [.., R] bf16, the normalized query; q [.., N] bf16,
     rotated). The per-row work runs once a row,
     not once per program of the wide GEMV, which recomputed it 2,048 times and lost to the
     compiler's version. The fork launches about nine kernels for the same."""
     K = x.shape[-1]
     R, N = wq_a.shape[0], wq_b.shape[0]
-    xq = act_quant_dequant(x, traced=traced).reshape(-1, K)
+    xq = (x.contiguous() if quantized else act_quant_dequant(x, traced=traced)).reshape(-1, K)
     M = xq.shape[0]
     bm, bn, bk = _pe_blocks(M, R, tiles=2, device=x.device)
     BR = triton.next_power_of_2(R)  # the per-row kernel masks past R
     if (M > GEMV_ROWS_MAX or K % 32 or R % 32 or N % head_dim or head_dim % bn
             or (head_dim - rope_dim) % bn or rope_dim % 2 or wq_b.shape[1] != R
-            or tuple(freqs.shape) != (M, rope_dim // 2, 2)):
+            or tuple(freqs.shape[1:]) != (rope_dim // 2, 2) or start.numel() * seqlen != M):
         raise ValueError(f"attn_q: x {tuple(x.shape)}, wq_a {tuple(wq_a.shape)}, wq_b {tuple(wq_b.shape)}, "
-                         f"heads {heads} x {head_dim}, rope {rope_dim}, freqs {tuple(freqs.shape)}")
+                         f"heads {heads} x {head_dim}, rope {rope_dim}, freqs {tuple(freqs.shape)}, "
+                         f"start {tuple(start.shape)} x {seqlen}")
     freqs = freqs.contiguous()
+    start = start.contiguous()
     rbm, rbn, rbk = _rows_blocks(M, K)
     ks = _narrow_ksplit(R, rbn, K, rbk, x.device)
     qr = gemv_rows(xq, wq_a, sa, traced=traced, ksplit=ks)
@@ -661,12 +669,12 @@ def attn_q(x, wq_a, sa, norm_weight, norm_eps, wq_b, sb, freqs, heads, head_dim,
     if M:
         post, ctx = _launcher(_row_post_kernel, x.device, traced)
         with ctx:
-            post[(M,)](qr, norm_weight.contiguous(), freqs, 1.0, qq, qn, M, R, 1, float(norm_eps),
+            post[(M,)](qr, norm_weight.contiguous(), freqs, start, 1.0, qq, qn, M, R, 1, seqlen, float(norm_eps),
                        NORM=True, RD=0, QUANT=True, STORE_PRE=True, BD=BR, KSUM=ks)
         kernel, ctx = _launcher(_gemv_pe_kernel, x.device, traced)
         with ctx:
             kernel[(triton.cdiv(N, bn),)](qq, wq_b.contiguous(), sb.contiguous().view(torch.uint8), q, q, qq,
-                                         freqs, 1.0, M, N, R, sb.shape[1], N, 0.0,
+                                         freqs, start, 1.0, M, N, R, sb.shape[1], N, seqlen, 0.0,
                                          PRO_NORM=False, PRO_ROTARY=False, PRO_QUANT=False, STORE_XN=False,
                                          EPI_ROTARY=True, HD=head_dim, RD=rope_dim, BM=bm, BN=bn, BK=bk)
     lead = tuple(x.shape[:-1])
@@ -675,13 +683,15 @@ def attn_q(x, wq_a, sa, norm_weight, norm_eps, wq_b, sb, freqs, heads, head_dim,
 
 if triton is not None:
     @triton.jit
-    def _row_post_kernel(x_ptr, nw_ptr, freqs_ptr, sign, y_ptr, pre_ptr, M, D, HPR, eps,
+    def _row_post_kernel(x_ptr, nw_ptr, freqs_ptr, start_ptr, sign, y_ptr, pre_ptr, M, D, HPR, S, eps,
                          NORM: tl.constexpr, RD: tl.constexpr, QUANT: tl.constexpr, STORE_PRE: tl.constexpr,
                          BD: tl.constexpr, KSUM: tl.constexpr = 1):
         """A row's finishing after a projection, one program per row of x [M, D] (bf16): RMSNorm
         with nw_ptr's weight (NORM; fp32, rounded to bf16), the rotary of the last RD elements in
-        adjacent pairs (freqs_ptr: the complex frequencies' real view [M, RD / 2, 2], cos and sin
-        interleaved, read in place; sign -1 for the inverse rotation; RD = 0 for none),
+        adjacent pairs (freqs_ptr: the whole table of complex frequencies as its real view
+        [positions, RD / 2, 2], cos and sin interleaved, read in place at the token's position:
+        token t of row b sits at start_ptr[b] + t, S tokens a row, so no gather of the table runs
+        before the kernel; sign -1 for the inverse rotation; RD = 0 for none),
         quantization to the fp8 grid per 32 elements (QUANT, act_quant with ue8m0 scales), stored
         as bf16. The fork's kv_norm, apply_rotary_emb and act_quant, each a kernel or more, as
         one. BD is D rounded up to a power of two; RD divides D and is even. HPR consecutive rows
@@ -710,7 +720,9 @@ if triton is not None:
             even_dim = 2 * tl.arange(0, BD // 2)
             tail = even_dim >= D - RD
             pair = (even_dim - (D - RD)) // 2
-            fb = freqs_ptr + (m // HPR) * RD + 2 * pair
+            tok = m // HPR  # the token this row belongs to (HPR heads a token)
+            pos = tl.load(start_ptr + tok // S) + tok % S
+            fb = freqs_ptr + pos * RD + 2 * pair
             c = tl.load(fb, mask=tail, other=1.0)
             sn = tl.load(fb + 1, mask=tail, other=0.0) * sign
             x = tl.reshape(tl.join(ev * c - od * sn, ev * sn + od * c), (BD,))
@@ -730,19 +742,22 @@ if triton is not None:
         tl.store(y_ptr + m * D + d, x.to(tl.bfloat16), mask=live)
 
 
-def window_kv(x, wkv, scale, norm_weight, norm_eps, freqs, rope_dim, traced=False):
-    """The attention's window key for a decode step's rows, in three kernels: x [.., K] quantized
-    to the fp8 grid, the projection wkv [D, K] (fp8, e8m0 block scales), and the row's finishing:
-    kv_norm, the rotary of the last rope_dim elements (freqs [rows, rope_dim / 2, 2] fp32: the
-    complex frequencies' real view, per row) and the quantization to the fp8 grid the cache
+def window_kv(x, wkv, scale, norm_weight, norm_eps, freqs, start, seqlen, rope_dim, quantized=False, traced=False):
+    """The attention's window key for a decode step's rows, in two or three kernels: x [.., K]
+    quantized to the fp8 grid (skipped when `quantized`), the projection wkv [D, K] (fp8, e8m0
+    block scales), and the row's finishing: kv_norm, the rotary of the last rope_dim elements
+    (freqs [positions, rope_dim / 2, 2] fp32: the whole table's real view, read at the row's
+    position start[b] + t, seqlen tokens a row) and the quantization to the fp8 grid the cache
     holds. Returns [.., D] bf16."""
     K = x.shape[-1]
     D = wkv.shape[0]
-    xq = act_quant_dequant(x, traced=traced).reshape(-1, K)
+    xq = (x.contiguous() if quantized else act_quant_dequant(x, traced=traced)).reshape(-1, K)
     M = xq.shape[0]
     BD = triton.next_power_of_2(D)  # the per-row kernel masks past D
-    if M > GEMV_ROWS_MAX or K % 32 or D % 32 or rope_dim % 2 or tuple(freqs.shape) != (M, rope_dim // 2, 2):
-        raise ValueError(f"window_kv: x {tuple(x.shape)}, wkv {tuple(wkv.shape)}, rope {rope_dim}, freqs {tuple(freqs.shape)}")
+    if (M > GEMV_ROWS_MAX or K % 32 or D % 32 or rope_dim % 2 or tuple(freqs.shape[1:]) != (rope_dim // 2, 2)
+            or start.numel() * seqlen != M):
+        raise ValueError(f"window_kv: x {tuple(x.shape)}, wkv {tuple(wkv.shape)}, rope {rope_dim}, "
+                         f"freqs {tuple(freqs.shape)}, start {tuple(start.shape)} x {seqlen}")
     rbm, rbn, rbk = _rows_blocks(M, K)
     ks = _narrow_ksplit(D, rbn, K, rbk, x.device)
     kv = gemv_rows(xq, wkv, scale, traced=traced, ksplit=ks)
@@ -750,15 +765,16 @@ def window_kv(x, wkv, scale, norm_weight, norm_eps, freqs, rope_dim, traced=Fals
     if M:
         kernel, ctx = _launcher(_row_post_kernel, x.device, traced)
         with ctx:
-            kernel[(M,)](kv, norm_weight.contiguous(), freqs.contiguous(), 1.0, y, y, M, D, 1,
-                         float(norm_eps), NORM=True, RD=rope_dim, QUANT=True, STORE_PRE=False, BD=BD, KSUM=ks)
+            kernel[(M,)](kv, norm_weight.contiguous(), freqs.contiguous(), start.contiguous(), 1.0, y, y, M, D, 1,
+                         seqlen, float(norm_eps), NORM=True, RD=rope_dim, QUANT=True, STORE_PRE=False, BD=BD, KSUM=ks)
     return y.reshape(tuple(x.shape[:-1]) + (D,))
 
 
-def attn_out(o, freqs, wo_a, sa, groups, rank, wo_b, sb, head_dim, rope_dim, traced=False):
+def attn_out(o, freqs, start, seqlen, wo_a, sa, groups, rank, wo_b, sb, head_dim, rope_dim, traced=False):
     """The attention's output path for a decode step's rows, in three kernels: one program per
-    (row, head) for the inverse rotary of the head's last rope_dim dims (freqs [rows, rope_dim /
-    2, 2] fp32: the complex frequencies' real view, per row) and the fp8-grid quantization; the
+    (row, head) for the inverse rotary of the head's last rope_dim dims (freqs [positions,
+    rope_dim / 2, 2] fp32: the whole table's real view, read at the row's position start[b] + t,
+    seqlen tokens a row) and the fp8-grid quantization; the
     grouped projection wo_a [groups * rank, heads_per_group * head_dim] (fp8, e8m0 block scales,
     block-diagonal over the groups) quantizing its result in its epilogue; wo_b [dim, groups * rank]. Returns
     [.., dim] bf16. The fork launches about five kernels; the fold of the rotary into the grouped
@@ -769,16 +785,17 @@ def attn_out(o, freqs, wo_a, sa, groups, rank, wo_b, sb, head_dim, rope_dim, tra
     N1, dim = wo_a.shape[0], wo_b.shape[0]
     if (M > GEMV_ROWS_MAX or hd != head_dim or N1 != groups * rank or triton.next_power_of_2(hd) != hd
             or (hd - rope_dim) % 2 or wo_a.shape[1] != Kg or wo_b.shape[1] != N1
-            or tuple(freqs.shape) != (M, rope_dim // 2, 2)):
+            or tuple(freqs.shape[1:]) != (rope_dim // 2, 2) or start.numel() * seqlen != M):
         raise ValueError(f"attn_out: o {tuple(o.shape)}, wo_a {tuple(wo_a.shape)}, wo_b {tuple(wo_b.shape)}, "
-                         f"groups {groups} rank {rank}, rope {rope_dim}, freqs {tuple(freqs.shape)}")
+                         f"groups {groups} rank {rank}, rope {rope_dim}, freqs {tuple(freqs.shape)}, "
+                         f"start {tuple(start.shape)} x {seqlen}")
     x = o.reshape(M * heads, hd).contiguous()
     oq = torch.empty_like(x)
     if M:
         post, ctx = _launcher(_row_post_kernel, o.device, traced)
         with ctx:
-            post[(M * heads,)](x, x, freqs.contiguous(), -1.0, oq, oq, M * heads, hd, heads, 0.0,
-                               NORM=False, RD=rope_dim, QUANT=True, STORE_PRE=False, BD=hd, KSUM=1)
+            post[(M * heads,)](x, x, freqs.contiguous(), start.contiguous(), -1.0, oq, oq, M * heads, hd, heads,
+                               seqlen, 0.0, NORM=False, RD=rope_dim, QUANT=True, STORE_PRE=False, BD=hd, KSUM=1)
     mid = gemv_rows(oq.view(M, heads * hd), wo_a, sa, group_rows=rank, traced=traced, quant_out=True)
     y = gemv_rows(mid, wo_b, sb, traced=traced)
     return y.reshape(tuple(lead) + (dim,))
@@ -841,9 +858,8 @@ if triton is not None:
             xn = (w * (x * rs_x)).to(tl.bfloat16)  # the normalized row, bf16 as the fork rounds it
             if p == 0:
                 tl.store(xn_ptr + r * D + d0 + ds, xn)
-                if GATE:
-                    xq = _quant_tile(tl.reshape(xn.to(tl.float32), (1, BD)), 1, BD)
-                    tl.store(xin_ptr + r * D + d0 + ds, tl.reshape(xq, (BD,)).to(tl.bfloat16))
+                xq = _quant_tile(tl.reshape(xn.to(tl.float32), (1, BD)), 1, BD)
+                tl.store(xin_ptr + r * D + d0 + ds, tl.reshape(xq, (BD,)).to(tl.bfloat16))
             if GATE:
                 gw = tl.load(gatew_ptr + es[:, None] * D + (d0 + ds)[None, :], mask=el[:, None], other=0.0).to(tl.float32)
                 acc_scores += tl.sum(gw * xn.to(tl.float32)[None, :], axis=1)
@@ -1000,9 +1016,8 @@ if triton is not None:
         xn = (w * (x * rs_x)).to(tl.bfloat16)  # the normalized row, bf16 as the fork rounds it
         if g == 0:
             tl.store(xn_ptr + r * D + ds, xn)
-            if GATE:
-                xq = _quant_tile(tl.reshape(xn.to(tl.float32), (1, BD)), 1, BD)
-                tl.store(xin_ptr + r * D + ds, tl.reshape(xq, (BD,)).to(tl.bfloat16))
+            xq = _quant_tile(tl.reshape(xn.to(tl.float32), (1, BD)), 1, BD)
+            tl.store(xin_ptr + r * D + ds, tl.reshape(xq, (BD,)).to(tl.bfloat16))
         st = tl.load(stream_ptr + r * HC * D + hs[:, None] * D + ds[None, :]).to(tl.float32)  # [HC, BD]
         for j in range(g, NMIX, G):
             fn = tl.load(hcfn_ptr + j * (HC * D) + hs[:, None] * D + ds[None, :])
@@ -1021,9 +1036,10 @@ FFN_FRONT_BD = 1024  # 36 us a row against 60 at 16 x 256), and the elements of 
 def hc_front(stream, pre_mix, hc_fn, hc_scale, hc_base, hc_mult, sinkhorn_iters, hc_eps, norm_weight, norm_eps,
              traced=False):
     """ops.hc_front's outputs: ffn_front's kernels without the gate."""
-    pre, post, comb, xn, _, _, _ = ffn_front(stream, pre_mix, hc_fn, hc_scale, hc_base, hc_mult, sinkhorn_iters, hc_eps,
-                                             norm_weight, norm_eps, None, None, 1, "", 1.0, False, 1.0, traced=traced)
-    return pre, post, comb, xn
+    pre, post, comb, xn, x_in, _, _ = ffn_front(stream, pre_mix, hc_fn, hc_scale, hc_base, hc_mult, sinkhorn_iters,
+                                                hc_eps, norm_weight, norm_eps, None, None, 1, "", 1.0, False, 1.0,
+                                                traced=traced)
+    return pre, post, comb, xn, x_in
 
 
 def ffn_front(stream, pre_mix, hc_fn, hc_scale, hc_base, hc_mult, sinkhorn_iters, hc_eps, norm_weight, norm_eps,
@@ -1047,7 +1063,7 @@ def ffn_front(stream, pre_mix, hc_fn, hc_scale, hc_base, hc_mult, sinkhorn_iters
     dev = stream.device
     mixes = torch.empty(rows, nmix, dtype=torch.float32, device=dev)
     xn = torch.empty(rows, d, dtype=stream.dtype, device=dev)
-    x_in = torch.empty(rows if gate else 0, d, dtype=torch.bfloat16, device=dev)
+    x_in = torch.empty(rows, d, dtype=torch.bfloat16, device=dev)  # act_quant(xn): the next linears' input
     scores = torch.empty(rows, max(E, 1), dtype=torch.float32, device=dev)
     pre = torch.empty(rows, hc, dtype=torch.float32, device=dev)
     post = torch.empty(rows, hc, dtype=torch.float32, device=dev)
@@ -1083,10 +1099,10 @@ FRONT_SPLIT_EB = 8  # experts per program of its second kernel
 def hc_front_split(stream, pre_mix, hc_fn, hc_scale, hc_base, hc_mult, sinkhorn_iters, hc_eps, norm_weight, norm_eps,
                    traced=False):
     """ops.hc_front's outputs: ffn_front_split's kernels without the gate."""
-    pre, post, comb, xn, _, _, _ = ffn_front_split(stream, pre_mix, hc_fn, hc_scale, hc_base, hc_mult, sinkhorn_iters,
-                                                   hc_eps, norm_weight, norm_eps, None, None, 1, "", 1.0, False, 1.0,
-                                                   traced=traced)
-    return pre, post, comb, xn
+    pre, post, comb, xn, x_in, _, _ = ffn_front_split(stream, pre_mix, hc_fn, hc_scale, hc_base, hc_mult,
+                                                      sinkhorn_iters, hc_eps, norm_weight, norm_eps, None, None, 1, "",
+                                                      1.0, False, 1.0, traced=traced)
+    return pre, post, comb, xn, x_in
 
 
 def ffn_front_split(stream, pre_mix, hc_fn, hc_scale, hc_base, hc_mult, sinkhorn_iters, hc_eps, norm_weight, norm_eps,
@@ -1117,7 +1133,7 @@ def ffn_front_split(stream, pre_mix, hc_fn, hc_scale, hc_base, hc_mult, sinkhorn
     part = torch.empty(rows, nc, 2, dtype=torch.float32, device=dev)
     mixp = torch.empty(rows, nc, nmix, dtype=torch.float32, device=dev)
     xn = torch.empty(rows, d, dtype=stream.dtype, device=dev)
-    x_in = torch.empty(rows if gate else 0, d, dtype=torch.bfloat16, device=dev)
+    x_in = torch.empty(rows, d, dtype=torch.bfloat16, device=dev)  # act_quant(xn): the next linears' input
     scorep = torch.empty(rows, nc, max(E, 1), dtype=torch.float32, device=dev)
     pre = torch.empty(rows, hc, dtype=torch.float32, device=dev)
     post = torch.empty(rows, hc, dtype=torch.float32, device=dev)
