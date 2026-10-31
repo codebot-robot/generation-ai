@@ -937,38 +937,45 @@ def _window_kv_reference(x, wkv, scale, norm_weight, norm_eps, freqs_table, star
 @custom_op("vxpu::attn_out", mutates_args=())  # pure tensor work: capturable
 def attn_out(o: torch.Tensor, freqs_table: torch.Tensor, start: torch.Tensor, seqlen: int, wo_a: torch.Tensor,
              sa: torch.Tensor, groups: int, rank: int, wo_b: torch.Tensor, sb: torch.Tensor, rope_dim: int,
-             residual: torch.Tensor, post: torch.Tensor, comb: torch.Tensor) -> torch.Tensor:
+             residual: torch.Tensor, post: torch.Tensor, comb: torch.Tensor, prepared: bool) -> torch.Tensor:
     """The attention's output path (the fork's Attention.forward after the attention, and the
     block's hc_post after it): the inverse rotary of each head's last rope_dim dims of o [b, s,
     heads, head_dim] by the frequencies of the token's position (freqs_table the whole complex
     table, token t of row b at start[b] + t; see attn_q), act_quant, the grouped fp8 projection
     wo_a [groups * rank, heads_per_group * head_dim], the fp8 projection wo_b [dim, groups *
     rank], and the result mixed back into the hyper-connection stream (residual [b, s, hc, dim],
-    post [b, s, hc], comb [b, s, hc, hc]). Returns the new stream [b, s, hc, dim]. About seven
-    kernels as aten, three as Triton (the mix is the last GEMV's epilogue)."""
+    post [b, s, hc], comb [b, s, hc, hc]). `prepared` says o comes rotated back and quantized
+    already (vxpu::attn_core), so the first step is skipped. Returns the new stream [b, s, hc,
+    dim]. About seven kernels as aten, three as Triton (two prepared; the mix is the last GEMV's
+    epilogue)."""
     impl = select("vxpu::attn_out", o, freqs_table, start, seqlen, wo_a, sa, groups, rank, wo_b, sb, rope_dim,
-                  residual, post, comb)
-    return impl.fn(o, freqs_table, start, seqlen, wo_a, sa, groups, rank, wo_b, sb, rope_dim, residual, post, comb)
+                  residual, post, comb, prepared)
+    return impl.fn(o, freqs_table, start, seqlen, wo_a, sa, groups, rank, wo_b, sb, rope_dim, residual, post, comb,
+                   prepared)
 
 
 @attn_out.register_fake
-def _(o, freqs_table, start, seqlen, wo_a, sa, groups, rank, wo_b, sb, rope_dim, residual, post, comb):
+def _(o, freqs_table, start, seqlen, wo_a, sa, groups, rank, wo_b, sb, rope_dim, residual, post, comb, prepared):
     return o.new_empty(residual.shape)
 
 
 def _attn_out_context(o, freqs_table, start, seqlen, wo_a, sa, groups, rank, wo_b, sb, rope_dim, residual, post,
-                      comb):
+                      comb, prepared):
     rows = o.numel() // (o.shape[-1] * o.shape[-2])
     return o.device.type, f"rows={rows} heads={o.shape[-2]}x{o.shape[-1]} groups={groups} rank={rank}", {
         "rows": rows, "heads": o.shape[-2], "head_dim": o.shape[-1], "groups": groups, "rank": rank,
         "rope_dim": rope_dim, "dim": wo_b.shape[0]}
 
 
-def _attn_out_body(o, freqs_cis, wo_a, sa, groups, rank, wo_b, sb, rope_dim, tk, act_quant_dequant, grouped):
+def _attn_out_body(o, freqs_cis, wo_a, sa, groups, rank, wo_b, sb, rope_dim, tk, act_quant_dequant, grouped,
+                   prepared=False):
     hd = o.shape[-1]
-    tail = tk.rotary(o[..., hd - rope_dim:], freqs_cis.real, -freqs_cis.imag).to(o.dtype)
-    o = torch.cat([o[..., :hd - rope_dim], tail], dim=-1)
-    o = act_quant_dequant(o.flatten(-2).unflatten(-1, (groups, -1)))
+    if prepared:
+        o = o.flatten(-2).unflatten(-1, (groups, -1))
+    else:
+        tail = tk.rotary(o[..., hd - rope_dim:], freqs_cis.real, -freqs_cis.imag).to(o.dtype)
+        o = torch.cat([o[..., :hd - rope_dim], tail], dim=-1)
+        o = act_quant_dequant(o.flatten(-2).unflatten(-1, (groups, -1)))
     mid = grouped(o, wo_a, sa).flatten(-2)
     return tk.fp8_gemv(tk.act_quant_dequant(mid).reshape(-1, mid.shape[-1]), wo_b, sb).reshape(
         tuple(o.shape[:-2]) + (wo_b.shape[0],)).to(o.dtype)
@@ -980,9 +987,10 @@ def _attn_out_body(o, freqs_cis, wo_a, sa, groups, rank, wo_b, sb, rope_dim, tk,
                 applies=lambda plan, lowering=False, rows=0, **_: _fusing(plan, lowering, "attn_out")
                 and rows <= FP8_GEMV_MAX_ROWS and _fp8_native(), lowerable=True, fused=True)
 def _attn_out_fused(o, freqs_table, start, seqlen, wo_a, sa, groups, rank, wo_b, sb, rope_dim, residual, post, comb,
-                    tk=triton_ops):
-    x = _attn_out_body(o, _freqs_at(freqs_table, start, seqlen), wo_a, sa, groups, rank, wo_b, sb, rope_dim, tk,
-                       tk.act_quant_dequant, lambda o_, w, s_: _grouped_gemv(o_, w, s_, tk=tk))
+                    prepared, tk=triton_ops):
+    x = _attn_out_body(o, None if prepared else _freqs_at(freqs_table, start, seqlen), wo_a, sa, groups, rank, wo_b,
+                       sb, rope_dim, tk, tk.act_quant_dequant, lambda o_, w, s_: _grouped_gemv(o_, w, s_, tk=tk),
+                       prepared)
     return _hc_post_reference(x, residual, post, comb)
 
 
@@ -994,22 +1002,25 @@ def _attn_out_fused(o, freqs_table, start, seqlen, wo_a, sa, groups, rank, wo_b,
                 and rows <= FP8_GEMV_MAX_ROWS and head_dim % 32 == 0 and (head_dim - rope_dim) % 2 == 0
                 and rank % 32 == 0 and groups and heads % groups == 0 and _fp8_native(), lowerable=True)
 def _attn_out_triton(o, freqs_table, start, seqlen, wo_a, sa, groups, rank, wo_b, sb, rope_dim, residual, post, comb,
-                     tk=triton_ops):
+                     prepared, tk=triton_ops):
     return tk.attn_out(o, _freqs_real(freqs_table), start, seqlen, wo_a, sa, groups, rank, wo_b, sb, o.shape[-1],
-                       rope_dim, residual, post, comb)
+                       rope_dim, residual, post, comb, prepared)
 
 
 @implementation("vxpu::attn_out", "reference", ("cpu", "cuda"), "bit-identical",
                 "the fork's: apply_rotary_emb inverse, act_quant, the dequantized grouped einsum and an fp8 linear "
                 "(aten)", reference=True)
 def _attn_out_reference(o, freqs_table, start, seqlen, wo_a, sa, groups, rank, wo_b, sb, rope_dim, residual, post,
-                        comb):
+                        comb, prepared):
     ds, ka = _fork_kernels()
-    freqs_cis = _freqs_at(freqs_table, start, seqlen)
     hd = o.shape[-1]
-    tail = _rotary_reference(o[..., hd - rope_dim:], freqs_cis, inverse=True).to(o.dtype)
-    o = torch.cat([o[..., :hd - rope_dim], tail], dim=-1).flatten(-2).unflatten(-1, (groups, -1)).contiguous()
-    o = ka.act_quant(o, ds.fp8_block_size, ds.scale_fmt, ds.scale_dtype, True)
+    if prepared:
+        o = o.flatten(-2).unflatten(-1, (groups, -1))
+    else:
+        freqs_cis = _freqs_at(freqs_table, start, seqlen)
+        tail = _rotary_reference(o[..., hd - rope_dim:], freqs_cis, inverse=True).to(o.dtype)
+        o = torch.cat([o[..., :hd - rope_dim], tail], dim=-1).flatten(-2).unflatten(-1, (groups, -1)).contiguous()
+        o = ka.act_quant(o, ds.fp8_block_size, ds.scale_fmt, ds.scale_dtype, True)
     mid = _grouped_reference(o, wo_a, sa).flatten(-2)
     return _hc_post_reference(_fp8_linear_reference(mid, wo_b, sb), residual, post, comb)
 
@@ -1162,6 +1173,52 @@ def _sparse_attn_triton(q, kv, attn_sink, topk_idxs, softmax_scale, tk=triton_op
 def _sparse_attn_reference(q, kv, attn_sink, topk_idxs, softmax_scale):
     ds, ka = _fork_kernels()
     return ka.sparse_attn(q, kv, attn_sink, topk_idxs, softmax_scale)
+
+
+@custom_op("vxpu::attn_core", mutates_args=())  # pure tensor work: capturable
+def attn_core(q: torch.Tensor, kv: torch.Tensor, attn_sink: torch.Tensor, topk_idxs: torch.Tensor,
+              softmax_scale: float, freqs_table: torch.Tensor, start: torch.Tensor, seqlen: int, rope_dim: int
+              ) -> torch.Tensor:
+    """vxpu::sparse_attn followed by the output path's first step: each head's last rope_dim dims
+    of o [b, s, heads, head_dim] rotated back by the frequencies of the token's position
+    (freqs_table the whole complex table, token t of row b at start[b] + t) and the head
+    quantized to the fp8 grid per 32 (the fork's apply_rotary_emb inverse and act_quant), so
+    vxpu::attn_out takes the result as prepared. On a GPU the combine kernel does it in its
+    epilogue: one launch fewer a layer."""
+    impl = select("vxpu::attn_core", q, kv, attn_sink, topk_idxs, softmax_scale, freqs_table, start, seqlen, rope_dim)
+    return impl.fn(q, kv, attn_sink, topk_idxs, softmax_scale, freqs_table, start, seqlen, rope_dim)
+
+
+@attn_core.register_fake
+def _(q, kv, attn_sink, topk_idxs, softmax_scale, freqs_table, start, seqlen, rope_dim):
+    return q.new_empty(q.shape)
+
+
+def _attn_core_context(q, kv, attn_sink, topk_idxs, softmax_scale, freqs_table, start, seqlen, rope_dim):
+    b, m, h, d = q.shape
+    return q.device.type, f"queries={b * m} heads={h} d={d} t={topk_idxs.shape[-1]}", {
+        "queries": b * m, "heads": h, "d": d, "t": topk_idxs.shape[-1]}
+
+
+@implementation("vxpu::attn_core", "gpu-triton", ("cuda",), "rounding",
+                "sparse_attn's two kernels, the second finishing each head: the rope tail rotated back and the head "
+                "quantized per 32 in its epilogue",
+                applies=lambda plan, d=0, heads=0, **_: plan["triton"] and d in (64, 128, 256, 512) and heads % 16 == 0,
+                lowerable=True)
+def _attn_core_triton(q, kv, attn_sink, topk_idxs, softmax_scale, freqs_table, start, seqlen, rope_dim, tk=triton_ops):
+    return tk.sparse_attn_finish(q, kv, attn_sink, topk_idxs, softmax_scale, _freqs_real(freqs_table), start, seqlen,
+                                 rope_dim)
+
+
+@implementation("vxpu::attn_core", "reference", ("cpu", "cuda"), "bit-identical",
+                "the fork's aten sparse_attn, apply_rotary_emb inverse and act_quant", reference=True)
+def _attn_core_reference(q, kv, attn_sink, topk_idxs, softmax_scale, freqs_table, start, seqlen, rope_dim):
+    ds, ka = _fork_kernels()
+    o = ka.sparse_attn(q, kv, attn_sink, topk_idxs, softmax_scale)
+    hd = o.shape[-1]
+    tail = _rotary_reference(o[..., hd - rope_dim:], _freqs_at(freqs_table, start, seqlen), inverse=True).to(o.dtype)
+    o = torch.cat([o[..., :hd - rope_dim], tail], dim=-1).contiguous()
+    return ka.act_quant(o, ds.fp8_block_size, ds.scale_fmt, ds.scale_dtype, True)
 
 
 @custom_op("vxpu::choose_argmax", mutates_args=())  # pure tensor work: capturable
@@ -1486,6 +1543,7 @@ SELECTION = {
     "vxpu::attn_q": _attn_q_context,
     "vxpu::window_kv": _window_kv_context,
     "vxpu::attn_out": _attn_out_context,
+    "vxpu::attn_core": _attn_core_context,
 }
 CALL = {"vxpu::head_linear": _call_head}
 

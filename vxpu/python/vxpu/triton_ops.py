@@ -821,7 +821,7 @@ def window_kv(x, wkv, scale, norm_weight, norm_eps, freqs, start, seqlen, rope_d
 
 
 def attn_out(o, freqs, start, seqlen, wo_a, sa, groups, rank, wo_b, sb, head_dim, rope_dim, residual=None, post=None,
-             comb=None, traced=False):
+             comb=None, prepared=False, traced=False):
     """The attention's output path for a decode step's rows, in three kernels: one program per
     (row, head) for the inverse rotary of the head's last rope_dim dims (freqs [positions,
     rope_dim / 2, 2] fp32: the whole table's real view, read at the row's position start[b] + t,
@@ -829,9 +829,10 @@ def attn_out(o, freqs, start, seqlen, wo_a, sa, groups, rank, wo_b, sb, head_dim
     grouped projection wo_a [groups * rank, heads_per_group * head_dim] (fp8, e8m0 block scales,
     block-diagonal over the groups) quantizing its result in its epilogue; wo_b [dim, groups * rank]. Returns
     [.., dim] bf16, or with residual [.., hc, dim], post [.., hc] and comb [.., hc, hc] the
-    stream [.., hc, dim] with the output mixed in by wo_b's epilogue (the fork's hc_post). The
-    fork launches about five kernels; the fold of the rotary into the grouped GEMV's prologue
-    recomputed it per program and was dropped."""
+    stream [.., hc, dim] with the output mixed in by wo_b's epilogue (the fork's hc_post). With
+    `prepared`, o comes rotated back and quantized already (sparse_attn's finish) and the per-row
+    kernel is skipped. The fork launches about five kernels; the fold of the rotary into the
+    grouped GEMV's prologue recomputed it per program and was dropped."""
     *lead, heads, hd = o.shape
     M = o.numel() // (heads * hd)
     Kg = heads * hd // groups  # a group's slice of o
@@ -843,8 +844,8 @@ def attn_out(o, freqs, start, seqlen, wo_a, sa, groups, rank, wo_b, sb, head_dim
                          f"groups {groups} rank {rank}, rope {rope_dim}, freqs {tuple(freqs.shape)}, "
                          f"start {tuple(start.shape)} x {seqlen}")
     x = o.reshape(M * heads, hd).contiguous()
-    oq = torch.empty_like(x)
-    if M:
+    oq = x if prepared else torch.empty_like(x)
+    if M and not prepared:
         rowk, ctx = _launcher(_row_post_kernel, o.device, traced)  # not `post`: that name is the mix's weights
         with ctx:
             rowk[(M * heads,)](x, x, freqs.contiguous(), start.contiguous(), -1.0, oq, oq, M * heads, hd, heads,
@@ -1342,11 +1343,16 @@ if triton is not None:
         tl.store(acc_ptr + part[:, None] * D + ds[None, :], acc, mask=hl[:, None])
 
     @triton.jit
-    def _sparse_attn_combine_kernel(m_ptr, l_ptr, acc_ptr, sink_ptr, o_ptr, H, S,
-                                    D: tl.constexpr, SP: tl.constexpr):
+    def _sparse_attn_combine_kernel(m_ptr, l_ptr, acc_ptr, sink_ptr, o_ptr, freqs_ptr, start_ptr, H, S, M, SQ,
+                                    D: tl.constexpr, SP: tl.constexpr, RD: tl.constexpr, FINISH: tl.constexpr):
         """Query row r, head h: the S splits' partials combined under the global max, the sink term
-        added to the denominator (only there), o = acc / denominator. A query with no valid slot
-        gives zeros."""
+        added to the denominator (only there), o = acc / denominator, rounded to bf16 as the fork
+        returns it. A query with no valid slot gives zeros. With FINISH the output path's first
+        step follows in the same program (the fork's apply_rotary_emb inverse and act_quant, as
+        _row_post_kernel does them): the head's last RD elements rotated back by the frequencies
+        at the token's position (freqs_ptr the table's real view, start_ptr[row // SQ] + row % SQ
+        with row = r // M... the query rows run b-major, M a row's queries, SQ the step's length)
+        and the head quantized to the fp8 grid per 32, so the grouped projection reads it as is."""
         r = tl.program_id(0).to(tl.int64)
         h = tl.program_id(1)
         ss = tl.arange(0, SP)
@@ -1360,13 +1366,47 @@ if triton is not None:
         ds = tl.arange(0, D)
         acc = tl.sum(w[:, None] * tl.load(acc_ptr + part[:, None] * D + ds[None, :], mask=sl[:, None], other=0.0), axis=0)
         denom = l + tl.exp(tl.load(sink_ptr + h).to(tl.float32) - m_safe)
-        tl.store(o_ptr + (r * H + h) * D + ds, (acc / denom).to(o_ptr.dtype.element_ty))
+        o = acc / denom
+        if FINISH:
+            o = o.to(tl.bfloat16).to(tl.float32)  # the attention's bf16 output, as the fork rotates it
+            ev, od = tl.split(tl.reshape(o, (D // 2, 2)))
+            even_dim = 2 * tl.arange(0, D // 2)
+            tail = even_dim >= D - RD
+            pair = (even_dim - (D - RD)) // 2
+            tok = r  # query rows run b-major: row b = r // M, token t = r % M
+            pos = tl.load(start_ptr + tok // M) + tok % M
+            fb = freqs_ptr + pos * RD + 2 * pair
+            c = tl.load(fb, mask=tail, other=1.0)
+            sn = -tl.load(fb + 1, mask=tail, other=0.0)  # the inverse rotation
+            o = tl.reshape(tl.join(ev * c - od * sn, ev * sn + od * c), (D,))
+            o = o.to(tl.bfloat16).to(tl.float32)  # the fork writes the rotated tail back as bf16
+            og = tl.reshape(o, (D // 32, 32))
+            amax = tl.maximum(tl.max(tl.abs(og), axis=1), 1e-4)
+            v = amax / 448.0
+            bits = v.to(tl.int32, bitcast=True)
+            exponent = (bits >> 23) & 0xFF
+            exponent = tl.where((bits & 0x7FFFFF) == 0, exponent, exponent + 1)
+            scale = (exponent << 23).to(tl.float32, bitcast=True)
+            q = tl.minimum(tl.maximum(og / scale[:, None], -448.0), 448.0)
+            o = tl.reshape(_round_e4m3(q) * scale[:, None], (D,))
+        tl.store(o_ptr + (r * H + h) * D + ds, o.to(o_ptr.dtype.element_ty))
 
 
-def sparse_attn(q, kv, attn_sink, topk_idxs, softmax_scale, traced=False):
+def sparse_attn(q, kv, attn_sink, topk_idxs, softmax_scale, freqs=None, start=None, seqlen=1, rope_dim=0,
+                finish=False, traced=False):
     """The fork's sparse_attn: q [b, m, h, d], kv [b, n, d] (K and V the same rows), attn_sink [h],
-    topk_idxs [b, m, t] int32 with -1 for an absent slot -> o [b, m, h, d] in q's dtype."""
+    topk_idxs [b, m, t] int32 with -1 for an absent slot -> o [b, m, h, d] in q's dtype. With
+    finish, the output path's first step runs in the combine kernel: each head's last rope_dim
+    elements rotated back by the frequencies at the token's position (freqs the table's real
+    view [positions, rope_dim / 2, 2], start [b] int64, seqlen the step's length: query token t
+    of row b at start[b] + t) and the head quantized to the fp8 grid per 32, so attn_out takes
+    the result as prepared (one launch fewer a layer)."""
     b, m, h, d = q.shape
+    if finish and (freqs is None or start is None or rope_dim % 2 or tuple(freqs.shape[1:]) != (rope_dim // 2, 2)
+                   or start.numel() * seqlen != b * m or d % 32):
+        raise ValueError(f"sparse_attn: finish needs the table and positions: freqs "
+                         f"{None if freqs is None else tuple(freqs.shape)}, start {None if start is None else tuple(start.shape)} "
+                         f"x {seqlen} for {b} x {m} queries, rope {rope_dim}, d {d}")
     n = kv.shape[1]
     t = topk_idxs.shape[-1]
     if kv.shape[-1] != d or (d & (d - 1)):
@@ -1388,9 +1428,17 @@ def sparse_attn(q, kv, attn_sink, topk_idxs, softmax_scale, traced=False):
                                                   l_part, acc_part, m, h, t, n, S, float(softmax_scale),
                                                   D=d, HB=HB, TB=TB, num_warps=4)
         combine, ctx = _launcher(_sparse_attn_combine_kernel, dev, traced)
+        fr = freqs.contiguous() if finish else o
+        st = start.contiguous() if finish else topk_idxs
         with ctx:
-            combine[(b * m, h)](m_part, l_part, acc_part, attn_sink.contiguous(), o, h, S, D=d, SP=sp, num_warps=4)
+            combine[(b * m, h)](m_part, l_part, acc_part, attn_sink.contiguous(), o, fr, st, h, S, m, seqlen, D=d,
+                                SP=sp, RD=rope_dim if finish else 2, FINISH=finish, num_warps=4)
     return o
+
+
+def sparse_attn_finish(q, kv, attn_sink, topk_idxs, softmax_scale, freqs, start, seqlen, rope_dim, traced=False):
+    """sparse_attn with finish (ops.attn_core): the output rotated back and quantized per head."""
+    return sparse_attn(q, kv, attn_sink, topk_idxs, softmax_scale, freqs, start, seqlen, rope_dim, True, traced=traced)
 
 
 def _gemv_blocks(K):
@@ -1576,14 +1624,22 @@ if triton is not None:
     @torch.library.triton_op("vxpu_triton::attn_out", mutates_args=())
     def _attn_out_op(o: torch.Tensor, freqs: torch.Tensor, start: torch.Tensor, seqlen: int, wo_a: torch.Tensor,
                      sa: torch.Tensor, groups: int, rank: int, wo_b: torch.Tensor, sb: torch.Tensor, head_dim: int,
-                     rope_dim: int, residual: torch.Tensor, post: torch.Tensor, comb: torch.Tensor) -> torch.Tensor:
+                     rope_dim: int, residual: torch.Tensor, post: torch.Tensor, comb: torch.Tensor, prepared: bool
+                     ) -> torch.Tensor:
         return attn_out(o, freqs, start, seqlen, wo_a, sa, groups, rank, wo_b, sb, head_dim, rope_dim, residual, post,
-                        comb, traced=True)
+                        comb, prepared, traced=True)
 
     @torch.library.triton_op("vxpu_triton::sparse_attn", mutates_args=())
     def _sparse_attn_op(q: torch.Tensor, kv: torch.Tensor, attn_sink: torch.Tensor, topk_idxs: torch.Tensor,
                         softmax_scale: float) -> torch.Tensor:
         return sparse_attn(q, kv, attn_sink, topk_idxs, softmax_scale, traced=True)
+
+    @torch.library.triton_op("vxpu_triton::sparse_attn_finish", mutates_args=())
+    def _sparse_attn_finish_op(q: torch.Tensor, kv: torch.Tensor, attn_sink: torch.Tensor, topk_idxs: torch.Tensor,
+                               softmax_scale: float, freqs: torch.Tensor, start: torch.Tensor, seqlen: int,
+                               rope_dim: int) -> torch.Tensor:
+        return sparse_attn(q, kv, attn_sink, topk_idxs, softmax_scale, freqs, start, seqlen, rope_dim, True,
+                           traced=True)
 
     @torch.library.triton_op("vxpu_triton::rotary", mutates_args=())
     def _rotary_op(x: torch.Tensor, cos: torch.Tensor, sin: torch.Tensor) -> torch.Tensor:
@@ -1607,6 +1663,7 @@ lowered = types.SimpleNamespace(
     attn_q=lambda *a: torch.ops.vxpu_triton.attn_q(*a),
     window_kv=lambda *a: torch.ops.vxpu_triton.window_kv(*a),
     attn_out=lambda *a: torch.ops.vxpu_triton.attn_out(*a),
+    sparse_attn_finish=lambda *a: torch.ops.vxpu_triton.sparse_attn_finish(*a),
     ffn_front=lambda *a: torch.ops.vxpu_triton.ffn_front(*a),
     hc_front=lambda *a: torch.ops.vxpu_triton.hc_front(*a),
     ffn_front_split=lambda *a: torch.ops.vxpu_triton.ffn_front_split(*a),
