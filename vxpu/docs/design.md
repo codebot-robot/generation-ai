@@ -310,6 +310,35 @@ layer) streamed an expert once per pair, so one prompt in nine rows read
 each of its six experts nine times (34 ms a step where the grouped path
 took 26); it now serves one row's pairs only.
 
+**The drafter's step is mostly bytes.** The premise that a six-token
+verify reads what a one-token step reads holds for the dense half only:
+the MoE half reads every expert any of the six tokens selects, about 25
+distinct experts a layer instead of 6 (inferred from the expert kernels'
+bytes at bandwidth: 215 + 119 µs a layer). Per-kernel profile of one
+speculative step at one row (measured): the verify step 24.5 ms of GPU
+time (experts 13.3, dense GEMVs 7.2, fronts and attention 1.7, small
+kernels 2.3), the drafter 2.3 ms (its 1.3 GB bf16 head 0.9 of it, five
+sequential Markov heads and argmaxes 0.4), and 3.2 ms of host gaps
+between the drafter's graphs and the verify's (the native loop syncs,
+copies the drafts to the host, writes the verify's input ids, syncs
+again; the plain loop has 0.8 ms of gaps) in a 30 ms step. Floors,
+estimated: the speculative step about 21 ms (dense 5.8, experts about
+13, drafter about 1.7), 8.5 ms a token at 2.46 accepted, against 8.9 ms
+a token without the drafter. So with five drafts, speculation is nearly
+byte-neutral for this model at one row on one GPU's bandwidth; its gain
+today (12.2 against 15.0 ms a token) comes from covering latency, and
+the draft length is a bytes-against-acceptance trade for the planner to
+measure. The same arithmetic explains the six-card recipe: at two GPUs'
+bandwidth per layer its verify step's bytes take about 9.3 ms, which is
+the 9.6 ms it reports with and without the drafter; a single row past
+about 120 tokens/s on these cards needs more than one GPU's bandwidth
+per layer. One change landed from this: on Blackwell the one-weight GEMV
+gives each program 32 weight rows (26.6 to 24.2 µs a launch at six rows,
+bit-identical; the two-weight and prologue kernels keep 16, which they
+measured faster with). The host round trip is the next removable piece:
+building the verify's input ids on the device from the drafter's output
+would take the two syncs out.
+
 The floor with different prompts depends on how many distinct experts
 the rows select a layer, which is not measured yet: at most 198 for 33
 rows (150 GB a step, 100 ms), about 156 if routing were uniform over
