@@ -295,18 +295,26 @@ for sites inside those segments, most likely a package cache key that
 does not carry the choice: a lowering bug to fix, since a planner whose
 choices are not applied is no planner.
 
-Batched rows and the drafter, sharded, the merged 7(b) code, the
-drafter's stages on the last GPU (Oct 31; measured; "same" is one
-prompt in every row, "different" a prompt per row; hero 7's numbers,
-where they existed, in parentheses):
+Batched rows and the drafter, sharded, the final 7(b) code (Oct 31, the
+clean rerun on an idle pod; measured; "same" is one prompt in every
+row, "different" a prompt per row; hero 7's numbers, where they
+existed, in parentheses):
 
 | rows | one prompt | same prompt per row | different prompts |
 |---|---|---|---|
-| 1 | 15.3 ms (20.3) | | |
-| 1 + drafter | 29.9 ms, 37 of 130 drafts accepted, 2.46 tokens a step, 82 tok/s | | |
-| 9 | 25.3 ms | 21.1 ms, 433 tok/s | 38.3 ms, 243 tok/s |
-| 8 + drafter | 69.4 ms, 2.78 tokens a step | 48.7 ms, 320 of 920 accepted, 453 tok/s | 107 ms, 2.89 tokens a step, 173 tok/s |
-| 33 | 40.5 ms | 39.9 ms, 804 tok/s | 112 ms, 303 tok/s |
+| 1 | 15.2 ms, 60 tok/s (20.3) | | |
+| 1 + drafter | 28.5 ms, 37 of 130 drafts accepted, 2.46 tokens a step, 86 tok/s | | |
+| 9 | 24.8 ms | 20.5 ms, 422 tok/s | 39.4 ms, 228 tok/s |
+| 8 + drafter | 69.2 ms, 2.78 tokens a step | 48.7 ms, 320 of 920 accepted, 452 tok/s | 116 ms, 2.89 tokens a step, 164 tok/s |
+| 33 | 40.6 ms | 39.9 ms, 802 tok/s | 112 ms, 295 tok/s |
+
+Against the floors: one row is 1.7 times 8.9 ms; one row with the
+drafter is 86 tok/s against the six-card recipe's 285 at two GPUs'
+bandwidth per layer and against about 120 at one; the batched floors
+wait on the distinct-expert count. A run on a pod another job was
+time-slicing gave flat medians at round numbers (20.0, 30.0, 60.0 ms,
+14 ms of GPU time in a 235 ms wall) and was discarded: a step
+measurement needs an idle pod, checked with nvidia-smi before the run.
 
 Every same-prompt run has token-identical rows and accepts rows times
 what one row accepts. Two bugs came out on the way to this table. The
