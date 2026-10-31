@@ -318,9 +318,10 @@ GEMV_ROWS_MAX = int(os.environ.get("VXPU_GEMV_ROWS_MAX", "64"))
 
 
 def _rows_blocks(M, K):
-    """Block shape for _gemv_rows_kernel: rows padded to a tensor-core tile, 16 weight rows per
+    """Block shape for the GEMV kernels: rows padded to a tensor-core tile, 16 weight rows per
     program (32 above 32 rows: measured on an L4, 16 fell to 130-175 GB/s at 33-64 rows where 32
-    held 180-255), a K step of 256 where K allows it."""
+    held 180-255), a K step of 256 where K allows it. The one-weight kernel takes 32 rows per
+    program on Blackwell (gemv_rows); the kernels holding two weights or a prologue keep 16."""
     bm = 16
     while bm < M:
         bm *= 2
@@ -357,6 +358,13 @@ def gemv_rows(x, weight, scale=None, group_rows=None, out_dtype=torch.bfloat16, 
     N, K = weight.shape
     R = group_rows or N
     bm, bn, bk = blocks or _rows_blocks(M, K)
+    if blocks is None and _blackwell(x.device):
+        # 32 weight rows per program on this card (measured cold on an RTX PRO 6000, 5120 x 8192
+        # fp8: 16 rows 33.3 us at one row of x and 36.8 at six; 32 rows 32.8 and 32.9), so the
+        # six-row verify step of a speculative decode stops paying 10 to 20% over one row. In the
+        # step: 26.6 -> 24.2 us a launch over 250 launches. The dual GEMV lost with 32 (28 -> 38 us),
+        # so only this kernel takes it. The planner's choice per shape and GPU; the record so far.
+        bn = max(bn, 32)
     if quant_out:
         bn = max(bn, 32)
     if ksplit > 1:
@@ -1866,6 +1874,16 @@ FP4_DIRECT_MAX = 8  # pairs up to which the direct kernels run (no schedule; eac
 # One row's pairs (top-6) and no more: the direct path streams an expert once per pair, so rows that share experts
 # multiply its bytes (one prompt in 9 rows: 54 pairs over 6 experts read each nine times, 19.1 ms of experts a step
 # against 4.5 at one row and 7.9 grouped); the grouped path reads each expert once for all its pairs.
+
+
+@functools.lru_cache(maxsize=None)
+def _blackwell(device=None):
+    """Whether the GPU (the current one by default) is Blackwell or later (compute capability 10+)."""
+    if not torch.cuda.is_available():
+        return False
+    index = device.index if isinstance(device, torch.device) else device
+    major, _ = torch.cuda.get_device_capability(torch.cuda.current_device() if index is None else index)
+    return major >= 10
 
 
 @functools.lru_cache(maxsize=None)
