@@ -171,13 +171,17 @@ class Recorder:
         return out
 
 
-def segment_info(split):
-    """[{name, kind, layers, nodes}] for a split module's segments, in call
-    order: kind is experts / engram / dense, layers the decoder layers its
-    nodes come from (from the export's module stacks)."""
+def segment_info(split, mtp_base=None):
+    """[{name, kind, layers, writes, nodes}] for a split module's segments, in
+    call order: kind is experts / engram / dense, layers the decoder layers
+    its nodes come from (from the export's module stacks; with mtp_base, the
+    drafter's stage k counts as layer mtp_base + k, the id its experts and
+    the placement use), writes the positions of the arguments it mutates in
+    place (a cache written through a view of a placeholder)."""
     import re
     from . import segments
     layer_re = re.compile(r"layers\.(\d+)")
+    stage_re = re.compile(r"(?:^|\.)mtp\.(\d+)")
     info = []
     for name, sub in segments.segments_of(split):
         graph = getattr(sub, "_orig_mod", sub).graph
@@ -192,6 +196,33 @@ def segment_info(split):
                 m = layer_re.search(path)
                 if m:
                     layers.add(int(m.group(1)))
-        info.append({"name": name, "kind": kind, "layers": sorted(layers),
+                m = stage_re.search(path)
+                if m and mtp_base is not None:
+                    layers.add(mtp_base + int(m.group(1)))
+        info.append({"name": name, "kind": kind, "layers": sorted(layers), "writes": segment_writes(graph),
                      "nodes": sum(1 for n in graph.nodes if n.op == "call_function")})
     return info
+
+
+def segment_writes(graph):
+    """The positions of graph's placeholders that an in-place op writes (aten.index_put_,
+    copy_ and the like, reached through views): a segment's caches. Sorted positions."""
+    from . import segments
+    order = [n for n in graph.nodes if n.op == "placeholder"]
+    position = {n: i for i, n in enumerate(order)}
+    written = set()
+    for n in graph.nodes:
+        if n.op != "call_function":
+            continue
+        name = str(n.target)
+        parts = name.split(".")
+        packet = parts[1] if len(parts) > 2 and parts[0] == "aten" else ""
+        if not (packet.endswith("_") and not packet.endswith("__")) or not n.args:
+            continue
+        base = n.args[0]
+        while (isinstance(base, torch.fx.Node) and base.op == "call_function" and base.args
+               and isinstance(base.args[0], torch.fx.Node) and segments._aliases(base)):
+            base = base.args[0]
+        if isinstance(base, torch.fx.Node) and base in position:
+            written.add(position[base])
+    return sorted(written)

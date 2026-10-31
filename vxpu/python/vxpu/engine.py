@@ -907,60 +907,121 @@ class Engine:
                 return torch.device(device)
         return None
 
+    def _mtp_base(self):
+        """The layer id of the drafter's first stage: one past the backbone's last layer (the id
+        the placement and the expert tensors use for the stages, deepseek_v41.external_spec)."""
+        if getattr(self, "_mtp_base_value", None) is None:
+            layers = [l for seg in segment_info(self._decode_split.split) for l in seg["layers"]]
+            self._mtp_base_value = (max(layers) + 1) if layers else 0
+        return self._mtp_base_value
+
+    def _graph(self, split):
+        """The dataflow graph of a split, with the drafter's stages counted as layers after the
+        backbone's so layer sharding places them."""
+        from . import dataflow
+        return dataflow.Graph.from_split(split, self._mtp_base())
+
     def _shard_layers(self):
         """Layer sharding: move each dense segment's resident tensors (its layers' weights and
         caches) to the GPU layer_devices gives its layers, in the decode, prefill and draft
         programs alike (their state is shared; their weights may be copies per program). A
         segment spanning two layers (one layer's tail and the next's attention) goes with the
-        later layer; a segment with no layer (the head) goes where the segment before it went. A
-        tensor read by segments on two GPUs stays where it was first placed and the dataflow
-        runner copies it for the other (dataflow.Runner._arg); a state tensor must not be one,
-        since the copy would go stale, so those are reported. The runner then runs every segment
-        where its tensors are, and the step crosses GPUs once per range."""
+        later layer; a segment with no layer (the head) goes where the segment before it went;
+        the drafter's stages count as the layers after the backbone's. A tensor read by segments
+        on two GPUs is owned by the one that writes it (the decode's last segment writes the
+        drafter's rings; a group's first layer writes the compressed KV its later layers read),
+        else by the first to read it, across all the programs; the dataflow runner copies it for
+        the others (dataflow.Runner._arg: a state tensor's replica is refreshed once a step from
+        the owner's). A tensor written on two GPUs is an error: the replica rule copies the
+        owner's writes out, never back. The runner then runs every segment where its tensors are,
+        and the step crosses GPUs once per range."""
         from . import dataflow
         state = set(self.binding["state"])
         programs = [("decode", self._decode_split.split)]
         for name, program in (("prefill", self._prefill), ("draft", self._draft)):
             if program is not None:
                 programs.append((name, segments.split_at_host_ops(program)[0]))
+        default = torch.device(self.device)
+        if default.index is None:  # "cuda" is "cuda:0" here; the comparisons below need the index
+            default = torch.device(default.type, torch.cuda.current_device())
+        # where each dense segment runs, and which residents it reads and writes there
+        plan = []  # (program, split, node, device)
+        readers, writers = {}, {}  # resident -> [devices, first touch first] / {device: (program, node)}
+        self._planned = {}  # (program, dense segment name) -> device, for the runners' placement
         for name, split in programs:
-            graph = dataflow.Graph.from_split(split)
-            device = torch.device(self.device)
-            if device.index is None:  # "cuda" is "cuda:0" here; the comparisons below need the index
-                device = torch.device(device.type, torch.cuda.current_device())
-            moved, bytes_moved, shared = {}, collections.Counter(), {}
-            for node in graph.nodes:
-                if node.kind != "dense":
-                    continue
-                layers = [int(x) for x in node.layers]
-                device = (self._layer_device(max(layers)) if layers else None) or device
-                # the segment's own tensors too: the constants export lifted into it (an n-gram
-                # layer's tables of offsets, a norm's epsilon tensor), which no argument names
-                bytes_moved[str(device)] += _move_module_tensors(getattr(split, node.name), device)
+            dense = [n for n in self._graph(split).nodes if n.kind == "dense"]
+            devices = [self._layer_device(max(int(x) for x in n.layers)) if n.layers else None for n in dense]
+            # a segment with no layer goes with the segment before it (the head), or, before any
+            # layered segment (the drafter's embedding), with the first that has one
+            device = default
+            for i, placed in enumerate(devices):  # forward: a layer-less segment follows the one before it
+                device = placed or device
+                devices[i] = device
+            following = None
+            for i in reversed(range(len(dense))):  # backward: leading layer-less segments join the first layered one
+                if dense[i].layers:
+                    following = devices[i]
+                elif following is not None and not any(n.layers for n in dense[:i]):
+                    devices[i] = following
+            for node, placed in zip(dense, devices):
+                plan.append((name, split, node, placed))
+                self._planned[(name, node.name)] = placed
+                written = {node.args[i].name for i in node.writes
+                           if i < len(node.args) and isinstance(node.args[i], dataflow.Ref)
+                           and node.args[i].kind == "resident"}
                 for r in dataflow._flat(node.refs()):
-                    if not (isinstance(r, dataflow.Ref) and r.kind == "resident"):
-                        continue
-                    if r.name in moved:
-                        if moved[r.name] != device:
-                            shared[r.name] = (moved[r.name], device)
-                        continue
-                    t = dataflow._attr(split, r.name)
-                    if isinstance(t, torch.Tensor) and t.device != device:
-                        t.data = t.data.to(device)  # in place: every program holding this tensor follows
-                        bytes_moved[str(device)] += t.numel() * t.element_size()
-                    moved[r.name] = device
-            msg = f"layer sharding, {name}: " + (", ".join(f"{b / 1e9:.1f} GB to {d}" for d, b in sorted(bytes_moved.items()))
-                                                  or "nothing to move")
-            if shared:
-                names = sorted(shared)
-                stale = [n for n in names if n in state]
-                msg += f"; {len(names)} tensors read from two GPUs (copied for the second)"
-                if stale:  # a cache written on one GPU and read on another: its replica is refreshed once a step
-                    msg += (f"; {len(stale)} of them state (a cache shared by layers on two GPUs: the compressed KV "
-                            f"or index keys written by a group's first layer), replicated and refreshed once a "
-                            f"step at the first read on the other GPU: {', '.join(stale)}")
-            print(f"[vxpu] {msg}", flush=True)
-            self.plan.note(msg)
+                    if isinstance(r, dataflow.Ref) and r.kind == "resident":
+                        readers.setdefault(r.name, []).append(placed)
+                        if r.name in written:
+                            writers.setdefault(r.name, {})[str(placed)] = (name, node.name, placed)
+        owner, by_writer = {}, []
+        for rname, devs in readers.items():
+            ws = writers.get(rname, {})
+            if len(ws) > 1:
+                where = ", ".join(f"{prog}'s {node} on {dev}" for prog, node, dev in ws.values())
+                raise RuntimeError(f"layer sharding: {rname} is written on two GPUs ({where}); a tensor must be "
+                                   f"written on one GPU, since the replica rule copies the owner's writes to its "
+                                   f"readers and never back")
+            owner[rname] = next(iter(ws.values()))[2] if ws else devs[0]
+            if ws and owner[rname] != devs[0]:
+                by_writer.append(rname)
+        # the segments' own tensors (the constants export lifted into them, which no argument names)
+        # copied per segment; the residents moved in place to their owner, so every program holding
+        # the tensor follows
+        bytes_moved, shared, done = collections.Counter(), {}, set()
+        for name, split, node, device in plan:
+            bytes_moved[str(device)] += _move_module_tensors(getattr(split, node.name), device)
+            for r in dataflow._flat(node.refs()):
+                if not (isinstance(r, dataflow.Ref) and r.kind == "resident"):
+                    continue
+                if device != owner[r.name]:
+                    shared[r.name] = (owner[r.name], device)
+                if (name, r.name) in done:
+                    continue
+                done.add((name, r.name))
+                t = dataflow._attr(split, r.name)
+                if isinstance(t, torch.Tensor) and t.device != owner[r.name]:
+                    t.data = t.data.to(owner[r.name])
+                    bytes_moved[str(owner[r.name])] += t.numel() * t.element_size()
+        counts = collections.Counter()
+        for name, _, node, device in plan:
+            counts[(name, str(device))] += 1
+        by_program = {name: {d: n for (p, d), n in sorted(counts.items()) if p == name} for name, _ in programs}
+        msg = ("layer sharding: " + (", ".join(f"{b / 1e9:.1f} GB to {d}" for d, b in sorted(bytes_moved.items()))
+                                     or "nothing to move") + f"; dense segments by GPU {by_program}")
+        if shared:
+            names = sorted(shared)
+            stale = [n for n in names if n in state]
+            msg += f"; {len(names)} tensors read from a GPU other than their owner's (copied for the reader)"
+            if stale:  # a cache written on one GPU and read on another: its replica is refreshed once a step
+                msg += (f"; {len(stale)} of them state (a cache shared by layers on two GPUs, or the drafter's "
+                        f"rings), replicated and refreshed once a step at the first read on the other GPU: "
+                        f"{', '.join(stale)}")
+        if by_writer:
+            msg += (f"; {len(by_writer)} owned by the GPU that writes them rather than the first to read them: "
+                    f"{', '.join(by_writer)}")
+        print(f"[vxpu] {msg}", flush=True)
+        self.plan.note(msg)
 
     def _run_as_dataflow(self, scratch):
         """Run decode through the dataflow runner (dataflow.py): over the
@@ -974,7 +1035,8 @@ class Engine:
                                               direct=self.plan["direct_host_ops"])
             self._resident = scratch
             self._resident_owner = None
-        runner = dataflow.Runner(split.split, *split.vxpu_segments, device=self.device)
+        runner = dataflow.Runner(split.split, *split.vxpu_segments, device=self.device,
+                                 graph=self._graph(split.split) if self.plan["layer_devices"] else None)
         runner.state = set(self.binding["state"])
         if self.plan["layer_range"]:  # only this engine's range of layers, decode and prefill (#387)
             runner = dataflow.Runner(split.split, *split.vxpu_segments, device=self.device,
@@ -989,9 +1051,9 @@ class Engine:
             # there, and its inputs and reply never cross
             runner.place(self._host_placement(runner.graph))
             prefill, _ = segments.split_at_host_ops(self._prefill)
-            graph = dataflow.Graph.from_split(prefill)
+            graph = self._graph(prefill)
             self._prefill_run = dataflow.Runner(prefill, len(graph.nodes), 0, device=self.device, graph=graph,
-                                                placement=self._host_placement(graph))
+                                                placement=self._host_placement(graph, "prefill"))
             self._prefill_run.state = set(self.binding["state"])
             devices = collections.Counter(str(d) for d in runner._devices.values())
             pdevices = collections.Counter(str(d) for d in self._prefill_run._devices.values())
@@ -1007,10 +1069,13 @@ class Engine:
             draft = self._draft_run
             if draft is not None and hasattr(draft, "split") and not self.plan["layer_range"]:
                 # the drafter's step too, so the native loop runs a speculative step with no Python
-                draft_runner = dataflow.Runner(draft.split, *draft.vxpu_segments, device=self.device)
+                draft_runner = dataflow.Runner(draft.split, *draft.vxpu_segments, device=self.device,
+                                               graph=self._graph(draft.split) if self.plan["layer_devices"] else None)
                 draft_runner.state = set(self.binding["state"])
                 if self.plan["layer_devices"]:
-                    draft_runner.place(self._host_placement(draft_runner.graph))
+                    draft_runner.place(self._host_placement(draft_runner.graph, "draft"))
+                    ddevices = collections.Counter(str(d) for d in draft_runner._devices.values())
+                    print(f"[vxpu] layer sharding: draft nodes by GPU {dict(ddevices)}", flush=True)
                 self._draft_run = StepGraph(draft_runner)
         self._segment_info = segment_info(self._decode_split.split)
         self._decode_run = self._decode_split
@@ -1077,12 +1142,12 @@ class Engine:
         started = time.time()
         with self._lock, self.external_scope():
             if not self.plan["layer_range"]:  # eager, a range engine would call the other ranges' experts
-                self._eager_step(self._decode)
+                self._eager_step(self._decode, "decode")
             for _ in range(2):
                 run(**values)
             if self._draft is not None:
                 draft_values = self._zero_inputs(self._draft)
-                self._eager_step(self._draft)
+                self._eager_step(self._draft, "draft")
                 for _ in range(2):
                     self._draft_run(**draft_values)
             torch.cuda.synchronize(self.device)
@@ -1097,13 +1162,21 @@ class Engine:
             print(f"[vxpu] {msg}", flush=True)
             self.plan.note(msg)
 
-    def _host_placement(self, graph):
-        """Under layer sharding, where each host node of graph (a layer's experts, an n-gram lookup)
-        runs: with its layer. Its expert pools are there, and its inputs and reply never cross."""
-        return {n.name: str(self._layer_device(max(int(x) for x in n.layers)) or self.device)
-                for n in graph.nodes if n.kind != "dense" and n.layers}
+    def _host_placement(self, graph, program="decode"):
+        """Under layer sharding, where each node of graph runs: a host node (a layer's experts, an
+        n-gram lookup) with its layer, so its expert pools are there and its inputs and reply never
+        cross; a dense segment where _shard_layers planned it (else the runner puts it where its
+        first resident tensor is, which is wrong for a segment whose first tensor is shared and
+        owned elsewhere: the drafter's embedding, the segment after a range boundary)."""
+        placement = {n.name: str(self._layer_device(max(int(x) for x in n.layers)) or self.device)
+                     for n in graph.nodes if n.kind != "dense" and n.layers}
+        planned = getattr(self, "_planned", {})
+        for n in graph.nodes:
+            if n.kind == "dense" and (program, n.name) in planned:
+                placement[n.name] = str(planned[(program, n.name)])
+        return placement
 
-    def _eager_step(self, program):
+    def _eager_step(self, program, name="decode"):
         """One eager decode step of program (the decode or draft graph module) on zeros. With the
         layers sharded across GPUs the whole module cannot run as one (its weights are on several),
         so it runs segment by segment through the dataflow runner, each where its tensors are, as
@@ -1113,9 +1186,9 @@ class Engine:
             return
         from . import dataflow
         split, _ = segments.split_at_host_ops(program)
-        graph = dataflow.Graph.from_split(split)
+        graph = self._graph(split)
         runner = dataflow.Runner(split, len(graph.nodes), 0, device=self.device, graph=graph,
-                                 placement=self._host_placement(graph))
+                                 placement=self._host_placement(graph, name))
         runner.state = set(self.binding["state"])
         runner(**self._zero_inputs(runner))
 
