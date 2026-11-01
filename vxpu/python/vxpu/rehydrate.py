@@ -493,3 +493,96 @@ def share_state(src_module, dst_module, state_fqns):
                 dst_parent._buffers[name] = src[fqn]
                 shared += 1
     return shared
+
+
+POPULATE_CHUNK = 64 * 1024 * 1024  # 64 MB chunks for concurrent faulting
+
+
+def chunk_ranges(start, length, chunk_size=POPULATE_CHUNK):
+    """Split [start, start + length) into disjoint contiguous ranges covering
+    the whole range exactly once.
+
+    If start is not a multiple of chunk_size, the first chunk covers from start
+    to the next chunk_size boundary (the unaligned head). Middle chunks have size
+    chunk_size, and the final chunk covers to the end of the range (the unaligned
+    tail).
+    """
+    if length <= 0:
+        return []
+    end = start + length
+    chunks = []
+    first_end = min(end, ((start + chunk_size) // chunk_size) * chunk_size)
+    chunks.append((start, first_end - start))
+    cur = first_end
+    while cur < end:
+        sz = min(chunk_size, end - cur)
+        chunks.append((cur, sz))
+        cur += sz
+    return chunks
+
+
+def populate(tensor, chunk_size=POPULATE_CHUNK, max_workers=16):
+    """Fault every page of a tensor's storage into memory concurrently (madvise
+    MADV_POPULATE_READ, Linux 5.14 and later), so a table the engine reads every
+    step does not page itself in from disk one lookup at a time.
+
+    Splits the storage into chunks (default 64 MB) and faults them across a
+    pool of worker threads so the disk sees a deep queue and reads at storage
+    bandwidth rather than latency-limited queue depth one.
+
+    Returns the seconds it took, or None where the call is unavailable (macOS,
+    an older kernel, or madvise failure).
+    """
+    import ctypes
+    import mmap
+    import sys
+    import time
+    from concurrent.futures import ThreadPoolExecutor
+
+    if not sys.platform.startswith("linux"):
+        return None
+    if tensor is None:
+        return None
+    try:
+        storage = tensor.untyped_storage()
+        addr, nbytes = storage.data_ptr(), storage.nbytes()
+    except Exception:
+        return None
+    if nbytes == 0:
+        return 0.0
+
+    page = mmap.PAGESIZE
+    start = addr - (addr % page)
+    end = ((addr + nbytes + page - 1) // page) * page
+    length = end - start
+
+    chunks = chunk_ranges(start, length, chunk_size)
+    if not chunks:
+        return 0.0
+
+    try:
+        libc = ctypes.CDLL("libc.so.6", use_errno=True)
+        libc.madvise.argtypes = (ctypes.c_void_p, ctypes.c_size_t, ctypes.c_int)
+        libc.madvise.restype = ctypes.c_int
+    except Exception:
+        return None
+
+    def _fault_chunk(c):
+        return libc.madvise(c[0], c[1], 22)  # MADV_POPULATE_READ
+
+    t0 = time.time()
+    try:
+        if len(chunks) == 1:
+            if _fault_chunk(chunks[0]) != 0:
+                return None
+        else:
+            workers = min(max_workers, len(chunks))
+            with ThreadPoolExecutor(max_workers=workers) as pool:
+                results = list(pool.map(_fault_chunk, chunks))
+                if any(r != 0 for r in results):
+                    return None
+    except Exception:
+        return None
+
+    return time.time() - t0
+

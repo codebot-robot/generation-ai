@@ -55,7 +55,7 @@ from .plan import Plan
 from .plan import record as plan_record
 from .telemetry import Recorder, segment_info
 from .rehydrate import (DTYPES, advise_random, derived_tensor, fetch_stacked, fetch_tensor,
-                        load_program, share_state, strip_asserts)
+                        load_program, populate, share_state, strip_asserts)
 
 
 class FileTable:
@@ -274,6 +274,8 @@ class Engine:
         self._timing_banks = 0.0
         self._timing_stacked = 0.0
         self._timing_graph = 0.0
+        self._timing_populate_bytes = 0
+        self._timing_populate_seconds = 0.0
         # What the graphs call out for (ops.py), owned here: it is freed
         # with the engine and seen by the ops only while this engine runs
         # a graph (external_scope).
@@ -410,6 +412,10 @@ class Engine:
                 f"graph {self._timing_graph:.1f}s")
         else:
             parts.append(f"graph {self._timing_graph:.1f}s")
+
+        if self._timing_populate_bytes > 0:
+            rate = (self._timing_populate_bytes / 1e9) / self._timing_populate_seconds if self._timing_populate_seconds > 0 else 0.0
+            parts.append(f"tables populate {self._timing_populate_seconds:.1f}s ({rate:.1f} GB/s)")
 
         self.load_breakdown = ", ".join(parts)
         self.plan.note(f"load: {self.load_breakdown}")
@@ -637,6 +643,15 @@ class Engine:
                     weight, scale = item
                     self.external.engram[int(layer)] = ds.host_engram(
                         int(layer), spec["num_embeddings"], spec["dim"], weight, scale)
+                    # the tables are read every step: their pages come in now, not lookup by lookup
+                    took = [populate(t) for t in (weight, scale)]
+                    if all(x is not None for x in took):
+                        total_bytes = weight.numel() * weight.element_size() + scale.numel() * scale.element_size()
+                        s = sum(took)
+                        gb = total_bytes / 1e9
+                        print(f"[vxpu] n-gram table of layer {layer} resident: {gb:.1f} GB in {s:.1f} s", flush=True)
+                        self._timing_populate_bytes += total_bytes
+                        self._timing_populate_seconds += s
                 ops.ENGRAM_DIM[int(layer)] = spec["dim"]
             if has_file_tables:
                 k = kernels.load()
