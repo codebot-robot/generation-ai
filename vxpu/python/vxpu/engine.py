@@ -193,13 +193,75 @@ def _has_tokenizer_files(repo):
     return any(os.path.exists(os.path.join(repo, f)) for f in TOKENIZER_FILES)
 
 
+def check_weight_sources(manifest, plan, summary=None):
+    """Enforce weight location policy: report when weights come from the Hub,
+    and refuse if a configured local tier (VXPU_BLOB_DIR) lacks files unless
+    hub_fallback is enabled."""
+    files = manifest.get("files", manifest)
+    blob_dir = plan.get("blob_dir") if hasattr(plan, "get") else (plan.get("blob_dir") if isinstance(plan, dict) else plan["blob_dir"])
+    if not blob_dir:
+        total_files = len(files)
+        total_bytes = sum(entry["size"] for entry in files.values())
+        return (f"[vxpu] WEIGHTS FROM THE HUB: no local weight tier (VXPU_BLOB_DIR unset); "
+                f"every tensor read goes over the network ({total_files} files, {total_bytes} bytes)")
+
+    if summary is None:
+        from . import localblobs
+        bucket = plan.get("blob_bucket") if hasattr(plan, "get") else (plan.get("blob_bucket") if isinstance(plan, dict) else None)
+        localized, summary = localblobs.localize(files, blob_dir, bucket)
+        if "files" in manifest:
+            manifest["files"] = localized
+        else:
+            manifest.clear()
+            manifest.update(localized)
+
+    print(f"[vxpu] local weight tier: {summary['local']} of {summary['files']} files on local disk", flush=True)
+    missing = summary.get("missing", [])
+    if missing:
+        for m in missing:
+            print(f"[vxpu] non-local weight file: {m['name']} ({m['size']} bytes)", flush=True)
+        hub_fallback = bool(plan.get("hub_fallback", False) if hasattr(plan, "get") else (plan.get("hub_fallback") if isinstance(plan, dict) else False))
+        if not hub_fallback:
+            missing_desc = ", ".join(f"{m['name']} ({m['size']} bytes)" for m in missing)
+            raise RuntimeError(
+                f"local weight tier configured ({blob_dir}) but {len(missing)} of {summary['files']} files are missing "
+                f"({missing_desc}); hub fallback is disabled (set VXPU_HUB_FALLBACK=1 or plan['hub_fallback']=True to allow)"
+            )
+        missing_bytes = sum(m["size"] for m in missing)
+        return (f"[vxpu] WEIGHTS FROM THE HUB: {len(missing)} files missing from local tier "
+                f"({missing_bytes} bytes); every missing tensor read goes over the network")
+    return None
+
+
+def load_tokenizer(repo, plan=None):
+    """Load the tokenizer for repo, preferring local files (local_files_only=True)
+    so cached files never touch the network, and falling back to the Hub under
+    the same policy as weights."""
+    if not _has_tokenizer_files(repo):
+        print(f"[vxpu] {repo} has no tokenizer files; "
+              "Chat is unavailable, Generate works", flush=True)
+        return None
+    from transformers import AutoTokenizer
+    try:
+        return AutoTokenizer.from_pretrained(repo, local_files_only=True)
+    except Exception:
+        has_local_tier = bool(plan.get("blob_dir")) if plan is not None and hasattr(plan, "get") else (bool(plan.get("blob_dir")) if isinstance(plan, dict) else False)
+        allow_hub = bool(plan.get("hub_fallback", False)) if plan is not None and hasattr(plan, "get") else (bool(plan.get("hub_fallback")) if isinstance(plan, dict) else False)
+        if has_local_tier and not allow_hub:
+            raise RuntimeError(
+                f"tokenizer {repo} is not cached locally; hub fallback is disabled "
+                "(set VXPU_HUB_FALLBACK=1 or plan['hub_fallback']=True to allow)"
+            )
+        print(f"[vxpu] TOKENIZER FROM THE HUB: {repo} not cached locally; fetching from the hub", flush=True)
+        return AutoTokenizer.from_pretrained(repo)
+
+
 class Engine:
     _copy_worker_hook = None
 
     def __init__(self, artifact_dir, device="cpu", compile_decode=False,
                  cas_dir=None, external_dir=None, plan_given=None,
                  _copy_worker_hook=None):
-        from transformers import AutoTokenizer
         from transformers.models.auto.configuration_auto import (
             CONFIG_MAPPING)
 
@@ -219,11 +281,9 @@ class Engine:
             self.manifest = json.load(f)
         # this machine's local weight tier: read checkpoint files from local
         # disk, copying the missing ones from the weight bucket first
-        if self.plan["blob_dir"]:
-            from . import localblobs
-            self.manifest["files"], summary = localblobs.localize(
-                self.manifest["files"], self.plan["blob_dir"], self.plan["blob_bucket"])
-            print(f"[vxpu] local weight tier: {summary['local']} of {summary['files']} files on local disk", flush=True)
+        warning = check_weight_sources(self.manifest, self.plan)
+        if warning:
+            print(warning, flush=True)
         with open(os.path.join(artifact_dir, "binding.json")) as f:
             self.binding = json.load(f)
         if cas_dir:
@@ -246,12 +306,7 @@ class Engine:
         # a transient Hub error is reported as one rather than as a
         # model with no tokenizer.
         repo = self.manifest["source"]["repo"]
-        if _has_tokenizer_files(repo):
-            self.tokenizer = AutoTokenizer.from_pretrained(repo)
-        else:
-            print(f"[vxpu] {repo} has no tokenizer files; "
-                  "Chat is unavailable, Generate works", flush=True)
-            self.tokenizer = None
+        self.tokenizer = load_tokenizer(repo, plan=self.plan)
         self.generation_config = self._generation_config()
         self.eos_ids = self._eos_ids()
         if self.tokenizer is not None and getattr(self.tokenizer, "chat_template", None) is None:

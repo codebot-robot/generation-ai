@@ -53,7 +53,7 @@ def localize(files, blob_dir, bucket=None, log=lambda msg: print(msg, flush=True
     """files is a manifest's {sha256: {"size", "name", "source"}}. Returns
     a copy whose sources are file:// paths under blob_dir for every file
     held locally (after copying the missing ones from bucket, if given),
-    and a summary {"local", "copied", "copied_bytes", "seconds"}."""
+    and a summary {"local", "files", "local_files", "missing", "copied", ...}."""
     os.makedirs(blob_dir, exist_ok=True)
     missing = [sha for sha, entry in files.items() if not _complete(os.path.join(blob_dir, sha), entry["size"])]
     copied, copied_bytes, started = 0, 0, time.time()
@@ -82,14 +82,18 @@ def localize(files, blob_dir, bucket=None, log=lambda msg: print(msg, flush=True
         finally:
             shutil.rmtree(incoming, ignore_errors=True)
     out, local = {}, 0
+    local_files, missing_files = [], []
     for sha, entry in files.items():
         path = os.path.join(blob_dir, sha)
         if _complete(path, entry["size"]):
             out[sha] = {**entry, "source": "file://" + os.path.abspath(path)}
             local += 1
+            local_files.append({"name": entry["name"], "size": entry["size"], "sha": sha})
         else:
             out[sha] = dict(entry)
-    summary = {"local": local, "files": len(files), "copied": copied, "copied_bytes": copied_bytes,
+            missing_files.append({"name": entry["name"], "size": entry["size"], "sha": sha})
+    summary = {"local": local, "files": len(files), "local_files": local_files, "missing": missing_files,
+               "missing_files": missing_files, "copied": copied, "copied_bytes": copied_bytes,
                "seconds": round(time.time() - started, 1)}
     if copied:
         log(f"[vxpu] copied {copied} files ({copied_bytes / 1e9:.1f} GB) in {summary['seconds']} s")

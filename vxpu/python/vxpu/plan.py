@@ -77,7 +77,7 @@ COORDINATOR_SWITCHES = frozenset({
     "VXPU_LOWER_DECODE", "VXPU_SEGMENT_RUNTIME", "VXPU_EXPERT_MAILBOXES", "VXPU_REMOTE_NODES", "VXPU_DATAFLOW",
     "VXPU_STEP_GRAPH", "VXPU_LAYER_RANGE", "VXPU_REMOTE_RANGES",
     "VXPU_DATAFLOW_PLACE", "VXPU_GPU_EXPERTS", "VXPU_GPU_EXPERTS_MOVES", "VXPU_GPU_EXPERTS_REQUEST_WEIGHT",
-    "VXPU_EXPERTS_IN_RAM", "VXPU_BF16_WEIGHT_CACHE", "VXPU_BF16_CACHE_HEADROOM_GB",
+    "VXPU_EXPERTS_IN_RAM", "VXPU_BF16_WEIGHT_CACHE", "VXPU_BF16_CACHE_HEADROOM_GB", "VXPU_HUB_FALLBACK",
 })
 
 
@@ -413,6 +413,9 @@ class Plan:
         bucket, src = env_text("VXPU_BLOB_BUCKET", None)
         self._set("blob_bucket", bucket, src, (),
                   "the weight bucket (gs://BUCKET, modelstore's layout) that fills blob_dir with files it lacks")
+        hub_fallback, src = env_flag("VXPU_HUB_FALLBACK", False)
+        self._set("hub_fallback", hub_fallback, src, (True, False),
+                  "fall back to reading weights or tokenizer from the Hub when the local tier lacks files")
         hot, src = env_text("VXPU_GPU_EXPERTS", None)
         if hot and not (cuda and self["triton"] and self["kernels"]):
             # the hot implementation needs all three: without one, holding
@@ -450,6 +453,10 @@ class Plan:
 
     def __getitem__(self, name):
         return self.choices[name].value
+
+    def get(self, name, default=None):
+        choice = self.choices.get(name)
+        return choice.value if choice is not None else default
 
     def note(self, text):
         """A runtime event worth reporting with the plan (once each)."""

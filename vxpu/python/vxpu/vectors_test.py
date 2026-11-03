@@ -1299,6 +1299,170 @@ def _check_local_blobs(model, prompts, settings, artifact, plain, workdir):
     return True
 
 
+def _check_weight_sources_policy(workdir):
+    """Enforce weight source reporting and fallback policy: localize reports
+    local and missing files by name and size; check_weight_sources refuses
+    a configured tier with missing files unless hub_fallback is set, and
+    allows with no blob directory with the loud warning line."""
+    from . import localblobs
+    from .engine import check_weight_sources
+
+    test_dir = os.path.join(workdir, "test-weight-policy")
+    blob_dir = os.path.join(test_dir, "blobs")
+    os.makedirs(blob_dir, exist_ok=True)
+    n = 3
+    manifest = {
+        "format": "vxpu-manifest/v1alpha1",
+        "source": {"repo": "org/test", "revision": "main"},
+        "files": {
+            f"sha_{i:04d}": {"size": 1000 + i, "name": f"shard_{i}.safetensors",
+                             "source": f"https://huggingface.co/org/test/resolve/main/shard_{i}.safetensors"}
+            for i in range(n)
+        },
+    }
+    # Put k = 2 of n files in blob_dir
+    k = 2
+    for i in range(k):
+        sha = f"sha_{i:04d}"
+        with open(os.path.join(blob_dir, sha), "wb") as f:
+            f.write(b"x" * (1000 + i))
+
+    _, summary = localblobs.localize(manifest["files"], blob_dir)
+    if summary["local"] != k or summary["files"] != n:
+        raise SystemExit(f"localize summary counts wrong: {summary}")
+    if len(summary["local_files"]) != k or [f["name"] for f in summary["local_files"]] != [f"shard_{i}.safetensors" for i in range(k)]:
+        raise SystemExit(f"localize local_files wrong: {summary['local_files']}")
+    if len(summary["missing"]) != n - k or [f["name"] for f in summary["missing"]] != [f"shard_{i}.safetensors" for i in range(k, n)]:
+        raise SystemExit(f"localize missing wrong: {summary['missing']}")
+    for f in summary["local_files"] + summary["missing"]:
+        if "size" not in f or "name" not in f:
+            raise SystemExit(f"localize file entries must have name and size: {f}")
+
+    # 1. Tier configured and a file is missing -> refuses when hub_fallback is off
+    p_refuse = {"blob_dir": blob_dir, "hub_fallback": False}
+    try:
+        check_weight_sources(manifest, p_refuse, summary=summary)
+    except RuntimeError as e:
+        if "hub fallback is disabled" not in str(e):
+            raise SystemExit(f"refusal message unexpected: {e}")
+    else:
+        raise SystemExit("check_weight_sources should refuse when files are missing and hub_fallback is false")
+
+    # 2. Tier configured and a file is missing -> allows with the plan field hub_fallback=True
+    p_allow = {"blob_dir": blob_dir, "hub_fallback": True}
+    warn = check_weight_sources(manifest, p_allow, summary=summary)
+    if not warn or "WEIGHTS FROM THE HUB" not in warn:
+        raise SystemExit(f"check_weight_sources with hub_fallback should return warning, got {warn}")
+
+    # Also test with a real Plan instance and given switch
+    from .plan import Plan
+    saved_blob = os.environ.get("VXPU_BLOB_DIR")
+    try:
+        os.environ["VXPU_BLOB_DIR"] = blob_dir
+        p_plan_refuse = Plan("cpu", given={"VXPU_HUB_FALLBACK": "0"})
+        try:
+            check_weight_sources(manifest, p_plan_refuse, summary=summary)
+        except RuntimeError:
+            pass
+        else:
+            raise SystemExit("check_weight_sources with Plan should refuse when hub_fallback is 0")
+        p_plan_allow = Plan("cpu", given={"VXPU_HUB_FALLBACK": "1"})
+        warn_plan = check_weight_sources(manifest, p_plan_allow, summary=summary)
+        if not warn_plan or "WEIGHTS FROM THE HUB" not in warn_plan:
+            raise SystemExit(f"check_weight_sources with Plan hub_fallback=1 should warn, got {warn_plan}")
+    finally:
+        if saved_blob is None:
+            os.environ.pop("VXPU_BLOB_DIR", None)
+        else:
+            os.environ["VXPU_BLOB_DIR"] = saved_blob
+
+    # 3. No blob directory -> allows and returns the unmistakable warning line with files and bytes
+    p_no_blob = {"blob_dir": None}
+    warn_no_blob = check_weight_sources(manifest, p_no_blob)
+    total_bytes = sum(1000 + i for i in range(n))
+    expected = "[vxpu] WEIGHTS FROM THE HUB: no local weight tier (VXPU_BLOB_DIR unset); every tensor read goes over the network"
+    if not warn_no_blob or expected not in warn_no_blob:
+        raise SystemExit(f"expected warning {expected!r} in {warn_no_blob!r}")
+    if f"{n} files" not in warn_no_blob or str(total_bytes) not in warn_no_blob:
+        raise SystemExit(f"expected {n} files and {total_bytes} bytes in warning: {warn_no_blob!r}")
+
+    # 4. Tier configured with all files present -> allows and returns None
+    for i in range(k, n):
+        with open(os.path.join(blob_dir, f"sha_{i:04d}"), "wb") as f:
+            f.write(b"x" * (1000 + i))
+    _, complete_summary = localblobs.localize(manifest["files"], blob_dir)
+    res = check_weight_sources(manifest, {"blob_dir": blob_dir}, summary=complete_summary)
+    if res is not None:
+        raise SystemExit(f"check_weight_sources with all files local should return None, got {res}")
+
+    print("weight sources policy: localize reports local and missing files; check_weight_sources enforces tier and hub fallback")
+
+
+def _check_tokenizer_local_files(workdir):
+    """The tokenizer loads with local_files_only=True first to avoid touching
+    the network when cached, falling back to the Hub only when allowed."""
+    from unittest.mock import patch
+    from transformers import AutoTokenizer
+    from .engine import load_tokenizer
+
+    repo_dir = os.path.join(workdir, "cached-repo")
+    os.makedirs(repo_dir, exist_ok=True)
+    with open(os.path.join(repo_dir, "tokenizer.json"), "w") as f:
+        f.write("{}")
+
+    calls = []
+
+    def fake_from_pretrained(repo, *args, **kwargs):
+        calls.append((repo, kwargs.copy()))
+        return "fake_tokenizer"
+
+    # 1. Local/cached repo: local_files_only=True passed first and succeeds without network
+    with patch.object(AutoTokenizer, "from_pretrained", side_effect=fake_from_pretrained):
+        tok = load_tokenizer(repo_dir, plan={"blob_dir": "/blobs"})
+        if tok != "fake_tokenizer":
+            raise SystemExit(f"load_tokenizer failed: {tok}")
+        if len(calls) != 1 or calls[0][1].get("local_files_only") is not True:
+            raise SystemExit(f"expected AutoTokenizer.from_pretrained with local_files_only=True, got {calls}")
+
+    # 2. Local files missing: refuses when tier configured and hub_fallback is False
+    calls.clear()
+
+    def fail_local_from_pretrained(repo, *args, **kwargs):
+        calls.append((repo, kwargs.copy()))
+        if kwargs.get("local_files_only"):
+            raise OSError("not in cache")
+        return "hub_tokenizer"
+
+    with patch.object(AutoTokenizer, "from_pretrained", side_effect=fail_local_from_pretrained):
+        try:
+            load_tokenizer("org/missing-local", plan={"blob_dir": "/blobs", "hub_fallback": False})
+        except RuntimeError as e:
+            if "hub fallback is disabled" not in str(e):
+                raise SystemExit(f"unexpected tokenizer refusal message: {e}")
+        else:
+            raise SystemExit("load_tokenizer should refuse when local files missing and hub_fallback is False")
+
+    # 3. Local files missing: falls back to Hub when hub_fallback=True
+    calls.clear()
+    with patch.object(AutoTokenizer, "from_pretrained", side_effect=fail_local_from_pretrained):
+        tok = load_tokenizer("org/missing-local", plan={"blob_dir": "/blobs", "hub_fallback": True})
+        if tok != "hub_tokenizer":
+            raise SystemExit(f"load_tokenizer fallback failed: {tok}")
+        if len(calls) != 2 or calls[0][1].get("local_files_only") is not True or "local_files_only" in calls[1][1]:
+            raise SystemExit(f"expected local_files_only=True then Hub fallback, got {calls}")
+
+    # 4. Local files missing: falls back to Hub when blob_dir is unset
+    calls.clear()
+    with patch.object(AutoTokenizer, "from_pretrained", side_effect=fail_local_from_pretrained):
+        tok = load_tokenizer("org/missing-local", plan={"blob_dir": None})
+        if tok != "hub_tokenizer":
+            raise SystemExit(f"load_tokenizer fallback failed: {tok}")
+        if len(calls) != 2 or calls[0][1].get("local_files_only") is not True:
+            raise SystemExit(f"expected local_files_only=True then Hub fallback, got {calls}")
+
+    print("tokenizer check: loads with local_files_only=True first, refuses when local tier configured, falls back when allowed")
+
+
 def _check_compile_names():
     """Names a compile writes (compile.py, modelstore.py, manifest.py): a tag
     must match modelstore's grammar as a whole string (a trailing newline
@@ -2471,6 +2635,8 @@ def selftest(workdir, settings):
     os.makedirs(workdir, exist_ok=True)
     _check_host_reads(workdir)
     _check_local_blobs_copy(workdir)
+    _check_weight_sources_policy(workdir)
+    _check_tokenizer_local_files(workdir)
     _check_expert_sim()
     _check_rotary()
     from .export import export_artifact
