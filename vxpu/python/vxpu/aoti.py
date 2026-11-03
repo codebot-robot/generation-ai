@@ -51,9 +51,14 @@ segments read them within the step, and the step's result is cloned
 (segments.Split).
 """
 
+import atexit
 import hashlib
 import os
+import shutil
+import signal
+import tempfile
 import time
+import zipfile
 
 import torch
 
@@ -61,6 +66,125 @@ from . import triton_ops
 
 FORMAT = "vxpu-aoti/1"  # in the cache key: a change here invalidates every package
 NUMERICS_CONFIG = ("deterministic", "prologue_fusion", "emulate_precision_casts")
+
+
+def _alive(pid):
+    """Whether process pid is still running."""
+    try:
+        os.kill(pid, 0)
+    except ProcessLookupError:
+        return False
+    except PermissionError:  # running, as another user
+        return True
+    return True
+
+
+def clean_strays(root):
+    """Remove extraction temporaries left by processes that no longer run."""
+    if not os.path.exists(root):
+        return
+    for name in os.listdir(root):
+        pid = None
+        if name.startswith("vxpu-aoti."):
+            pid = name[len("vxpu-aoti."):]
+        elif name.startswith("vxpu-aoti-"):
+            pid = name[len("vxpu-aoti-"):]
+        elif name.startswith("aoti-"):
+            pid = name[len("aoti-"):]
+        elif name.split("-", 1)[0].isdigit():
+            pid = name.split("-", 1)[0]
+        elif name.isdigit():
+            pid = name
+        if pid and pid.isdigit() and int(pid) != os.getpid() and not _alive(int(pid)):
+            shutil.rmtree(os.path.join(root, name), ignore_errors=True)
+        elif name.endswith(".tmp") and "." in name:
+            parts = name.split(".")
+            if len(parts) >= 2 and parts[-2].isdigit():
+                tpid = int(parts[-2])
+                if tpid != os.getpid() and not _alive(tpid):
+                    shutil.rmtree(os.path.join(root, name), ignore_errors=True)
+
+
+_TMPDIR_INITIALIZED = False
+
+
+def _init_tmpdir():
+    """Ensure the extraction space under TMPDIR is owned by this process."""
+    global _TMPDIR_INITIALIZED
+    if _TMPDIR_INITIALIZED:
+        return
+    _TMPDIR_INITIALIZED = True
+    base = os.environ.get("TMPDIR") or tempfile.gettempdir()
+    clean_strays(base)
+    proc_tmp = os.path.join(base, f"vxpu-aoti.{os.getpid()}")
+    os.makedirs(proc_tmp, exist_ok=True)
+    os.environ["TMPDIR"] = proc_tmp
+    tempfile.tempdir = proc_tmp
+
+    try:
+        import torch._inductor.codecache as cc
+        cc._HEADER_DIR = os.path.join(proc_tmp, "precompiled_headers")
+        cc._HEADER_LOCK_DIR = os.path.join(cc._HEADER_DIR, "locks")
+    except (ImportError, AttributeError):
+        pass
+
+    def _cleanup():
+        if os.path.exists(proc_tmp):
+            shutil.rmtree(proc_tmp, ignore_errors=True)
+
+    atexit.register(_cleanup)
+
+    def _handler(signum, frame):
+        _cleanup()
+        signal.signal(signum, signal.SIG_DFL)
+        os.kill(os.getpid(), signum)
+
+    for sig in (signal.SIGTERM, signal.SIGINT):
+        try:
+            prev = signal.getsignal(sig)
+            if prev not in (signal.SIG_IGN, signal.SIG_DFL, None):
+                def chained(signum, frame, p=prev):
+                    _cleanup()
+                    p(signum, frame)
+                signal.signal(sig, chained)
+            else:
+                signal.signal(sig, _handler)
+        except (ValueError, OSError):
+            pass
+
+
+def extract(path):
+    """Extract a .pt2 package archive once into a keyed .d directory beside it.
+
+    Returns (dir_path, extracted_bytes). Reuses an existing directory.
+    """
+    if os.path.isdir(path) and path.endswith(".d"):
+        return path, 0
+    d = (path[:-len(".pt2")] if path.endswith(".pt2") else path) + ".d"
+    if os.path.isdir(d):
+        return d, 0
+    if not os.path.exists(path):
+        raise FileNotFoundError(path)
+    tmp = f"{d}.{os.getpid()}.tmp"
+    shutil.rmtree(tmp, ignore_errors=True)
+    os.makedirs(tmp, exist_ok=True)
+    with zipfile.ZipFile(path, "r") as zf:
+        zf.extractall(tmp)
+        extracted_bytes = sum(f.file_size for f in zf.infolist())
+    try:
+        os.replace(tmp, d)
+    except OSError:
+        shutil.rmtree(tmp, ignore_errors=True)
+    return d, extracted_bytes
+
+
+def load_package(path):
+    """Load an AOTInductor package from an extracted directory or .pt2 archive."""
+    if os.path.isdir(path):
+        from torch.export.pt2_archive._package import AOTICompiledModel
+        loader = torch._C._aoti.AOTIModelPackageLoader(path, "model", True, 1, -1)
+        return AOTICompiledModel(loader)
+    return torch._inductor.aoti_load_package(path, run_single_threaded=True)
 
 
 def canonical_code(sub, args_of=None):
@@ -130,7 +254,7 @@ def cache_key(sub, args, extra="", code=None):
 
 
 class Packages:
-    """The package cache: a directory of <key>.pt2."""
+    """The package cache: a directory of <key>.pt2 and extracted <key>.d."""
 
     def __init__(self, cache_dir, expected=0):
         # made and probed here, while the engine loads, so a directory that
@@ -141,28 +265,32 @@ class Packages:
         with open(probe, "w"):
             pass
         os.remove(probe)
+        _init_tmpdir()
         self.expected = expected  # segments that will ask: the summary is printed when all have
         self.built = self.loaded = 0
         self.build_s = 0.0
+        self.extracted = 0
+        self.extracted_bytes = 0
 
     def get(self, sub, args, extra="", code=None):
         """The segment's package, loaded (built first if not cached)."""
         path = self.path(sub, args, extra, code)
-        runner = torch._inductor.aoti_load_package(path, run_single_threaded=True)
+        runner = load_package(path)
         if self.built + self.loaded == self.expected:
             print(f"[vxpu] AOTInductor segments: {self.loaded} loaded from the cache, {self.built} built"
-                  + (f" in {self.build_s:.0f} s" if self.built else ""), flush=True)
+                  + (f" in {self.build_s:.0f} s" if self.built else "")
+                  + f", {self.extracted} extracted ({self.extracted_bytes / 1e9:.1f} GB)", flush=True)
         return runner
 
     def path(self, sub, args, extra="", code=None, dynamic_shapes=None):
-        """The segment's package file, built first if not cached."""
+        """The segment's package directory (extracted from its .pt2), built first if not cached."""
         import torch._inductor.config as inductor_config
         with inductor_config.patch(deterministic=True):
             return self._path(sub, args, extra + repr(dynamic_shapes), code, dynamic_shapes)
 
     def _path(self, sub, args, extra, code, dynamic_shapes=None):
-        path = os.path.join(self.cache_dir, cache_key(sub, args, extra, code) + ".pt2")
-        if os.path.exists(path):
+        pt2 = os.path.join(self.cache_dir, cache_key(sub, args, extra, code) + ".pt2")
+        if os.path.exists(pt2):
             self.loaded += 1
         else:
             if not self.built:
@@ -170,12 +298,16 @@ class Packages:
                       f"machine; kept in {self.cache_dir})", flush=True)
             t = time.perf_counter()
             ep = torch.export.export(sub, tuple(args), dynamic_shapes=dynamic_shapes, strict=False)
-            tmp = f"{path[:-len('.pt2')]}.{os.getpid()}.tmp.pt2"  # aoti_compile_and_package wants .pt2
+            tmp = f"{pt2[:-len('.pt2')]}.{os.getpid()}.tmp.pt2"  # aoti_compile_and_package wants .pt2
             torch._inductor.aoti_compile_and_package(ep, package_path=tmp)
-            os.replace(tmp, path)  # another process building the same key writes the same package
+            os.replace(tmp, pt2)  # another process building the same key writes the same package
             self.build_s += time.perf_counter() - t
             self.built += 1
-        return path
+        d, extracted_bytes = extract(pt2)
+        if extracted_bytes:
+            self.extracted += 1
+            self.extracted_bytes += extracted_bytes
+        return d
 
 
 class GraphedSegment(torch.nn.Module):
