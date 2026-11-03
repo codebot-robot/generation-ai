@@ -31,8 +31,10 @@ import fcntl
 import hashlib
 import math
 import os
+import random
 import tempfile
 import threading
+import time
 import weakref
 from concurrent.futures import ThreadPoolExecutor
 
@@ -61,7 +63,9 @@ def _session():
     session = getattr(_local, "session", None)
     if session is None:
         session = _local.session = requests.Session()
-        adapter = requests.adapters.HTTPAdapter(pool_connections=4, pool_maxsize=4, max_retries=3)
+        retries = requests.adapters.Retry(connect=3, read=False, redirect=False,
+                                          status=False, respect_retry_after_header=False)
+        adapter = requests.adapters.HTTPAdapter(pool_connections=4, pool_maxsize=4, max_retries=retries)
         session.mount("http://", adapter)
         session.mount("https://", adapter)
     return session
@@ -73,27 +77,74 @@ PART_BYTES = 1 << 30
 PART_WORKERS = 8
 CHUNK = 8 << 20
 
+RETRY_STATUSES = {408, 425, 429, 499, 500, 502, 503, 504}
+MAX_WAIT = 120.0
+BACKOFF_BASE = 0.5
 
-def _read_range(url, offset, length, into):
+
+def _parse_retry_after(value):
+    """Parse a Retry-After header into seconds to wait, or None."""
+    if not value:
+        return None
+    try:
+        return max(0.0, float(value))
+    except ValueError:
+        try:
+            import email.utils
+            return max(0.0, email.utils.parsedate_to_datetime(value).timestamp() - time.time())
+        except Exception:
+            return None
+
+
+def _read_range(url, offset, length, into, log=lambda msg: print(msg, flush=True),
+                max_wait=None, backoff_base=None):
     """Stream bytes [offset, offset + length) of url into the memoryview
-    `into`, in chunks, so nothing is held twice."""
+    `into`, in chunks, so nothing is held twice. Retries transient HTTP
+    statuses (408, 425, 429, 499, 500, 502, 503, 504) with backoff and jitter."""
     end = offset + length - 1
     if url.startswith("file://"):  # a local checkpoint directory
         with open(url[len("file://"):], "rb") as f:
             f.seek(offset)
             got = f.readinto(into)
     else:
-        resp = _session().get(url, headers={"Range": f"bytes={offset}-{end}"}, stream=True)
-        resp.raise_for_status()
-        if resp.status_code != 206:
-            raise RuntimeError(f"expected HTTP 206 Partial Content, got {resp.status_code}")
-        got = 0
-        for chunk in resp.iter_content(CHUNK):
-            n = len(chunk)
-            if got + n > length:
-                raise RuntimeError(f"server sent more than {length} bytes")
-            into[got:got + n] = chunk
-            got += n
+        max_wait = MAX_WAIT if max_wait is None else max_wait
+        backoff_base = BACKOFF_BASE if backoff_base is None else backoff_base
+        attempts, total_waited = 0, 0.0
+        while True:
+            attempts += 1
+            resp = _session().get(url, headers={"Range": f"bytes={offset}-{end}"}, stream=True)
+            if resp.status_code in RETRY_STATUSES:
+                retry_after = _parse_retry_after(resp.headers.get("Retry-After"))
+                wait = retry_after if retry_after is not None else min(
+                    backoff_base * (2 ** (attempts - 1)), 30.0) * (0.5 + random.random() * 0.5)
+                if total_waited + wait > max_wait:
+                    try:
+                        resp.raise_for_status()
+                    except requests.exceptions.HTTPError as err:
+                        count = f"{attempts} attempt" if attempts == 1 else f"{attempts} attempts"
+                        raise type(err)(f"{err} (after {count})", response=err.response) from err
+                    finally:
+                        resp.close()
+                resp.close()
+                log(f"[vxpu] retry HTTP {resp.status_code} for {url} offset {offset}: waiting {wait:.2f}s")
+                time.sleep(wait)
+                total_waited += wait
+                continue
+            resp.raise_for_status()
+            if resp.status_code != 206:
+                resp.close()
+                raise RuntimeError(f"expected HTTP 206 Partial Content, got {resp.status_code}")
+            got = 0
+            try:
+                for chunk in resp.iter_content(CHUNK):
+                    n = len(chunk)
+                    if got + n > length:
+                        raise RuntimeError(f"server sent more than {length} bytes")
+                    into[got:got + n] = chunk
+                    got += n
+            finally:
+                resp.close()
+            break
     if got != length:
         raise RuntimeError(f"expected {length} bytes, got {got} bytes")
 
