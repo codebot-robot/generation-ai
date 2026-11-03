@@ -1,0 +1,98 @@
+# Copyright 2026 Google LLC
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
+# Hero pod template (e.g. hero-a, hero-b).
+# Replaces bare Pods with a one-replica StatefulSet so the pod keeps a stable
+# name and its expert banks PVC, and recreates automatically on node preemption.
+# Anti-affinity keeps sibling hero pods on separate nodes.
+apiVersion: apps/v1
+kind: StatefulSet
+metadata:
+  name: hero-a
+  labels:
+    app: hero
+    hero: hero-a
+spec:
+  replicas: 1
+  serviceName: hero-a
+  selector:
+    matchLabels:
+      app: hero
+      hero: hero-a
+  template:
+    metadata:
+      labels:
+        app: hero
+        hero: hero-a
+    spec:
+      terminationGracePeriodSeconds: 15
+      affinity:
+        nodeAffinity:
+          requiredDuringSchedulingIgnoredDuringExecution:
+            nodeSelectorTerms:
+              - matchExpressions:
+                  - key: cloud.google.com/gke-accelerator
+                    operator: In
+                    values:
+                      - nvidia-rtx-pro-6000
+        podAntiAffinity:
+          requiredDuringSchedulingIgnoredDuringExecution:
+            - labelSelector:
+                matchExpressions:
+                  - key: app
+                    operator: In
+                    values:
+                      - hero
+              topologyKey: kubernetes.io/hostname
+      tolerations:
+        - key: nvidia.com/gpu
+          operator: Exists
+          effect: NoSchedule
+        - key: cloud.google.com/gke-spot
+          operator: Equal
+          value: "true"
+          effect: NoSchedule
+      containers:
+        - name: hero
+          image: nvidia/cuda:13.0.1-devel-ubuntu24.04
+          command: ["sleep", "infinity"]
+          resources:
+            requests:
+              cpu: "180"
+              memory: 1300Gi
+              nvidia.com/gpu: 4
+            limits:
+              cpu: "180"
+              memory: 1300Gi
+              nvidia.com/gpu: 4
+          volumeMounts:
+            - name: scratch
+              mountPath: /mnt/ssd
+            - name: dshm
+              mountPath: /dev/shm
+            - name: banks
+              mountPath: /mnt/ssd/external
+              readOnly: true
+      volumes:
+        - name: scratch
+          emptyDir:
+            medium: Memory
+            sizeLimit: 700Gi
+        - name: dshm
+          emptyDir:
+            medium: Memory
+            sizeLimit: 32Gi
+        - name: banks
+          persistentVolumeClaim:
+            claimName: hero-banks
