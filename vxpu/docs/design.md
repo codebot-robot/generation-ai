@@ -146,6 +146,25 @@ describes the machine it runs on (the `Describe` RPC: its own probe), and
 the router matches that to the database. The executors stay Python,
 where torch and the kernels are, and report what they measure.
 
+### The critical-path cost model (v0)
+
+In addition to the bytes-over-bandwidth layout ranking model (`cost.go`),
+the planner provides a critical-path cost model (`pkg/planner: CriticalPathCostModel`).
+The bytes-over-bandwidth model ranks candidate placements analytically before execution.
+In contrast, the critical-path model predicts step times from in-graph phase trace stamps
+recorded at specific plan shapes.
+
+The model evaluates plans using three rules:
+1. **Critical path membership.** The step time equals the sum of node durations
+on the critical path. A node on a side branch contributes only the duration
+uncovered by concurrent main-stream execution.
+2. **In-place fused costing.** The model costs a fused region in place as one
+entity through its parent node, rather than summing the isolated durations of
+its constituent parts.
+3. **Measured row counts and collective wait.** The model requires per-site
+costs measured at the plan's row counts, and includes collective wait times
+measured at those row counts.
+
 ## 2. Models by name, and executors
 
 A model is registered by name (`vxpu register REPO`). The router imports
