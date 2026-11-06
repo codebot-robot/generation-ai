@@ -477,6 +477,20 @@ computes.
   experts each layer selected. The site is Go, served by the coordinator
   (#331).
 
+**Process-per-rank execution (#539).**
+The distributed engine executes one card per process. A coordinator
+orchestrates the ranks through shared memory (`vxpu.shmbox`, #539).
+Independent rank processes compile Inductor packages in parallel, avoid
+multi-device group calls in NCCL, and eliminate host serialization between
+model segments.
+
+The shared-memory control plane provides:
+- Dedicated message slots for each sender and destination pair.
+- Monotonic 64-bit sequence numbers and payload checksums for lock-free polling.
+- Consumer acknowledgement backpressure before a slot is overwritten.
+- Single-phase barriers using cacheline-aligned monotonic round counters.
+- Compact binary structs for step parameters, acceptance decisions, and rank status.
+
 ## 7. Numerics
 
 Every implementation declares whether it is bit-identical to the model's
