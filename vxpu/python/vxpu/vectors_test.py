@@ -2178,7 +2178,7 @@ def _check_plan_given():
 
 
 def _check_physplan():
-    """Verify physical plan round-trip, apply_env on fake env, and refusing unknown strategies."""
+    """Verify physical plan round-trip, apply_env on fake env, refusing unknown strategies, and versioned run record schema."""
     from . import physplan
     fake_env = {}
     plan = {
@@ -2205,7 +2205,23 @@ def _check_physplan():
         raise SystemExit("physplan: unknown strategy was not refused")
     except ValueError:
         pass
-    print("physplan check: plan round-trips, unknown strategy refused")
+
+    record = physplan.create_run_record(
+        plan=plan,
+        knobs_in_effect=knobs,
+        median_step_ms=12.5,
+        tokens_per_step=1.0,
+        checks={"status": "not run"},
+        build_time_s=0.45,
+    )
+    assert record["format"] == physplan.RECORD_FORMAT
+    assert record["schema_version"] == physplan.RECORD_SCHEMA_VERSION
+    assert record["tokens_per_step"] == 1.0
+    assert record["build_time_s"] == 0.45
+    assert record["checks"]["status"] == "not run"
+    parsed = physplan.parse_record(record)
+    assert parsed["median_step_ms"] == 12.5
+    print("physplan check: plan round-trips, unknown strategy refused, record schema versioned")
 
 
 def _check_dedup_constants(workdir):

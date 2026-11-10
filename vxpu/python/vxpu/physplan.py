@@ -12,17 +12,21 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""Physical execution plans, per-site strategies, and execution knobs (#529).
+"""Physical execution plans, per-site strategies, and run records (#529).
 
 This module defines the mapping from a physical plan's per-site strategy
-choices to the engine's effective knobs.
+choices to the engine's effective knobs, and the run record format written
+at the end of an execution.
 """
 
 import hashlib
 import json
 import os
+import time
 
 PLAN_FORMAT = "vxpu-plan/1"
+RECORD_FORMAT = "vxpu-run-record/1"
+RECORD_SCHEMA_VERSION = 1
 BUILD_COMMIT = ""
 
 KNOWN_STRATEGIES = {
@@ -108,3 +112,95 @@ def apply_env(plan, env=None):
     if env is not None:
         env.update(knobs)
     return knobs
+
+
+def create_run_record(plan=None, knobs_in_effect=None, median_step_ms=0.0,
+                      tokens_per_step=1.0, tokens_a_step=None, checks=None,
+                      per_card_peak_memory=None, build_time_s=0.0, build_time=None,
+                      per_class_times=None, plan_hash_val=None,
+                      tree_commit=None, artifact_md5=None):
+    """Build a versioned run record dictionary."""
+    if plan is not None:
+        plan_dict = load_plan(plan)
+        if plan_hash_val is None:
+            plan_hash_val = plan_hash(plan_dict)
+        if tree_commit is None:
+            tree_commit = plan_dict.get("tree_commit")
+        if artifact_md5 is None:
+            artifact_md5 = plan_dict.get("artifact_md5")
+
+    if plan_hash_val is None:
+        plan_hash_val = "unknown"
+    if tree_commit is None:
+        tree_commit = get_tree_commit()
+    if artifact_md5 is None:
+        artifact_md5 = "unknown"
+    if knobs_in_effect is None:
+        knobs_in_effect = {}
+    if checks is None:
+        checks = {"status": "not run"}
+    if per_card_peak_memory is None:
+        per_card_peak_memory = {}
+
+    eff_tokens_per_step = tokens_per_step if tokens_a_step is None else tokens_a_step
+    eff_build_time_s = build_time_s if build_time is None else build_time
+
+    return {
+        "format": RECORD_FORMAT,
+        "schema_version": RECORD_SCHEMA_VERSION,
+        "plan_hash": str(plan_hash_val),
+        "tree_commit": str(tree_commit),
+        "artifact_md5": str(artifact_md5),
+        "knobs_in_effect": {str(k): str(v) for k, v in knobs_in_effect.items()},
+        "median_step_ms": round(float(median_step_ms), 3),
+        "tokens_per_step": float(eff_tokens_per_step),
+        "checks": dict(checks),
+        "per_card_peak_memory": dict(per_card_peak_memory),
+        "build_time_s": round(float(eff_build_time_s), 3),
+        "per_class_times": dict(per_class_times) if per_class_times is not None else None,
+        "timestamp": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
+    }
+
+
+def parse_record(record_or_path):
+    """Validate and parse a run record, checking schema version and required fields."""
+    if isinstance(record_or_path, (str, bytes, os.PathLike)):
+        if isinstance(record_or_path, bytes):
+            record_or_path = record_or_path.decode("utf-8")
+        s = str(record_or_path).strip()
+        if s.startswith("{"):
+            record = json.loads(s)
+        else:
+            if not os.path.exists(s):
+                raise FileNotFoundError(f"run record file not found: {s}")
+            with open(s, "r", encoding="utf-8") as f:
+                record = json.load(f)
+    elif isinstance(record_or_path, dict):
+        record = dict(record_or_path)
+    else:
+        raise TypeError(f"expected dict, path or JSON string for record, got {type(record_or_path)!r}")
+
+    if record.get("format") != RECORD_FORMAT:
+        raise ValueError(f"unexpected record format {record.get('format')!r}, expected {RECORD_FORMAT!r}")
+    if record.get("schema_version") != RECORD_SCHEMA_VERSION:
+        raise ValueError(f"unexpected record schema version {record.get('schema_version')!r}, expected {RECORD_SCHEMA_VERSION!r}")
+    if not record.get("plan_hash"):
+        raise ValueError("missing plan_hash")
+    if not record.get("tree_commit"):
+        raise ValueError("missing tree_commit")
+    if not record.get("artifact_md5"):
+        raise ValueError("missing artifact_md5")
+    if "knobs_in_effect" not in record or record["knobs_in_effect"] is None:
+        raise ValueError("missing knobs_in_effect")
+    return record
+
+
+def write_run_record(record, out_path):
+    """Validate and write a run record to out_path as formatted JSON."""
+    validated = parse_record(record)
+    parent = os.path.dirname(out_path)
+    if parent:
+        os.makedirs(parent, exist_ok=True)
+    with open(out_path, "w", encoding="utf-8") as f:
+        json.dump(validated, f, indent=2)
+        f.write("\n")

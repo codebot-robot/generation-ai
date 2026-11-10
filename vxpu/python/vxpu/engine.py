@@ -1322,7 +1322,62 @@ class Engine:
         if recorder is not None:
             done["telemetry"] = recorder.result(plan_record(self.explain()))
 
+        median_ms = (sorted(step_ms)[len(step_ms) // 2] if step_ms
+                     else (done["ms_per_token"] if done.get("ms_per_token") else 0.0))
+        self.last_run_record = self._build_run_record(median_ms, 1.0)
         yield done
+
+        out_record_path = os.environ.get("VXPU_RUN_RECORD")
+        if out_record_path:
+            try:
+                from . import physplan
+                physplan.write_run_record(self.last_run_record, out_record_path)
+            except Exception as e:
+                import logging
+                logging.getLogger("vxpu.engine").warning(
+                    "failed to write run record to %s: %s", out_record_path, e)
+
+    def _build_run_record(self, median_step_ms, tokens_per_step=1.0):
+        from . import physplan
+        peak_memory = {}
+        if str(self.device).startswith("cuda"):
+            try:
+                import torch
+                if torch.cuda.is_available():
+                    for idx in range(torch.cuda.device_count()):
+                        peak_memory[f"cuda:{idx}"] = torch.cuda.max_memory_allocated(idx)
+            except Exception:
+                pass
+
+        checks = {"status": "not run"}
+        plan_dict = getattr(self, "physplan", None)
+        return physplan.create_run_record(
+            plan=plan_dict,
+            knobs_in_effect=getattr(self, "effective_knobs", {}),
+            median_step_ms=median_step_ms,
+            tokens_per_step=tokens_per_step,
+            checks=checks,
+            per_card_peak_memory=peak_memory,
+            build_time_s=getattr(self, "build_time_s", 0.0),
+            tree_commit=getattr(self, "tree_commit", None),
+            artifact_md5=plan_dict.get("artifact_md5") if plan_dict else None,
+        )
+
+    def run_record(self):
+        """Return the run record from the most recent run."""
+        if hasattr(self, "last_run_record"):
+            return self.last_run_record
+        return self._build_run_record(0.0, 1.0)
+
+    def write_run_record(self, path=None):
+        """Write the run record from the most recent run to path."""
+        path = path or os.environ.get("VXPU_RUN_RECORD")
+        if not path:
+            raise ValueError("write_run_record: no path specified and VXPU_RUN_RECORD not set")
+        from . import physplan
+        rec = self.run_record()
+        physplan.write_run_record(rec, path)
+        return rec
 
 
 class SamplingParams:
