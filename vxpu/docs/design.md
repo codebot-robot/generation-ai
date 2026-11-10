@@ -152,6 +152,7 @@ The planner improves plans by running candidate choices on real hardware and mea
 The evaluation loop connects the Go planner, the Python executor, and the local measurement ledger:
 
 1. `vxpu plan emit --artifact DIR --out plan.json` reads the artifact's manifest and binding. It enumerates the model's call sites across five classes: dense GEMV, expert op, sum site, attention, and drafter. It writes each site with its tensor shapes, supported row counts, and current default strategy. The plan file records the artifact MD5 checksum and tree commit.
+2. `physplan.apply_env` reads the plan file and determines the effective knobs for the executor. Unknown strategies produce an immediate error.
 
 ## 2. Models by name, and executors
 

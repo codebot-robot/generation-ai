@@ -198,15 +198,35 @@ class Engine:
 
     def __init__(self, artifact_dir, device="cpu", compile_decode=False,
                  cas_dir=None, external_dir=None, plan_given=None,
-                 _copy_worker_hook=None):
+                 _copy_worker_hook=None, plan=None):
         from transformers import AutoTokenizer
         from transformers.models.auto.configuration_auto import (
             CONFIG_MAPPING)
+        from . import physplan
 
+        self._load_t0 = time.time()
         self.artifact_dir = artifact_dir
         self.device = device
         self.compile_decode = compile_decode
         self._copy_worker_hook = _copy_worker_hook or self._copy_worker_hook
+
+        # Load physical plan and apply knobs if provided
+        plan_source = plan or os.environ.get("VXPU_PLAN")
+        if plan_source:
+            self.physplan = physplan.load_plan(plan_source)
+            self.effective_knobs = physplan.apply_env(self.physplan)
+            combined = dict(self.effective_knobs)
+            if plan_given:
+                combined.update(plan_given)
+            plan_given = combined
+        else:
+            self.physplan = None
+            self.effective_knobs = {}
+
+        self.tree_commit = (
+            self.physplan.get("tree_commit") if self.physplan else None
+        ) or physplan.get_tree_commit()
+
         # The physical plan: every choice about how this engine runs the
         # artifact, made here once and reported by explain() (plan.py).
         self.plan = Plan(device, compile_decode=compile_decode, external_dir=external_dir, given=plan_given)
@@ -413,6 +433,7 @@ class Engine:
 
         self.load_breakdown = ", ".join(parts)
         self.plan.note(f"load: {self.load_breakdown}")
+        self.build_time_s = time.time() - self._load_t0
 
         print("[vxpu] " + self.plan.summary(self.plan_ops()).replace("\n", "\n[vxpu] "), flush=True)
 
@@ -1263,6 +1284,7 @@ class Engine:
             logits_sink(0, logits[0, -1])
         next_id = sampler.pick(logits[0, -1], ids)
         loop_started = time.perf_counter()
+        step_ms = []
         for step in range(max_tokens_to_generate):
             token_ids.append(next_id)
             yield {"token_ids": [next_id], "done": False}
@@ -1271,7 +1293,7 @@ class Engine:
                 break
             if len(cached) >= self.max_cache_len:
                 break
-            step_started = time.perf_counter() if recorder is not None else 0.0
+            step_started = time.perf_counter()
             logits = self._decode_run(
                 input_ids=torch.tensor([[next_id]], device=self.device),
                 cache_position=torch.tensor([len(cached)],
@@ -1280,8 +1302,10 @@ class Engine:
             if logits_sink is not None:
                 logits_sink(step + 1, logits[0, -1])
             next_id = sampler.pick(logits[0, -1], cached)
+            duration_ms = (time.perf_counter() - step_started) * 1e3
+            step_ms.append(duration_ms)
             if recorder is not None:
-                recorder.step_ms.append((time.perf_counter() - step_started) * 1e3)
+                recorder.step_ms.append(duration_ms)
         loop_s = time.perf_counter() - loop_started
 
         done = {
@@ -1297,6 +1321,7 @@ class Engine:
         }
         if recorder is not None:
             done["telemetry"] = recorder.result(plan_record(self.explain()))
+
         yield done
 
 
