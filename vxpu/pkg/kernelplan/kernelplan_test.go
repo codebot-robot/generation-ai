@@ -15,6 +15,10 @@
 package kernelplan
 
 import (
+	"bufio"
+	"encoding/json"
+	"os"
+	"path/filepath"
 	"slices"
 	"testing"
 )
@@ -119,5 +123,105 @@ func TestEmitTreeCommitFromManifest(t *testing.T) {
 	badManifest := `{"config": {"dim": 128}}`
 	if _, err := EmitFromArtifact([]byte(badManifest), []byte(binding), "", []int{1, 5}); err == nil {
 		t.Error("expected error when tree commit cannot be determined, got nil")
+	}
+}
+
+func TestValidateRecord(t *testing.T) {
+	valid := RunRecord{
+		Format:        RecordFormat,
+		SchemaVersion: 1,
+		PlanHash:      "hash123",
+		TreeCommit:    "commit123",
+		ArtifactMD5:   "md5_abc",
+		KnobsInEffect: map[string]string{
+			"VXPU_FUSED_EXPERTS": "1",
+		},
+		MedianStepMs:  12.34,
+		TokensPerStep: 1.0,
+		BuildTimeS:    0.45,
+		Checks: map[string]any{
+			"status": "not run",
+		},
+	}
+	data, err := json.Marshal(valid)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	rec, err := ValidateRecord(data)
+	if err != nil {
+		t.Fatalf("ValidateRecord failed on valid record: %v", err)
+	}
+	if rec.PlanHash != "hash123" {
+		t.Errorf("rec.PlanHash = %q, want hash123", rec.PlanHash)
+	}
+
+	// Wrong schema version
+	wrongVer := valid
+	wrongVer.SchemaVersion = 2
+	data, _ = json.Marshal(wrongVer)
+	if _, err := ValidateRecord(data); err == nil {
+		t.Error("expected error for schema_version 2, got nil")
+	}
+
+	// Wrong format
+	wrongFmt := valid
+	wrongFmt.Format = "vxpu-run-record/2"
+	data, _ = json.Marshal(wrongFmt)
+	if _, err := ValidateRecord(data); err == nil {
+		t.Error("expected error for wrong format, got nil")
+	}
+
+	// Missing plan_hash
+	noHash := valid
+	noHash.PlanHash = ""
+	data, _ = json.Marshal(noHash)
+	if _, err := ValidateRecord(data); err == nil {
+		t.Error("expected error for record missing plan_hash, got nil")
+	}
+}
+
+func TestAppendLedger(t *testing.T) {
+	tmpDir := t.TempDir()
+	ledgerPath := filepath.Join(tmpDir, "ledger.jsonl")
+
+	rec := &RunRecord{
+		Format:        RecordFormat,
+		SchemaVersion: 1,
+		PlanHash:      "hash456",
+		TreeCommit:    "commit456",
+		ArtifactMD5:   "md5_def",
+		KnobsInEffect: map[string]string{
+			"VXPU_FUSED_EXPERTS": "1",
+		},
+		MedianStepMs:  28.6,
+		TokensPerStep: 1.0,
+		BuildTimeS:    0.5,
+		Checks: map[string]any{
+			"status": "not run",
+		},
+	}
+
+	if err := AppendLedger(ledgerPath, rec); err != nil {
+		t.Fatalf("AppendLedger failed: %v", err)
+	}
+
+	file, err := os.Open(ledgerPath)
+	if err != nil {
+		t.Fatalf("Open ledger failed: %v", err)
+	}
+	defer file.Close()
+
+	scanner := bufio.NewScanner(file)
+	if !scanner.Scan() {
+		t.Fatal("expected at least one line in ledger")
+	}
+
+	readRec, err := ValidateRecord(scanner.Bytes())
+	if err != nil {
+		t.Fatalf("ValidateRecord failed on ledger line: %v", err)
+	}
+	if readRec.PlanHash != "hash456" {
+		t.Errorf("readRec.PlanHash = %q, want hash456", readRec.PlanHash)
 	}
 }

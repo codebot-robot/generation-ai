@@ -28,11 +28,13 @@ import (
 
 func cmdPlan(ctx context.Context, args []string) error {
 	if len(args) < 1 {
-		return fmt.Errorf("usage: vxpu plan emit [flags]")
+		return fmt.Errorf("usage: vxpu plan emit [flags] | vxpu plan record [flags]")
 	}
 	switch args[0] {
 	case "emit":
 		return cmdPlanEmit(ctx, args[1:])
+	case "record":
+		return cmdPlanRecord(ctx, args[1:])
 	default:
 		return fmt.Errorf("unknown plan command %q", args[0])
 	}
@@ -82,6 +84,33 @@ func cmdPlanEmit(ctx context.Context, args []string) error {
 
 	if err := os.WriteFile(*out, append(data, '\n'), 0644); err != nil {
 		return fmt.Errorf("write plan to %s: %w", *out, err)
+	}
+	return nil
+}
+
+func cmdPlanRecord(ctx context.Context, args []string) error {
+	flags := flag.NewFlagSet("plan record", flag.ContinueOnError)
+	in := flags.String("in", "", "path to run record JSON file")
+	ledger := flags.String("ledger", "ledger.jsonl", "path to local ledger file")
+	if err := flags.Parse(args); err != nil {
+		return err
+	}
+	if *in == "" {
+		return fmt.Errorf("--in is required")
+	}
+
+	data, err := os.ReadFile(*in)
+	if err != nil {
+		return fmt.Errorf("read run record %s: %w", *in, err)
+	}
+
+	rec, err := kernelplan.ValidateRecord(data)
+	if err != nil {
+		return fmt.Errorf("validate run record: %w", err)
+	}
+
+	if err := kernelplan.AppendLedger(*ledger, rec); err != nil {
+		return fmt.Errorf("append to ledger: %w", err)
 	}
 	return nil
 }

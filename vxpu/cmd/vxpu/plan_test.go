@@ -23,7 +23,7 @@ import (
 	"github.com/gke-labs/generation-ai/vxpu/pkg/kernelplan"
 )
 
-func TestCmdPlanEmit(t *testing.T) {
+func TestCmdPlanEmitAndRecord(t *testing.T) {
 	tmpDir := t.TempDir()
 
 	manifest := `{
@@ -59,6 +59,7 @@ func TestCmdPlanEmit(t *testing.T) {
 	planPath := filepath.Join(tmpDir, "plan.json")
 	ctx := t.Context()
 
+	// 1. Emit
 	if err := cmdPlan(ctx, []string{"emit", "--artifact", artDir, "--out", planPath, "--rows", "1,5,8"}); err != nil {
 		t.Fatalf("cmdPlan emit failed: %v", err)
 	}
@@ -82,7 +83,43 @@ func TestCmdPlanEmit(t *testing.T) {
 		t.Error("expected at least one site in plan")
 	}
 
-	if _, err := kernelplan.HashPlan(&plan); err != nil {
+	planHash, err := kernelplan.HashPlan(&plan)
+	if err != nil {
 		t.Fatalf("HashPlan failed: %v", err)
+	}
+
+	// 2. Record
+	runRec := kernelplan.RunRecord{
+		Format:        kernelplan.RecordFormat,
+		SchemaVersion: 1,
+		PlanHash:      planHash,
+		TreeCommit:    plan.TreeCommit,
+		ArtifactMD5:   plan.ArtifactMD5,
+		KnobsInEffect: map[string]string{"VXPU_FUSED_EXPERTS": "1"},
+		MedianStepMs:  15.5,
+		TokensPerStep: 1.0,
+		BuildTimeS:    0.35,
+		Checks:        map[string]any{"status": "not run"},
+	}
+	runPath := filepath.Join(tmpDir, "run.json")
+	runBytes, err := json.Marshal(runRec)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(runPath, runBytes, 0644); err != nil {
+		t.Fatal(err)
+	}
+
+	ledgerPath := filepath.Join(tmpDir, "ledger.jsonl")
+	if err := cmdPlan(ctx, []string{"record", "--in", runPath, "--ledger", ledgerPath}); err != nil {
+		t.Fatalf("cmdPlan record failed: %v", err)
+	}
+
+	ledgerBytes, err := os.ReadFile(ledgerPath)
+	if err != nil {
+		t.Fatalf("ReadFile ledger failed: %v", err)
+	}
+	if len(ledgerBytes) == 0 {
+		t.Error("expected non-empty ledger file")
 	}
 }
