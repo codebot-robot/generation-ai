@@ -100,12 +100,18 @@ func (h *Harness) DockerBuild(tag, dockerfile, context string) {
 // DockerBuildErr builds a docker image and returns any error instead of calling Fatalf.
 // This is safe to call from background goroutines.
 func (h *Harness) DockerBuildErr(tag, dockerfile, context string) error {
-	cmd := exec.Command("docker", "build", "-t", tag, "-f", dockerfile, context)
+	cmdName := "docker"
+	args := []string{"build", "-t", tag, "-f", dockerfile}
+	if os.Getenv("CI") != "" && strings.Contains(tag, "vxpu-executor") {
+		args = []string{"buildx", "build", "--cache-from=type=gha,scope=vxpu-executor", "-t", tag, "-f", dockerfile, "--load"}
+	}
+	args = append(args, context)
+	cmd := exec.Command(cmdName, args...)
 	var buf bytes.Buffer
 	cmd.Stdout = io.MultiWriter(os.Stdout, &buf)
 	cmd.Stderr = io.MultiWriter(os.Stderr, &buf)
 	if err := cmd.Run(); err != nil {
-		return fmt.Errorf("command failed: docker build -t %s -f %s %s: %w\nOutput: %s", tag, dockerfile, context, err, buf.String())
+		return fmt.Errorf("command failed: %s %s: %w\nOutput: %s", cmdName, strings.Join(args, " "), err, buf.String())
 	}
 	return nil
 }

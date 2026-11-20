@@ -250,6 +250,18 @@ Cache saved with key: vxpu-gpu-Linux-1284383514f7bc2a3aa0cdfe94839bc06281ed7d9f3
 ```
 This occupies approximately 34% of the repository's 10 GB quota.
 
+The executor Docker image layer cache for `test-vxpu-image` and `ap-e2e-vxpu` presubmits uses Docker BuildKit's GitHub Actions cache backend (`--cache-from=type=gha,scope=vxpu-executor`, `--cache-to=type=gha,mode=max,scope=vxpu-executor`).
+
+#### Token Exposure and Write Isolation
+- The `crazy-max/ghaction-github-runtime` step exposes `ACTIONS_CACHE_URL` and `ACTIONS_RUNTIME_TOKEN` to `GITHUB_ENV` in the `test-vxpu-image` and `ap-e2e-vxpu` jobs only.
+- In pull request runs, `test-vxpu-image` and `ap-e2e-vxpu` only import cache layers (`--cache-from=type=gha,scope=vxpu-executor`) and never export (`--cache-to`).
+- In addition, pull request runs from forks receive read-only cache access from GitHub (`cache-mode: read`). GitHub Actions branch scoping prevents any pull request ref from writing to `refs/heads/main`.
+- Only `test-vxpu-image` runs on `push` events to `main` export the cache with `--cache-to=type=gha,mode=max,scope=vxpu-executor`. `ap-e2e-vxpu` only imports and never exports, preventing duplicate writes and key reservation collisions.
+
+#### Quota Impact
+- The GPU presubmit dependency cache occupies ~3.4 GB.
+- BuildKit layer cache exported on `main` stores intermediate layers (~3 GB), maintaining the total repository cache within the 10 GB quota and preventing cache eviction of the GPU runner dependencies.
+
 **Measured job timings**:
 - **Cache miss (Run 44014665691)**: `uv` downloaded Python 3.13, PyTorch 2.14.1, and CUDA 13 libraries from PyPI. The dependency installation step took **155.19 s** (04:05:18 to 04:07:53).
 - **Cache hit (Run 44016066227)**: `actions/cache/restore` downloaded and unpacked the 3.40 GB archive from the cache service in 87.25 s (04:16:57 to 04:18:24):

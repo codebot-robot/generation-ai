@@ -135,6 +135,9 @@ jobs:
           # .git/config (zizmor: artipacked).
           persist-credentials: false
 
+      - name: Expose GitHub Actions cache runtime
+        uses: crazy-max/ghaction-github-runtime@3cb05d89e1f492524af3d41a1c98c83bc3025124 # ratchet:crazy-max/ghaction-github-runtime@v3.1.0
+
       - name: Run ap-e2e-vxpu
         run: ./dev/ci/presubmits/ap-e2e-vxpu
 
@@ -222,6 +225,9 @@ jobs:
           # Presubmit scripts never push; don't leave the token in
           # .git/config (zizmor: artipacked).
           persist-credentials: false
+
+      - name: Expose GitHub Actions cache runtime
+        uses: crazy-max/ghaction-github-runtime@3cb05d89e1f492524af3d41a1c98c83bc3025124 # ratchet:crazy-max/ghaction-github-runtime@v3.1.0
 
       - name: Run test-vxpu-image
         run: ./dev/ci/presubmits/test-vxpu-image
