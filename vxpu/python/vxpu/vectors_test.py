@@ -305,7 +305,7 @@ def record_deepseek_eager(model, revision, prompts, settings):
 
 
 def record_vxpu_engine(model, revision, prompts, settings, artifact, device="cpu",
-                       compile_decode=False, telemetry=vxpu_pb2.TELEMETRY_NONE, keep=None, prepare=None, external_dir=None):
+                       telemetry=vxpu_pb2.TELEMETRY_NONE, keep=None, prepare=None, external_dir=None):
     """Candidate: the executor's engine in this process (no cluster).
     With ``telemetry=vxpu_pb2.TELEMETRY_SUMMARY``, each prompt carries its execution
     telemetry. With ``telemetry=vxpu_pb2.TELEMETRY_TRACE``, it also records ordered
@@ -314,7 +314,7 @@ def record_vxpu_engine(model, revision, prompts, settings, artifact, device="cpu
     import torch
     from .engine import Engine, SamplingParams
     tok = _tokenizer(model, revision, prompts)
-    engine = Engine(artifact, device=device, compile_decode=compile_decode,
+    engine = Engine(artifact, device=device,
                     external_dir=external_dir)
     if prepare is not None:  # a check's change to the loaded engine, before it generates
         prepare(engine)
@@ -349,7 +349,6 @@ def record_vxpu_engine(model, revision, prompts, settings, artifact, device="cpu
     from .plan import record as plan_record
     producer = {"kind": "vxpu-engine" if not external_dir else "vxpu-engine (external_dir)",
                 **_versions(device),
-                "compile": compile_decode,
                 "binding": {k: len(binding.get(k, [])) for k in
                             ("bound", "derived", "state", "stacked", "aliases")},
                 "quantization": binding.get("quantization"),
@@ -680,7 +679,7 @@ def cmd_record(args):
     elif args.producer == "vxpu-engine":
         doc = record_vxpu_engine(args.model, args.revision, args.prompts, settings,
                                  args.artifact, device=args.device,
-                                 compile_decode=args.compile, telemetry=telemetry)
+                                 telemetry=telemetry)
     elif args.producer == "deepseek-eager":
         doc = record_deepseek_eager(args.model, args.revision, args.prompts, settings)
     elif args.producer == "vllm":
@@ -1522,14 +1521,14 @@ def _check_range_server(model, prompts, settings, artifact, plain, device="cpu")
     base = {"VXPU_DATAFLOW": "1", "VXPU_DATAFLOW_PLACE": None, "VXPU_EXPERT_MAILBOXES": None, "VXPU_GPU_EXPERTS": None}
     kw = {}
     if device != "cpu":
-        base.update({"VXPU_SEGMENT_RUNTIME": "aoti", "VXPU_STEP_GRAPH": "1"})
-        kw = {"device": device, "compile_decode": True}
+        base.update({"VXPU_STEP_GRAPH": "1"})
+        kw = {"device": device}
     if device != "cpu":  # the reference: one engine, the same step graph on the same GPU
         plain = _with_env(base, record_vxpu_engine, model, "main", prompts, settings, artifact, **kw)
     # the other range as the coordinator starts it: an executor loads the model with its range
     # (LoadModel, VXPU_LAYER_RANGE) and serves it (ServeRange); the head is wired by its plan
     import grpc
-    from . import vxpu_pb2
+    from . import plan_pb2, vxpu_pb2
     from .server import ExecutorServicer
 
     class Context:
@@ -1553,7 +1552,7 @@ def _check_range_server(model, prompts, settings, artifact, plain, device="cpu")
     executor.LoadModel(vxpu_pb2.LoadModelRequest(manifest_json=files["manifest.json"].decode(),
                                                  binding_json=files["binding.json"].decode(),
                                                  prefill_graph=files["prefill.pt2"], decode_graph=files["decode.pt2"],
-                                                 plan=plan), ctx)
+                                                 plan=plan, plan_file=plan_pb2.PlanFile()), ctx)
     if ctx.code is not None:  # LoadModel refused the plan or failed, so nothing will start serving
         print(f"range server check: LoadModel failed: {ctx.code} {ctx.details}")
         return False
@@ -1805,7 +1804,7 @@ def _check_plan_given():
     # LoadModel answers every refusal as INVALID_ARGUMENT (final: the router doesn't retry), a
     # switch's own check (a plain ValueError) included, before it touches the artifact
     import grpc
-    from . import vxpu_pb2
+    from . import plan_pb2, vxpu_pb2
     from .server import ExecutorServicer
 
     class Context:
@@ -1817,11 +1816,16 @@ def _check_plan_given():
         def set_details(self, details):
             self.details = details
 
-    ctx = Context()
     plan_work = tempfile.mkdtemp(prefix="vxpu-plan-")
     atexit.register(shutil.rmtree, plan_work, True)
-    ExecutorServicer(work_dir=plan_work, device="cpu").LoadModel(
-        vxpu_pb2.LoadModelRequest(plan={"VXPU_DATAFLOW_PLACE": "experts"}), ctx)
+    servicer = ExecutorServicer(work_dir=plan_work, device="cpu")
+    ctx = Context()
+    servicer.LoadModel(vxpu_pb2.LoadModelRequest(), ctx)
+    if ctx.code != grpc.StatusCode.INVALID_ARGUMENT:
+        raise SystemExit(f"plan: LoadModel answered a missing plan_file with {ctx.code} ({ctx.details})")
+    ctx = Context()
+    servicer.LoadModel(
+        vxpu_pb2.LoadModelRequest(plan={"VXPU_DATAFLOW_PLACE": "experts"}, plan_file=plan_pb2.PlanFile()), ctx)
     if ctx.code != grpc.StatusCode.INVALID_ARGUMENT:
         raise SystemExit(f"plan: LoadModel answered a refused plan with {ctx.code} ({ctx.details})")
     print("plan check: the coordinator's switches win over the environment's; others, empty ones and paths are refused")
@@ -2154,7 +2158,6 @@ def main(argv=None):
                      help="router admin host:port (for --producer vxpu-router --telemetry; default: port-forward to port 50052)")
     rec.add_argument("--device", default="cpu", help="transformers / vxpu-engine producers (vllm places itself)")
     rec.add_argument("--dtype", default="auto", help="transformers / vllm model dtype (auto: the config's)")
-    rec.add_argument("--compile", action="store_true", help="vxpu-engine: torch.compile the decode graph")
     rec.add_argument("--telemetry", choices=["summary", "trace"], default=None,
                      help="vxpu-engine / vxpu-router: keep execution telemetry ('summary') or with ordered expert traces ('trace')")
     rec.add_argument("--dequantize", action="store_true",
