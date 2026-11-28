@@ -49,6 +49,7 @@ import (
 	"github.com/gke-labs/generation-ai/vxpu/pkg/blobserver"
 	"github.com/gke-labs/generation-ai/vxpu/pkg/collections"
 	"github.com/gke-labs/generation-ai/vxpu/pkg/kernelplan"
+	"github.com/gke-labs/generation-ai/vxpu/pkg/pki"
 	"github.com/gke-labs/generation-ai/vxpu/pkg/weightstore"
 )
 
@@ -140,6 +141,11 @@ const (
 	annotationAccelerator = "vxpu.gke-labs.dev/accelerator"
 	annotationImage       = "vxpu.gke-labs.dev/image"
 	annotationStore       = "vxpu.gke-labs.dev/store"
+	annotationAgentMTLS   = "vxpu.gke-labs.dev/agent-mtls"
+
+	agentServiceAccountName = "vxpu-agent"
+	agentTLSVolumeName      = "vxpu-tls"
+	agentTLSMountPath       = "/var/run/vxpu/tls"
 )
 
 func NewServer(clientset kubernetes.Interface, namespace, imageName, accelerator string) *Server {
@@ -542,8 +548,8 @@ func getPeerKey(ctx context.Context) string {
 }
 
 // placementAnnotations records what a pod was sized for, so a later
-// LoadModel can tell whether an existing pod fits the model and runs the expected image and store.
-func placementAnnotations(p Placement, image, storeURL string) map[string]string {
+// LoadModel can tell whether an existing pod fits the model and runs the expected image, store, and mTLS mode.
+func placementAnnotations(p Placement, image, storeURL string, agentMTLS bool) map[string]string {
 	m := map[string]string{
 		annotationWeightBytes: strconv.FormatInt(p.WeightBytes, 10),
 		annotationAccelerator: p.Accelerator,
@@ -554,13 +560,16 @@ func placementAnnotations(p Placement, image, storeURL string) map[string]string
 	if storeURL != "" {
 		m[annotationStore] = storeURL
 	}
+	if agentMTLS {
+		m[annotationAgentMTLS] = "true"
+	}
 	return m
 }
 
 // placementMatches reports whether an existing pod was created for
-// this placement, image, and modelstore URL. Pods without annotations
+// this placement, image, modelstore URL, and mTLS mode. Pods without annotations
 // (created before they were recorded) are kept.
-func placementMatches(pod *corev1.Pod, p Placement, image, storeURL string) bool {
+func placementMatches(pod *corev1.Pod, p Placement, image, storeURL string, agentMTLS bool) bool {
 	weight, ok := pod.Annotations[annotationWeightBytes]
 	if !ok {
 		return true
@@ -576,6 +585,13 @@ func placementMatches(pod *corev1.Pod, p Placement, image, storeURL string) bool
 		}
 	}
 	if pod.Annotations[annotationStore] != storeURL {
+		return false
+	}
+	wantMTLS := ""
+	if agentMTLS {
+		wantMTLS = "true"
+	}
+	if pod.Annotations[annotationAgentMTLS] != wantMTLS {
 		return false
 	}
 	return true
@@ -646,12 +662,13 @@ func (s *Server) getOrStartPod(ctx context.Context, modelID string, want *Placem
 		return "", errNoExecutor
 	}
 	storeURL := s.weightStoreURL()
+	agentMTLS := s.agentCreds != nil
 	if err == nil {
 		log.Info("Found existing pod", "pod", podName, "phase", pod.Status.Phase)
 		recreate := ""
 		switch {
-		case !placementMatches(pod, *want, s.imageName, storeURL):
-			recreate = "existing pod was sized for a different placement, image, or store"
+		case !placementMatches(pod, *want, s.imageName, storeURL, agentMTLS):
+			recreate = "existing pod was sized for a different placement, image, store, or mTLS mode"
 		case pod.Status.Phase == corev1.PodFailed || pod.Status.Phase == corev1.PodUnknown:
 			recreate = "existing pod is in bad state"
 		case pod.Status.Phase == corev1.PodRunning && pod.Status.PodIP != "":
@@ -742,6 +759,66 @@ func (s *Server) getOrStartPod(ctx context.Context, modelID string, want *Placem
 			agentArgs = append(agentArgs, "--store="+storeURL)
 		}
 
+		volumes := []corev1.Volume{
+			{
+				Name: "work",
+				VolumeSource: corev1.VolumeSource{
+					EmptyDir: &corev1.EmptyDirVolumeSource{
+						SizeLimit: func() *resource.Quantity {
+							q := resource.MustParse("80Gi")
+							return &q
+						}(),
+					},
+				},
+			},
+		}
+		volumeMounts := []corev1.VolumeMount{
+			{
+				Name:      "work",
+				MountPath: "/tmp/vxpu",
+			},
+		}
+		if agentMTLS {
+			mode0400 := int32(0o400)
+			volumes = append(volumes, corev1.Volume{
+				Name: agentTLSVolumeName,
+				VolumeSource: corev1.VolumeSource{
+					Projected: &corev1.ProjectedVolumeSource{
+						Sources: []corev1.VolumeProjection{
+							{
+								ConfigMap: &corev1.ConfigMapProjection{
+									LocalObjectReference: corev1.LocalObjectReference{
+										Name: pki.CABundleConfigMapName,
+									},
+									Items: []corev1.KeyToPath{
+										{Key: "ca.crt", Path: "ca.crt"},
+									},
+								},
+							},
+							{
+								Secret: &corev1.SecretProjection{
+									LocalObjectReference: corev1.LocalObjectReference{
+										Name: pki.AgentSecretName,
+									},
+									Items: []corev1.KeyToPath{
+										{Key: corev1.TLSCertKey, Path: corev1.TLSCertKey, Mode: &mode0400},
+										{Key: corev1.TLSPrivateKeyKey, Path: corev1.TLSPrivateKeyKey, Mode: &mode0400},
+									},
+								},
+							},
+						},
+					},
+				},
+			})
+			volumeMounts = append(volumeMounts, corev1.VolumeMount{
+				Name:      agentTLSVolumeName,
+				MountPath: agentTLSMountPath,
+				ReadOnly:  true,
+			})
+			agentArgs = append(agentArgs, "--tls-dir="+agentTLSMountPath)
+		}
+
+		automountServiceAccountToken := false
 		newPod := &corev1.Pod{
 			ObjectMeta: metav1.ObjectMeta{
 				Name:      podName,
@@ -750,23 +827,13 @@ func (s *Server) getOrStartPod(ctx context.Context, modelID string, want *Placem
 					"app":      "vxpu-executor",
 					"model-id": modelID,
 				},
-				Annotations: placementAnnotations(placement, s.imageName, storeURL),
+				Annotations: placementAnnotations(placement, s.imageName, storeURL, agentMTLS),
 			},
 			Spec: corev1.PodSpec{
-				NodeSelector: nodeSelector,
-				Volumes: []corev1.Volume{
-					{
-						Name: "work",
-						VolumeSource: corev1.VolumeSource{
-							EmptyDir: &corev1.EmptyDirVolumeSource{
-								SizeLimit: func() *resource.Quantity {
-									q := resource.MustParse("80Gi")
-									return &q
-								}(),
-							},
-						},
-					},
-				},
+				ServiceAccountName:           agentServiceAccountName,
+				AutomountServiceAccountToken: &automountServiceAccountToken,
+				NodeSelector:                 nodeSelector,
+				Volumes:                      volumes,
 				Containers: []corev1.Container{
 					{
 						Name:  "executor",
@@ -791,14 +858,9 @@ func (s *Server) getOrStartPod(ctx context.Context, modelID string, want *Placem
 							InitialDelaySeconds: 1,
 							PeriodSeconds:       2,
 						},
-						VolumeMounts: []corev1.VolumeMount{
-							{
-								Name:      "work",
-								MountPath: "/tmp/vxpu",
-							},
-						},
-						Env:       containerEnv,
-						Resources: resources,
+						VolumeMounts: volumeMounts,
+						Env:          containerEnv,
+						Resources:    resources,
 					},
 				},
 				RestartPolicy: corev1.RestartPolicyNever,
